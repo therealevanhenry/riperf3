@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "libriperf3",
+    "riperf3",
+]
+resolver = "2"
