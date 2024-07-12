@@ -1,7 +1,11 @@
 extern crate libriperf3;
 
-fn main() {
-    libriperf3::perform_test();
+use libriperf3::iperf_api;
 
-    println!("riperf3 is running!");
+fn main() {
+    let test = iperf_api::IperfTest {
+        ..iperf_api::IperfTest::default()
+    };
+
+    println!("{:?}", test);
 }
