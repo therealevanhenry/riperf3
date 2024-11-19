@@ -1,0 +1,5 @@
+# Makefile.toml for riperf3 workspace
+
+[env]
+# Define the environment variables for the workspace
+RUST_LOG = "debug"
