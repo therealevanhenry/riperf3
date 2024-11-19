@@ -4,4 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# riperf3 workspace dependencies
 riperf3 = { path = "../riperf3" }
+
+# external depdenencies
+clap.workspace = true
+log.workspace = true
+log4rs.workspace = true
+
+[[bin]]
+name = "riperf3"
+path = "src/main.rs"
