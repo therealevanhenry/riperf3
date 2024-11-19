@@ -1,6 +1,6 @@
-extern crate libriperf3;
+extern crate riperf3;
 
-use libriperf3::iperf_api;
+use riperf3::iperf_api;
 
 fn main() {
     let test = iperf_api::IperfTest {

@@ -1,6 +1,6 @@
 // Module: iperf_api
-// Path: libriperf3/src/iperf_api.rs
-// This module is used to define the API for the libriperf3 crate.
+// Path: riperf3/src/iperf_api.rs
+// This module is used to define the API for the riperf3 crate.
 
 #[derive(Debug, PartialEq)]
 pub enum DebugLevel {
@@ -8,7 +8,7 @@ pub enum DebugLevel {
     Warn,
     Info,
     Debug,
-    Max,    // TODO: what is different between Debug and Max?
+    Max, // TODO: what is different between Debug and Max?
 }
 
 #[derive(Debug, PartialEq)]
@@ -26,27 +26,27 @@ pub enum IperfMode {
 
 #[derive(Debug, PartialEq)]
 pub struct IperfSettings {
-    pub domain: i32,    // AF_INET or AF_INET6
-    pub socket_bufsize: i32,    // window size for TCP
-    pub blksize: i32,    // size of read/write blocks for '-l' flag
+    pub domain: i32,         // AF_INET or AF_INET6
+    pub socket_bufsize: i32, // window size for TCP
+    pub blksize: i32,        // size of read/write blocks for '-l' flag
     // TODO: iperf_size_t rate;    // target data rate for the test
     // TODO: iperf_size_t bitrate_limit;    // server's total bitrate limit
-    pub bitrate_limit_interval: i32,    // interval for averaging server's total bitrate limit
-    pub bitrate_limit_stats_per_interval: i32,    // number of stats periods to accumulate for
-                                                  // server's total bitrate average
-    pub fqrate: u64,    // target data rate for FQ pacing
-    pub pacing_timer: i32,    // pacing timer for FQ pacing in microseconds
-    pub burst: i32,    // number of packets to send in a burst
-    pub mss: i32,    // TCP maximum segment size
-    pub ttl: i32,    // IP TTL (Time to Live)
-    pub tos: i32,    // IP TOS (Type of Service)
+    pub bitrate_limit_interval: i32, // interval for averaging server's total bitrate limit
+    pub bitrate_limit_stats_per_interval: i32, // number of stats periods to accumulate for
+    // server's total bitrate average
+    pub fqrate: u64,       // target data rate for FQ pacing
+    pub pacing_timer: i32, // pacing timer for FQ pacing in microseconds
+    pub burst: i32,        // number of packets to send in a burst
+    pub mss: i32,          // TCP maximum segment size
+    pub ttl: i32,          // IP TTL (Time to Live)
+    pub tos: i32,          // IP TOS (Type of Service)
     pub flowlabel: i32,    // IPv6 flow label
     // TODO: iperf_size_t bytes;    // number of bytes to transmit/receive
     // TODO: iperf_size_t blocks;    // number of blocks (packets) to transmit/receive
-    pub unit_format: char,  // 'k', 'K', 'm', 'M', 'g', 'G' for Kbits/sec, Mbits/sec, Gbits/sec
-                            // KBytes/sec, MBytes/sec, GBytes/sec '-f' flag
-    pub num_ostreams: i32,    // SCTP initmsg settings
-    pub dont_fragment: bool,    // set/clear IP Don't Fragment flag
+    pub unit_format: char, // 'k', 'K', 'm', 'M', 'g', 'G' for Kbits/sec, Mbits/sec, Gbits/sec
+    // KBytes/sec, MBytes/sec, GBytes/sec '-f' flag
+    pub num_ostreams: i32,   // SCTP initmsg settings
+    pub dont_fragment: bool, // set/clear IP Don't Fragment flag
 
     // TODO:    if defined(HAVE_SSL)
     //              char *authtoken;
@@ -54,12 +54,12 @@ pub struct IperfSettings {
     //              char *client_password;
     //              EVP_PKEY *client_rsa_pubkey;
     //          #endif
-    pub connect_timeout: i32,    // timeout for control connection setup, in milliseconds
+    pub connect_timeout: i32, // timeout for control connection setup, in milliseconds
     pub idle_timeout: i32,    // server idle time timeout, in seconds
-    pub snd_timeout: u32,       // Timeout for sending TCP messages in active mode 
-                                // in microseconds
-    // TODO: struct iperf_time rcv_timeout;   // Timeout for receiving TCP messages in 
-    //                                        // active mode in microseconds
+    pub snd_timeout: u32,     // Timeout for sending TCP messages in active mode
+                              // in microseconds
+                              // TODO: struct iperf_time rcv_timeout;   // Timeout for receiving TCP messages in
+                              //                                        // active mode in microseconds
 }
 
 impl Default for IperfSettings {
@@ -89,57 +89,54 @@ impl Default for IperfSettings {
 
 #[derive(Debug, PartialEq)]
 pub struct IperfTest {
-    pub role: IperfRole,    // '-s' (server) or '-c' (client) flags
-    pub mode: IperfMode,    // defaults to Sender unless '-R' (reverse) or '--bidir' (bidirectional)
-                            // flags are specified
+    pub role: IperfRole, // '-s' (server) or '-c' (client) flags
+    pub mode: IperfMode, // defaults to Sender unless '-R' (reverse) or '--bidir' (bidirectional)
+    // flags are specified
     pub sender_has_retransmits: bool,
-    pub other_side_has_retransmits: bool,    // used if mode is Bidirectional
+    pub other_side_has_retransmits: bool, // used if mode is Bidirectional
 
     // TODO: struct protocol *protocol;
 
     // TODO: signed char state;
-
-    pub server_hostname: String,    // hostname of test server, used with '-c' flag
+    pub server_hostname: String, // hostname of test server, used with '-c' flag
     pub tmp_template: String,
-    pub bind_address: String,       // bind to the interface at this address
-    pub bind_dev: String,           // bind to the interface at this device
+    pub bind_address: String, // bind to the interface at this address
+    pub bind_dev: String,     // bind to the interface at this device
 
     // TODO: TAILQ_HEAD(xbind_addrhead, xbind_entry) xbind_addrs;
-
-    pub bind_port: i32,             // '--cport' flag
+    pub bind_port: i32, // '--cport' flag
     pub server_port: i32,
-    pub omit: i32,                  // duration of omit period '-O' flag
-    pub duration: i32,              // total duration of test '-t' flag
-    pub diskfile_name: String,       // name of file to write test output to '-F' flag
+    pub omit: i32,             // duration of omit period '-O' flag
+    pub duration: i32,         // total duration of test '-t' flag
+    pub diskfile_name: String, // name of file to write test output to '-F' flag
 
     // TODO: Can this be refactored to just use affinity?
-    pub affinity: i32,              // cpu affinity '-A' flag
-    pub server_affinity: i32,       // server cpu affinity '-A' flag
+    pub affinity: i32,        // cpu affinity '-A' flag
+    pub server_affinity: i32, // server cpu affinity '-A' flag
 
     // TODO:    #if defined (HAVE_CPUSET_SETAFFINITY)
     //          cpuset_t cpumask;
     //          #endif
-
-    pub title: String,              // title to include in JSON output '-T' flag
-    pub extra_data: String,         // '--extra-data' flag
-    pub congestion: String,         // '-C' flag to specify preferred congestion control algorithm
-    pub congestion_used: String,    // The congestion control algorithm used
-    pub remote_congestion_used: String,    // The congestion control algorithm used on the remote side
+    pub title: String,                  // title to include in JSON output '-T' flag
+    pub extra_data: String,             // '--extra-data' flag
+    pub congestion: String, // '-C' flag to specify preferred congestion control algorithm
+    pub congestion_used: String, // The congestion control algorithm used
+    pub remote_congestion_used: String, // The congestion control algorithm used on the remote side
 
     // TODO: Are we sure this is the '-P' flag?
-    pub pidfile: String,            // '-P' flag
+    pub pidfile: String, // '-P' flag
 
-    pub logfile: String,            // '--logfile' flag
+    pub logfile: String, // '--logfile' flag
 
     // TODO: FILE *outfile;
 
     // TODO: should this be a socket object instead of an int32?
-    pub ctrl_sck: i32,              // control socket
-    pub mapped_v4: i32,             // test uses mapped address
-    pub listener: i32,              // listener socket
-    pub prot_listener: i32,         // listener socket for protocol
+    pub ctrl_sck: i32,      // control socket
+    pub mapped_v4: i32,     // test uses mapped address
+    pub listener: i32,      // listener socket
+    pub prot_listener: i32, // listener socket for protocol
 
-    pub ctrl_sck_mss: i32,          // MSS for control socket
+    pub ctrl_sck_mss: i32, // MSS for control socket
 
     // TODO:    #if defined(HAVE_SSL)
     //              char *server_authorized_users;
@@ -149,33 +146,33 @@ pub struct IperfTest {
     //          #endif
 
     // boolean variables for flags
-    pub daemon: bool,               // '-D' flag
-    pub one_off: bool,              // '-1' flag
-    pub no_delay: bool,             // '-N' flag
-    pub reverse: bool,              // '-R' flag
-    pub bidir: bool,                // '--bidir' flag
-    pub verbose: bool,              // '-V' flag
-    pub json_output: bool,          // '-J' flag
-    pub json_stream: bool,          // '--json-stream' flag
-    pub zerocopy: bool,             // '-Z' flag uses sendfile
-    pub debug: bool,                // '-d' flag
-    pub debug_level: DebugLevel,    // '-d' flag with explicit level
-    pub get_server_output: bool,    // '--get-server-output' flag
-    pub udp_counters_64bit: bool,   // '--udp-counters-64bit' flag
-    pub forceflush: bool,           // '--forceflush' flag to flush output after every interval
+    pub daemon: bool,             // '-D' flag
+    pub one_off: bool,            // '-1' flag
+    pub no_delay: bool,           // '-N' flag
+    pub reverse: bool,            // '-R' flag
+    pub bidir: bool,              // '--bidir' flag
+    pub verbose: bool,            // '-V' flag
+    pub json_output: bool,        // '-J' flag
+    pub json_stream: bool,        // '--json-stream' flag
+    pub zerocopy: bool,           // '-Z' flag uses sendfile
+    pub debug: bool,              // '-d' flag
+    pub debug_level: DebugLevel,  // '-d' flag with explicit level
+    pub get_server_output: bool,  // '--get-server-output' flag
+    pub udp_counters_64bit: bool, // '--udp-counters-64bit' flag
+    pub forceflush: bool,         // '--forceflush' flag to flush output after every interval
     pub multisend: bool,
-    pub repeating_payload: bool,    // '--repeating-payload' flag
-    pub timestamps: bool,           // '--timestamps' flag
+    pub repeating_payload: bool, // '--repeating-payload' flag
+    pub timestamps: bool,        // '--timestamps' flag
     pub timestamp_format: String,
 
-    pub json_output_string: String,    // JSON output string used with '--json-output' flag
+    pub json_output_string: String, // JSON output string used with '--json-output' flag
 
     pub max_fd: i32,
     // TODO: fd_set read_set;   // set of read sockets
     // TODO: fd_set write_set;  // set of write sockets
 
     // interval related variables
-    pub omitting: bool,             // '-O' flag
+    pub omitting: bool, // '-O' flag
     pub stats_interval: f64,
     pub reporter_interval: f64,
     // TODO: void (*stats_callback)(struct iperf_test *test);
@@ -189,16 +186,15 @@ pub struct IperfTest {
     // TODO: double cpu_util[3];    // cpu utilization of system - total, user, system
     // TODO: double remote_cpu_util[3];    // cpu utilization for the remote host/client - total,
     // user, system
-
-    pub num_streams: i32,           // number of parallel streams to run '-P' flag
+    pub num_streams: i32, // number of parallel streams to run '-P' flag
 
     // TODO: atomic_iperf_size_t bytes_sent;
     // TODO: atomic_iperf_size_t blocks_sent;
     //
     // TODO: atomic_iperf_size_t bytes_received;
     // TODO: atomic_iperf_size_t blocks_received;
-    // 
-    // TODO: iperf_size_t bitrate_limit_stats_count;    // Number of stats periods accumuldated for 
+    //
+    // TODO: iperf_size_t bitrate_limit_stats_count;    // Number of stats periods accumuldated for
     // server's total bitrate average
     //
     // TODO: iperf_size_t *bitrate_limit_intervals_traffic_bytes;   // Pointer to cyclic array that
@@ -206,25 +202,22 @@ pub struct IperfTest {
 
     // TODO: iperf_size_t bitrate_limit_last_interval_index;    // Index of the last interval into
     // the cyclic array
+    pub bitrate_limit_exceeded: bool, // Set by callback routine when average data rate exceeded
+    // the server's bitrate limit
+    pub server_last_run_rc: i32, // Save the last server run return code for the next test
+    pub server_forced_idle_restarts_count: u32, // count number of forced server restarts due
+    // to idle to make sure it is not stuck
+    pub server_forced_no_msg_restarts_count: u32, // count number of forced server restarts due
+    // to no messages receiveda to make sure it
+    // is not stuck
+    pub server_test_number: u32, // count number of tests run by the server
 
-    pub bitrate_limit_exceeded: bool,   // Set by callback routine when average data rate exceeded
-                                        // the server's bitrate limit
-
-    pub server_last_run_rc: i32,    // Save the last server run return code for the next test
-    pub server_forced_idle_restarts_count: u32,     // count number of forced server restarts due
-                                                    // to idle to make sure it is not stuck
-    pub server_forced_no_msg_restarts_count: u32,   // count number of forced server restarts due
-                                                    // to no messages receiveda to make sure it 
-                                                    // is not stuck
-    pub server_test_number: u32,    // count number of tests run by the server
-
-    pub cookie: String,    // cookie string for authentication
+    pub cookie: String, // cookie string for authentication
 
     // Presumably, the SLIST_HEAD macro replaced the `struct iperf_stream *streams;` pointer
     // struct iperf_stream *streams;    /* pointer to list of struct stream */
     // TODO: SLIST_HEAD(slisthead, iperf_stream) streams;
-
-    pub settings: IperfSettings,    // TODO: implement the struct
+    pub settings: IperfSettings, // TODO: implement the struct
 
     // TODO: SLIST_HEAD(plisthead, protocl) protocols;
 
@@ -336,17 +329,16 @@ impl Default for IperfTest {
 
 // TODO: should we create the cookie string to be a fixed size?
 //pub const COOKIE_SIZE: u8 = 37;     // ASCII UUID size is 36 characters + null terminator
-pub const PORT: i32 = 5201;          // default port number is 5201
-pub const OMIT: i32 = 0;             // default omit period is 0 seconds
-pub const DURATION: i32 = 10;        // default duration is 10 seconds
-pub const TIMESTAMP_FORMAT: &str = "%c ";    // default timestamp format
+pub const PORT: i32 = 5201; // default port number is 5201
+pub const OMIT: i32 = 0; // default omit period is 0 seconds
+pub const DURATION: i32 = 10; // default duration is 10 seconds
+pub const TIMESTAMP_FORMAT: &str = "%c "; // default timestamp format
 
 //
 // Unit Tests for the iperf_api module
 //
 #[cfg(test)]
-mod tests
-{
+mod tests {
     use super::*;
 
     // This module is a collection of tests for the DebugLevel enum.
