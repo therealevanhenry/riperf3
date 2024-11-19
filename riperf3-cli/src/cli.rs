@@ -15,7 +15,7 @@ pub struct Cli {
     pub server: bool,
 
     /// Run in client mode
-    #[arg(short, long, group = "mode", value_name = "HOST")]
+    #[arg(short, long, group = "mode", value_name = "host")]
     pub client: Option<String>,
 
     /// Port number to connect to or listen on
@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(
         short,
         long,
-        value_name = "LEVEL",
+        value_name = "level",
         num_args = 0..=1,
         value_parser = clap::value_parser!(u8).range(1..=4),
         default_missing_value = "4",
