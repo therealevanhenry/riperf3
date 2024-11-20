@@ -1,0 +1,24 @@
+# Cargo.toml for riperf3 workspace
+[workspace]
+resolver = "2"
+members = [
+    "riperf3",
+    "riperf3-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Evan Henry"]
+edition = "2021"
+homepage = "https://github.com/therealevanhenry/riperf3"
+repository = "https://github.com/therealevanhenry/riperf3"
+keywords = ["riperf3", "riperf", "iperf3", "iperf", "network", "networking", "speedtest", "speed", "test", "bandwidth"]
+description = "A Rust library and CLI for running iperf3 speed tests."
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+log4rs = { version = "1.3", features = ["toml_format"] }
+
+[profile.release]
+strip = "symbols"
