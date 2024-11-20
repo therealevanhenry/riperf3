@@ -252,10 +252,10 @@ impl Default for IperfTest {
             tmp_template: String::from(""),
             bind_address: String::from(""),
             bind_dev: String::from(""),
-            bind_port: PORT,
-            server_port: PORT,
-            omit: OMIT,
-            duration: DURATION,
+            bind_port: DEFAULT_PORT,
+            server_port: DEFAULT_PORT,
+            omit: DEFAULT_OMIT,
+            duration: DEFAULT_DURATION,
             diskfile_name: String::from(""),
             affinity: 0,
             server_affinity: 0,
@@ -291,7 +291,7 @@ impl Default for IperfTest {
             multisend: false,
             repeating_payload: false,
             timestamps: false,
-            timestamp_format: String::from(TIMESTAMP_FORMAT),
+            timestamp_format: String::from(DEFAULT_TIMESTAMP_FORMAT),
             json_output_string: String::from(""),
             max_fd: 0,
             // TODO: read_set
@@ -329,16 +329,16 @@ impl Default for IperfTest {
 
 // TODO: should we create the cookie string to be a fixed size?
 //pub const COOKIE_SIZE: u8 = 37;     // ASCII UUID size is 36 characters + null terminator
-pub const PORT: i32 = 5201; // default port number is 5201
-pub const OMIT: i32 = 0; // default omit period is 0 seconds
-pub const DURATION: i32 = 10; // default duration is 10 seconds
-pub const TIMESTAMP_FORMAT: &str = "%c "; // default timestamp format
+pub const DEFAULT_PORT: i32 = 5201; // default port number is 5201
+pub const DEFAULT_OMIT: i32 = 0; // default omit period is 0 seconds
+pub const DEFAULT_DURATION: i32 = 10; // default duration is 10 seconds
+pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c "; // default timestamp format
 
 //
 // Unit Tests for the iperf_api module
 //
 #[cfg(test)]
-mod tests {
+mod iperf_api_tests {
     use super::*;
 
     // This module is a collection of tests for the DebugLevel enum.
@@ -471,10 +471,10 @@ mod tests {
             assert_eq!(test.tmp_template, "");
             assert_eq!(test.bind_address, "");
             assert_eq!(test.bind_dev, "");
-            assert_eq!(test.bind_port, PORT);
-            assert_eq!(test.server_port, PORT);
-            assert_eq!(test.omit, OMIT);
-            assert_eq!(test.duration, DURATION);
+            assert_eq!(test.bind_port, DEFAULT_PORT);
+            assert_eq!(test.server_port, DEFAULT_PORT);
+            assert_eq!(test.omit, DEFAULT_OMIT);
+            assert_eq!(test.duration, DEFAULT_DURATION);
             assert_eq!(test.diskfile_name, "");
             assert_eq!(test.affinity, 0);
             assert_eq!(test.server_affinity, 0);
@@ -507,7 +507,7 @@ mod tests {
             assert_eq!(test.multisend, false);
             assert_eq!(test.repeating_payload, false);
             assert_eq!(test.timestamps, false);
-            assert_eq!(test.timestamp_format, TIMESTAMP_FORMAT);
+            assert_eq!(test.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
             assert_eq!(test.json_output_string, "");
             assert_eq!(test.max_fd, 0);
             assert_eq!(test.omitting, false);
