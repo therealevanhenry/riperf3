@@ -1,9 +1,9 @@
 use clap::{ArgGroup, Parser, ValueEnum};
 
-// The main CLI struct for the riperf3-cli application.
+// The main CLI struct for the riperf3-cli application named 'riperf3'.
 // The automatic version flag is disabled to support 'V' for verbosity.
 #[derive(Parser, Debug)]
-#[command(about, author, long_about = None, version, disable_version_flag = true)]
+#[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
 #[command(group(
         ArgGroup::new("mode")
             .required(true)
@@ -26,13 +26,8 @@ pub struct Cli {
     pub client: Option<String>,
 
     // Server port to listen on/connect to
-    #[arg(
-        short,
-        long,
-        default_value_t = 5201,
-        help = "server port to listen on/connect to"
-    )]
-    pub port: u16,
+    #[arg(short, long, help = "server port to listen on/connect to")]
+    pub port: Option<u16>,
 
     // Format to report: Kbits, Mbits, Gbits, Tbits
     #[arg(
@@ -51,10 +46,9 @@ pub struct Cli {
         short,
         long,
         value_name = "interval",
-        default_value = "1",
         help = "interval in seconds between periodic throughput reports"
     )]
-    pub interval: u8,
+    pub interval: Option<u8>,
 
     // Write the PID to a file
     // TODO: Add the PID argument `-I`, `--pidfile <file>`
@@ -260,10 +254,95 @@ pub struct Cli {
 }
 
 // Format argument parser for ValueEnum
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum Format {
     K,
     M,
     G,
     T,
+}
+
+//
+// Unit Tests for the cli module
+//
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    // This module tests the common arguments for client and server modes
+    mod common_arg_tests {
+        use super::*;
+
+        // Test the common arguments defaults
+        #[test]
+        fn test_common_defaults() {
+            let cli = Cli::parse_from(&["riperf3", "--server"]);
+            assert!(cli.server);
+            assert!(!cli.client.is_some());
+            assert_eq!(cli.port, None);
+            assert_eq!(cli.format, Format::M);
+            assert_eq!(cli.interval, None);
+            assert!(!cli.verbose);
+            assert_eq!(cli.debug, None);
+            assert_eq!(cli.version, None);
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost"]);
+            assert!(!cli.server);
+            assert_eq!(cli.client, Some("localhost".to_string()));
+            assert_eq!(cli.port, None);
+            assert_eq!(cli.format, Format::M);
+            assert_eq!(cli.interval, None);
+            assert!(!cli.verbose);
+            assert_eq!(cli.debug, None);
+            assert_eq!(cli.version, None);
+        }
+
+        // Test the common arguments with a port
+        #[test]
+        fn test_common_port() {
+            let cli = Cli::parse_from(&["riperf3", "--server", "--port", "1234"]);
+            assert_eq!(cli.port, Some(1234));
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--port", "1234"]);
+            assert_eq!(cli.port, Some(1234));
+        }
+
+        // Test the common arguments with a format
+        #[test]
+        fn test_common_format() {
+            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "k"]);
+            assert_eq!(cli.format, Format::K);
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "g"]);
+            assert_eq!(cli.format, Format::G);
+
+            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "t"]);
+            assert_eq!(cli.format, Format::T);
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "m"]);
+            assert_eq!(cli.format, Format::M);
+
+            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "M"]);
+            assert_eq!(cli.format, Format::M);
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "T"]);
+            assert_eq!(cli.format, Format::T);
+
+            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "G"]);
+            assert_eq!(cli.format, Format::G);
+
+            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "K"]);
+            assert_eq!(cli.format, Format::K);
+        }
+    }
+
+    // This module tests the server mode arguments
+    mod server_mode_tests {
+        //TODO: Add server mode argument tests as they are implemented
+    }
+
+    // This module tests the client mode arguments
+    mod client_mode_tests {
+        //TODO: Add client mode argument tests as they are implemented
+    }
 }

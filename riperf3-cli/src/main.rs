@@ -13,6 +13,9 @@ use log4rs::encode::pattern::PatternEncoder;
 mod cli;
 use cli::Cli;
 
+// riperf3 library crate
+use riperf3;
+
 fn main() {
     // Parse the command line arguments
     let cli = Cli::parse();
@@ -22,15 +25,17 @@ fn main() {
     configure_log4rs(log_level);
     log::trace!("log4rs configured with verbosity: {}", log_level);
 
-    if let Some(server_addr) = cli.client {
-        log::info!(
-            "Running in client mode, connecting to server at {} on port {}",
-            server_addr,
-            cli.port
-        );
+    // Check the mode we are running in
+    if let Some(_) = cli.client {
+        // If the client argument was passed, we are in client mode
+        log::trace!("CLI parsed client mode");
+        riperf3::run_client();
     } else if cli.server {
-        log::info!("Running in server mode, listening on port {}", cli.port);
+        // If the server argument was passed, we are in server mode
+        log::trace!("CLI parsed server mode");
+        riperf3::run_server();
     } else {
+        // This should be impossible to reach, as the CLI parser should catch this.
         log::error!("No mode specified, exiting.");
         return;
     }
