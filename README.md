@@ -32,6 +32,6 @@ This is a nascent project which is in need of contributors. Please reach out to 
 
 ## License
 
-`riperf3` is [dual-licensed](LICENSE.txt) under the [MIT License](LICENSE-MIT.txt) and the [Apache License 2.0](LICENSE-APACHE.txt). You may choose either license to govern your use of the software.
+`riperf3` is dual-licensed under the [MIT License](LICENSE-MIT.txt) and the [Apache License 2.0](LICENSE-APACHE.txt). You may choose either license to govern your use of the software.
 
 For more details, please refer to the respective license files included in this repository.
