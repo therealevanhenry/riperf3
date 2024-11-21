@@ -2,6 +2,6 @@
 CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
 
 [tasks.lint]
-description = "Run clippy on all workspace members"
+description = "Run clippy on the crate for all targets"
 command = "cargo"
 args = ["clippy", "--all-targets", "--", "-D", "warnings"]

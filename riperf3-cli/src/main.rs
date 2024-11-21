@@ -13,10 +13,8 @@ use log4rs::encode::pattern::PatternEncoder;
 mod cli;
 use cli::Cli;
 
-// riperf3 library crate
-use riperf3;
-
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse the command line arguments
     let cli = Cli::parse();
 
@@ -37,8 +35,9 @@ fn main() {
     } else {
         // This should be impossible to reach, as the CLI parser should catch this.
         log::error!("No mode specified, exiting.");
-        return;
     }
+
+    Ok(())
 }
 
 ////////////////////////////////////////////////////////////////////////////////

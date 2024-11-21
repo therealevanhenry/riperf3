@@ -5,15 +5,18 @@ pub mod iperf_api;
 macro_rules! vprintln {
     ($verbose:expr, $($arg:tt)*) => {
         if $verbose {
+            log::trace!($($arg)*);
             println!($($arg)*);
         }
     };
 }
 
 pub fn run_client() {
-    println!("Running client");
+    vprintln!(true, "Running client");
+    log::debug!("test client");
 }
 
 pub fn run_server() {
-    println!("Running server");
+    vprintln!(true, "Running server");
+    log::debug!("test server");
 }
