@@ -3,6 +3,9 @@
 // This module defines the CLI structure for the riperf3-cli application.
 use clap::{ArgGroup, Parser, ValueEnum};
 
+// riperf3 library crate
+use riperf3;
+
 #[derive(Parser, Debug)]
 // The automatic version flag is disabled to support 'V' for verbosity.
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
@@ -285,9 +288,9 @@ mod cli_tests {
         // Test the common arguments defaults
         #[test]
         fn test_common_defaults() {
-            let cli = Cli::parse_from(&["riperf3", "--server"]);
+            let cli = Cli::parse_from(["riperf3", "--server"]);
             assert!(cli.server);
-            assert!(!cli.client.is_some());
+            assert!(cli.client.is_none());
             assert_eq!(cli.port, None);
             assert_eq!(cli.format, Format::M);
             assert_eq!(cli.interval, None);
@@ -295,7 +298,7 @@ mod cli_tests {
             assert_eq!(cli.debug, None);
             assert_eq!(cli.version, None);
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost"]);
             assert!(!cli.server);
             assert_eq!(cli.client, Some("localhost".to_string()));
             assert_eq!(cli.port, None);
@@ -309,38 +312,38 @@ mod cli_tests {
         // Test the common arguments with a port
         #[test]
         fn test_common_port() {
-            let cli = Cli::parse_from(&["riperf3", "--server", "--port", "1234"]);
+            let cli = Cli::parse_from(["riperf3", "--server", "--port", "1234"]);
             assert_eq!(cli.port, Some(1234));
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--port", "1234"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--port", "1234"]);
             assert_eq!(cli.port, Some(1234));
         }
 
         // Test the common arguments with a format
         #[test]
         fn test_common_format() {
-            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "k"]);
+            let cli = Cli::parse_from(["riperf3", "--server", "--format", "k"]);
             assert_eq!(cli.format, Format::K);
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "g"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "g"]);
             assert_eq!(cli.format, Format::G);
 
-            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "t"]);
+            let cli = Cli::parse_from(["riperf3", "--server", "--format", "t"]);
             assert_eq!(cli.format, Format::T);
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "m"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "m"]);
             assert_eq!(cli.format, Format::M);
 
-            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "M"]);
+            let cli = Cli::parse_from(["riperf3", "--server", "--format", "M"]);
             assert_eq!(cli.format, Format::M);
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "T"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "T"]);
             assert_eq!(cli.format, Format::T);
 
-            let cli = Cli::parse_from(&["riperf3", "--server", "--format", "G"]);
+            let cli = Cli::parse_from(["riperf3", "--server", "--format", "G"]);
             assert_eq!(cli.format, Format::G);
 
-            let cli = Cli::parse_from(&["riperf3", "--client", "localhost", "--format", "K"]);
+            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "K"]);
             assert_eq!(cli.format, Format::K);
         }
     }

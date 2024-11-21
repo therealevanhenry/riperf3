@@ -26,7 +26,7 @@ fn main() {
     log::trace!("log4rs configured with verbosity: {}", log_level);
 
     // Check the mode we are running in
-    if let Some(_) = cli.client {
+    if cli.client.is_some() {
         // If the client argument was passed, we are in client mode
         log::trace!("CLI parsed client mode");
         riperf3::run_client();
