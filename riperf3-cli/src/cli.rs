@@ -3,9 +3,6 @@
 // This module defines the CLI structure for the riperf3-cli application.
 use clap::{ArgGroup, Parser, ValueEnum};
 
-// riperf3 library crate
-use riperf3;
-
 #[derive(Parser, Debug)]
 // The automatic version flag is disabled to support 'V' for verbosity.
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]

@@ -11,6 +11,7 @@ riperf3 = { path = "../riperf3" }
 clap.workspace = true
 log.workspace = true
 log4rs.workspace = true
+tokio.workspace = true
 
 [[bin]]
 name = "riperf3"
