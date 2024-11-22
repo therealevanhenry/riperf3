@@ -1,22 +1,22 @@
+// The iperf_api module mimicks the iperf3_api.h header file from the iperf3 project. It is unused
+// at this time, but will (likely) be used in the future to interact with the iperf3 C API via FFI.
 pub mod iperf_api;
 
-// Verbose mode println!(...) macro
-#[macro_export]
-macro_rules! vprintln {
-    ($verbose:expr, $($arg:tt)*) => {
-        if $verbose {
-            log::trace!($($arg)*);
-            println!($($arg)*);
-        }
-    };
-}
+// The macros module contains custom macros used in the riperf3 project.
+#[macro_use]
+mod macros;
 
-pub fn run_client() {
-    vprintln!(true, "Running client");
-    log::debug!("test client");
-}
+// The error module contains the error handling types used in the riperf3 project.
+pub mod error;
+pub use error::ConfigError;
 
-pub fn run_server() {
-    vprintln!(true, "Running server");
-    log::debug!("test server");
-}
+// The utils module contains utility functions and types used in the riperf3 project.
+pub mod utils;
+
+// The client module contains the client-specific types and functions for the riperf3 project.
+pub mod client;
+pub use client::{Client, ClientBuilder};
+
+// The server module contains the server-specific types and functions for the riperf3 project.
+pub mod server;
+pub use server::{Server, ServerBuilder};
