@@ -31,12 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     vprintln!("Log level set to: {}", log_level);
 
     // Check the mode we are running in
-    if let Some(server_address) = cli.client {
+    if let Some(server_host) = cli.client {
         // If the client argument was passed, we are in client mode
         use riperf3::ClientBuilder;
 
         // Create a new ClientBuilder
-        let client_builder = ClientBuilder::new().address(&server_address).port(cli.port);
+        let client_builder = ClientBuilder::new().host(&server_host).port(cli.port);
 
         // Ready to build the Client
         let client = client_builder.build()?;
