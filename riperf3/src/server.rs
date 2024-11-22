@@ -125,30 +125,23 @@ mod tests {
         // Test defaults and setting different fields
         #[test]
         fn test_server_default() {
-            let server = Server {
-                port: DEFAULT_PORT,
-            };
+            let server = Server { port: DEFAULT_PORT };
             assert_eq!(server.port, DEFAULT_PORT);
         }
 
         #[test]
         fn test_server_port() {
-            let server = Server {
-                port: 1234,
-            };
+            let server = Server { port: 1234 };
             assert_eq!(server.port, 1234);
         }
 
         // Test run
         #[tokio::test]
         async fn test_server_run() {
-            let server = Server {
-                port: 1234,
-            };
+            let server = Server { port: 1234 };
 
             let result = server.run().await;
             assert!(result.is_ok());
         }
     }
 }
-
