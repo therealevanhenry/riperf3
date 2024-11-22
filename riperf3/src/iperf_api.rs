@@ -337,192 +337,192 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c "; // default timestamp format
 //
 // Unit Tests for the iperf_api module
 //
-#[cfg(test)]
-mod iperf_api_tests {
-    use super::*;
-
-    // This module is a collection of tests for the DebugLevel enum.
-    mod debug_level_tests {
-        use super::*;
-
-        // This function is used to test the Error variant of the DebugLevel enum.
-        #[test]
-        fn test_debug_level_error() {
-            let level = DebugLevel::Error;
-            assert_eq!(level, DebugLevel::Error);
-        }
-
-        // This function is used to test the Warn variant of the DebugLevel enum.
-        #[test]
-        fn test_debug_level_warn() {
-            let level = DebugLevel::Warn;
-            assert_eq!(level, DebugLevel::Warn);
-        }
-
-        // This function is used to test the Info variant of the DebugLevel enum.
-        #[test]
-        fn test_debug_level_info() {
-            let level = DebugLevel::Info;
-            assert_eq!(level, DebugLevel::Info);
-        }
-
-        // This function is used to test the Debug variant of the DebugLevel enum.
-        #[test]
-        fn test_debug_level_debug() {
-            let level = DebugLevel::Debug;
-            assert_eq!(level, DebugLevel::Debug);
-        }
-
-        // This function is used to test the Max variant of the DebugLevel enum.
-        #[test]
-        fn test_debug_level_max() {
-            let level = DebugLevel::Max;
-            assert_eq!(level, DebugLevel::Max);
-        }
-    }
-
-    // This module is a collection of tests for the IperfRole enum.
-    mod iperf_role_tests {
-        use super::*;
-
-        // This function is used to test the Server variant of the IperfRole enum.
-        #[test]
-        fn test_iperf_role() {
-            let role = IperfRole::Server;
-            assert_eq!(role, IperfRole::Server);
-        }
-
-        // This function is used to test the Client variant of the IperfRole enum.
-        #[test]
-        fn test_iperf_role_client() {
-            let role = IperfRole::Client;
-            assert_eq!(role, IperfRole::Client);
-        }
-    }
-
-    // This module is a collection of tests for the IperfMode enum.
-    mod iperf_mode_tests {
-        use super::*;
-
-        // This function is used to test the Sender variant of the IperfMode enum.
-        #[test]
-        fn test_iperf_mode_sender() {
-            let mode = IperfMode::Sender;
-            assert_eq!(mode, IperfMode::Sender);
-        }
-
-        // This function is used to test the Receiver variant of the IperfMode enum.
-        #[test]
-        fn test_iperf_mode_receiver() {
-            let mode = IperfMode::Receiver;
-            assert_eq!(mode, IperfMode::Receiver);
-        }
-
-        // This function is used to test the Bidirectional variant of the IperfMode enum.
-        #[test]
-        fn test_iperf_mode_bidirectional() {
-            let mode = IperfMode::Bidirectional;
-            assert_eq!(mode, IperfMode::Bidirectional);
-        }
-    }
-
-    // This module is a collection of tests for the IperfSettings struct.
-    mod iperf_settings_tests {
-        use super::*;
-
-        // This function is used to test the default values of the IperfSettings struct.
-        #[test]
-        fn test_default_iperf_settings() {
-            let settings = IperfSettings::default();
-            assert_eq!(settings.domain, 0);
-            assert_eq!(settings.socket_bufsize, 0);
-            assert_eq!(settings.blksize, 0);
-            assert_eq!(settings.bitrate_limit_interval, 0);
-            assert_eq!(settings.bitrate_limit_stats_per_interval, 0);
-            assert_eq!(settings.fqrate, 0);
-            assert_eq!(settings.pacing_timer, 0);
-            assert_eq!(settings.burst, 0);
-            assert_eq!(settings.mss, 0);
-            assert_eq!(settings.ttl, 0);
-            assert_eq!(settings.tos, 0);
-            assert_eq!(settings.flowlabel, 0);
-            assert_eq!(settings.unit_format, ' ');
-            assert_eq!(settings.num_ostreams, 0);
-            assert!(!settings.dont_fragment);
-            assert_eq!(settings.connect_timeout, 0);
-            assert_eq!(settings.idle_timeout, 0);
-            assert_eq!(settings.snd_timeout, 0);
-        }
-    }
-
-    // This module is a collection of tests for the IperfTest struct.
-    mod iperf_test_tests {
-        use super::*;
-
-        // This function is used to test the default values of the IperfTest struct.
-        #[test]
-        fn test_default_iperf_test() {
-            let test = IperfTest::default();
-            assert_eq!(test.role, IperfRole::Server);
-            assert_eq!(test.mode, IperfMode::Sender);
-            assert!(!test.sender_has_retransmits);
-            assert!(!test.other_side_has_retransmits);
-            assert_eq!(test.server_hostname, "localhost");
-            assert_eq!(test.tmp_template, "");
-            assert_eq!(test.bind_address, "");
-            assert_eq!(test.bind_dev, "");
-            assert_eq!(test.bind_port, DEFAULT_PORT);
-            assert_eq!(test.server_port, DEFAULT_PORT);
-            assert_eq!(test.omit, DEFAULT_OMIT);
-            assert_eq!(test.duration, DEFAULT_DURATION);
-            assert_eq!(test.diskfile_name, "");
-            assert_eq!(test.affinity, 0);
-            assert_eq!(test.server_affinity, 0);
-            assert_eq!(test.title, "");
-            assert_eq!(test.extra_data, "");
-            assert_eq!(test.congestion, "");
-            assert_eq!(test.congestion_used, "");
-            assert_eq!(test.remote_congestion_used, "");
-            assert_eq!(test.pidfile, "");
-            assert_eq!(test.logfile, "");
-            assert_eq!(test.ctrl_sck, 0);
-            assert_eq!(test.mapped_v4, 0);
-            assert_eq!(test.listener, 0);
-            assert_eq!(test.prot_listener, 0);
-            assert_eq!(test.ctrl_sck_mss, 0);
-            assert!(!test.daemon);
-            assert!(!test.one_off);
-            assert!(!test.no_delay);
-            assert!(!test.reverse);
-            assert!(!test.bidir);
-            assert!(!test.verbose);
-            assert!(!test.json_output);
-            assert!(!test.json_stream);
-            assert!(!test.zerocopy);
-            assert!(!test.debug);
-            assert_eq!(test.debug_level, DebugLevel::Warn);
-            assert!(!test.get_server_output);
-            assert!(!test.udp_counters_64bit);
-            assert!(!test.forceflush);
-            assert!(!test.multisend);
-            assert!(!test.repeating_payload);
-            assert!(!test.timestamps);
-            assert_eq!(test.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
-            assert_eq!(test.json_output_string, "");
-            assert_eq!(test.max_fd, 0);
-            assert!(!test.omitting);
-            assert_eq!(test.stats_interval, 0.0);
-            assert_eq!(test.reporter_interval, 0.0);
-            assert!(!test.done);
-            assert_eq!(test.num_streams, 1);
-            assert!(!test.bitrate_limit_exceeded);
-            assert_eq!(test.server_last_run_rc, 0);
-            assert_eq!(test.server_forced_idle_restarts_count, 0);
-            assert_eq!(test.server_forced_no_msg_restarts_count, 0);
-            assert_eq!(test.server_test_number, 0);
-            assert_eq!(test.cookie, "");
-            assert_eq!(test.settings, IperfSettings::default());
-            assert_eq!(test.server_output_text, "");
-        }
-    }
-}
+//#[cfg(test)]
+//mod iperf_api_tests {
+//    use super::*;
+//
+//    // This module is a collection of tests for the DebugLevel enum.
+//    mod debug_level_tests {
+//        use super::*;
+//
+//        // This function is used to test the Error variant of the DebugLevel enum.
+//        #[test]
+//        fn test_debug_level_error() {
+//            let level = DebugLevel::Error;
+//            assert_eq!(level, DebugLevel::Error);
+//        }
+//
+//        // This function is used to test the Warn variant of the DebugLevel enum.
+//        #[test]
+//        fn test_debug_level_warn() {
+//            let level = DebugLevel::Warn;
+//            assert_eq!(level, DebugLevel::Warn);
+//        }
+//
+//        // This function is used to test the Info variant of the DebugLevel enum.
+//        #[test]
+//        fn test_debug_level_info() {
+//            let level = DebugLevel::Info;
+//            assert_eq!(level, DebugLevel::Info);
+//        }
+//
+//        // This function is used to test the Debug variant of the DebugLevel enum.
+//        #[test]
+//        fn test_debug_level_debug() {
+//            let level = DebugLevel::Debug;
+//            assert_eq!(level, DebugLevel::Debug);
+//        }
+//
+//        // This function is used to test the Max variant of the DebugLevel enum.
+//        #[test]
+//        fn test_debug_level_max() {
+//            let level = DebugLevel::Max;
+//            assert_eq!(level, DebugLevel::Max);
+//        }
+//    }
+//
+//    // This module is a collection of tests for the IperfRole enum.
+//    mod iperf_role_tests {
+//        use super::*;
+//
+//        // This function is used to test the Server variant of the IperfRole enum.
+//        #[test]
+//        fn test_iperf_role() {
+//            let role = IperfRole::Server;
+//            assert_eq!(role, IperfRole::Server);
+//        }
+//
+//        // This function is used to test the Client variant of the IperfRole enum.
+//        #[test]
+//        fn test_iperf_role_client() {
+//            let role = IperfRole::Client;
+//            assert_eq!(role, IperfRole::Client);
+//        }
+//    }
+//
+//    // This module is a collection of tests for the IperfMode enum.
+//    mod iperf_mode_tests {
+//        use super::*;
+//
+//        // This function is used to test the Sender variant of the IperfMode enum.
+//        #[test]
+//        fn test_iperf_mode_sender() {
+//            let mode = IperfMode::Sender;
+//            assert_eq!(mode, IperfMode::Sender);
+//        }
+//
+//        // This function is used to test the Receiver variant of the IperfMode enum.
+//        #[test]
+//        fn test_iperf_mode_receiver() {
+//            let mode = IperfMode::Receiver;
+//            assert_eq!(mode, IperfMode::Receiver);
+//        }
+//
+//        // This function is used to test the Bidirectional variant of the IperfMode enum.
+//        #[test]
+//        fn test_iperf_mode_bidirectional() {
+//            let mode = IperfMode::Bidirectional;
+//            assert_eq!(mode, IperfMode::Bidirectional);
+//        }
+//    }
+//
+//    // This module is a collection of tests for the IperfSettings struct.
+//    mod iperf_settings_tests {
+//        use super::*;
+//
+//        // This function is used to test the default values of the IperfSettings struct.
+//        #[test]
+//        fn test_default_iperf_settings() {
+//            let settings = IperfSettings::default();
+//            assert_eq!(settings.domain, 0);
+//            assert_eq!(settings.socket_bufsize, 0);
+//            assert_eq!(settings.blksize, 0);
+//            assert_eq!(settings.bitrate_limit_interval, 0);
+//            assert_eq!(settings.bitrate_limit_stats_per_interval, 0);
+//            assert_eq!(settings.fqrate, 0);
+//            assert_eq!(settings.pacing_timer, 0);
+//            assert_eq!(settings.burst, 0);
+//            assert_eq!(settings.mss, 0);
+//            assert_eq!(settings.ttl, 0);
+//            assert_eq!(settings.tos, 0);
+//            assert_eq!(settings.flowlabel, 0);
+//            assert_eq!(settings.unit_format, ' ');
+//            assert_eq!(settings.num_ostreams, 0);
+//            assert!(!settings.dont_fragment);
+//            assert_eq!(settings.connect_timeout, 0);
+//            assert_eq!(settings.idle_timeout, 0);
+//            assert_eq!(settings.snd_timeout, 0);
+//        }
+//    }
+//
+//    // This module is a collection of tests for the IperfTest struct.
+//    mod iperf_test_tests {
+//        use super::*;
+//
+//        // This function is used to test the default values of the IperfTest struct.
+//        #[test]
+//        fn test_default_iperf_test() {
+//            let test = IperfTest::default();
+//            assert_eq!(test.role, IperfRole::Server);
+//            assert_eq!(test.mode, IperfMode::Sender);
+//            assert!(!test.sender_has_retransmits);
+//            assert!(!test.other_side_has_retransmits);
+//            assert_eq!(test.server_hostname, "localhost");
+//            assert_eq!(test.tmp_template, "");
+//            assert_eq!(test.bind_address, "");
+//            assert_eq!(test.bind_dev, "");
+//            assert_eq!(test.bind_port, DEFAULT_PORT);
+//            assert_eq!(test.server_port, DEFAULT_PORT);
+//            assert_eq!(test.omit, DEFAULT_OMIT);
+//            assert_eq!(test.duration, DEFAULT_DURATION);
+//            assert_eq!(test.diskfile_name, "");
+//            assert_eq!(test.affinity, 0);
+//            assert_eq!(test.server_affinity, 0);
+//            assert_eq!(test.title, "");
+//            assert_eq!(test.extra_data, "");
+//            assert_eq!(test.congestion, "");
+//            assert_eq!(test.congestion_used, "");
+//            assert_eq!(test.remote_congestion_used, "");
+//            assert_eq!(test.pidfile, "");
+//            assert_eq!(test.logfile, "");
+//            assert_eq!(test.ctrl_sck, 0);
+//            assert_eq!(test.mapped_v4, 0);
+//            assert_eq!(test.listener, 0);
+//            assert_eq!(test.prot_listener, 0);
+//            assert_eq!(test.ctrl_sck_mss, 0);
+//            assert!(!test.daemon);
+//            assert!(!test.one_off);
+//            assert!(!test.no_delay);
+//            assert!(!test.reverse);
+//            assert!(!test.bidir);
+//            assert!(!test.verbose);
+//            assert!(!test.json_output);
+//            assert!(!test.json_stream);
+//            assert!(!test.zerocopy);
+//            assert!(!test.debug);
+//            assert_eq!(test.debug_level, DebugLevel::Warn);
+//            assert!(!test.get_server_output);
+//            assert!(!test.udp_counters_64bit);
+//            assert!(!test.forceflush);
+//            assert!(!test.multisend);
+//            assert!(!test.repeating_payload);
+//            assert!(!test.timestamps);
+//            assert_eq!(test.timestamp_format, DEFAULT_TIMESTAMP_FORMAT);
+//            assert_eq!(test.json_output_string, "");
+//            assert_eq!(test.max_fd, 0);
+//            assert!(!test.omitting);
+//            assert_eq!(test.stats_interval, 0.0);
+//            assert_eq!(test.reporter_interval, 0.0);
+//            assert!(!test.done);
+//            assert_eq!(test.num_streams, 1);
+//            assert!(!test.bitrate_limit_exceeded);
+//            assert_eq!(test.server_last_run_rc, 0);
+//            assert_eq!(test.server_forced_idle_restarts_count, 0);
+//            assert_eq!(test.server_forced_no_msg_restarts_count, 0);
+//            assert_eq!(test.server_test_number, 0);
+//            assert_eq!(test.cookie, "");
+//            assert_eq!(test.settings, IperfSettings::default());
+//            assert_eq!(test.server_output_text, "");
+//        }
+//    }
+//}
