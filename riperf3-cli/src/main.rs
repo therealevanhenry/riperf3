@@ -24,11 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set the verbose flag
     set_verbose(cli.verbose);
+    vprintln!("Verbose mode enabled.");
 
     // Configure log4rs
     let log_level = cli.debug.unwrap_or(0); // Default to 0 if not specified, which is ERROR
     configure_log4rs(log_level);
-    vprintln!("Log level set to: {}", log_level);
+    log::debug!("Log level set to: {}", log_level);
 
     // Check the mode we are running in
     if let Some(server_host) = cli.client {
@@ -36,9 +37,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use riperf3::ClientBuilder;
 
         // Create a new ClientBuilder
-        let client_builder = ClientBuilder::new().host(&server_host).port(cli.port);
+        let mut client_builder = ClientBuilder::new(&server_host);
 
-        // Ready to build the Client
+        // Set the port if it was specified
+        if cli.port.is_some() {
+            client_builder = client_builder.port(cli.port);
+        }
+
+        // Build the Client
         let client = client_builder.build()?;
 
         // Run the client
@@ -48,9 +54,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use riperf3::ServerBuilder;
 
         // Create a new ServerBuilder
-        let server_builder = ServerBuilder::new().port(cli.port);
+        let mut server_builder = ServerBuilder::new();
 
-        // Ready to build the Server
+        // Set the port if it was specified
+        if cli.port.is_some() {
+            server_builder = server_builder.port(cli.port);
+        }
+
+        // Build the Server
         let server = server_builder.build()?;
 
         // Run the server

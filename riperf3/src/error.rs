@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum ConfigError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
