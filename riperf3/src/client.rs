@@ -6,7 +6,7 @@ use crate::utils::DEFAULT_PORT;
 
 // Client-specific struct
 pub struct Client {
-    host: String,
+    hostname: String,
     port: u16,
     //TODO: Add fields
 }
@@ -14,7 +14,7 @@ pub struct Client {
 // Implement client-specific functions
 impl Client {
     pub async fn run(&self) -> Result<(), ConfigError> {
-        vprintln!("Client connecting to: {}:{}", self.host, self.port);
+        vprintln!("Client connecting to: {}:{}", self.hostname, self.port);
         //TODO: Implement client logic
 
         Ok(())
@@ -25,7 +25,7 @@ impl Client {
 
 // Client builder struct
 pub struct ClientBuilder {
-    host: Option<String>,
+    hostname: Option<String>,
     port: Option<u16>,
     //TODO: Add fields
 }
@@ -33,14 +33,14 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     pub fn new() -> Self {
         Self {
-            host: None,
+            hostname: None,
             port: None,
             //TODO: Initialize fields
         }
     }
 
-    pub fn host(mut self, host: &str) -> Self {
-        self.host = Some(host.to_string());
+    pub fn hostname(mut self, hostname: &str) -> Self {
+        self.hostname = Some(hostname.to_string());
         self
     }
 
@@ -56,7 +56,7 @@ impl ClientBuilder {
         // Validate required fields
         Ok(Client {
             // Initialize Client with validated fields
-            host: self.host.ok_or(ConfigError::MissingField("host"))?,
+            hostname: self.hostname.ok_or(ConfigError::MissingField("hostname"))?,
             // If there is no port, use DEFAULT_PORT
             port: self.port.unwrap_or(DEFAULT_PORT),
             // TODO: Initialize additional fields
