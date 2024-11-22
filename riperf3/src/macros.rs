@@ -4,7 +4,7 @@
 macro_rules! vprintln {
     ($($arg:tt)*) => {
         if $crate::utils::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-            log::trace!($($arg)*);
+            log::info!($($arg)*);
             println!($($arg)*);
         }
     };
