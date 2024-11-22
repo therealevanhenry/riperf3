@@ -50,6 +50,7 @@ impl ServerBuilder {
             // Initialize Client with validated fields
             // If there is no port, use DEFAULT_PORT
             port: self.port.unwrap_or(DEFAULT_PORT),
+
             // TODO: Initialize additional fields
         })
     }
