@@ -5,6 +5,7 @@ use crate::error::ConfigError;
 use crate::utils::DEFAULT_PORT;
 
 // Client-specific struct
+#[derive(Debug)]
 pub struct Client {
     host: String,
     port: u16,
@@ -30,13 +31,19 @@ pub struct ClientBuilder {
     //TODO: Add fields
 }
 
-impl ClientBuilder {
-    pub fn new() -> Self {
+impl Default for ClientBuilder {
+    fn default() -> Self {
         Self {
             host: None,
-            port: None,
+            port: Some(DEFAULT_PORT),
             //TODO: Initialize fields
         }
+    }
+}
+
+impl ClientBuilder {
+    pub fn new(host: &str) -> Self {
+        Self::default().host(host)
     }
 
     pub fn host(mut self, host: &str) -> Self {
@@ -60,15 +67,128 @@ impl ClientBuilder {
 
             // If there is no port, use DEFAULT_PORT
             port: self.port.unwrap_or(DEFAULT_PORT),
-
             //
             // TODO: Initialize additional fields
         })
     }
 }
 
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        Self::new()
+//////////////////////////////////////////////////////////////////////////////
+// Unit tests for the client module //////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ClientBuilder tests
+    mod client_builder_tests {
+        use super::*;
+
+        // Test default, new, and different fields
+        #[test]
+        fn test_client_builder_default() {
+            let client_builder = ClientBuilder::default();
+            assert_eq!(client_builder.host, None);
+            assert_eq!(client_builder.port, Some(DEFAULT_PORT));
+        }
+
+        #[test]
+        fn test_client_builder_new() {
+            let client_builder = ClientBuilder::new("localhost");
+            assert_eq!(client_builder.host, Some("localhost".to_string()));
+            assert_eq!(client_builder.port, Some(DEFAULT_PORT));
+        }
+
+        #[test]
+        fn test_client_builder_host() {
+            let client_builder = ClientBuilder::new("localhost").host("otherhost");
+            assert_eq!(client_builder.host, Some("otherhost".to_string()));
+        }
+
+        #[test]
+        fn test_client_builder_port() {
+            let client_builder = ClientBuilder::new("localhost").port(Some(1234));
+            assert_eq!(client_builder.port, Some(1234));
+        }
+
+        //
+        //TODO: Add tests for additional fields
+
+        // Test build
+        #[test]
+        fn test_client_builder_build() {
+            // Test with default values, this should return a ConfigError::MissingField
+            let client = ClientBuilder::default().build();
+            assert!(client.is_err());
+            assert_eq!(client.unwrap_err(), ConfigError::MissingField("host"));
+
+            // Test new, this should work
+            let client = ClientBuilder::new("localhost").build();
+            assert!(client.is_ok());
+            let client = client.unwrap();
+            assert_eq!(client.host, "localhost");
+            assert_eq!(client.port, DEFAULT_PORT);
+
+            // Test with new and change the host value, this should work
+            let client = ClientBuilder::new("localhost").host("otherhost").build();
+            assert!(client.is_ok());
+            let client = client.unwrap();
+            assert_eq!(client.host, "otherhost");
+            assert_eq!(client.port, DEFAULT_PORT);
+
+            // Test with new and set the port value, this should work
+            let client = ClientBuilder::new("localhost").port(Some(1234)).build();
+            assert!(client.is_ok());
+            let client = client.unwrap();
+            assert_eq!(client.host, "localhost");
+            assert_eq!(client.port, 1234);
+
+            // Test with new and set both host and port values, this should work
+            let client = ClientBuilder::new("localhost")
+                .host("otherhost")
+                .port(Some(1234))
+                .build();
+            assert!(client.is_ok());
+            let client = client.unwrap();
+            assert_eq!(client.host, "otherhost");
+            assert_eq!(client.port, 1234);
+        }
+    }
+
+    // Client tests
+    mod client_tests {
+        use super::*;
+
+        // Test defaults and setting different fields
+        #[test]
+        fn test_client_default() {
+            let client = Client {
+                host: "localhost".to_string(),
+                port: DEFAULT_PORT,
+            };
+            assert_eq!(client.host, "localhost");
+            assert_eq!(client.port, DEFAULT_PORT);
+        }
+
+        #[test]
+        fn test_client_with_fields() {
+            let client = Client {
+                host: "localhost".to_string(),
+                port: 1234,
+            };
+            assert_eq!(client.host, "localhost");
+            assert_eq!(client.port, 1234);
+        }
+
+        // Test run
+        #[tokio::test]
+        async fn test_client_run() {
+            let client = Client {
+                host: "localhost".to_string(),
+                port: DEFAULT_PORT,
+            };
+            let result = client.run().await;
+            assert!(result.is_ok());
+        }
     }
 }
