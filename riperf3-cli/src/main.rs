@@ -9,6 +9,10 @@ use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Config, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 
+// Use riperf3 for the necessary riper3 types and functions.
+use riperf3::utils::set_verbose;
+use riperf3::vprintln;
+
 // riperf3 CLI module
 mod cli;
 use cli::Cli;
@@ -18,23 +22,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse the command line arguments
     let cli = Cli::parse();
 
+    // Set the verbose flag
+    set_verbose(cli.verbose);
+
     // Configure log4rs
     let log_level = cli.debug.unwrap_or(0); // Default to 0 if not specified, which is ERROR
     configure_log4rs(log_level);
-    log::trace!("log4rs configured with verbosity: {}", log_level);
+    vprintln!("Log level set to: {}", log_level);
 
     // Check the mode we are running in
-    if cli.client.is_some() {
+    if let Some(server_address) = cli.client {
         // If the client argument was passed, we are in client mode
-        log::trace!("CLI parsed client mode");
-        riperf3::run_client();
+        use riperf3::ClientBuilder;
+
+        // Create a new ClientBuilder
+        let client_builder = ClientBuilder::new().address(&server_address).port(cli.port);
+
+        // Ready to build the Client
+        let client = client_builder.build()?;
+
+        // Run the client
+        client.run().await?;
     } else if cli.server {
         // If the server argument was passed, we are in server mode
-        log::trace!("CLI parsed server mode");
-        riperf3::run_server();
+        use riperf3::ServerBuilder;
+
+        // Create a new ServerBuilder
+        let server_builder = ServerBuilder::new().port(cli.port);
+
+        // Ready to build the Server
+        let server = server_builder.build()?;
+
+        // Run the server
+        server.run().await?;
     } else {
         // This should be impossible to reach, as the CLI parser should catch this.
-        log::error!("No mode specified, exiting.");
+        vprintln!("No mode specified. Exiting.");
     }
 
     Ok(())

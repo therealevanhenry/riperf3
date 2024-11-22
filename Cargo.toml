@@ -19,6 +19,7 @@ description = "A Rust library and CLI for running iperf3 speed tests."
 clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
 log4rs = { version = "1.3", features = ["toml_format"] }
+thiserror = "2.0"
 tokio = { version = "1.41", features = ["full"] }
 
 [profile.release]
