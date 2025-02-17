@@ -32,24 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::debug!("Log level set to: {}", log_level);
 
     // Check the mode we are running in
-    if let Some(server_host) = cli.client {
-        // If the client argument was passed, we are in client mode
-        use riperf3::ClientBuilder;
-
-        // Create a new ClientBuilder
-        let mut client_builder = ClientBuilder::new(&server_host);
-
-        // Set the port if it was specified
-        if cli.port.is_some() {
-            client_builder = client_builder.port(cli.port);
-        }
-
-        // Build the Client
-        let client = client_builder.build()?;
-
-        // Run the client
-        client.run().await?;
-    } else if cli.server {
+    if cli.server {
         // If the server argument was passed, we are in server mode
         use riperf3::ServerBuilder;
 
@@ -67,8 +50,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Run the server
         server.run().await?;
     } else {
-        // This should be impossible to reach, as the CLI parser should catch this.
-        vprintln!("No mode specified. Exiting.");
+        // Since server was false, we are in client mode so create a new ClientBuilder
+        use riperf3::ClientBuilder;
+
+        // Create a new ClientBuilder
+        let mut client_builder = ClientBuilder::new(cli.client);
+
+        // Set the port if it was specified
+        if cli.port.is_some() {
+            client_builder = client_builder.port(cli.port);
+        }
+
+        // Build the Client
+        let client = client_builder.build()?;
+
+        // Run the client
+        client.run().await?;
     }
 
     Ok(())
