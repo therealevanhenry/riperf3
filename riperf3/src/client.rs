@@ -101,7 +101,8 @@ mod tests {
 
         #[test]
         fn test_client_builder_host() {
-            let client_builder = ClientBuilder::new(Some("localhost".to_string())).host(Some("otherhost".to_string()));
+            let client_builder = ClientBuilder::new(Some("localhost".to_string()))
+                .host(Some("otherhost".to_string()));
             assert_eq!(client_builder.host, Some("otherhost".to_string()));
         }
 
@@ -130,14 +131,18 @@ mod tests {
             assert_eq!(client.port, DEFAULT_PORT);
 
             // Test with new and change the host value, this should work
-            let client = ClientBuilder::new(Some("localhost".to_string())).host(Some("otherhost".to_string())).build();
+            let client = ClientBuilder::new(Some("localhost".to_string()))
+                .host(Some("otherhost".to_string()))
+                .build();
             assert!(client.is_ok());
             let client = client.unwrap();
             assert_eq!(client.host, "otherhost");
             assert_eq!(client.port, DEFAULT_PORT);
 
             // Test with new and set the port value, this should work
-            let client = ClientBuilder::new(Some("localhost".to_string())).port(Some(1234)).build();
+            let client = ClientBuilder::new(Some("localhost".to_string()))
+                .port(Some(1234))
+                .build();
             assert!(client.is_ok());
             let client = client.unwrap();
             assert_eq!(client.host, "localhost");
