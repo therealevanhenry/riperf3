@@ -1,9 +1,11 @@
 Provision both sandbox VMs for riperf3 interchange testing.
 
-1. Check sandbox status with `sandbox list`. If not running, start them:
+NOTE: The `sandbox` command is a fish shell function. Always invoke it via `fish -c 'sandbox ...'`.
+
+1. Check sandbox status with `fish -c 'sandbox list'`. If not running, start them:
    ```
-   sandbox start sandbox-server-1
-   sandbox start sandbox-client-1
+   fish -c 'sandbox start sandbox-server-1'
+   fish -c 'sandbox start sandbox-client-1'
    ```
 
 2. Wait for cloud-init to complete on both:
