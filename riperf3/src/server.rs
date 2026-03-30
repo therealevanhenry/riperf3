@@ -144,34 +144,21 @@ impl Server {
 
         match cfg.protocol {
             TransportProtocol::Tcp => {
-                // If client requested special socket options, create a new data listener.
-                let data_listener = if cfg.mss.is_some() || cfg.window.is_some() || cfg.no_delay {
-                    let port = listener.local_addr()?.port();
-                    Some(
-                        net::tcp_listen_with_opts(
-                            None,
-                            port,
-                            cfg.mss,
-                            cfg.window,
-                            cfg.window,
-                            cfg.no_delay,
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                let accept_from = data_listener.as_ref().unwrap_or(listener);
-
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
 
                 for i in 0..total {
-                    let (mut data_stream, _) = accept_from.accept().await?;
+                    let (mut data_stream, _) = listener.accept().await?;
                     let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
                     if stream_cookie != cookie {
                         return Err(RiperfError::CookieMismatch);
                     }
-                    net::configure_tcp_stream(&data_stream, cfg.no_delay)?;
+                    // Apply socket options (nodelay, MSS, window) to each accepted stream
+                    net::configure_tcp_stream_full(
+                        &data_stream,
+                        cfg.no_delay,
+                        cfg.mss,
+                        cfg.window,
+                    )?;
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
