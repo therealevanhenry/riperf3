@@ -346,15 +346,16 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
 
 /// Client-side UDP connect handshake.
 /// Sends the magic word and waits for the server's reply.
+/// Note: iperf3 uses native byte order (not network byte order) for the magic values.
 pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
-    socket.send(&UDP_CONNECT_MSG.to_be_bytes()).await?;
+    socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
 
     let mut buf = [0u8; 4];
     let n = socket.recv(&mut buf).await?;
     if n < 4 {
         return Err(RiperfError::Protocol("UDP connect reply too short".into()));
     }
-    let reply = u32::from_be_bytes(buf);
+    let reply = u32::from_ne_bytes(buf);
     // Accept both the current and legacy reply values
     if reply != UDP_CONNECT_REPLY && reply != 0xb168_de3a {
         return Err(RiperfError::Protocol(format!(
@@ -367,6 +368,7 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
 /// Server-side UDP connect handshake.
 /// Waits for the client's magic word, "connects" the socket to the client,
 /// sends the reply, and returns the client address.
+/// Note: iperf3 uses native byte order (not network byte order) for the magic values.
 pub async fn udp_connect_server(socket: &UdpSocket) -> Result<SocketAddr> {
     let mut buf = [0u8; 65536];
     let (n, addr) = socket.recv_from(&mut buf).await?;
@@ -375,16 +377,15 @@ pub async fn udp_connect_server(socket: &UdpSocket) -> Result<SocketAddr> {
             "UDP connect message too short".into(),
         ));
     }
-    let msg = u32::from_be_bytes(buf[..4].try_into().unwrap());
+    let msg = u32::from_ne_bytes(buf[..4].try_into().unwrap());
     if msg != UDP_CONNECT_MSG {
         return Err(RiperfError::Protocol(format!(
             "unexpected UDP connect message: {msg:#x}"
         )));
     }
 
-    // Lock the socket to this client so send/recv work without addresses.
     socket.connect(addr).await?;
-    socket.send(&UDP_CONNECT_REPLY.to_be_bytes()).await?;
+    socket.send(&UDP_CONNECT_REPLY.to_ne_bytes()).await?;
 
     Ok(addr)
 }
