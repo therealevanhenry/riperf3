@@ -362,15 +362,29 @@ impl Server {
             } else {
                 s.counters.bytes_received()
             };
-            let bits_per_sec = bytes as f64 * 8.0 / test_duration;
-            let role = if s.is_sender { "sender" } else { "receiver" };
-            println!(
-                "[{:3}] 0.00-{:.2} sec  {:.2} GBytes  {:.2} Gbits/sec  {}",
-                s.id,
-                test_duration,
-                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                bits_per_sec / 1_000_000_000.0,
-                role,
+
+            let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                udp_stats
+                    .lock()
+                    .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                    .unwrap_or((None, None, None))
+            } else {
+                (None, None, None)
+            };
+
+            crate::reporter::print_summary(
+                &crate::reporter::StreamSummary {
+                    stream_id: s.id,
+                    start: 0.0,
+                    end: test_duration,
+                    bytes,
+                    is_sender: s.is_sender,
+                    retransmits: None,
+                    jitter,
+                    lost,
+                    total_packets: total,
+                },
+                'a',
             );
         }
 

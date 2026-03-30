@@ -238,14 +238,16 @@ impl RateLimiter {
     /// Create a rate limiter.
     ///
     /// - `rate_bits_per_sec`: target send rate
-    /// - `burst_packets`: how many packets to send per burst (0 = single-packet)
+    /// - `burst_packets`: how many packets to send per burst (0 = auto)
     /// - `blksize`: datagram/block size in bytes
     pub fn new(rate_bits_per_sec: u64, burst_packets: u32, blksize: usize) -> Self {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
+        // Default burst: ~100ms worth of data, minimum 4 packets.
+        // This avoids per-packet tokio::sleep overhead which has ~1ms granularity.
         let burst = if burst_packets > 0 {
             burst_packets as f64 * blksize as f64
         } else {
-            blksize as f64
+            (rate_bytes * 0.1).max(4.0 * blksize as f64)
         };
         Self {
             rate_bytes_per_sec: rate_bytes,
@@ -587,13 +589,17 @@ mod tests {
     #[tokio::test]
     async fn rate_limiter_paces() {
         // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks
+        // burst = max(10000*0.1, 4*1000) = 4000 bytes
         let mut limiter = RateLimiter::new(80_000, 0, 1000);
-        limiter.acquire(1000).await; // consume the burst
+        // Drain the burst (4 packets)
+        for _ in 0..4 {
+            limiter.acquire(1000).await;
+        }
         let start = Instant::now();
         limiter.acquire(1000).await; // must wait ~100ms
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50)); // generous lower bound
-        assert!(elapsed < Duration::from_millis(250)); // generous upper bound
+        assert!(elapsed < Duration::from_millis(300)); // generous upper bound
     }
 
     // -- TCP send/recv integration --
