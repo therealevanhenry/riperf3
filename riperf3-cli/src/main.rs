@@ -85,6 +85,75 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         if cli.json {
             builder = builder.json_output(true);
         }
+        if cli.json_stream {
+            builder = builder.json_stream(true);
+        }
+        if cli.udp_counters_64bit {
+            builder = builder.udp_counters_64bit(true);
+        }
+        if cli.repeating_payload {
+            builder = builder.repeating_payload(true);
+        }
+        if cli.dont_fragment {
+            builder = builder.dont_fragment(true);
+        }
+        if let Some(port) = cli.cport {
+            builder = builder.cport(port);
+        }
+        if cli.get_server_output {
+            builder = builder.get_server_output(true);
+        }
+        if cli.forceflush {
+            builder = builder.forceflush(true);
+        }
+        if let Some(ref fmt) = cli.timestamps {
+            builder = builder.timestamps(fmt);
+        }
+        if let Some(ref addr) = cli.bind {
+            builder = builder.bind_address(addr);
+        }
+        if let Some(ref dev) = cli.bind_dev {
+            builder = builder.bind_dev(dev);
+        }
+        if let Some(ref s) = cli.fq_rate {
+            builder = builder.fq_rate(parse_kmg(s)?);
+        }
+        if let Some(label) = cli.flowlabel {
+            builder = builder.flowlabel(label);
+        }
+        if cli.version4 {
+            builder = builder.ip_version(4);
+        }
+        if cli.version6 {
+            builder = builder.ip_version(6);
+        }
+        if cli.mptcp {
+            builder = builder.mptcp(true);
+        }
+        if cli.skip_rx_copy {
+            builder = builder.skip_rx_copy(true);
+        }
+        if let Some(ms) = cli.rcv_timeout {
+            builder = builder.rcv_timeout(ms);
+        }
+        if let Some(ms) = cli.snd_timeout {
+            builder = builder.snd_timeout(ms);
+        }
+        if let Some(ref path) = cli.file {
+            builder = builder.file(path);
+        }
+        if let Some(ref spec) = cli.affinity {
+            builder = builder.affinity(spec);
+        }
+        if let Some(ref val) = cli.dscp {
+            builder = builder.dscp(val);
+        }
+        if let Some(ref path) = cli.pidfile {
+            builder = builder.pidfile(path);
+        }
+        if let Some(ref path) = cli.logfile {
+            builder = builder.logfile(path);
+        }
 
         let client = builder.build()?;
         client.run().await?;
@@ -100,6 +169,33 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         if cli.verbose {
             builder = builder.verbose(true);
+        }
+        if cli.daemon {
+            builder = builder.daemon(true);
+        }
+        if let Some(secs) = cli.idle_timeout {
+            builder = builder.idle_timeout(secs);
+        }
+        if let Some(ref s) = cli.server_bitrate_limit {
+            builder = builder.server_bitrate_limit(parse_kmg(s)?);
+        }
+        if let Some(secs) = cli.server_max_duration {
+            builder = builder.server_max_duration(secs);
+        }
+        if let Some(ref path) = cli.pidfile {
+            builder = builder.pidfile(path);
+        }
+        if let Some(ref path) = cli.logfile {
+            builder = builder.logfile(path);
+        }
+        if cli.forceflush {
+            builder = builder.forceflush(true);
+        }
+        if let Some(ref addr) = cli.bind {
+            builder = builder.bind_address(addr);
+        }
+        if let Some(ref fmt) = cli.timestamps {
+            builder = builder.timestamps(fmt);
         }
 
         let server = builder.build()?;

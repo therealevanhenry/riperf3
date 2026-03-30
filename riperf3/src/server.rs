@@ -73,6 +73,15 @@ pub struct Server {
     pub port: u16,
     pub one_off: bool,
     pub verbose: bool,
+    pub daemon: bool,
+    pub idle_timeout: Option<u32>,
+    pub server_bitrate_limit: Option<u64>,
+    pub server_max_duration: Option<u32>,
+    pub pidfile: Option<String>,
+    pub logfile: Option<String>,
+    pub forceflush: bool,
+    pub bind_address: Option<String>,
+    pub timestamps: Option<String>,
 }
 
 impl Server {
@@ -406,6 +415,15 @@ pub struct ServerBuilder {
     port: Option<u16>,
     one_off: bool,
     verbose: bool,
+    daemon: bool,
+    idle_timeout: Option<u32>,
+    server_bitrate_limit: Option<u64>,
+    server_max_duration: Option<u32>,
+    pidfile: Option<String>,
+    logfile: Option<String>,
+    forceflush: bool,
+    bind_address: Option<String>,
+    timestamps: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -414,6 +432,15 @@ impl Default for ServerBuilder {
             port: Some(DEFAULT_PORT),
             one_off: false,
             verbose: false,
+            daemon: false,
+            idle_timeout: None,
+            server_bitrate_limit: None,
+            server_max_duration: None,
+            pidfile: None,
+            logfile: None,
+            forceflush: false,
+            bind_address: None,
+            timestamps: None,
         }
     }
 }
@@ -438,11 +465,65 @@ impl ServerBuilder {
         self
     }
 
+    pub fn daemon(mut self, daemon: bool) -> Self {
+        self.daemon = daemon;
+        self
+    }
+
+    pub fn idle_timeout(mut self, secs: u32) -> Self {
+        self.idle_timeout = Some(secs);
+        self
+    }
+
+    pub fn server_bitrate_limit(mut self, rate: u64) -> Self {
+        self.server_bitrate_limit = Some(rate);
+        self
+    }
+
+    pub fn server_max_duration(mut self, secs: u32) -> Self {
+        self.server_max_duration = Some(secs);
+        self
+    }
+
+    pub fn pidfile(mut self, path: &str) -> Self {
+        self.pidfile = Some(path.to_string());
+        self
+    }
+
+    pub fn logfile(mut self, path: &str) -> Self {
+        self.logfile = Some(path.to_string());
+        self
+    }
+
+    pub fn forceflush(mut self, enabled: bool) -> Self {
+        self.forceflush = enabled;
+        self
+    }
+
+    pub fn bind_address(mut self, addr: &str) -> Self {
+        self.bind_address = Some(addr.to_string());
+        self
+    }
+
+    pub fn timestamps(mut self, fmt: &str) -> Self {
+        self.timestamps = Some(fmt.to_string());
+        self
+    }
+
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
         Ok(Server {
             port: self.port.unwrap_or(DEFAULT_PORT),
             one_off: self.one_off,
             verbose: self.verbose,
+            daemon: self.daemon,
+            idle_timeout: self.idle_timeout,
+            server_bitrate_limit: self.server_bitrate_limit,
+            server_max_duration: self.server_max_duration,
+            pidfile: self.pidfile,
+            logfile: self.logfile,
+            forceflush: self.forceflush,
+            bind_address: self.bind_address,
+            timestamps: self.timestamps,
         })
     }
 }

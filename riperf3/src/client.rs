@@ -43,8 +43,29 @@ pub struct Client {
     pub extra_data: Option<String>,
     pub verbose: bool,
     pub json_output: bool,
+    pub json_stream: bool,
     pub bytes_to_send: Option<u64>,
     pub blocks_to_send: Option<u64>,
+    pub repeating_payload: bool,
+    pub dont_fragment: bool,
+    pub cport: Option<u16>,
+    pub get_server_output: bool,
+    pub forceflush: bool,
+    pub timestamps: Option<String>,
+    pub bind_address: Option<String>,
+    pub bind_dev: Option<String>,
+    pub fq_rate: Option<u64>,
+    pub flowlabel: Option<i32>,
+    pub ip_version: Option<u8>,
+    pub mptcp: bool,
+    pub skip_rx_copy: bool,
+    pub rcv_timeout: Option<u64>,
+    pub snd_timeout: Option<u64>,
+    pub file: Option<String>,
+    pub affinity: Option<String>,
+    pub dscp: Option<String>,
+    pub pidfile: Option<String>,
+    pub logfile: Option<String>,
 }
 
 impl Client {
@@ -625,8 +646,29 @@ pub struct ClientBuilder {
     extra_data: Option<String>,
     verbose: bool,
     json_output: bool,
+    json_stream: bool,
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
+    repeating_payload: bool,
+    dont_fragment: bool,
+    cport: Option<u16>,
+    get_server_output: bool,
+    forceflush: bool,
+    timestamps: Option<String>,
+    bind_address: Option<String>,
+    bind_dev: Option<String>,
+    fq_rate: Option<u64>,
+    flowlabel: Option<i32>,
+    ip_version: Option<u8>,
+    mptcp: bool,
+    skip_rx_copy: bool,
+    rcv_timeout: Option<u64>,
+    snd_timeout: Option<u64>,
+    file: Option<String>,
+    affinity: Option<String>,
+    dscp: Option<String>,
+    pidfile: Option<String>,
+    logfile: Option<String>,
 }
 
 impl Default for ClientBuilder {
@@ -653,8 +695,29 @@ impl Default for ClientBuilder {
             extra_data: None,
             verbose: false,
             json_output: false,
+            json_stream: false,
             bytes_to_send: None,
             blocks_to_send: None,
+            repeating_payload: false,
+            dont_fragment: false,
+            cport: None,
+            get_server_output: false,
+            forceflush: false,
+            timestamps: None,
+            bind_address: None,
+            bind_dev: None,
+            fq_rate: None,
+            flowlabel: None,
+            ip_version: None,
+            mptcp: false,
+            skip_rx_copy: false,
+            rcv_timeout: None,
+            snd_timeout: None,
+            file: None,
+            affinity: None,
+            dscp: None,
+            pidfile: None,
+            logfile: None,
         }
     }
 }
@@ -779,6 +842,111 @@ impl ClientBuilder {
         self
     }
 
+    pub fn json_stream(mut self, enabled: bool) -> Self {
+        self.json_stream = enabled;
+        self
+    }
+
+    pub fn repeating_payload(mut self, enabled: bool) -> Self {
+        self.repeating_payload = enabled;
+        self
+    }
+
+    pub fn dont_fragment(mut self, enabled: bool) -> Self {
+        self.dont_fragment = enabled;
+        self
+    }
+
+    pub fn cport(mut self, port: u16) -> Self {
+        self.cport = Some(port);
+        self
+    }
+
+    pub fn get_server_output(mut self, enabled: bool) -> Self {
+        self.get_server_output = enabled;
+        self
+    }
+
+    pub fn forceflush(mut self, enabled: bool) -> Self {
+        self.forceflush = enabled;
+        self
+    }
+
+    pub fn timestamps(mut self, fmt: &str) -> Self {
+        self.timestamps = Some(fmt.to_string());
+        self
+    }
+
+    pub fn bind_address(mut self, addr: &str) -> Self {
+        self.bind_address = Some(addr.to_string());
+        self
+    }
+
+    pub fn bind_dev(mut self, dev: &str) -> Self {
+        self.bind_dev = Some(dev.to_string());
+        self
+    }
+
+    pub fn fq_rate(mut self, rate: u64) -> Self {
+        self.fq_rate = Some(rate);
+        self
+    }
+
+    pub fn flowlabel(mut self, label: i32) -> Self {
+        self.flowlabel = Some(label);
+        self
+    }
+
+    pub fn ip_version(mut self, version: u8) -> Self {
+        self.ip_version = Some(version);
+        self
+    }
+
+    pub fn mptcp(mut self, enabled: bool) -> Self {
+        self.mptcp = enabled;
+        self
+    }
+
+    pub fn skip_rx_copy(mut self, enabled: bool) -> Self {
+        self.skip_rx_copy = enabled;
+        self
+    }
+
+    pub fn rcv_timeout(mut self, ms: u64) -> Self {
+        self.rcv_timeout = Some(ms);
+        self
+    }
+
+    pub fn snd_timeout(mut self, ms: u64) -> Self {
+        self.snd_timeout = Some(ms);
+        self
+    }
+
+    pub fn file(mut self, path: &str) -> Self {
+        self.file = Some(path.to_string());
+        self
+    }
+
+    pub fn affinity(mut self, spec: &str) -> Self {
+        self.affinity = Some(spec.to_string());
+        self
+    }
+
+    pub fn dscp(mut self, val: &str) -> Self {
+        self.dscp = Some(val.to_string());
+        self
+    }
+
+    pub fn pidfile(mut self, path: &str) -> Self {
+        self.pidfile = Some(path.to_string());
+        self
+    }
+
+    pub fn logfile(mut self, path: &str) -> Self {
+        self.logfile = Some(path.to_string());
+        self
+    }
+
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
 
@@ -809,8 +977,29 @@ impl ClientBuilder {
             extra_data: self.extra_data,
             verbose: self.verbose,
             json_output: self.json_output,
+            json_stream: self.json_stream,
             bytes_to_send: self.bytes_to_send,
             blocks_to_send: self.blocks_to_send,
+            repeating_payload: self.repeating_payload,
+            dont_fragment: self.dont_fragment,
+            cport: self.cport,
+            get_server_output: self.get_server_output,
+            forceflush: self.forceflush,
+            timestamps: self.timestamps,
+            bind_address: self.bind_address,
+            bind_dev: self.bind_dev,
+            fq_rate: self.fq_rate,
+            flowlabel: self.flowlabel,
+            ip_version: self.ip_version,
+            mptcp: self.mptcp,
+            skip_rx_copy: self.skip_rx_copy,
+            rcv_timeout: self.rcv_timeout,
+            snd_timeout: self.snd_timeout,
+            file: self.file,
+            affinity: self.affinity,
+            dscp: self.dscp,
+            pidfile: self.pidfile,
+            logfile: self.logfile,
         })
     }
 }

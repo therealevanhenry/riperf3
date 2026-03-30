@@ -59,9 +59,45 @@ pub struct Cli {
     // Server-specific arguments
     // -----------------------------------------------------------------------
 
+    /// Write PID to file
+    #[arg(short = 'I', long, value_name = "file")]
+    pub pidfile: Option<String>,
+
+    /// Send output to a log file
+    #[arg(long, value_name = "file")]
+    pub logfile: Option<String>,
+
+    /// Force flushing output at every interval
+    #[arg(long)]
+    pub forceflush: bool,
+
+    /// Emit a timestamp at the start of each output line
+    #[arg(long, value_name = "format", num_args = 0..=1, default_missing_value = "%c ")]
+    pub timestamps: Option<String>,
+
+    // -----------------------------------------------------------------------
+    // Server-specific arguments
+    // -----------------------------------------------------------------------
+
     /// Handle one client connection then exit
     #[arg(short = '1', long)]
     pub one_off: bool,
+
+    /// Run the server as a daemon
+    #[arg(short = 'D', long)]
+    pub daemon: bool,
+
+    /// Restart idle server after # seconds
+    #[arg(long, value_name = "secs")]
+    pub idle_timeout: Option<u32>,
+
+    /// Server's total bit rate limit
+    #[arg(long = "server-bitrate-limit", value_name = "rate")]
+    pub server_bitrate_limit: Option<String>,
+
+    /// Max time a test can run on the server
+    #[arg(long = "server-max-duration", value_name = "secs")]
+    pub server_max_duration: Option<u32>,
 
     // -----------------------------------------------------------------------
     // Client-specific arguments
@@ -142,6 +178,118 @@ pub struct Cli {
     /// Get results from server
     #[arg(long)]
     pub get_server_output: bool,
+
+    /// Use 64-bit counters in UDP test packets
+    #[arg(long)]
+    pub udp_counters_64bit: bool,
+
+    /// Use repeating pattern in payload instead of zeros
+    #[arg(long)]
+    pub repeating_payload: bool,
+
+    /// Set IPv4 Don't Fragment flag
+    #[arg(long)]
+    pub dont_fragment: bool,
+
+    /// Bind to a specific client port
+    #[arg(long, value_name = "port")]
+    pub cport: Option<u16>,
+
+    /// Set the server timing for pacing in microseconds (deprecated)
+    #[arg(long, value_name = "usec")]
+    pub pacing_timer: Option<u32>,
+
+    /// Only use IPv4
+    #[arg(short = '4', long)]
+    pub version4: bool,
+
+    /// Only use IPv6
+    #[arg(short = '6', long)]
+    pub version6: bool,
+
+    /// Bind to the interface associated with the address
+    #[arg(short = 'B', long, value_name = "host[%dev]")]
+    pub bind: Option<String>,
+
+    /// Bind to the network interface with SO_BINDTODEVICE
+    #[arg(long, value_name = "dev")]
+    pub bind_dev: Option<String>,
+
+    /// Enable fair-queuing based socket pacing (bits/sec, Linux only)
+    #[arg(long, value_name = "rate")]
+    pub fq_rate: Option<String>,
+
+    /// Set the IPv6 flow label (Linux only)
+    #[arg(short = 'L', long, value_name = "N")]
+    pub flowlabel: Option<i32>,
+
+    /// Set the IP DSCP value (0-63 or symbolic)
+    #[arg(long, value_name = "val")]
+    pub dscp: Option<String>,
+
+    /// Use MPTCP rather than plain TCP
+    #[arg(short = 'm', long)]
+    pub mptcp: bool,
+
+    /// Use zero copy method of sending data
+    #[arg(short = 'Z', long)]
+    pub zerocopy: bool,
+
+    /// Ignore received messages using MSG_TRUNC
+    #[arg(long)]
+    pub skip_rx_copy: bool,
+
+    /// Idle timeout for receiving data (ms)
+    #[arg(long, value_name = "ms")]
+    pub rcv_timeout: Option<u64>,
+
+    /// Timeout for unacknowledged TCP data (ms)
+    #[arg(long, value_name = "ms")]
+    pub snd_timeout: Option<u64>,
+
+    /// Transmit/receive the specified file
+    #[arg(short = 'F', long, value_name = "name")]
+    pub file: Option<String>,
+
+    /// Set CPU affinity
+    #[arg(short = 'A', long, value_name = "n[,m]")]
+    pub affinity: Option<String>,
+
+    /// Output in line-delimited JSON format
+    #[arg(long)]
+    pub json_stream: bool,
+
+    /// Enable UDP GSO/GRO
+    #[arg(long)]
+    pub gsro: bool,
+
+    /// Use control connection TCP keepalive
+    #[arg(long, value_name = "idle/intv/cnt")]
+    pub cntl_ka: Option<String>,
+
+    /// Username for authentication
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Path to RSA public key for authentication
+    #[arg(long, value_name = "file")]
+    pub rsa_public_key_path: Option<String>,
+
+    /// Path to RSA private key for authentication (server)
+    #[arg(long, value_name = "file")]
+    pub rsa_private_key_path: Option<String>,
+
+    /// Path to authorized users file (server)
+    #[arg(long, value_name = "file")]
+    pub authorized_users_path: Option<String>,
+
+    /// Time skew threshold for authentication (seconds)
+    #[arg(long, value_name = "secs")]
+    pub time_skew_threshold: Option<u32>,
+
+    /// Use PKCS#1 padding for authentication
+    #[arg(long)]
+    pub use_pkcs1_padding: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
@@ -350,6 +498,75 @@ mod cli_tests {
             if cli.json {
                 b = b.json_output(true);
             }
+            if cli.json_stream {
+                b = b.json_stream(true);
+            }
+            if cli.udp_counters_64bit {
+                b = b.udp_counters_64bit(true);
+            }
+            if cli.repeating_payload {
+                b = b.repeating_payload(true);
+            }
+            if cli.dont_fragment {
+                b = b.dont_fragment(true);
+            }
+            if let Some(port) = cli.cport {
+                b = b.cport(port);
+            }
+            if cli.get_server_output {
+                b = b.get_server_output(true);
+            }
+            if cli.forceflush {
+                b = b.forceflush(true);
+            }
+            if let Some(ref fmt) = cli.timestamps {
+                b = b.timestamps(fmt);
+            }
+            if let Some(ref addr) = cli.bind {
+                b = b.bind_address(addr);
+            }
+            if let Some(ref dev) = cli.bind_dev {
+                b = b.bind_dev(dev);
+            }
+            if let Some(ref s) = cli.fq_rate {
+                b = b.fq_rate(parse_kmg(s).unwrap());
+            }
+            if let Some(label) = cli.flowlabel {
+                b = b.flowlabel(label);
+            }
+            if cli.version4 {
+                b = b.ip_version(4);
+            }
+            if cli.version6 {
+                b = b.ip_version(6);
+            }
+            if cli.mptcp {
+                b = b.mptcp(true);
+            }
+            if cli.skip_rx_copy {
+                b = b.skip_rx_copy(true);
+            }
+            if let Some(ms) = cli.rcv_timeout {
+                b = b.rcv_timeout(ms);
+            }
+            if let Some(ms) = cli.snd_timeout {
+                b = b.snd_timeout(ms);
+            }
+            if let Some(ref path) = cli.file {
+                b = b.file(path);
+            }
+            if let Some(ref spec) = cli.affinity {
+                b = b.affinity(spec);
+            }
+            if let Some(ref val) = cli.dscp {
+                b = b.dscp(val);
+            }
+            if let Some(ref path) = cli.pidfile {
+                b = b.pidfile(path);
+            }
+            if let Some(ref path) = cli.logfile {
+                b = b.logfile(path);
+            }
             b.build().unwrap()
         }
 
@@ -535,6 +752,197 @@ mod cli_tests {
             }
             let s = b.build().unwrap();
             assert!(s.one_off);
+        }
+
+        // -- New flag wiring tests --
+
+        #[test]
+        fn udp_counters_64bit_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--udp-counters-64bit"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.udp_counters_64bit);
+        }
+
+        #[test]
+        fn repeating_payload_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--repeating-payload"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.repeating_payload);
+        }
+
+        #[test]
+        fn dont_fragment_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--dont-fragment"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.dont_fragment);
+        }
+
+        #[test]
+        fn cport_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cport", "12345"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.cport, Some(12345));
+        }
+
+        #[test]
+        fn get_server_output_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--get-server-output"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.get_server_output);
+        }
+
+        #[test]
+        fn forceflush_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--forceflush"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.forceflush);
+        }
+
+        #[test]
+        fn timestamps_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--timestamps", "%H:%M"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.timestamps, Some("%H:%M".to_string()));
+        }
+
+        #[test]
+        fn version4_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-4"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.ip_version, Some(4));
+        }
+
+        #[test]
+        fn version6_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-6"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.ip_version, Some(6));
+        }
+
+        #[test]
+        fn bind_address_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-B", "10.0.0.1"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.bind_address, Some("10.0.0.1".to_string()));
+        }
+
+        #[test]
+        fn bind_dev_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.bind_dev, Some("eth0".to_string()));
+        }
+
+        #[test]
+        fn fq_rate_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--fq-rate", "1G"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.fq_rate, Some(1024 * 1024 * 1024));
+        }
+
+        #[test]
+        fn flowlabel_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-L", "42"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.flowlabel, Some(42));
+        }
+
+        #[test]
+        fn dscp_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--dscp", "46"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.dscp, Some("46".to_string()));
+        }
+
+        #[test]
+        fn mptcp_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-m"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.mptcp);
+        }
+
+        #[test]
+        fn skip_rx_copy_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--skip-rx-copy"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.skip_rx_copy);
+        }
+
+        #[test]
+        fn rcv_timeout_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--rcv-timeout", "5000"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.rcv_timeout, Some(5000));
+        }
+
+        #[test]
+        fn snd_timeout_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--snd-timeout", "3000"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.snd_timeout, Some(3000));
+        }
+
+        #[test]
+        fn file_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-F", "/tmp/data"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.file, Some("/tmp/data".to_string()));
+        }
+
+        #[test]
+        fn affinity_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-A", "2,3"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.affinity, Some("2,3".to_string()));
+        }
+
+        #[test]
+        fn json_stream_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--json-stream"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.json_stream);
+        }
+
+        #[test]
+        fn pidfile_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-I", "/tmp/pid"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.pidfile, Some("/tmp/pid".to_string()));
+        }
+
+        #[test]
+        fn logfile_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--logfile", "/tmp/log"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.logfile, Some("/tmp/log".to_string()));
+        }
+
+        // Server new flags
+        #[test]
+        fn server_daemon_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-D"]);
+            let mut b = riperf3::ServerBuilder::new();
+            if cli.daemon { b = b.daemon(true); }
+            let s = b.build().unwrap();
+            assert!(s.daemon);
+        }
+
+        #[test]
+        fn server_idle_timeout_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--idle-timeout", "30"]);
+            let mut b = riperf3::ServerBuilder::new();
+            if let Some(secs) = cli.idle_timeout { b = b.idle_timeout(secs); }
+            let s = b.build().unwrap();
+            assert_eq!(s.idle_timeout, Some(30));
+        }
+
+        #[test]
+        fn server_max_duration_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-max-duration", "60"]);
+            let mut b = riperf3::ServerBuilder::new();
+            if let Some(secs) = cli.server_max_duration { b = b.server_max_duration(secs); }
+            let s = b.build().unwrap();
+            assert_eq!(s.server_max_duration, Some(60));
         }
     }
 }
