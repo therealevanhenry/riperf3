@@ -180,6 +180,121 @@ async fn udp_normal_single_stream() {
 }
 
 // ---------------------------------------------------------------------------
+// Socket option tests — these exercise server listener recreation with
+// MSS, window, and no_delay. Currently expected to fail (bug: server
+// tries to bind a second listener on the same port without closing the first).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_no_delay() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .no_delay(true)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(result.is_ok(), "Client failed with -N: {result:?}");
+
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_mss() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .mss(1400)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(result.is_ok(), "Client failed with -M 1400: {result:?}");
+
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_window_size() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .window(256 * 1024)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(result.is_ok(), "Client failed with -w 256K: {result:?}");
+
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_combined_socket_opts() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .num_streams(2)
+        .reverse(true)
+        .no_delay(true)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(
+        result.is_ok(),
+        "Client failed with -P 2 -R -N: {result:?}"
+    );
+
+    let _ = server_task.await;
+}
+
+// ---------------------------------------------------------------------------
 // Builder coverage tests
 // ---------------------------------------------------------------------------
 
