@@ -28,6 +28,16 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
 
+/// Compute the stream ID for the given 0-based stream index.
+/// Matches iperf3's `iperf_add_stream()` assignment: 1, 3, 4, 5, 6, ...
+pub fn iperf3_stream_id(index: u32) -> i32 {
+    if index == 0 {
+        1
+    } else {
+        (index + 2) as i32
+    }
+}
+
 /// Maximum UDP payload: 65535 - 8 (UDP header) - 20 (IP header)
 pub const MAX_UDP_BLKSIZE: usize = 65507;
 

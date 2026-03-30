@@ -176,7 +176,7 @@ impl Server {
                     }
                     net::configure_tcp_stream(&data_stream, cfg.no_delay)?;
 
-                    let stream_id = (i + 1) as i32;
+                    let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
                     let raw_fd = data_stream.as_raw_fd();
@@ -214,7 +214,7 @@ impl Server {
                     let udp_sock = net::udp_bind(None, self.port).await?;
                     let _client_addr = protocol::udp_connect_server(&udp_sock).await?;
 
-                    let stream_id = (i + 1) as i32;
+                    let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
 
@@ -339,8 +339,9 @@ impl Server {
         };
 
         protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
-        protocol::send_results(&mut ctrl, &server_results).await?;
+        // iperf3 protocol: server reads client results first, then sends its own
         let _client_results = protocol::recv_results(&mut ctrl).await?;
+        protocol::send_results(&mut ctrl, &server_results).await?;
 
         // ---- DisplayResults / IperfDone ----
         protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;

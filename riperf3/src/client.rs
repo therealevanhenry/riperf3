@@ -180,8 +180,6 @@ impl Client {
         let send_count = if self.reverse && !self.bidir { 0 } else { self.num_streams };
         let recv_count = if self.reverse || self.bidir { self.num_streams } else { 0 };
         let total = send_count + recv_count;
-        let mut stream_id = 0i32;
-
         match self.protocol {
             TransportProtocol::Tcp => {
                 for i in 0..total {
@@ -190,7 +188,7 @@ impl Client {
                     protocol::send_cookie(&mut data_stream, cookie).await?;
                     net::configure_tcp_stream(&data_stream, self.no_delay)?;
 
-                    stream_id += 1;
+                    let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
                     let raw_fd = data_stream.as_raw_fd();
@@ -229,7 +227,7 @@ impl Client {
                         .await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
-                    stream_id += 1;
+                    let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
 
