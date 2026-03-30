@@ -1,82 +1,113 @@
-// The main entry point for the riperf3-cli application.
-
-// Use clap to parse the command line arguments.
 use clap::Parser;
-
-// Use log and log4rs for logging.
 use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Config, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 
-// Use riperf3 for the necessary riper3 types and functions.
-use riperf3::utils::set_verbose;
-use riperf3::vprintln;
+use riperf3::protocol::TransportProtocol;
+use riperf3::utils::{parse_bitrate, parse_kmg, set_verbose};
 
-// riperf3 CLI module
 mod cli;
 use cli::Cli;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse the command line arguments
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Set the verbose flag
     set_verbose(cli.verbose);
-    vprintln!("Verbose mode enabled.");
+    configure_log4rs(cli.debug.unwrap_or(0));
 
-    // Configure log4rs
-    let log_level = cli.debug.unwrap_or(0); // Default to 0 if not specified, which is ERROR
-    configure_log4rs(log_level);
-    log::debug!("Log level set to: {}", log_level);
-
-    // Check the mode we are running in
     if let Some(server_host) = cli.client {
-        // If the client argument was passed, we are in client mode
-        use riperf3::ClientBuilder;
+        // ---- Client mode ----
+        let mut builder = riperf3::ClientBuilder::new(&server_host);
 
-        // Create a new ClientBuilder
-        let mut client_builder = ClientBuilder::new(&server_host);
-
-        // Set the port if it was specified
-        if cli.port.is_some() {
-            client_builder = client_builder.port(cli.port);
+        if let Some(port) = cli.port {
+            builder = builder.port(Some(port));
+        }
+        if cli.udp {
+            builder = builder.protocol(TransportProtocol::Udp);
+        }
+        if let Some(t) = cli.time {
+            builder = builder.duration(t);
+        }
+        if let Some(ref s) = cli.bytes {
+            builder = builder.bytes(parse_kmg(s)?);
+        }
+        if let Some(ref s) = cli.blockcount {
+            builder = builder.blocks(parse_kmg(s)?);
+        }
+        if let Some(ref s) = cli.length {
+            builder = builder.blksize(parse_kmg(s)? as usize);
+        }
+        if let Some(n) = cli.parallel {
+            builder = builder.num_streams(n);
+        }
+        if cli.reverse {
+            builder = builder.reverse(true);
+        }
+        if cli.bidir {
+            builder = builder.bidir(true);
+        }
+        if let Some(ref s) = cli.window {
+            builder = builder.window(parse_kmg(s)? as i32);
+        }
+        if let Some(ref algo) = cli.congestion {
+            builder = builder.congestion(algo);
+        }
+        if let Some(mss) = cli.mss {
+            builder = builder.mss(mss);
+        }
+        if cli.no_delay {
+            builder = builder.no_delay(true);
+        }
+        if let Some(ref s) = cli.bitrate {
+            let (rate, _burst) = parse_bitrate(s)?;
+            builder = builder.bandwidth(rate);
+        }
+        if let Some(tos) = cli.tos {
+            builder = builder.tos(tos);
+        }
+        if let Some(o) = cli.omit {
+            builder = builder.omit(o);
+        }
+        if let Some(ref t) = cli.title {
+            builder = builder.title(t);
+        }
+        if let Some(ref d) = cli.extra_data {
+            builder = builder.extra_data(d);
+        }
+        if let Some(ms) = cli.connect_timeout {
+            builder = builder.connect_timeout(std::time::Duration::from_millis(ms));
+        }
+        if cli.verbose {
+            builder = builder.verbose(true);
         }
 
-        // Build the Client
-        let client = client_builder.build()?;
-
-        // Run the client
+        let client = builder.build()?;
         client.run().await?;
     } else if cli.server {
-        // If the server argument was passed, we are in server mode
-        use riperf3::ServerBuilder;
+        // ---- Server mode ----
+        let mut builder = riperf3::ServerBuilder::new();
 
-        // Create a new ServerBuilder
-        let mut server_builder = ServerBuilder::new();
-
-        // Set the port if it was specified
-        if cli.port.is_some() {
-            server_builder = server_builder.port(cli.port);
+        if let Some(port) = cli.port {
+            builder = builder.port(Some(port));
+        }
+        if cli.one_off {
+            builder = builder.one_off(true);
+        }
+        if cli.verbose {
+            builder = builder.verbose(true);
         }
 
-        // Build the Server
-        let server = server_builder.build()?;
-
-        // Run the server
+        let server = builder.build()?;
         server.run().await?;
     } else {
-        // This should be impossible to reach, as the CLI parser should catch this.
-        vprintln!("No mode specified. Exiting.");
+        eprintln!("No mode specified. Use -s for server or -c <host> for client.");
     }
 
     Ok(())
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Log4rs configuration ////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
 fn configure_log4rs(verbosity: u8) {
     let level = match verbosity {
         0 => LevelFilter::Error,

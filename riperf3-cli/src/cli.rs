@@ -1,268 +1,149 @@
-// Module: cli
-// Path: riperf3-cli/src/cli.rs
-// This module defines the CLI structure for the riperf3-cli application.
 use clap::{ArgGroup, Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
-// The automatic version flag is disabled to support 'V' for verbosity.
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
 #[command(group(
-        ArgGroup::new("mode")
-            .required(true)
-            .args(&["server", "client"])
+    ArgGroup::new("mode")
+        .required(true)
+        .args(&["server", "client"])
 ))]
 #[command(group(
-        ArgGroup::new("meta")
-            .required(false)
-            .args(&["help", "version"])
+    ArgGroup::new("meta")
+        .required(false)
+        .args(&["help", "version"])
 ))]
 pub struct Cli {
-    ///////////////////////////////////////////////////////////////////////////
-    // Common arguments for both server and client modes //////////////////////
-    ///////////////////////////////////////////////////////////////////////////
+    // -----------------------------------------------------------------------
+    // Common arguments
+    // -----------------------------------------------------------------------
 
-    // Run in server mode
+    /// Run in server mode
     #[arg(short, long, group = "mode")]
     pub server: bool,
 
-    // Run in client mode
+    /// Run in client mode, connecting to <host>
     #[arg(short, long, group = "mode", value_name = "host")]
     pub client: Option<String>,
 
-    // Server port to listen on/connect to
-    #[arg(short, long, help = "server port to listen on/connect to")]
+    /// Server port to listen on/connect to
+    #[arg(short, long)]
     pub port: Option<u16>,
 
-    // Format to report: Kbits, Mbits, Gbits, Tbits
-    #[arg(
-        short,
-        long,
-        ignore_case = true,
-        value_enum,
-        value_name = "format",
-        default_value = "m",
-        help = "format to report: Kbits, Mbits, Gbits, Tbits"
-    )]
+    /// Format to report: Kbits, Mbits, Gbits, Tbits
+    #[arg(short, long, ignore_case = true, value_enum, value_name = "format", default_value = "m")]
     pub format: Format,
 
-    // Interval in seconds between periodic throughput reports
-    #[arg(
-        short,
-        long,
-        value_name = "interval",
-        help = "interval in seconds between periodic throughput reports"
-    )]
+    /// Seconds between periodic throughput reports
+    #[arg(short, long, value_name = "interval")]
     pub interval: Option<u8>,
 
-    // Write the PID to a file
-    // TODO: Add the PID argument `-I`, `--pidfile <file>`
-
-    // Transmit/receive the specified file
-    // TODO: Add the file argument `-F`, `--file <name>`
-
-    // Set the CPU affinity
-    // TODO: Add the affinity argument `-A`, `--affinity <n[,m]>`
-
-    // Bind to the interface associated with the address `<host>`
-    // (optional `<dev>` equivalent to `--bind-dev <dev>`)
-    // TODO: Add the bind argument `-B`, `--bind <host>[%<dev>]`
-
-    // Bind to the network interface using SO_BINDTODEVICE
-    // TODO: Add the bind-dev argument `--bind-dev <dev>`
-
-    // Enable verbosity for more detailed output
-    // The short 'V' alias conflicts with the default clap version flag
-    #[arg(short = 'V', long, help = "enable verbosity for more detailed output")]
+    /// Enable verbose output
+    #[arg(short = 'V', long)]
     pub verbose: bool,
 
-    // Output results in JSON format
-    // TODO: Add the json argument `-J`, `--json`
+    /// Output in JSON format
+    #[arg(short = 'J', long)]
+    pub json: bool,
 
-    // Output results in line-delimited JSON format
-    // TODO: Add the JSON stream argument `--json-stream`
-
-    // Send output to a log file
-    // TODO: Add the logfile argument `--logfile <f>`
-
-    // Force flushing of output at every interval
-    // TODO: Add the forceflush argument `--forceflush`
-
-    // Emit a timestamp at the start of each output line
-    // (optional `=<format>` as per `strftime(3)`)
-    // TODO: Add the timestamp argument `--timestamp[=<format>]`
-
-    // Idle timeout for receiving data (default: 120000 ms)
-    // TODO: Add the rcv-timeout argument `--rcv-timeout <#>`
-
-    // Timeout for unacknowledged TCP data
-    // (in ms, default is system settings)
-    // TODO: Add the snd-timeout argument `--snd-timeout <#>`
-
-    // Emit debugging output (optional "=" and debug level: 1-4. Default is 4 - all messages)
-    #[arg(
-        short,
-        long,
-        value_name = "level",
-        num_args = 0..=1,
-        value_parser = clap::value_parser!(u8).range(1..=4),
-        default_missing_value = "4",
-        help = "emit debugging output (optional '=' and debug level: 1-4. Default is 4 - all messages)"
-    )]
+    /// Debug level 1-4 (default 4)
+    #[arg(short, long, value_name = "level", num_args = 0..=1,
+          value_parser = clap::value_parser!(u8).range(1..=4),
+          default_missing_value = "4")]
     pub debug: Option<u8>,
 
-    // Support the version flag with the 'v' alias
-    #[arg(short = 'v', long, group = "meta", action = clap::ArgAction::Version, help = "print version information")]
+    /// Print version
+    #[arg(short = 'v', long, group = "meta", action = clap::ArgAction::Version)]
     pub version: Option<bool>,
-    //
-    // The help argument is automatically generated by clap
 
-    // End of common arguments ////////////////////////////////////////////////
+    // -----------------------------------------------------------------------
+    // Server-specific arguments
+    // -----------------------------------------------------------------------
 
-    ///////////////////////////////////////////////////////////////////////////
-    // The server-specific arguments //////////////////////////////////////////
-    ///////////////////////////////////////////////////////////////////////////
+    /// Handle one client connection then exit
+    #[arg(short = '1', long)]
+    pub one_off: bool,
 
-    // Run the server as a daemon
-    // TODO: Add the daemon argument `-D`, `--daemon`
+    // -----------------------------------------------------------------------
+    // Client-specific arguments
+    // -----------------------------------------------------------------------
 
-    // Handle one client connection then exit
-    // TODO: Add the one-off argument `-1`, `--one-off`
+    /// Use UDP rather than TCP
+    #[arg(short = 'u', long)]
+    pub udp: bool,
 
-    // Server's total bit rate limit (default 0 = no limit)
-    // Optional slash and number of seconds interval for averaging total data rate.
-    // Default interval is 5 seconds.
-    // Format: `<#[KMG][/#]>`
-    // Example: `100M/10` for 100 Mbit/sec averaged over 10 seconds
-    // TODO: Add the server bitrate limit argument `--server-bitrate-limit <#[KMG][/#]>`
+    /// Time in seconds to transmit for (default 10 secs)
+    #[arg(short = 't', long, value_name = "secs")]
+    pub time: Option<u32>,
 
-    // Restart idle server after `#` seconds in case it gets stuck (default: no timeout)
-    // TODO: Add the idle timeout argument `--idle-timeout <#>`
+    /// Number of bytes to transmit (instead of -t)
+    #[arg(short = 'n', long, value_name = "bytes")]
+    pub bytes: Option<String>,
 
-    // Path to the RSA private key used to decrypt authentication credentials
-    // TODO: Add the RSA private key path argument `--rsa-private-key-path <file>`
+    /// Number of blocks (packets) to transmit (instead of -t or -n)
+    #[arg(short = 'k', long, value_name = "count")]
+    pub blockcount: Option<String>,
 
-    // Path to the configuration file containing user credentials
-    // TODO: Add the authorized users path argument `--authorized-users-path <file>`
+    /// Length of buffer to read or write (default 128 KB for TCP, 1460 for UDP)
+    #[arg(short = 'l', long, value_name = "size")]
+    pub length: Option<String>,
 
-    // Time skew threshold (in seconds) between the server and client during authentication
-    // process.
-    // TODO: Add the time skew threshold argument `--time-skew-threshold <#>`
+    /// Number of parallel client streams to run
+    #[arg(short = 'P', long, value_name = "num")]
+    pub parallel: Option<u32>,
 
-    // Use PKCS#1 padding at your own risk
-    // TODO: Add the use PKCS#1 padding argument `--use-pkcs1-padding`
+    /// Reverse mode (server sends, client receives)
+    #[arg(short = 'R', long)]
+    pub reverse: bool,
 
-    // End of server arguments ////////////////////////////////////////////////
+    /// Bidirectional mode: client and server send and receive
+    #[arg(long)]
+    pub bidir: bool,
 
-    ///////////////////////////////////////////////////////////////////////////
-    // The client-specific arguments //////////////////////////////////////////
-    ///////////////////////////////////////////////////////////////////////////
+    /// Set socket buffer sizes (indirectly sets TCP window size)
+    #[arg(short = 'w', long, value_name = "size")]
+    pub window: Option<String>,
 
-    // Use UDP rather than TCP
-    // TODO: Add the UDP argument `-u`, `--udp`
+    /// Set TCP congestion control algorithm
+    #[arg(short = 'C', long, value_name = "algo")]
+    pub congestion: Option<String>,
 
-    // Timeout for control connection setup in milliseconds
-    // TODO: Add the connect-timeout argument `--connect-timeout <#>`
+    /// Set TCP/SCTP maximum segment size (MTU - 40 bytes)
+    #[arg(short = 'M', long = "set-mss", value_name = "mss")]
+    pub mss: Option<i32>,
 
-    // Target bitrate in bits/sec (0 for unlimited)
-    // Default is 1 Mbit/sec for UDP and unlimited for TCP
-    // Optional slash and packet count for burst mode
-    // TODO: Add the bitrate argument `-b`, `--bitrate <#[KMG][/#]>`
+    /// Disable Nagle's algorithm (set TCP_NODELAY)
+    #[arg(short = 'N', long = "no-delay")]
+    pub no_delay: bool,
 
-    // Set the server timing for pacing in microseconds (default 1000)
-    // Deprecated: For servers using older versions for backward compatibility
-    // TODO: Add the pacing-timer argument `--pacing-timer <#[KMG]>`
+    /// Target bitrate in bits/sec (0 = unlimited for TCP, 1M default for UDP)
+    #[arg(short = 'b', long, value_name = "rate[/burst]")]
+    pub bitrate: Option<String>,
 
-    // Enable fair-queuing based socket pacing in bits/sec (Linux only)
-    // TODO: Add the fq-rate argument `--fq-rate <#[KMG]>`
+    /// Set the IP type of service (0-255)
+    #[arg(short = 'S', long, value_name = "tos")]
+    pub tos: Option<i32>,
 
-    // Time in seconds to transmit for (default 10 seconds)
-    // TODO: Add the time argument `-t`, `--time <#>`
+    /// Omit the first N seconds of the test
+    #[arg(short = 'O', long, value_name = "secs")]
+    pub omit: Option<u32>,
 
-    // Number of bytes to transmit (instead of `-t`)
-    // TODO: Add the bytes argument `-n`, `--bytes <#[KMG]>`
+    /// Prefix every output line with this string
+    #[arg(short = 'T', long, value_name = "title")]
+    pub title: Option<String>,
 
-    // Number of blocks (packets) to transmit (instead of `-t` or `-n`)
-    // TODO: Add the blockcount argument `-k`, `--blockcount <#[KMG]>`
+    /// Extra data string to include in JSON output
+    #[arg(long, value_name = "str")]
+    pub extra_data: Option<String>,
 
-    // Length of buffer to read or write
-    // Default is 128 KB for TCP, dynamic or 1460 for UDP
-    // TODO: Add the length argument `-l`, `--length <#[KMG]>`
+    /// Timeout for control connection setup (ms)
+    #[arg(long, value_name = "ms")]
+    pub connect_timeout: Option<u64>,
 
-    // Bind to a specific client port (TCP and UDP, default: ephemeral port)
-    // TODO: Add the client port argument `--cport <port>`
-
-    // Number of parallel client streams to run
-    // TODO: Add the parallel argument `-P`, `--parallel <#>`
-
-    // Run in reverse mode (server sends, client receives)
-    // TODO: Add the reverse argument `-R`, `--reverse`
-
-    // Run in bidirectional mode. Client and server send and receive data.
-    // TODO: Add the bidirectional argument `--bidir`
-
-    // Set send/receive socket buffer sizes (indirectly sets TCP window size)
-    // TODO: Add the window argument `-w`, `--window <#[KMG]>`
-
-    // Set TCP congestion control algorithm (Linux and FreeBSD only)
-    // TODO: Add the congestion argument `-C`, `--congestion <algo>`
-
-    // Set TCP/SCTP maximum segment size (MTU - 40 bytes)
-    // TODO: Add the set-MSS argument `-M`, `--set-mss <#>`
-
-    // Set TCP/SCTP no delay, disabling Nagle's Algorithm
-    // TODO: Add the no-delay argument `-N`, `--no-delay`
-
-    // Only use IPv4
-    // TODO: Add the IPv4 version argument `-4`, `--version4`
-
-    // Only use IPv6
-    // TODO: Add the IPv6 version argument `-6`, `--version6`
-
-    // Set the IP type of service (0-255).
-    // Supports octal and hexadecimal prefixes (e.g., 52, 064, 0x34)
-    // TODO: Add the TOS argument `-S`, `--tos <N>`
-
-    // Set the IP DSCP value, either 0-63 or symbolic.
-    // Numeric values can be in decimal, octal, or hex (see `--tos`)
-    // TODO: Add the DSCP argument `--dscp <N|val>`
-
-    // Set the IPv6 flow label (only supported on Linux)
-    // TODO: Add the flowlabel argument `-L`, `--flowlabel <N>`
-
-    // Use a 'zero copy' method of sending data
-    // TODO: Add the zerocopy argument `-Z`, `--zerocopy`
-
-    // Perform a pre-test for N seconds and omit the pre-test statistics
-    // TODO: Add the omit argument `-O`, `--omit <N>`
-
-    // Prefix every output line with this string
-    // TODO: Add the title argument `-T`, `--title <str>`
-
-    // Data string to include in client and server JSON
-    // TODO: Add the extra-data argument `--extra-data <str>`
-
-    // Get results from server
-    // TODO: Add the get-server-output argument `--get-server-output`
-
-    // Use 64-bit counters in UDP test packets
-    // TODO: Add the UDP counters 64-bit argument `--udp-counters-64bit`
-
-    // Use a repeating pattern in payload instead of randomized payload (like in iperf2)
-    // TODO: Add the repeating-payload argument `--repeating-payload`
-
-    // Set IPv4 Don't Fragment flag
-    // TODO: Add the dont-fragment argument `--dont-fragment`
-
-    // Username for authentication
-    // TODO: Add the username argument `--username`
-
-    // Path to the RSA public key used to encrypt authentication credentials
-    // TODO: Add the RSA public key path argument `--rsa-public-key-path <file>`
-
-    // End of client arguments ////////////////////////////////////////////////
+    /// Get results from server
+    #[arg(long)]
+    pub get_server_output: bool,
 }
 
-// Format argument parser for ValueEnum
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum Format {
     K,
@@ -271,18 +152,17 @@ pub enum Format {
     T,
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Unit Tests for the cli module ///////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
 
-    // This module tests the common arguments for client and server modes
     mod common_arg_tests {
         use super::*;
 
-        // Test the common arguments defaults
         #[test]
         fn test_common_defaults() {
             let cli = Cli::parse_from(["riperf3", "--server"]);
@@ -306,7 +186,6 @@ mod cli_tests {
             assert_eq!(cli.version, None);
         }
 
-        // Test the common arguments with a port
         #[test]
         fn test_common_port() {
             let cli = Cli::parse_from(["riperf3", "--server", "--port", "1234"]);
@@ -316,7 +195,6 @@ mod cli_tests {
             assert_eq!(cli.port, Some(1234));
         }
 
-        // Test the common arguments with a format
         #[test]
         fn test_common_format() {
             let cli = Cli::parse_from(["riperf3", "--server", "--format", "k"]);
@@ -345,13 +223,54 @@ mod cli_tests {
         }
     }
 
-    // This module tests the server mode arguments
-    mod server_mode_tests {
-        //TODO: Add server mode argument tests as they are implemented
+    mod client_arg_tests {
+        use super::*;
+
+        #[test]
+        fn test_client_flags() {
+            let cli = Cli::parse_from([
+                "riperf3", "-c", "10.0.0.1",
+                "-u", "-t", "30", "-P", "4", "-R", "--bidir",
+                "-N", "-l", "1460", "-b", "100M",
+            ]);
+            assert!(cli.udp);
+            assert_eq!(cli.time, Some(30));
+            assert_eq!(cli.parallel, Some(4));
+            assert!(cli.reverse);
+            assert!(cli.bidir);
+            assert!(cli.no_delay);
+            assert_eq!(cli.length, Some("1460".to_string()));
+            assert_eq!(cli.bitrate, Some("100M".to_string()));
+        }
+
+        #[test]
+        fn test_client_bytes_and_blocks() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-n", "1G"]);
+            assert_eq!(cli.bytes, Some("1G".to_string()));
+
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-k", "100K"]);
+            assert_eq!(cli.blockcount, Some("100K".to_string()));
+        }
+
+        #[test]
+        fn test_client_window_mss_congestion() {
+            let cli = Cli::parse_from([
+                "riperf3", "-c", "host",
+                "-w", "512K", "-M", "1400", "-C", "bbr",
+            ]);
+            assert_eq!(cli.window, Some("512K".to_string()));
+            assert_eq!(cli.mss, Some(1400));
+            assert_eq!(cli.congestion, Some("bbr".to_string()));
+        }
     }
 
-    // This module tests the client mode arguments
-    mod client_mode_tests {
-        //TODO: Add client mode argument tests as they are implemented
+    mod server_arg_tests {
+        use super::*;
+
+        #[test]
+        fn test_one_off() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-1"]);
+            assert!(cli.one_off);
+        }
     }
 }

@@ -1,38 +1,404 @@
-// riperf3/riperf3/src/server.rs
-// Implements the Server types and functions for the riperf3 project.
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::error::ConfigError;
-use crate::utils::DEFAULT_PORT;
+use crate::cpu::CpuSnapshot;
+use crate::error::{ConfigError, RiperfError, Result};
+use crate::net;
+use crate::protocol::{
+    self, TestParams, TestResultsJson, TestState, TransportProtocol,
+};
+use crate::stream::{
+    self, DataStream, RateLimiter, StreamCounters, UdpRecvStats,
+};
+use crate::utils::*;
 
-// Server-specific struct
-pub struct Server {
-    port: u16,
-    //TODO: Add fields
+/// Shared test configuration derived from the client's parameter JSON.
+struct TestConfig {
+    protocol: TransportProtocol,
+    duration: u32,
+    num_streams: u32,
+    blksize: usize,
+    reverse: bool,
+    bidir: bool,
+    #[allow(dead_code)]
+    omit: u32,
+    no_delay: bool,
+    mss: Option<i32>,
+    window: Option<i32>,
+    bandwidth: u64,
+    #[allow(dead_code)]
+    tos: i32,
+    #[allow(dead_code)]
+    congestion: Option<String>,
+    udp_counters_64bit: bool,
 }
 
-// Implement server-specific functions
-impl Server {
-    pub async fn run(&self) -> Result<(), ConfigError> {
-        vprintln!("Server running on port: {}", self.port);
-        //TODO: Implement server logic
+impl TestConfig {
+    fn from_params(params: &TestParams) -> Self {
+        let is_udp = params.udp.unwrap_or(false);
+        let protocol = if is_udp {
+            TransportProtocol::Udp
+        } else {
+            TransportProtocol::Tcp
+        };
 
+        let default_blksize = if is_udp {
+            DEFAULT_UDP_BLKSIZE
+        } else {
+            DEFAULT_TCP_BLKSIZE
+        };
+
+        Self {
+            protocol,
+            duration: params.time.unwrap_or(DEFAULT_DURATION as i32) as u32,
+            num_streams: params.parallel.unwrap_or(1) as u32,
+            blksize: params.len.unwrap_or(default_blksize as i32) as usize,
+            reverse: params.reverse.unwrap_or(false),
+            bidir: params.bidirectional.unwrap_or(false),
+            omit: params.omit.unwrap_or(0) as u32,
+            no_delay: params.nodelay.unwrap_or(false),
+            mss: params.mss,
+            window: params.window,
+            bandwidth: params.bandwidth.unwrap_or(0),
+            tos: params.tos.unwrap_or(0),
+            congestion: params.congestion.clone(),
+            udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+pub struct Server {
+    pub(crate) port: u16,
+    pub(crate) one_off: bool,
+    pub(crate) verbose: bool,
+}
+
+impl Server {
+    pub async fn run(&self) -> Result<()> {
+        let listener = net::tcp_listen(None, self.port).await?;
+        let sep = "-----------------------------------------------------------";
+        println!("{sep}");
+        println!("Server listening on {}", self.port);
+        println!("{sep}");
+
+        loop {
+            match self.handle_one_test(&listener).await {
+                Ok(()) => {}
+                Err(RiperfError::PeerDisconnected) => {
+                    if self.verbose {
+                        vprintln!("Client disconnected.");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("iperf3: error - {e}");
+                }
+            }
+
+            if self.one_off {
+                break;
+            }
+            println!("{sep}");
+            println!("Server listening on {}", self.port);
+            println!("{sep}");
+        }
         Ok(())
     }
 
-    //TODO: Add additional functions
+    async fn handle_one_test(
+        &self,
+        listener: &tokio::net::TcpListener,
+    ) -> Result<()> {
+        // ---- Accept control connection ----
+        let (mut ctrl, peer_addr) = listener.accept().await?;
+        if self.verbose {
+            vprintln!("Accepted connection from {peer_addr}");
+        }
+        net::configure_tcp_stream(&ctrl, true)?;
+
+        // ---- Cookie ----
+        let cookie = protocol::recv_cookie(&mut ctrl).await?;
+
+        // ---- ParamExchange ----
+        protocol::send_state(&mut ctrl, TestState::ParamExchange).await?;
+        let params = protocol::recv_params(&mut ctrl).await?;
+        let cfg = TestConfig::from_params(&params);
+
+        if self.verbose {
+            vprintln!(
+                "Test: {:?} {} stream(s) blksize={} duration={}s",
+                cfg.protocol, cfg.num_streams, cfg.blksize, cfg.duration
+            );
+        }
+
+        // ---- CreateStreams ----
+        let done = Arc::new(AtomicBool::new(false));
+        let mut streams: Vec<DataStream> = Vec::new();
+
+        // Determine how many streams to accept and their roles.
+        // Normal: server receives. Reverse: server sends. Bidir: both.
+        let recv_count = if cfg.reverse && !cfg.bidir { 0 } else { cfg.num_streams };
+        let send_count = if cfg.reverse || cfg.bidir { cfg.num_streams } else { 0 };
+        let total = recv_count + send_count;
+
+        match cfg.protocol {
+            TransportProtocol::Tcp => {
+                // If client requested special socket options, create a new data listener.
+                let data_listener = if cfg.mss.is_some() || cfg.window.is_some() || cfg.no_delay {
+                    let port = listener.local_addr()?.port();
+                    Some(
+                        net::tcp_listen_with_opts(
+                            None,
+                            port,
+                            cfg.mss,
+                            cfg.window,
+                            cfg.window,
+                            cfg.no_delay,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let accept_from = data_listener.as_ref().unwrap_or(listener);
+
+                protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
+
+                for i in 0..total {
+                    let (mut data_stream, _) = accept_from.accept().await?;
+                    let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
+                    if stream_cookie != cookie {
+                        return Err(RiperfError::CookieMismatch);
+                    }
+                    net::configure_tcp_stream(&data_stream, cfg.no_delay)?;
+
+                    let stream_id = (i + 1) as i32;
+                    let is_sender = i >= recv_count;
+                    let counters = Arc::new(StreamCounters::new());
+                    let raw_fd = data_stream.as_raw_fd();
+
+                    let task = if is_sender {
+                        let buf = vec![0u8; cfg.blksize];
+                        let c = counters.clone();
+                        let d = done.clone();
+                        tokio::spawn(async move {
+                            stream::run_tcp_sender(data_stream, c, buf, d).await
+                        })
+                    } else {
+                        let c = counters.clone();
+                        let d = done.clone();
+                        let bs = cfg.blksize;
+                        tokio::spawn(async move {
+                            stream::run_tcp_receiver(data_stream, c, bs, d).await
+                        })
+                    };
+
+                    streams.push(DataStream {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        udp_recv_stats: None,
+                        task,
+                        raw_fd: Some(raw_fd),
+                    });
+                }
+            }
+            TransportProtocol::Udp => {
+                protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
+
+                for i in 0..total {
+                    let udp_sock = net::udp_bind(None, self.port).await?;
+                    let _client_addr = protocol::udp_connect_server(&udp_sock).await?;
+
+                    let stream_id = (i + 1) as i32;
+                    let is_sender = i >= recv_count;
+                    let counters = Arc::new(StreamCounters::new());
+
+                    let task = if is_sender {
+                        let c = counters.clone();
+                        let d = done.clone();
+                        let bs = cfg.blksize;
+                        let limiter = if cfg.bandwidth > 0 {
+                            Some(RateLimiter::new(cfg.bandwidth, 0, bs))
+                        } else {
+                            Some(RateLimiter::new(DEFAULT_UDP_RATE, 0, bs))
+                        };
+                        let u64bit = cfg.udp_counters_64bit;
+                        tokio::spawn(async move {
+                            stream::run_udp_sender(udp_sock, c, bs, d, limiter, u64bit).await
+                        })
+                    } else {
+                        let c = counters.clone();
+                        let d = done.clone();
+                        let bs = cfg.blksize;
+                        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+                        let stats_clone = stats.clone();
+                        let u64bit = cfg.udp_counters_64bit;
+                        let task = tokio::spawn(async move {
+                            stream::run_udp_receiver(udp_sock, c, stats_clone, bs, d, u64bit)
+                                .await
+                        });
+                        streams.push(DataStream {
+                            id: stream_id,
+                            is_sender,
+                            counters,
+                            udp_recv_stats: Some(stats),
+                            task,
+                            raw_fd: None,
+                        });
+                        continue;
+                    };
+
+                    streams.push(DataStream {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        udp_recv_stats: None,
+                        task,
+                        raw_fd: None,
+                    });
+                }
+            }
+        }
+
+        // ---- TestStart / TestRunning ----
+        protocol::send_state(&mut ctrl, TestState::TestStart).await?;
+        let cpu_start = CpuSnapshot::now();
+        protocol::send_state(&mut ctrl, TestState::TestRunning).await?;
+
+        // ---- Wait for TEST_END from client ----
+        loop {
+            let state = protocol::recv_state(&mut ctrl).await?;
+            match state {
+                TestState::TestEnd => break,
+                TestState::ClientTerminate => {
+                    return Err(RiperfError::Aborted("client terminated".into()));
+                }
+                _ => {}
+            }
+        }
+
+        // ---- Shut down streams ----
+        done.store(true, Ordering::Relaxed);
+        let cpu_end = CpuSnapshot::now();
+
+        // Wait briefly then join tasks (senders may be blocked on write)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut result_streams = Vec::new();
+        let test_duration = cfg.duration as f64;
+
+        for s in &streams {
+            let bytes = if s.is_sender {
+                s.counters.bytes_sent()
+            } else {
+                s.counters.bytes_received()
+            };
+
+            let (jitter, errors, packets) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                if let Ok(stats) = udp_stats.lock() {
+                    (stats.jitter, stats.cnt_error, stats.packet_count)
+                } else {
+                    (0.0, 0, 0)
+                }
+            } else {
+                (0.0, 0, 0)
+            };
+
+            result_streams.push(protocol::StreamResultJson {
+                id: s.id,
+                bytes,
+                retransmits: -1,
+                jitter,
+                errors,
+                omitted_errors: 0,
+                packets,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: test_duration,
+            });
+        }
+
+        // ---- ExchangeResults ----
+        let cpu_util = cpu_end.utilization_since(&cpu_start);
+        let server_results = TestResultsJson {
+            cpu_util_total: cpu_util.host_total,
+            cpu_util_user: cpu_util.host_user,
+            cpu_util_system: cpu_util.host_system,
+            sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
+                0
+            } else {
+                -1
+            },
+            congestion_used: None,
+            streams: result_streams,
+        };
+
+        protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
+        protocol::send_results(&mut ctrl, &server_results).await?;
+        let _client_results = protocol::recv_results(&mut ctrl).await?;
+
+        // ---- DisplayResults / IperfDone ----
+        protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;
+
+        // Wait for client to send IperfDone
+        loop {
+            match protocol::recv_state(&mut ctrl).await {
+                Ok(TestState::IperfDone) => break,
+                Ok(_) => continue,
+                Err(RiperfError::PeerDisconnected) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Print summary
+        for s in &streams {
+            let bytes = if s.is_sender {
+                s.counters.bytes_sent()
+            } else {
+                s.counters.bytes_received()
+            };
+            let bits_per_sec = bytes as f64 * 8.0 / test_duration;
+            let role = if s.is_sender { "sender" } else { "receiver" };
+            println!(
+                "[{:3}] 0.00-{:.2} sec  {:.2} GBytes  {:.2} Gbits/sec  {}",
+                s.id,
+                test_duration,
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                bits_per_sec / 1_000_000_000.0,
+                role,
+            );
+        }
+
+        // Join stream tasks (best-effort, they should be done)
+        for s in streams {
+            let _ = s.task.await;
+        }
+
+        Ok(())
+    }
 }
 
-// Server builder struct
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
+
 pub struct ServerBuilder {
     port: Option<u16>,
-    //TODO: Add fields
+    one_off: bool,
+    verbose: bool,
 }
 
 impl Default for ServerBuilder {
     fn default() -> Self {
         Self {
             port: Some(DEFAULT_PORT),
-            //TODO: Initialize fields
+            one_off: false,
+            verbose: false,
         }
     }
 }
@@ -47,101 +413,81 @@ impl ServerBuilder {
         self
     }
 
-    //TODO: Add methods for additional fields
+    pub fn one_off(mut self, one_off: bool) -> Self {
+        self.one_off = one_off;
+        self
+    }
 
-    // Build function to produce a Server struct
-    pub fn build(self) -> Result<Server, ConfigError> {
-        // Validate required fields
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    pub fn build(self) -> std::result::Result<Server, ConfigError> {
         Ok(Server {
-            // Initialize Client with validated fields
-            // If there is no port, use DEFAULT_PORT
             port: self.port.unwrap_or(DEFAULT_PORT),
-            //
-            // TODO: Initialize additional fields
+            one_off: self.one_off,
+            verbose: self.verbose,
         })
     }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Unit tests for the server module ///////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ServerBuilder tests
     mod server_builder_tests {
         use super::*;
 
-        // Test default, new, and different fields
         #[test]
         fn test_server_builder_default() {
-            let server_builder = ServerBuilder::default();
-            assert_eq!(server_builder.port, Some(DEFAULT_PORT));
+            let b = ServerBuilder::default();
+            assert_eq!(b.port, Some(DEFAULT_PORT));
+            assert!(!b.one_off);
         }
 
         #[test]
         fn test_server_builder_new() {
-            let server_builder = ServerBuilder::new();
-            assert_eq!(server_builder.port, Some(DEFAULT_PORT));
+            let b = ServerBuilder::new();
+            assert_eq!(b.port, Some(DEFAULT_PORT));
         }
 
         #[test]
         fn test_server_builder_port() {
-            let server_builder = ServerBuilder::new().port(Some(1234));
-            assert_eq!(server_builder.port, Some(1234));
+            let b = ServerBuilder::new().port(Some(1234));
+            assert_eq!(b.port, Some(1234));
         }
 
-        //
-        //TODO: Add additional tests for other fields
-
-        // Test build
         #[test]
         fn test_server_builder_build() {
-            // Test with default, this should work
-            let server = ServerBuilder::default().build();
-            assert!(server.is_ok());
-            let server = server.unwrap();
-            assert_eq!(server.port, DEFAULT_PORT);
+            let s = ServerBuilder::default().build().unwrap();
+            assert_eq!(s.port, DEFAULT_PORT);
 
-            // Test with new, this should work
-            let server = ServerBuilder::new().build();
-            assert!(server.is_ok());
-            let server = server.unwrap();
-            assert_eq!(server.port, DEFAULT_PORT);
+            let s = ServerBuilder::new().build().unwrap();
+            assert_eq!(s.port, DEFAULT_PORT);
 
-            // Test with adding a port, this should work
-            let server = ServerBuilder::new().port(Some(1234)).build();
-            assert!(server.is_ok());
-            let server = server.unwrap();
-            assert_eq!(server.port, 1234);
+            let s = ServerBuilder::new().port(Some(1234)).build().unwrap();
+            assert_eq!(s.port, 1234);
         }
     }
 
-    // Server tests
     mod server_tests {
         use super::*;
 
-        // Test defaults and setting different fields
         #[test]
         fn test_server_default() {
-            let server = Server { port: DEFAULT_PORT };
-            assert_eq!(server.port, DEFAULT_PORT);
+            let s = ServerBuilder::default().build().unwrap();
+            assert_eq!(s.port, DEFAULT_PORT);
         }
 
         #[test]
         fn test_server_port() {
-            let server = Server { port: 1234 };
-            assert_eq!(server.port, 1234);
-        }
-
-        // Test run
-        #[tokio::test]
-        async fn test_server_run() {
-            let server = Server { port: 1234 };
-
-            let result = server.run().await;
-            assert!(result.is_ok());
+            let s = ServerBuilder::new().port(Some(1234)).build().unwrap();
+            assert_eq!(s.port, 1234);
         }
     }
 }
