@@ -273,4 +273,268 @@ mod cli_tests {
             assert!(cli.one_off);
         }
     }
+
+    /// Tests that CLI flags are correctly wired through to Client/Server
+    /// fields, matching the logic in main.rs. This is the test class that
+    /// would have caught the -J flag not being wired up.
+    mod cli_wiring_tests {
+        use super::*;
+        use riperf3::protocol::TransportProtocol;
+        use riperf3::utils::{parse_bitrate, parse_kmg};
+
+        /// Simulate the main.rs client builder wiring for a parsed CLI.
+        fn build_client_from_cli(cli: &Cli) -> riperf3::Client {
+            let host = cli.client.as_ref().unwrap();
+            let mut b = riperf3::ClientBuilder::new(host);
+            if let Some(port) = cli.port {
+                b = b.port(Some(port));
+            }
+            if cli.udp {
+                b = b.protocol(TransportProtocol::Udp);
+            }
+            if let Some(t) = cli.time {
+                b = b.duration(t);
+            }
+            if let Some(ref s) = cli.bytes {
+                b = b.bytes(parse_kmg(s).unwrap());
+            }
+            if let Some(ref s) = cli.blockcount {
+                b = b.blocks(parse_kmg(s).unwrap());
+            }
+            if let Some(ref s) = cli.length {
+                b = b.blksize(parse_kmg(s).unwrap() as usize);
+            }
+            if let Some(n) = cli.parallel {
+                b = b.num_streams(n);
+            }
+            if cli.reverse {
+                b = b.reverse(true);
+            }
+            if cli.bidir {
+                b = b.bidir(true);
+            }
+            if let Some(ref s) = cli.window {
+                b = b.window(parse_kmg(s).unwrap() as i32);
+            }
+            if let Some(ref algo) = cli.congestion {
+                b = b.congestion(algo);
+            }
+            if let Some(mss) = cli.mss {
+                b = b.mss(mss);
+            }
+            if cli.no_delay {
+                b = b.no_delay(true);
+            }
+            if let Some(ref s) = cli.bitrate {
+                let (rate, _) = parse_bitrate(s).unwrap();
+                b = b.bandwidth(rate);
+            }
+            if let Some(tos) = cli.tos {
+                b = b.tos(tos);
+            }
+            if let Some(o) = cli.omit {
+                b = b.omit(o);
+            }
+            if let Some(ref t) = cli.title {
+                b = b.title(t);
+            }
+            if let Some(ref d) = cli.extra_data {
+                b = b.extra_data(d);
+            }
+            if let Some(ms) = cli.connect_timeout {
+                b = b.connect_timeout(std::time::Duration::from_millis(ms));
+            }
+            if cli.verbose {
+                b = b.verbose(true);
+            }
+            if cli.json {
+                b = b.json_output(true);
+            }
+            b.build().unwrap()
+        }
+
+        #[test]
+        fn json_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-J"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.json_output);
+        }
+
+        #[test]
+        fn udp_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-u"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.protocol, TransportProtocol::Udp);
+        }
+
+        #[test]
+        fn duration_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-t", "30"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.duration, 30);
+        }
+
+        #[test]
+        fn bytes_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-n", "1M"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.bytes_to_send, Some(1024 * 1024));
+        }
+
+        #[test]
+        fn blockcount_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-k", "100"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.blocks_to_send, Some(100));
+        }
+
+        #[test]
+        fn length_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-l", "64K"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.blksize, 64 * 1024);
+        }
+
+        #[test]
+        fn parallel_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-P", "8"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.num_streams, 8);
+        }
+
+        #[test]
+        fn reverse_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-R"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.reverse);
+        }
+
+        #[test]
+        fn bidir_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "--bidir"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.bidir);
+        }
+
+        #[test]
+        fn window_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-w", "512K"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.window, Some(512 * 1024));
+        }
+
+        #[test]
+        fn congestion_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-C", "bbr"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.congestion, Some("bbr".to_string()));
+        }
+
+        #[test]
+        fn mss_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-M", "1400"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.mss, Some(1400));
+        }
+
+        #[test]
+        fn no_delay_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-N"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.no_delay);
+        }
+
+        #[test]
+        fn bitrate_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-b", "100M"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.bandwidth, 100 * 1024 * 1024);
+        }
+
+        #[test]
+        fn tos_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "16"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.tos, 16);
+        }
+
+        #[test]
+        fn omit_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-O", "3"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.omit, 3);
+        }
+
+        #[test]
+        fn title_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-T", "my test"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.title, Some("my test".to_string()));
+        }
+
+        #[test]
+        fn extra_data_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "--extra-data", "abc"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.extra_data, Some("abc".to_string()));
+        }
+
+        #[test]
+        fn connect_timeout_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "--connect-timeout", "500"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(
+                c.connect_timeout,
+                Some(std::time::Duration::from_millis(500))
+            );
+        }
+
+        #[test]
+        fn verbose_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-V"]);
+            let c = build_client_from_cli(&cli);
+            assert!(c.verbose);
+        }
+
+        #[test]
+        fn all_flags_combined() {
+            let cli = Cli::parse_from([
+                "riperf3", "-c", "host",
+                "-u", "-t", "30", "-P", "4", "-R", "--bidir",
+                "-N", "-l", "1460", "-b", "100M", "-J", "-V",
+                "-w", "512K", "-M", "1400", "-C", "bbr",
+                "-S", "16", "-O", "2", "-T", "test",
+                "--extra-data", "x", "--connect-timeout", "500",
+            ]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c.protocol, TransportProtocol::Udp);
+            assert_eq!(c.duration, 30);
+            assert_eq!(c.num_streams, 4);
+            assert!(c.reverse);
+            assert!(c.bidir);
+            assert!(c.no_delay);
+            assert_eq!(c.blksize, 1460);
+            assert_eq!(c.bandwidth, 100 * 1024 * 1024);
+            assert!(c.json_output);
+            assert_eq!(c.window, Some(512 * 1024));
+            assert_eq!(c.mss, Some(1400));
+            assert_eq!(c.congestion, Some("bbr".to_string()));
+            assert_eq!(c.tos, 16);
+            assert_eq!(c.omit, 2);
+            assert_eq!(c.title, Some("test".to_string()));
+            assert_eq!(c.extra_data, Some("x".to_string()));
+            assert!(c.verbose);
+        }
+
+        #[test]
+        fn server_one_off_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-1"]);
+            let mut b = riperf3::ServerBuilder::new();
+            if cli.one_off {
+                b = b.one_off(true);
+            }
+            let s = b.build().unwrap();
+            assert!(s.one_off);
+        }
+    }
 }

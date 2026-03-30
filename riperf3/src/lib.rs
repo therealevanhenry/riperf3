@@ -22,4 +22,4 @@ pub mod client;
 pub use client::{Client, ClientBuilder};
 
 pub mod server;
-pub use server::{Server, ServerBuilder};
+pub use server::{Server, ServerBuilder, TestConfig};

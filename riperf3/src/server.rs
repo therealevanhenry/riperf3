@@ -14,28 +14,25 @@ use crate::stream::{
 use crate::utils::*;
 
 /// Shared test configuration derived from the client's parameter JSON.
-struct TestConfig {
-    protocol: TransportProtocol,
-    duration: u32,
-    num_streams: u32,
-    blksize: usize,
-    reverse: bool,
-    bidir: bool,
-    #[allow(dead_code)]
-    omit: u32,
-    no_delay: bool,
-    mss: Option<i32>,
-    window: Option<i32>,
-    bandwidth: u64,
-    #[allow(dead_code)]
-    tos: i32,
-    #[allow(dead_code)]
-    congestion: Option<String>,
-    udp_counters_64bit: bool,
+pub struct TestConfig {
+    pub protocol: TransportProtocol,
+    pub duration: u32,
+    pub num_streams: u32,
+    pub blksize: usize,
+    pub reverse: bool,
+    pub bidir: bool,
+    pub omit: u32,
+    pub no_delay: bool,
+    pub mss: Option<i32>,
+    pub window: Option<i32>,
+    pub bandwidth: u64,
+    pub tos: i32,
+    pub congestion: Option<String>,
+    pub udp_counters_64bit: bool,
 }
 
 impl TestConfig {
-    fn from_params(params: &TestParams) -> Self {
+    pub fn from_params(params: &TestParams) -> Self {
         let is_udp = params.udp.unwrap_or(false);
         let protocol = if is_udp {
             TransportProtocol::Udp
@@ -73,9 +70,9 @@ impl TestConfig {
 // ---------------------------------------------------------------------------
 
 pub struct Server {
-    pub(crate) port: u16,
-    pub(crate) one_off: bool,
-    pub(crate) verbose: bool,
+    pub port: u16,
+    pub one_off: bool,
+    pub verbose: bool,
 }
 
 impl Server {
