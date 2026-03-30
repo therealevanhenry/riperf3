@@ -738,12 +738,308 @@ mod stream_id_tests {
 
     #[test]
     fn matches_iperf3_pattern() {
-        // iperf3's iperf_add_stream assigns: 1, 3, 4, 5, 6, ...
         assert_eq!(iperf3_stream_id(0), 1);
         assert_eq!(iperf3_stream_id(1), 3);
         assert_eq!(iperf3_stream_id(2), 4);
         assert_eq!(iperf3_stream_id(3), 5);
         assert_eq!(iperf3_stream_id(4), 6);
         assert_eq!(iperf3_stream_id(9), 11);
+    }
+}
+
+// ===========================================================================
+// Unimplemented flag tests
+//
+// Every iperf3 flag not yet supported in riperf3 has a test below.
+// Tests are #[ignore] with a reason indicating their status.
+// As flags are implemented, remove the #[ignore] to activate the test.
+// ===========================================================================
+
+mod unimplemented_flags {
+    use super::*;
+
+    // -- Tier 1: Trivial flag plumbing --
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -f format not wired to reporter"]
+    async fn format_flag_affects_output() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: capture stdout and verify output uses Kbits format
+        let _client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -i interval reporting"]
+    async fn interval_reporting_produces_periodic_output() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: run 3s test with -i 1, verify at least 2 interval lines appear
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(3).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --get-server-output not wired"]
+    async fn get_server_output() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        // TODO: verify server output text is included in client output
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --udp-counters-64bit CLI flag"]
+    async fn udp_counters_64bit_flag() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .udp_counters_64bit(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --repeating-payload"]
+    async fn repeating_payload() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: client with repeating_payload=true, verify non-zero buffer pattern
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --dont-fragment"]
+    async fn dont_fragment() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: client with dont_fragment=true
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --cport"]
+    async fn client_port_binding() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: client with cport=Some(12345), verify local port used
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --pidfile"]
+    async fn pidfile_written() {
+        // TODO: start server with pidfile=/tmp/test.pid, verify file contains PID
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --logfile"]
+    async fn logfile_output() {
+        // TODO: start server with logfile=/tmp/test.log, verify output goes to file
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --forceflush"]
+    async fn forceflush_output() {
+        // TODO: verify output is flushed after each interval line
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --timestamps"]
+    async fn timestamps_in_output() {
+        // TODO: verify output lines are prefixed with timestamps
+    }
+
+    // -- Tier 2: Socket/network options --
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -4 --version4"]
+    async fn force_ipv4() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: client with ip_version=4, verify IPv4 connection
+        let client = ClientBuilder::new("127.0.0.1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok());
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -6 --version6"]
+    async fn force_ipv6() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // TODO: client with ip_version=6, connect to ::1
+        let client = ClientBuilder::new("::1").port(Some(port)).duration(1).build().unwrap();
+        let result = client.run().await;
+        // May fail if IPv6 not available — that's fine as a test skeleton
+        let _ = result;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -B --bind"]
+    async fn bind_address() {
+        // TODO: server with bind_addr="127.0.0.1", client with bind_addr
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --bind-dev"]
+    async fn bind_device() {
+        // TODO: setsockopt SO_BINDTODEVICE (requires root or CAP_NET_RAW)
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --fq-rate"]
+    async fn fq_rate_pacing() {
+        // TODO: client with fq_rate, verify SO_MAX_PACING_RATE is set
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -L --flowlabel"]
+    async fn ipv6_flowlabel() {
+        // TODO: IPv6-only, set flow label on data sockets
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --dscp"]
+    async fn dscp_value() {
+        // TODO: set DSCP (maps to TOS), verify both numeric and symbolic values
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -m --mptcp"]
+    async fn mptcp_protocol() {
+        // TODO: use IPPROTO_MPTCP (may not be available on all kernels)
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --skip-rx-copy"]
+    async fn skip_rx_copy() {
+        // TODO: receiver uses MSG_TRUNC to skip data copy
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --rcv-timeout"]
+    async fn receive_timeout() {
+        // TODO: set SO_RCVTIMEO on data sockets
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --snd-timeout"]
+    async fn send_timeout() {
+        // TODO: set TCP_USER_TIMEOUT on data sockets
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --cntl-ka"]
+    async fn control_keepalive() {
+        // TODO: set TCP keepalive on control connection
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -A --affinity"]
+    async fn cpu_affinity() {
+        // TODO: pin to specific CPU core via sched_setaffinity
+    }
+
+    // -- Tier 3: Features requiring new logic --
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -D --daemon"]
+    async fn daemon_mode() {
+        // TODO: server forks into background, PID file written
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --idle-timeout"]
+    async fn idle_timeout_restarts() {
+        // TODO: server with idle_timeout=2, verify it restarts after 2s idle
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --server-max-duration"]
+    async fn server_max_duration() {
+        // TODO: server terminates test if client runs longer than limit
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --server-bitrate-limit"]
+    async fn server_bitrate_limit() {
+        // TODO: server terminates test if aggregate rate exceeds limit
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: -F --file"]
+    async fn file_transfer_mode() {
+        // TODO: sender reads from file, receiver writes to file
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --json-stream"]
+    async fn json_stream_output() {
+        // TODO: each interval emitted as standalone JSON line
+    }
+
+    #[tokio::test]
+    #[ignore = "not yet implemented: --gsro"]
+    async fn udp_gso_gro() {
+        // TODO: UDP GSO (sendmsg with UDP_SEGMENT) and GRO (recvmsg with UDP_GRO)
+    }
+
+    // -- Deferred flags --
+
+    #[tokio::test]
+    #[ignore = "deferred: -Z zerocopy requires sendfile/splice implementation"]
+    async fn zerocopy_send() {
+        // TODO: use sendfile() or splice() to avoid userspace-to-kernel copy
+    }
+
+    #[tokio::test]
+    #[ignore = "deferred: auth requires RSA key handling"]
+    async fn rsa_authentication() {
+        // TODO: --username, --rsa-public-key-path (client)
+        // TODO: --rsa-private-key-path, --authorized-users-path (server)
+        // TODO: --time-skew-threshold, --use-pkcs1-padding
     }
 }
