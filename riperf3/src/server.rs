@@ -205,17 +205,34 @@ impl Server {
                 }
             }
             TransportProtocol::Udp => {
+                // Create the initial UDP listener with SO_REUSEADDR.
+                // For each stream: accept the connect handshake on the listener,
+                // which locks that socket to the client. Then create a fresh
+                // listener for the next stream (iperf3's recycling pattern).
+                let mut udp_listener = net::udp_bind_reusable(None, self.port).await?;
+
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
 
                 for i in 0..total {
-                    let udp_sock = net::udp_bind(None, self.port).await?;
-                    let _client_addr = protocol::udp_connect_server(&udp_sock).await?;
+                    // Accept: recv magic, connect() to client, send reply
+                    let _client_addr =
+                        protocol::udp_connect_server(&udp_listener).await?;
+                    // The listener is now locked to this client — use it as the data socket
+                    let data_sock = udp_listener;
+
+                    // Create a fresh listener for the next stream (if any)
+                    if i + 1 < total {
+                        udp_listener = net::udp_bind_reusable(None, self.port).await?;
+                    } else {
+                        // Last stream — create a dummy that won't be used
+                        udp_listener = net::udp_bind(None, 0).await?;
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
 
-                    let task = if is_sender {
+                    if is_sender {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = cfg.blksize;
@@ -225,9 +242,18 @@ impl Server {
                             Some(RateLimiter::new(DEFAULT_UDP_RATE, 0, bs))
                         };
                         let u64bit = cfg.udp_counters_64bit;
-                        tokio::spawn(async move {
-                            stream::run_udp_sender(udp_sock, c, bs, d, limiter, u64bit).await
-                        })
+                        let task = tokio::spawn(async move {
+                            stream::run_udp_sender(data_sock, c, bs, d, limiter, u64bit)
+                                .await
+                        });
+                        streams.push(DataStream {
+                            id: stream_id,
+                            is_sender,
+                            counters,
+                            udp_recv_stats: None,
+                            task,
+                            raw_fd: None,
+                        });
                     } else {
                         let c = counters.clone();
                         let d = done.clone();
@@ -236,7 +262,7 @@ impl Server {
                         let stats_clone = stats.clone();
                         let u64bit = cfg.udp_counters_64bit;
                         let task = tokio::spawn(async move {
-                            stream::run_udp_receiver(udp_sock, c, stats_clone, bs, d, u64bit)
+                            stream::run_udp_receiver(data_sock, c, stats_clone, bs, d, u64bit)
                                 .await
                         });
                         streams.push(DataStream {
@@ -247,17 +273,7 @@ impl Server {
                             task,
                             raw_fd: None,
                         });
-                        continue;
-                    };
-
-                    streams.push(DataStream {
-                        id: stream_id,
-                        is_sender,
-                        counters,
-                        udp_recv_stats: None,
-                        task,
-                        raw_fd: None,
-                    });
+                    }
                 }
             }
         }

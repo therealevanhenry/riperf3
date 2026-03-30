@@ -153,7 +153,6 @@ async fn tcp_bytes_limit() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "UDP loopback not yet working — pending UDP interchange fix"]
 async fn udp_normal_single_stream() {
     let port = next_port();
 

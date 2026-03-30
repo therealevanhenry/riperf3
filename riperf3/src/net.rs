@@ -120,6 +120,27 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(&addr).await?)
 }
 
+/// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
+/// Used by the server to recycle the UDP listener after each stream connect.
+pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
+    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or("0.0.0.0"), port)
+        .parse()
+        .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
+
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    Ok(UdpSocket::from_std(std_socket)?)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
