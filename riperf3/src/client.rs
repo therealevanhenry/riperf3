@@ -42,6 +42,7 @@ pub struct Client {
     pub(crate) title: Option<String>,
     pub(crate) extra_data: Option<String>,
     pub(crate) verbose: bool,
+    pub(crate) json_output: bool,
     pub(crate) bytes_to_send: Option<u64>,
     pub(crate) blocks_to_send: Option<u64>,
 }
@@ -61,6 +62,7 @@ impl Client {
         let done = Arc::new(AtomicBool::new(false));
         let mut streams: Vec<DataStream> = Vec::new();
         let mut cpu_start: Option<CpuSnapshot> = None;
+        let mut server_results: Option<TestResultsJson> = None;
 
         // ---- State machine: react to server-driven transitions ----
         loop {
@@ -88,13 +90,12 @@ impl Client {
 
                 TestState::ExchangeResults => {
                     let results = self.build_results(&streams, cpu_start.as_ref());
-                    // Client sends first, then reads server's results
                     protocol::send_results(&mut ctrl, &results).await?;
-                    let _server_results = protocol::recv_results(&mut ctrl).await?;
+                    server_results = Some(protocol::recv_results(&mut ctrl).await?);
                 }
 
                 TestState::DisplayResults => {
-                    self.print_results(&streams);
+                    self.print_results(&streams, cpu_start.as_ref(), server_results.as_ref());
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
                 }
@@ -402,7 +403,20 @@ impl Client {
         }
     }
 
-    fn print_results(&self, streams: &[DataStream]) {
+    fn print_results(
+        &self,
+        streams: &[DataStream],
+        cpu_start: Option<&CpuSnapshot>,
+        remote_cpu: Option<&TestResultsJson>,
+    ) {
+        if self.json_output {
+            self.print_results_json(streams, cpu_start, remote_cpu);
+        } else {
+            self.print_results_text(streams);
+        }
+    }
+
+    fn print_results_text(&self, streams: &[DataStream]) {
         let test_duration = self.duration as f64;
         crate::reporter::print_separator();
 
@@ -434,9 +448,148 @@ impl Client {
                     lost,
                     total_packets: total,
                 },
-                'a', // adaptive format
+                'a',
             );
         }
+    }
+
+    fn print_results_json(
+        &self,
+        streams: &[DataStream],
+        cpu_start: Option<&CpuSnapshot>,
+        remote_cpu: Option<&TestResultsJson>,
+    ) {
+        let test_duration = self.duration as f64;
+        let cpu_end = CpuSnapshot::now();
+        let cpu_util = cpu_start
+            .map(|start| cpu_end.utilization_since(start))
+            .unwrap_or_default();
+
+        let protocol_str = match self.protocol {
+            TransportProtocol::Tcp => "TCP",
+            TransportProtocol::Udp => "UDP",
+        };
+
+        // Build per-stream end results
+        let mut j_streams = Vec::new();
+        let mut sum_sent_bytes: u64 = 0;
+        let mut sum_recv_bytes: u64 = 0;
+        let sum_retransmits: i64 = 0;
+
+        for s in streams {
+            let sent = s.counters.bytes_sent();
+            let recv = s.counters.bytes_received();
+            let bytes = if s.is_sender { sent } else { recv };
+            let bits_per_sec = bytes as f64 * 8.0 / test_duration;
+
+            if s.is_sender {
+                sum_sent_bytes += sent;
+            } else {
+                sum_recv_bytes += recv;
+            }
+
+            let mut stream_obj = serde_json::json!({
+                "socket": s.id,
+                "start": 0.0,
+                "end": test_duration,
+                "seconds": test_duration,
+                "bytes": bytes,
+                "bits_per_second": bits_per_sec,
+                "sender": s.is_sender
+            });
+
+            if let (Some(ref udp_stats_lock), false) = (&s.udp_recv_stats, s.is_sender) {
+                if let Ok(stats) = udp_stats_lock.lock() {
+                    stream_obj["jitter_ms"] = serde_json::json!(stats.jitter * 1000.0);
+                    stream_obj["lost_packets"] = serde_json::json!(stats.cnt_error);
+                    stream_obj["packets"] = serde_json::json!(stats.packet_count);
+                    let pct = if stats.packet_count > 0 {
+                        stats.cnt_error as f64 / stats.packet_count as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    stream_obj["lost_percent"] = serde_json::json!(pct);
+                }
+            }
+
+            j_streams.push(stream_obj);
+        }
+
+        // If we only have senders, use sent bytes for both
+        if sum_recv_bytes == 0 {
+            sum_recv_bytes = sum_sent_bytes;
+        }
+        if sum_sent_bytes == 0 {
+            sum_sent_bytes = sum_recv_bytes;
+        }
+
+        let (remote_total, remote_user, remote_system) = remote_cpu
+            .map(|r| (r.cpu_util_total, r.cpu_util_user, r.cpu_util_system))
+            .unwrap_or((0.0, 0.0, 0.0));
+
+        let output = serde_json::json!({
+            "start": {
+                "connected": streams.iter().map(|s| {
+                    serde_json::json!({
+                        "socket": s.id,
+                        "local_host": self.host,
+                        "local_port": self.port,
+                        "remote_host": self.host,
+                        "remote_port": self.port
+                    })
+                }).collect::<Vec<_>>(),
+                "version": format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+                "system_info": "",
+                "connecting_to": {
+                    "host": self.host,
+                    "port": self.port
+                },
+                "test_start": {
+                    "protocol": protocol_str,
+                    "num_streams": self.num_streams,
+                    "blksize": self.blksize,
+                    "omit": self.omit,
+                    "duration": self.duration,
+                    "bytes": 0,
+                    "blocks": 0,
+                    "reverse": if self.reverse { 1 } else { 0 },
+                    "tos": self.tos,
+                    "target_bitrate": self.bandwidth,
+                    "bidir": if self.bidir { 1 } else { 0 }
+                }
+            },
+            "intervals": [],
+            "end": {
+                "streams": j_streams,
+                "sum_sent": {
+                    "start": 0.0,
+                    "end": test_duration,
+                    "seconds": test_duration,
+                    "bytes": sum_sent_bytes,
+                    "bits_per_second": sum_sent_bytes as f64 * 8.0 / test_duration,
+                    "retransmits": sum_retransmits,
+                    "sender": true
+                },
+                "sum_received": {
+                    "start": 0.0,
+                    "end": test_duration,
+                    "seconds": test_duration,
+                    "bytes": sum_recv_bytes,
+                    "bits_per_second": sum_recv_bytes as f64 * 8.0 / test_duration,
+                    "sender": true
+                },
+                "cpu_utilization_percent": {
+                    "host_total": cpu_util.host_total,
+                    "host_user": cpu_util.host_user,
+                    "host_system": cpu_util.host_system,
+                    "remote_total": remote_total,
+                    "remote_user": remote_user,
+                    "remote_system": remote_system
+                }
+            }
+        });
+
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
     }
 }
 
@@ -471,6 +624,7 @@ pub struct ClientBuilder {
     title: Option<String>,
     extra_data: Option<String>,
     verbose: bool,
+    json_output: bool,
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
 }
@@ -498,6 +652,7 @@ impl Default for ClientBuilder {
             title: None,
             extra_data: None,
             verbose: false,
+            json_output: false,
             bytes_to_send: None,
             blocks_to_send: None,
         }
@@ -609,6 +764,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn json_output(mut self, enabled: bool) -> Self {
+        self.json_output = enabled;
+        self
+    }
+
     pub fn bytes(mut self, bytes: u64) -> Self {
         self.bytes_to_send = Some(bytes);
         self
@@ -648,6 +808,7 @@ impl ClientBuilder {
             title: self.title,
             extra_data: self.extra_data,
             verbose: self.verbose,
+            json_output: self.json_output,
             bytes_to_send: self.bytes_to_send,
             blocks_to_send: self.blocks_to_send,
         })

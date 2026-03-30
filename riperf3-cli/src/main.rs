@@ -82,6 +82,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         if cli.verbose {
             builder = builder.verbose(true);
         }
+        if cli.json {
+            builder = builder.json_output(true);
+        }
 
         let client = builder.build()?;
         client.run().await?;
