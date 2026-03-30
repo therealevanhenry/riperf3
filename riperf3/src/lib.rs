@@ -9,6 +9,9 @@ pub mod utils;
 
 pub mod protocol;
 pub mod net;
+pub mod stream;
+pub mod tcp_info;
+pub mod cpu;
 
 // The iperf_api module contains reference type definitions mirroring iperf3's C API.
 pub mod iperf_api;

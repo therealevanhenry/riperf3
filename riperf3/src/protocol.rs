@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
+
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 use crate::error::{RiperfError, Result, UnknownState};
 
@@ -339,6 +341,55 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
 }
 
 // ---------------------------------------------------------------------------
+// UDP "connect" handshake
+// ---------------------------------------------------------------------------
+
+/// Client-side UDP connect handshake.
+/// Sends the magic word and waits for the server's reply.
+pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
+    socket.send(&UDP_CONNECT_MSG.to_be_bytes()).await?;
+
+    let mut buf = [0u8; 4];
+    let n = socket.recv(&mut buf).await?;
+    if n < 4 {
+        return Err(RiperfError::Protocol("UDP connect reply too short".into()));
+    }
+    let reply = u32::from_be_bytes(buf);
+    // Accept both the current and legacy reply values
+    if reply != UDP_CONNECT_REPLY && reply != 0xb168_de3a {
+        return Err(RiperfError::Protocol(format!(
+            "unexpected UDP connect reply: {reply:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Server-side UDP connect handshake.
+/// Waits for the client's magic word, "connects" the socket to the client,
+/// sends the reply, and returns the client address.
+pub async fn udp_connect_server(socket: &UdpSocket) -> Result<SocketAddr> {
+    let mut buf = [0u8; 65536];
+    let (n, addr) = socket.recv_from(&mut buf).await?;
+    if n < 4 {
+        return Err(RiperfError::Protocol(
+            "UDP connect message too short".into(),
+        ));
+    }
+    let msg = u32::from_be_bytes(buf[..4].try_into().unwrap());
+    if msg != UDP_CONNECT_MSG {
+        return Err(RiperfError::Protocol(format!(
+            "unexpected UDP connect message: {msg:#x}"
+        )));
+    }
+
+    // Lock the socket to this client so send/recv work without addresses.
+    socket.connect(addr).await?;
+    socket.send(&UDP_CONNECT_REPLY.to_be_bytes()).await?;
+
+    Ok(addr)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -530,5 +581,23 @@ mod tests {
         writer.await.unwrap();
 
         assert_eq!(original, received);
+    }
+
+    #[tokio::test]
+    async fn udp_connect_handshake() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let addr = udp_connect_server(&server_sock).await.unwrap();
+            addr
+        });
+
+        udp_connect_client(&client_sock).await.unwrap();
+        let client_addr = server_task.await.unwrap();
+        assert_eq!(client_addr, client_sock.local_addr().unwrap());
     }
 }
