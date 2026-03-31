@@ -962,7 +962,6 @@ mod implemented_flag_tests {
 
     #[tokio::test]
     async fn bind_address_server() {
-        // Server with explicit bind address should listen on that address
         let port = next_port();
         let server = ServerBuilder::new()
             .port(Some(port))
@@ -981,6 +980,23 @@ mod implemented_flag_tests {
         assert!(result.is_ok(), "-B 127.0.0.1 server failed: {result:?}");
         let _ = server_task.await;
     }
+
+    #[tokio::test]
+    async fn client_port_binding() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .cport(next_port())
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--cport failed: {result:?}");
+        let _ = server_task.await;
+    }
 }
 
 // ===========================================================================
@@ -988,28 +1004,10 @@ mod implemented_flag_tests {
 // ===========================================================================
 
 mod unimplemented_flags {
+    #[allow(unused_imports)]
     use super::*;
 
     // -- Tier 2: behavior not yet wired --
-
-    #[tokio::test]
-    #[ignore = "not yet implemented: --cport bind not applied in stream creation"]
-    async fn client_port_binding() {
-        let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
-        let server_task = tokio::spawn(async move { server.run().await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // TODO: verify client data socket local port matches cport value
-        let client = ClientBuilder::new("127.0.0.1")
-            .port(Some(port))
-            .duration(1)
-            .cport(23456)
-            .build()
-            .unwrap();
-        let result = client.run().await;
-        assert!(result.is_ok(), "--cport failed: {result:?}");
-        let _ = server_task.await;
-    }
 
     #[tokio::test]
     #[ignore = "not yet implemented: -6 requires IPv6 listener support"]
