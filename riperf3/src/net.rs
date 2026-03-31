@@ -75,6 +75,7 @@ pub fn configure_tcp_stream_full(
     no_delay: bool,
     mss: Option<i32>,
     window: Option<i32>,
+    congestion: Option<&str>,
 ) -> Result<()> {
     stream.set_nodelay(no_delay)?;
 
@@ -112,6 +113,19 @@ pub fn configure_tcp_stream_full(
                     libc::SO_SNDBUF,
                     &size as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        if let Some(algo) = congestion {
+            let algo_bytes = algo.as_bytes();
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONGESTION,
+                    algo_bytes.as_ptr() as *const libc::c_void,
+                    algo_bytes.len() as libc::socklen_t,
                 );
             }
         }

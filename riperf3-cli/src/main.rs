@@ -10,8 +10,7 @@ use riperf3::utils::{parse_bitrate, parse_kmg, set_verbose};
 mod cli;
 use cli::Cli;
 
-#[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     set_verbose(cli.verbose);
@@ -21,6 +20,27 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if let Some(ref path) = cli.pidfile {
         std::fs::write(path, format!("{}\n", std::process::id()))?;
     }
+
+    // Set CPU affinity BEFORE building the tokio runtime so worker threads
+    // inherit the affinity mask from the main thread.
+    if let Some(ref spec) = cli.affinity {
+        if let Some(core_str) = spec.split(',').next() {
+            if let Ok(core) = core_str.parse::<usize>() {
+                riperf3::net::set_cpu_affinity(core)?;
+            }
+        }
+    }
+
+    // Build tokio runtime manually (instead of #[tokio::main]) so that
+    // CPU affinity is set before worker threads are spawned.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     if let Some(server_host) = cli.client {
         // ---- Client mode ----

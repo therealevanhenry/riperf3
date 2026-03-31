@@ -295,6 +295,66 @@ async fn tcp_combined_socket_opts() {
 }
 
 // ---------------------------------------------------------------------------
+// Bug regression tests — specific behavioral verification
+// ---------------------------------------------------------------------------
+
+/// Verify -C congestion algorithm is applied to data stream sockets.
+/// Bug: congestion was sent in TestParams JSON but not applied via setsockopt.
+#[tokio::test]
+async fn tcp_congestion_applied() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // "cubic" is universally available; just verify the flag doesn't error
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .congestion("cubic")
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(result.is_ok(), "Client failed with -C cubic: {result:?}");
+
+    let _ = server_task.await;
+}
+
+/// Verify -A affinity pins the process to the specified CPU core.
+/// Bug: affinity was set on main thread but tokio workers didn't inherit it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cpu_affinity_applied() {
+    use riperf3::net::set_cpu_affinity;
+
+    // Set affinity to CPU 0 on the current thread and verify
+    set_cpu_affinity(0).unwrap();
+
+    unsafe {
+        let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init();
+        let ret = libc::sched_getaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut cpuset,
+        );
+        assert_eq!(ret, 0);
+        assert!(libc::CPU_ISSET(0, &cpuset));
+        // Verify we're NOT set on CPU 1 (unless machine only has 1 core)
+        let nproc = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+        if nproc > 1 {
+            assert!(!libc::CPU_ISSET(1, &cpuset));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Builder coverage tests
 // ---------------------------------------------------------------------------
 

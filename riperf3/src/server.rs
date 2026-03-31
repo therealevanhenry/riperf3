@@ -170,12 +170,13 @@ impl Server {
                     if stream_cookie != cookie {
                         return Err(RiperfError::CookieMismatch);
                     }
-                    // Apply socket options (nodelay, MSS, window) to each accepted stream
+                    // Apply socket options (nodelay, MSS, window, congestion) to each stream
                     net::configure_tcp_stream_full(
                         &data_stream,
                         cfg.no_delay,
                         cfg.mss,
                         cfg.window,
+                        cfg.congestion.as_deref(),
                     )?;
 
                     let stream_id = iperf3_stream_id(i);
