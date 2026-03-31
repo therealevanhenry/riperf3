@@ -331,32 +331,53 @@ impl Server {
             )
         };
 
-        // ---- Wait for TEST_END from client (with optional max duration) ----
-        let max_dur = self.server_max_duration.map(|s| std::time::Duration::from_secs(s as u64));
-        let wait_result = async {
-            loop {
-                let state = protocol::recv_state(&mut ctrl).await?;
-                match state {
-                    TestState::TestEnd => return Ok(()),
-                    TestState::ClientTerminate => {
-                        return Err(RiperfError::Aborted("client terminated".into()));
-                    }
-                    _ => {}
-                }
-            }
-        };
+        // ---- Wait for TEST_END (with optional max duration and bitrate limit) ----
+        let bitrate_limit = self.server_bitrate_limit;
+        let test_start = std::time::Instant::now();
+        let max_dur_secs = self.server_max_duration.unwrap_or(0) as u64;
 
-        if let Some(dur) = max_dur {
-            match tokio::time::timeout(dur, wait_result).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    // Max duration exceeded — terminate the test
+        let mut rate_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        rate_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rate_check.tick().await; // skip immediate tick
+
+        let mut server_terminated = false;
+
+        loop {
+            tokio::select! {
+                state = protocol::recv_state(&mut ctrl) => {
+                    match state? {
+                        TestState::TestEnd => break,
+                        TestState::ClientTerminate => {
+                            return Err(RiperfError::Aborted("client terminated".into()));
+                        }
+                        _ => {}
+                    }
+                }
+                _ = rate_check.tick(), if bitrate_limit.is_some() => {
+                    let elapsed = test_start.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        let total_bytes: u64 = streams.iter().map(|s| {
+                            s.counters.bytes_sent() + s.counters.bytes_received()
+                        }).sum();
+                        let bits_per_sec = total_bytes as f64 * 8.0 / elapsed;
+                        if let Some(limit) = bitrate_limit {
+                            if bits_per_sec > limit as f64 {
+                                protocol::send_state(&mut ctrl, TestState::ServerTerminate).await?;
+                                server_terminated = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(max_dur_secs)), if max_dur_secs > 0 => {
                     protocol::send_state(&mut ctrl, TestState::ServerTerminate).await?;
+                    server_terminated = true;
+                    break;
                 }
             }
-        } else {
-            wait_result.await?;
         }
+
+        let _ = server_terminated;
 
         // ---- Shut down streams ----
         done.store(true, Ordering::Relaxed);

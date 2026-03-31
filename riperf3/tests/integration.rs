@@ -1434,8 +1434,29 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --server-bitrate-limit"]
-    async fn server_bitrate_limit() {}
+    async fn server_bitrate_limit() {
+        // Server with a very low bitrate limit should terminate the test
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .server_bitrate_limit(1_000) // 1 Kbit/s — absurdly low
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(10)
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let _ = client.run().await; // may error — server terminates early
+        let elapsed = start.elapsed();
+        // Should terminate well before 10 seconds
+        assert!(elapsed.as_secs() < 5, "bitrate limit didn't cut test: {elapsed:?}");
+        let _ = server_task.await;
+    }
 
     #[tokio::test]
     #[ignore = "not yet implemented: -F --file"]
