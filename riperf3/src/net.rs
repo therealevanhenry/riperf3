@@ -10,6 +10,14 @@ use crate::error::{Result, RiperfError};
 // TCP
 // ---------------------------------------------------------------------------
 
+/// Resolve the default bind address for the given IP version preference.
+fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
+    match ip_version {
+        Some(6) => "::",
+        _ => "0.0.0.0",
+    }
+}
+
 /// Connect to a TCP endpoint, optionally with a timeout.
 pub async fn tcp_connect(
     host: &str,
@@ -30,38 +38,13 @@ pub async fn tcp_connect(
 }
 
 /// Create a TCP listener with SO_REUSEADDR.
-/// If `bind_addr` is `None`, binds to `0.0.0.0`.
-pub async fn tcp_listen(bind_addr: Option<&str>, port: u16) -> Result<TcpListener> {
-    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or("0.0.0.0"), port)
-        .parse()
-        .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
-
-    let domain = if addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::STREAM, None)?;
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(128)?;
-
-    let std_listener: std::net::TcpListener = socket.into();
-    Ok(TcpListener::from_std(std_listener)?)
-}
-
-/// Create a TCP listener pre-configured with optional socket options (MSS, buffer sizes, etc.).
-/// Used by the server when client requests specific socket options for data streams.
-pub async fn tcp_listen_with_opts(
+/// If `bind_addr` is `None`, binds to 0.0.0.0 (or :: if `ip_version` is 6).
+pub async fn tcp_listen(
     bind_addr: Option<&str>,
     port: u16,
-    mss: Option<i32>,
-    recv_buf: Option<i32>,
-    send_buf: Option<i32>,
-    no_delay: bool,
+    ip_version: Option<u8>,
 ) -> Result<TcpListener> {
-    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or("0.0.0.0"), port)
+    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or(default_bind_addr(ip_version)), port)
         .parse()
         .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
 
@@ -73,30 +56,6 @@ pub async fn tcp_listen_with_opts(
     let socket = Socket::new(domain, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-
-    if let Some(mss_val) = mss {
-        // TCP_MAXSEG must be set before listen
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let val = mss_val as libc::c_int;
-            libc::setsockopt(
-                std::os::fd::AsRawFd::as_raw_fd(&socket) as libc::c_int,
-                libc::IPPROTO_TCP,
-                libc::TCP_MAXSEG,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
-    if let Some(size) = recv_buf {
-        socket.set_recv_buffer_size(size as usize)?;
-    }
-    if let Some(size) = send_buf {
-        socket.set_send_buffer_size(size as usize)?;
-    }
-    socket.set_nodelay(no_delay)?;
-
     socket.bind(&addr.into())?;
     socket.listen(128)?;
 
@@ -250,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_listen_and_connect() {
-        let listener = tcp_listen(Some("127.0.0.1"), 0).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {

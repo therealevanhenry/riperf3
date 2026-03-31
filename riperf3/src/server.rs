@@ -86,7 +86,16 @@ pub struct Server {
 
 impl Server {
     pub async fn run(&self) -> Result<()> {
-        let listener = net::tcp_listen(None, self.port).await?;
+        if self.daemon {
+            #[cfg(unix)]
+            unsafe {
+                if libc::daemon(0, 0) != 0 {
+                    return Err(RiperfError::Io(std::io::Error::last_os_error()));
+                }
+            }
+        }
+
+        let listener = net::tcp_listen(self.bind_address.as_deref(), self.port, None).await?;
         let sep = "-----------------------------------------------------------";
         println!("{sep}");
         println!("Server listening on {}", self.port);
