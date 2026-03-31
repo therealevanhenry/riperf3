@@ -301,13 +301,32 @@ pub struct DataStream {
 // ---------------------------------------------------------------------------
 
 /// TCP sender: writes full blocks as fast as the kernel will accept them.
+/// If `file_path` is set, reads from the file into the buffer each iteration.
 pub async fn run_tcp_sender(
     mut stream: TcpStream,
     counters: Arc<StreamCounters>,
-    buf: Vec<u8>,
+    mut buf: Vec<u8>,
     done: Arc<AtomicBool>,
+    file_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    use std::io::Read;
+    let mut file = file_path
+        .as_ref()
+        .map(std::fs::File::open)
+        .transpose()?;
+
     while !done.load(Ordering::Relaxed) {
+        // Refill buffer from file if specified
+        if let Some(ref mut f) = file {
+            let n = f.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                // EOF — rewind and retry
+                use std::io::Seek;
+                f.seek(std::io::SeekFrom::Start(0))?;
+                let _ = f.read(&mut buf);
+            }
+        }
+
         match stream.write_all(&buf).await {
             Ok(()) => counters.record_sent(buf.len() as u64),
             Err(e)
@@ -324,14 +343,26 @@ pub async fn run_tcp_sender(
 
 /// TCP receiver: reads until the peer closes the connection or `done` is set.
 /// If `skip_rx_copy` is true, uses MSG_TRUNC to avoid copying data (Linux only).
+/// If `file_path` is set, writes received data to the file.
 pub async fn run_tcp_receiver(
     mut stream: TcpStream,
     counters: Arc<StreamCounters>,
     blksize: usize,
     done: Arc<AtomicBool>,
     skip_rx_copy: bool,
+    file_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut buf = vec![0u8; blksize];
+    let mut file = file_path
+        .as_ref()
+        .map(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(p)
+        })
+        .transpose()?;
 
     if skip_rx_copy {
         #[cfg(target_os = "linux")]
@@ -370,10 +401,10 @@ pub async fn run_tcp_receiver(
         #[cfg(not(target_os = "linux"))]
         {
             // Fallback: normal read path
-            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done).await;
+            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await;
         }
     } else {
-        return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done).await;
+        return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await;
     }
     Ok(())
 }
@@ -383,6 +414,7 @@ async fn run_tcp_receiver_normal(
     counters: &StreamCounters,
     buf: &mut [u8],
     done: &AtomicBool,
+    file: &mut Option<std::fs::File>,
 ) -> Result<()> {
     loop {
         if done.load(Ordering::Relaxed) {
@@ -390,7 +422,13 @@ async fn run_tcp_receiver_normal(
         }
         match stream.read(buf).await {
             Ok(0) => break,
-            Ok(n) => counters.record_received(n as u64),
+            Ok(n) => {
+                counters.record_received(n as u64);
+                if let Some(ref mut f) = file {
+                    use std::io::Write;
+                    let _ = f.write_all(&buf[..n]);
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
             Err(e) => return Err(e.into()),
         }
@@ -701,14 +739,14 @@ mod tests {
         let sender = tokio::spawn(async move {
             let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d).await
+            run_tcp_sender(stream, sc, buf, d, None).await
         });
 
         let rc = recv_counters.clone();
         let d2 = done.clone();
         let receiver = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            run_tcp_receiver(stream, rc, 1024, d2, false).await
+            run_tcp_receiver(stream, rc, 1024, d2, false, None).await
         });
 
         // Let data flow for a short time

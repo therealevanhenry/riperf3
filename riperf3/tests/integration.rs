@@ -1873,8 +1873,59 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
-    #[ignore = "not yet implemented: -F --file"]
-    async fn file_transfer_mode() {}
+    async fn file_transfer_send() {
+        // -F with sender: read from file instead of zero buffer
+        let port = next_port();
+
+        // Create a temp file with known content
+        let tmp = std::env::temp_dir().join(format!("riperf3-test-send-{port}"));
+        std::fs::write(&tmp, vec![0xABu8; 1024 * 1024]).unwrap(); // 1 MB
+
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .file(tmp.to_str().unwrap())
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-F send failed: {result:?}");
+
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn file_transfer_recv() {
+        // -F with receiver (-R): write received data to file
+        let port = next_port();
+        let tmp = std::env::temp_dir().join(format!("riperf3-test-recv-{port}"));
+
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .reverse(true)
+            .file(tmp.to_str().unwrap())
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-F recv failed: {result:?}");
+
+        // File should exist and have data
+        let meta = std::fs::metadata(&tmp);
+        assert!(meta.is_ok(), "output file should exist");
+        assert!(meta.unwrap().len() > 0, "output file should have data");
+
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     #[tokio::test]
     async fn json_stream_runs() {

@@ -254,13 +254,14 @@ impl Client {
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
+                    let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
                     let task = if is_sender {
                         let buf = make_send_buffer(self.blksize, self.repeating_payload);
                         let c = counters.clone();
                         let d = done.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp).await
                         })
                     } else {
                         let c = counters.clone();
@@ -268,7 +269,7 @@ impl Client {
                         let bs = self.blksize;
                         let srxc = self.skip_rx_copy;
                         tokio::spawn(async move {
-                            stream::run_tcp_receiver(data_stream, c, bs, d, srxc).await
+                            stream::run_tcp_receiver(data_stream, c, bs, d, srxc, fp).await
                         })
                     };
 

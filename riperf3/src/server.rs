@@ -203,14 +203,14 @@ impl Server {
                         let c = counters.clone();
                         let d = done.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, None).await
                         })
                     } else {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = cfg.blksize;
                         tokio::spawn(async move {
-                            stream::run_tcp_receiver(data_stream, c, bs, d, false).await
+                            stream::run_tcp_receiver(data_stream, c, bs, d, false, None).await
                         })
                     };
 
