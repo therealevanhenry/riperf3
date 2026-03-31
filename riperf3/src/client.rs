@@ -223,6 +223,12 @@ impl Client {
                     if let Some(rate) = self.fq_rate {
                         net::set_fq_rate(raw_fd, rate)?;
                     }
+                    if let Some(ms) = self.rcv_timeout {
+                        net::set_rcv_timeout(raw_fd, ms)?;
+                    }
+                    if let Some(ms) = self.snd_timeout {
+                        net::set_snd_timeout(raw_fd, ms)?;
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;

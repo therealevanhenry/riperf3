@@ -982,6 +982,40 @@ mod implemented_flag_tests {
     }
 
     #[tokio::test]
+    async fn rcv_timeout_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .rcv_timeout(120_000)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--rcv-timeout failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn snd_timeout_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .snd_timeout(30_000)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--snd-timeout failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn client_port_binding() {
         let port = next_port();
         let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
@@ -1035,13 +1069,7 @@ mod unimplemented_flags {
     #[ignore = "not yet implemented: --skip-rx-copy requires MSG_TRUNC in recv loop"]
     async fn skip_rx_copy() {}
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --rcv-timeout requires SO_RCVTIMEO on data sockets"]
-    async fn receive_timeout() {}
-
-    #[tokio::test]
-    #[ignore = "not yet implemented: --snd-timeout requires TCP_USER_TIMEOUT on data sockets"]
-    async fn send_timeout() {}
+    // --rcv-timeout and --snd-timeout moved to implemented_flag_tests
 
     #[tokio::test]
     #[ignore = "not yet implemented: --cntl-ka requires keepalive on control connection"]

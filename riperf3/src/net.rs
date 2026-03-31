@@ -177,6 +177,57 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(&addr).await?)
 }
 
+/// Set SO_RCVTIMEO on a socket (receive timeout in milliseconds).
+#[cfg(target_os = "linux")]
+pub fn set_rcv_timeout(fd: i32, ms: u64) -> Result<()> {
+    let tv = libc::timeval {
+        tv_sec: (ms / 1000) as libc::time_t,
+        tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t,
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_rcv_timeout(_fd: i32, _ms: u64) -> Result<()> {
+    Ok(())
+}
+
+/// Set TCP_USER_TIMEOUT on a socket (send timeout in milliseconds).
+#[cfg(target_os = "linux")]
+pub fn set_snd_timeout(fd: i32, ms: u64) -> Result<()> {
+    let val = ms as libc::c_uint;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_snd_timeout(_fd: i32, _ms: u64) -> Result<()> {
+    Ok(())
+}
+
 /// Set the IPv4 Don't Fragment bit on a socket.
 #[cfg(target_os = "linux")]
 pub fn set_dont_fragment(fd: i32) -> Result<()> {
