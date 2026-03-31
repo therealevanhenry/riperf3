@@ -399,6 +399,31 @@ pub fn set_cpu_affinity(_core: usize) -> Result<()> {
     Ok(())
 }
 
+/// Set IPv6 flow label on a socket (Linux only).
+#[cfg(target_os = "linux")]
+pub fn set_ipv6_flowlabel(fd: i32, label: i32) -> Result<()> {
+    let val = label as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_FLOWINFO_SEND,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        // Flowlabel may require special kernel config; don't fail hard
+        log::debug!("IPV6_FLOWINFO_SEND failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_ipv6_flowlabel(_fd: i32, _label: i32) -> Result<()> {
+    Ok(())
+}
+
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
 pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {

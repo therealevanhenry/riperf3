@@ -1129,8 +1129,29 @@ mod unimplemented_flags {
     async fn bind_device() {}
 
     #[tokio::test]
-    #[ignore = "not yet implemented: -L flowlabel requires IPv6"]
-    async fn ipv6_flowlabel() {}
+    async fn ipv6_flowlabel() {
+        // Flow label is IPv6-only. Just verify the flag is accepted
+        // and test completes over IPv6 loopback.
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .bind_address("::1")
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("::1")
+            .port(Some(port))
+            .duration(1)
+            .ip_version(6)
+            .flowlabel(12345)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-L flowlabel failed: {result:?}");
+        let _ = server_task.await;
+    }
 
     // --dscp moved to implemented_flag_tests
 

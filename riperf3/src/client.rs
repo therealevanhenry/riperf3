@@ -238,6 +238,9 @@ impl Client {
                     if let Some(ms) = self.snd_timeout {
                         net::set_snd_timeout(raw_fd, ms)?;
                     }
+                    if let Some(label) = self.flowlabel {
+                        net::set_ipv6_flowlabel(raw_fd, label)?;
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
