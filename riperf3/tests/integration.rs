@@ -1375,12 +1375,49 @@ mod unimplemented_flags {
     // (can't test fork/file-redirect from library integration tests)
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --idle-timeout"]
-    async fn idle_timeout_restarts() {}
+    async fn idle_timeout_restarts() {
+        // Server with idle_timeout=2 should timeout if no client connects
+        // within 2 seconds and exit cleanly (one_off mode).
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .idle_timeout(2)
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let result = server.run().await;
+        let elapsed = start.elapsed();
+        // Server should have timed out after ~2 seconds, not hung forever
+        assert!(elapsed.as_secs() < 5, "idle-timeout took too long: {elapsed:?}");
+        // Timeout is not an error in one-off mode — server just exits
+        let _ = result;
+    }
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --server-max-duration"]
-    async fn server_max_duration() {}
+    async fn server_max_duration() {
+        // Server with max_duration=2 should terminate a test that runs longer
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .server_max_duration(2)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Client tries to run 10 seconds but server should cut it at 2
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(10)
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let _ = client.run().await;
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 5, "server-max-duration didn't cut test: {elapsed:?}");
+        let _ = server_task.await;
+    }
 
     #[tokio::test]
     #[ignore = "not yet implemented: --server-bitrate-limit"]

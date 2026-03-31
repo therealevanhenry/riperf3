@@ -128,8 +128,22 @@ impl Server {
         &self,
         listener: &tokio::net::TcpListener,
     ) -> Result<()> {
-        // ---- Accept control connection ----
-        let (mut ctrl, peer_addr) = listener.accept().await?;
+        // ---- Accept control connection (with optional idle timeout) ----
+        let (mut ctrl, peer_addr) = if let Some(secs) = self.idle_timeout {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(secs as u64),
+                listener.accept(),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(RiperfError::Aborted("idle timeout".into()));
+                }
+            }
+        } else {
+            listener.accept().await?
+        };
         if self.verbose {
             vprintln!("Accepted connection from {peer_addr}");
         }
@@ -316,16 +330,31 @@ impl Server {
             )
         };
 
-        // ---- Wait for TEST_END from client ----
-        loop {
-            let state = protocol::recv_state(&mut ctrl).await?;
-            match state {
-                TestState::TestEnd => break,
-                TestState::ClientTerminate => {
-                    return Err(RiperfError::Aborted("client terminated".into()));
+        // ---- Wait for TEST_END from client (with optional max duration) ----
+        let max_dur = self.server_max_duration.map(|s| std::time::Duration::from_secs(s as u64));
+        let wait_result = async {
+            loop {
+                let state = protocol::recv_state(&mut ctrl).await?;
+                match state {
+                    TestState::TestEnd => return Ok(()),
+                    TestState::ClientTerminate => {
+                        return Err(RiperfError::Aborted("client terminated".into()));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+        };
+
+        if let Some(dur) = max_dur {
+            match tokio::time::timeout(dur, wait_result).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    // Max duration exceeded — terminate the test
+                    protocol::send_state(&mut ctrl, TestState::ServerTerminate).await?;
+                }
+            }
+        } else {
+            wait_result.await?;
         }
 
         // ---- Shut down streams ----
