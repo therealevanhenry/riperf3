@@ -71,6 +71,15 @@ pub struct Client {
 
 impl Client {
     pub async fn run(&self) -> Result<()> {
+        // ---- CPU affinity ----
+        if let Some(ref spec) = self.affinity {
+            if let Some(core_str) = spec.split(',').next() {
+                if let Ok(core) = core_str.parse::<usize>() {
+                    net::set_cpu_affinity(core)?;
+                }
+            }
+        }
+
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout).await?;

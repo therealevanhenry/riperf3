@@ -178,6 +178,111 @@ pub fn set_fq_rate(_fd: i32, _rate: u64) -> Result<()> {
     Ok(())
 }
 
+/// Bind socket to a specific network device (SO_BINDTODEVICE, Linux only, needs CAP_NET_RAW).
+#[cfg(target_os = "linux")]
+pub fn set_bind_dev(fd: i32, dev: &str) -> Result<()> {
+    let dev_bytes = dev.as_bytes();
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            dev_bytes.as_ptr() as *const libc::c_void,
+            dev_bytes.len() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_bind_dev(_fd: i32, _dev: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Set TCP keepalive options on a socket.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_keepalive(
+    fd: i32,
+    idle: Option<u32>,
+    interval: Option<u32>,
+    count: Option<u32>,
+) -> Result<()> {
+    let enable: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if let Some(val) = idle {
+            let val = val as libc::c_int;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        if let Some(val) = interval {
+            let val = val as libc::c_int;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        if let Some(val) = count {
+            let val = val as libc::c_int;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_keepalive(
+    _fd: i32,
+    _idle: Option<u32>,
+    _interval: Option<u32>,
+    _count: Option<u32>,
+) -> Result<()> {
+    Ok(())
+}
+
+/// Set CPU affinity for the current thread (Linux only).
+#[cfg(target_os = "linux")]
+pub fn set_cpu_affinity(core: usize) -> Result<()> {
+    unsafe {
+        let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init();
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core, &mut cpuset);
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+        if ret < 0 {
+            return Err(RiperfError::Io(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_cpu_affinity(_core: usize) -> Result<()> {
+    Ok(())
+}
+
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
 pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
