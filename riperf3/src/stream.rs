@@ -509,6 +509,35 @@ mod tests {
         assert_eq!(c.take_received_interval(), 0);
     }
 
+    /// Regression: verify that interval swap-and-reset does NOT
+    /// affect cumulative counters. This is the invariant that
+    /// prevents the interval reporter from stealing bytes from
+    /// the final summary.
+    #[test]
+    fn interval_swap_does_not_affect_cumulative() {
+        let c = StreamCounters::new();
+        c.record_sent(1000);
+        c.record_sent(2000);
+        assert_eq!(c.bytes_sent(), 3000);
+
+        // Simulate interval reporter draining the interval counter
+        assert_eq!(c.take_sent_interval(), 3000);
+
+        // Cumulative counter must be unaffected
+        assert_eq!(c.bytes_sent(), 3000);
+
+        // Record more data
+        c.record_sent(500);
+        assert_eq!(c.bytes_sent(), 3500);
+        assert_eq!(c.take_sent_interval(), 500);
+        assert_eq!(c.bytes_sent(), 3500); // still unaffected
+
+        // Same for received
+        c.record_received(100);
+        assert_eq!(c.take_received_interval(), 100);
+        assert_eq!(c.bytes_received(), 100);
+    }
+
     // -- UdpHeader --
 
     #[test]

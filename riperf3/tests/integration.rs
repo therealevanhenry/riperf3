@@ -16,6 +16,54 @@ fn next_port() -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// Default path regression tests — verify data actually flows
+// ---------------------------------------------------------------------------
+
+/// Regression: a byte-limited transfer must complete, proving the
+/// data path works end-to-end even with the interval reporter running
+/// (which calls take_*_interval() every second).
+#[tokio::test]
+async fn regression_default_path_transfers_data() {
+    let port = next_port();
+    let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 1 MB byte-limited test — will hang if data path is broken
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .bytes(1024 * 1024)
+        .build()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let result = client.run().await;
+    let elapsed = start.elapsed();
+    assert!(result.is_ok(), "default path failed: {result:?}");
+    // Should complete in well under 5 seconds on loopback
+    assert!(elapsed.as_secs() < 5, "default path too slow: {elapsed:?}");
+    let _ = server_task.await;
+}
+
+/// Regression: UDP default path with interval reporter active.
+#[tokio::test]
+async fn regression_udp_default_path() {
+    let port = next_port();
+    let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .protocol(TransportProtocol::Udp)
+        .duration(2)
+        .bandwidth(1_000_000)
+        .build()
+        .unwrap();
+    let result = client.run().await;
+    assert!(result.is_ok(), "UDP default path failed: {result:?}");
+    let _ = server_task.await;
+}
+
+// ---------------------------------------------------------------------------
 // TCP loopback tests
 // ---------------------------------------------------------------------------
 
