@@ -28,6 +28,58 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
 
+/// Parse a DSCP value — either numeric (0-63, decimal/octal/hex) or symbolic.
+/// Returns the TOS byte value (DSCP << 2).
+pub fn parse_dscp(s: &str) -> std::result::Result<i32, ConfigError> {
+    // Try symbolic names first
+    let dscp_val = match s.to_lowercase().as_str() {
+        "cs0" => 0,
+        "cs1" => 8,
+        "cs2" => 16,
+        "cs3" => 24,
+        "cs4" => 32,
+        "cs5" => 40,
+        "cs6" => 48,
+        "cs7" => 56,
+        "af11" => 10,
+        "af12" => 12,
+        "af13" => 14,
+        "af21" => 18,
+        "af22" => 20,
+        "af23" => 22,
+        "af31" => 26,
+        "af32" => 28,
+        "af33" => 30,
+        "af41" => 34,
+        "af42" => 36,
+        "af43" => 38,
+        "ef" => 46,
+        "voice-admit" => 44,
+        "le" => 1,
+        _ => {
+            // Numeric: supports decimal, 0x hex, 0 octal
+            let val = if s.starts_with("0x") || s.starts_with("0X") {
+                i32::from_str_radix(&s[2..], 16)
+            } else if s.starts_with('0') && s.len() > 1 {
+                i32::from_str_radix(&s[1..], 8)
+            } else {
+                s.parse::<i32>()
+            };
+            val.map_err(|_| ConfigError::InvalidValue("dscp", s.to_string()))?
+        }
+    };
+
+    if !(0..=63).contains(&dscp_val) {
+        return Err(ConfigError::InvalidValue(
+            "dscp",
+            format!("{dscp_val} out of range 0-63"),
+        ));
+    }
+
+    // DSCP occupies the top 6 bits of the TOS byte
+    Ok(dscp_val << 2)
+}
+
 /// Parse a `--cntl-ka` keepalive spec: `idle/interval/count`.
 /// Each component is optional (uses system defaults if empty).
 /// Examples: "10/5/3", "10//", "//3", ""

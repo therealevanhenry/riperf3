@@ -1032,6 +1032,40 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
+    #[test]
+    fn dscp_symbolic_and_numeric() {
+        use riperf3::utils::parse_dscp;
+        // Symbolic names
+        assert_eq!(parse_dscp("ef").unwrap(), 46 << 2);    // EF = 184
+        assert_eq!(parse_dscp("af11").unwrap(), 10 << 2);  // AF11 = 40
+        assert_eq!(parse_dscp("cs1").unwrap(), 8 << 2);    // CS1 = 32
+        // Numeric
+        assert_eq!(parse_dscp("46").unwrap(), 46 << 2);
+        assert_eq!(parse_dscp("0x2e").unwrap(), 46 << 2);  // 0x2e = 46
+        assert_eq!(parse_dscp("056").unwrap(), 46 << 2);   // 056 octal = 46
+        // Out of range
+        assert!(parse_dscp("64").is_err());
+        assert!(parse_dscp("abc").is_err());
+    }
+
+    #[tokio::test]
+    async fn dscp_flag_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .dscp("ef")
+            .build()
+            .unwrap();
+        assert_eq!(client.tos, 46 << 2); // EF mapped to TOS
+        let result = client.run().await;
+        assert!(result.is_ok(), "--dscp ef failed: {result:?}");
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn client_port_binding() {
         let port = next_port();
@@ -1074,9 +1108,7 @@ mod unimplemented_flags {
     #[ignore = "not yet implemented: -L flowlabel requires IPv6"]
     async fn ipv6_flowlabel() {}
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --dscp symbolic name mapping"]
-    async fn dscp_value() {}
+    // --dscp moved to implemented_flag_tests
 
     #[tokio::test]
     #[ignore = "not yet implemented: -m mptcp requires IPPROTO_MPTCP in socket creation"]

@@ -997,6 +997,13 @@ impl ClientBuilder {
             TransportProtocol::Udp => DEFAULT_UDP_BLKSIZE,
         };
 
+        // If --dscp is set, convert to TOS and override
+        let tos = if let Some(ref dscp) = self.dscp {
+            parse_dscp(dscp)?
+        } else {
+            self.tos
+        };
+
         Ok(Client {
             host,
             port: self.port.unwrap_or(DEFAULT_PORT),
@@ -1011,7 +1018,7 @@ impl ClientBuilder {
             mss: self.mss,
             window: self.window,
             bandwidth: self.bandwidth,
-            tos: self.tos,
+            tos,
             congestion: self.congestion,
             udp_counters_64bit: self.udp_counters_64bit,
             connect_timeout: self.connect_timeout,
