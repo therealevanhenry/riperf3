@@ -7,8 +7,9 @@ edition = "2021"
 # riperf3 workspace dependencies
 riperf3 = { path = "../riperf3" }
 
-# external depdenencies
+# external dependencies
 clap.workspace = true
+libc.workspace = true
 log.workspace = true
 log4rs.workspace = true
 thiserror.workspace = true

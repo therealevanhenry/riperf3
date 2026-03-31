@@ -363,6 +363,8 @@ impl Client {
                     format_char: self.format_char,
                     omit_secs: self.omit,
                     num_streams: streams.len(),
+                    forceflush: self.forceflush,
+                    timestamp_format: self.timestamps.clone(),
                 },
                 stream_refs,
                 done.clone(),

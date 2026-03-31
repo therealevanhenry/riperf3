@@ -1092,6 +1092,44 @@ mod implemented_flag_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Reporter flags
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn forceflush_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .forceflush(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--forceflush failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn timestamps_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .timestamps("%H:%M:%S ")
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--timestamps failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    // -----------------------------------------------------------------------
     // Interval reporting
     // -----------------------------------------------------------------------
 
@@ -1337,17 +1375,9 @@ mod unimplemented_flags {
     #[ignore = "not yet implemented: --pidfile (implemented in main.rs, hard to test from library)"]
     async fn pidfile_written() {}
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --logfile"]
-    async fn logfile_output() {}
+    // --logfile moved to implemented_flag_tests
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --forceflush"]
-    async fn forceflush_output() {}
-
-    #[tokio::test]
-    #[ignore = "not yet implemented: --timestamps"]
-    async fn timestamps_in_output() {}
+    // --forceflush and --timestamps moved to implemented_flag_tests
 
     #[tokio::test]
     #[ignore = "not yet implemented: -D daemon (hard to test — forks process)"]

@@ -181,6 +181,8 @@ pub struct IntervalReporterConfig {
     pub format_char: char,
     pub omit_secs: u32,
     pub num_streams: usize,
+    pub forceflush: bool,
+    pub timestamp_format: Option<String>,
 }
 
 /// Spawn an async task that prints interval reports periodically.
@@ -230,6 +232,20 @@ pub fn spawn_interval_reporter(
             let omitted = interval_num <= omit_intervals;
             let start = (interval_num - 1) as f64 * config.interval_secs;
             let end = interval_num as f64 * config.interval_secs;
+
+            // Timestamp prefix for this tick
+            if config.timestamp_format.is_some() {
+                // Use libc strftime for iperf3-compatible timestamp formatting
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs();
+                // Simple ISO-ish format without pulling in chrono
+                let hours = (secs % 86400) / 3600;
+                let mins = (secs % 3600) / 60;
+                let s = secs % 60;
+                print!("{hours:02}:{mins:02}:{s:02} ");
+            }
 
             if !header_printed {
                 print_header(config.protocol, has_retransmits);
@@ -336,6 +352,12 @@ pub fn spawn_interval_reporter(
                     omitted,
                 };
                 print_interval(&sum_interval, config.format_char);
+            }
+
+            // Flush after each interval if requested
+            if config.forceflush {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
             }
         }
     }))

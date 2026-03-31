@@ -21,6 +21,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::fs::write(path, format!("{}\n", std::process::id()))?;
     }
 
+    // Redirect stdout to logfile if requested
+    if let Some(ref path) = cli.logfile {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::IntoRawFd;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let fd = file.into_raw_fd();
+        unsafe {
+            libc::dup2(fd, libc::STDOUT_FILENO);
+            libc::close(fd);
+        }
+    }
+
     // Set CPU affinity BEFORE building the tokio runtime so worker threads
     // inherit the affinity mask from the main thread.
     if let Some(ref spec) = cli.affinity {

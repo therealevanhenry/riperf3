@@ -308,6 +308,8 @@ impl Server {
                     format_char: 'a',
                     omit_secs: cfg.omit,
                     num_streams: streams.len(),
+                    forceflush: self.forceflush,
+                    timestamp_format: self.timestamps.clone(),
                 },
                 stream_refs,
                 done.clone(),
