@@ -209,12 +209,23 @@ impl Client {
                     let mut data_stream =
                         net::tcp_connect(&self.host, self.port, self.connect_timeout).await?;
                     protocol::send_cookie(&mut data_stream, cookie).await?;
-                    net::configure_tcp_stream(&data_stream, self.no_delay)?;
+                    net::configure_tcp_stream_full(
+                        &data_stream,
+                        self.no_delay,
+                        self.mss,
+                        self.window,
+                    )?;
+                    let raw_fd = data_stream.as_raw_fd();
+                    if self.dont_fragment {
+                        net::set_dont_fragment(raw_fd)?;
+                    }
+                    if let Some(rate) = self.fq_rate {
+                        net::set_fq_rate(raw_fd, rate)?;
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
-                    let raw_fd = data_stream.as_raw_fd();
 
                     let task = if is_sender {
                         let buf = make_send_buffer(self.blksize, self.repeating_payload);

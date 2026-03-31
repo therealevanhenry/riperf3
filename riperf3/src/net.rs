@@ -171,6 +171,54 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
     Ok(UdpSocket::bind(&addr).await?)
 }
 
+/// Set the IPv4 Don't Fragment bit on a socket.
+#[cfg(target_os = "linux")]
+pub fn set_dont_fragment(fd: i32) -> Result<()> {
+    let val: libc::c_int = libc::IP_PMTUDISC_DO;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_dont_fragment(_fd: i32) -> Result<()> {
+    Ok(()) // Not supported on this platform
+}
+
+/// Set SO_MAX_PACING_RATE for FQ-based socket pacing (Linux only).
+#[cfg(target_os = "linux")]
+pub fn set_fq_rate(fd: i32, rate_bits_per_sec: u64) -> Result<()> {
+    let rate_bytes = (rate_bits_per_sec / 8) as libc::c_uint;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MAX_PACING_RATE,
+            &rate_bytes as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_fq_rate(_fd: i32, _rate: u64) -> Result<()> {
+    Ok(())
+}
+
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
 pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
