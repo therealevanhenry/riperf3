@@ -31,9 +31,6 @@ pub enum RiperfError {
     #[error("access denied by server")]
     AccessDenied,
 
-    #[error("server is busy")]
-    ServerBusy,
-
     #[error("connection timed out")]
     ConnectionTimeout,
 

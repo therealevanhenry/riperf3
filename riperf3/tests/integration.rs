@@ -844,7 +844,7 @@ mod error_tests {
         assert_eq!(format!("{}", RiperfError::CookieMismatch), "cookie mismatch");
         assert_eq!(format!("{}", RiperfError::AccessDenied), "access denied by server");
         assert_eq!(format!("{}", RiperfError::PeerDisconnected), "peer disconnected");
-        assert_eq!(format!("{}", RiperfError::ServerBusy), "server is busy");
+        assert!(format!("{}", RiperfError::Aborted("test".into())).contains("test"));
         assert_eq!(format!("{}", RiperfError::ConnectionTimeout), "connection timed out");
         assert!(format!("{}", RiperfError::Protocol("bad".into())).contains("bad"));
         assert!(format!("{}", RiperfError::Aborted("reason".into())).contains("reason"));
@@ -862,6 +862,297 @@ mod error_tests {
             .unwrap();
         let result = client.run().await;
         assert!(result.is_err(), "connecting to port 1 should fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol error state tests
+// ---------------------------------------------------------------------------
+
+mod protocol_error_tests {
+    use riperf3::protocol::{self, TestState};
+
+    #[tokio::test]
+    async fn client_handles_access_denied() {
+        // Server sends AccessDenied state — client should return AccessDenied error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read cookie (37 bytes)
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie).await.unwrap();
+            // Send AccessDenied
+            protocol::send_state(&mut stream, TestState::AccessDenied).await.unwrap();
+        });
+
+        let client = riperf3::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on AccessDenied");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("access denied") || err.contains("protocol"),
+            "error should mention access denied, got: {err}"
+        );
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn client_handles_server_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie).await.unwrap();
+            protocol::send_state(&mut stream, TestState::ServerError).await.unwrap();
+        });
+
+        let client = riperf3::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on ServerError");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn client_handles_peer_disconnect_during_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Accept connection then immediately close it
+            drop(stream);
+        });
+
+        let client = riperf3::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on peer disconnect");
+        let _ = server_task.await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON output validation
+// ---------------------------------------------------------------------------
+
+mod json_output_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn json_output_has_required_fields() {
+        // Run a test with JSON output and validate the structure
+        // by building results directly (can't capture stdout easily)
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .json_output(true)
+            .build()
+            .unwrap();
+        // This prints JSON to stdout — we verify it doesn't crash
+        let result = client.run().await;
+        assert!(result.is_ok(), "JSON output test failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_params_serializes_all_fields() {
+        use riperf3::protocol::TestParams;
+        let p = TestParams {
+            tcp: Some(true),
+            time: Some(10),
+            parallel: Some(4),
+            len: Some(131072),
+            reverse: Some(true),
+            bidirectional: Some(true),
+            nodelay: Some(true),
+            mss: Some(1400),
+            window: Some(524288),
+            bandwidth: Some(1_000_000),
+            tos: Some(16),
+            congestion: Some("bbr".to_string()),
+            client_version: Some("riperf3 0.1.0".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tcp"], true);
+        assert_eq!(v["time"], 10);
+        assert_eq!(v["parallel"], 4);
+        assert_eq!(v["len"], 131072);
+        assert_eq!(v["reverse"], true);
+        assert_eq!(v["bidirectional"], true);
+        assert_eq!(v["nodelay"], true);
+        assert_eq!(v["MSS"], 1400);
+        assert_eq!(v["window"], 524288);
+        assert_eq!(v["bandwidth"], 1_000_000);
+        assert_eq!(v["TOS"], 16);
+        assert_eq!(v["congestion"], "bbr");
+        assert_eq!(v["client_version"], "riperf3 0.1.0");
+    }
+
+    #[test]
+    fn test_results_json_structure() {
+        use riperf3::protocol::{TestResultsJson, StreamResultJson};
+        let r = TestResultsJson {
+            cpu_util_total: 50.0,
+            cpu_util_user: 40.0,
+            cpu_util_system: 10.0,
+            sender_has_retransmits: 5,
+            congestion_used: Some("cubic".to_string()),
+            streams: vec![StreamResultJson {
+                id: 1,
+                bytes: 10_000_000_000,
+                retransmits: 5,
+                jitter: 0.001,
+                errors: 2,
+                omitted_errors: 0,
+                packets: 10000,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: 10.0,
+            }],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cpu_util_total"], 50.0);
+        assert_eq!(v["sender_has_retransmits"], 5);
+        assert_eq!(v["congestion_used"], "cubic");
+        assert_eq!(v["streams"][0]["id"], 1);
+        assert_eq!(v["streams"][0]["bytes"], 10_000_000_000u64);
+        assert_eq!(v["streams"][0]["retransmits"], 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interval reporter edge cases
+// ---------------------------------------------------------------------------
+
+mod interval_reporter_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use riperf3::protocol::TransportProtocol;
+    use riperf3::reporter::{IntervalReporterConfig, spawn_interval_reporter};
+
+    #[tokio::test]
+    async fn disabled_returns_none() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: 0.0,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+        };
+        assert!(spawn_interval_reporter(config, vec![], done).is_none());
+    }
+
+    #[tokio::test]
+    async fn negative_interval_returns_none() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: -1.0,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+        };
+        assert!(spawn_interval_reporter(config, vec![], done).is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_streams_doesnt_panic() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: 0.5,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 0,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+        };
+        let handle = spawn_interval_reporter(config, vec![], done.clone());
+        assert!(handle.is_some());
+        // Let it tick once then stop
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        done.store(true, Ordering::Relaxed);
+        if let Some(h) = handle {
+            let _ = h.await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UDP edge cases
+// ---------------------------------------------------------------------------
+
+mod udp_edge_tests {
+    use riperf3::stream::{UdpHeader, UdpRecvStats};
+
+    #[test]
+    fn udp_header_32bit_sequence_max() {
+        let h = UdpHeader { sec: 0, usec: 0, seq: u32::MAX as u64 };
+        let mut buf = [0u8; 16];
+        h.write_to(&mut buf, false);
+        let h2 = UdpHeader::read_from(&buf, false).unwrap();
+        assert_eq!(h2.seq, u32::MAX as u64);
+    }
+
+    #[test]
+    fn udp_header_64bit_sequence_max() {
+        let h = UdpHeader { sec: 0, usec: 0, seq: u64::MAX };
+        let mut buf = [0u8; 16];
+        h.write_to(&mut buf, true);
+        let h2 = UdpHeader::read_from(&buf, true).unwrap();
+        assert_eq!(h2.seq, u64::MAX);
+    }
+
+    #[test]
+    fn udp_stats_massive_gap() {
+        // Simulate losing 1000 packets at once
+        let mut stats = UdpRecvStats::new();
+        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.0);
+        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1002 }, 1.0);
+        assert_eq!(stats.cnt_error, 1000);
+        assert_eq!(stats.packet_count, 1002);
+    }
+
+    #[test]
+    fn udp_stats_duplicate_packet() {
+        let mut stats = UdpRecvStats::new();
+        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.0);
+        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 2 }, 0.001);
+        // Duplicate of packet 1
+        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.002);
+        assert_eq!(stats.outoforder_packets, 1);
+        assert_eq!(stats.packet_count, 2);
     }
 }
 
