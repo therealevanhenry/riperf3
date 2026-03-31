@@ -1371,17 +1371,8 @@ mod unimplemented_flags {
     #[ignore = "not yet implemented: --get-server-output"]
     async fn get_server_output() {}
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --pidfile (implemented in main.rs, hard to test from library)"]
-    async fn pidfile_written() {}
-
-    // --logfile moved to implemented_flag_tests
-
-    // --forceflush and --timestamps moved to implemented_flag_tests
-
-    #[tokio::test]
-    #[ignore = "not yet implemented: -D daemon (hard to test — forks process)"]
-    async fn daemon_mode() {}
+    // --pidfile, --logfile, --forceflush, --timestamps, -D: implemented and validated on sandbox
+    // (can't test fork/file-redirect from library integration tests)
 
     #[tokio::test]
     #[ignore = "not yet implemented: --idle-timeout"]
