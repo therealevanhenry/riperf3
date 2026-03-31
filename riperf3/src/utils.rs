@@ -28,6 +28,17 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
 
+/// Create a send buffer of `size` bytes.
+/// If `repeating_payload` is true, fills with a repeating 0x00..0xFF pattern (like iperf2).
+/// Otherwise returns a zero-filled buffer.
+pub fn make_send_buffer(size: usize, repeating_payload: bool) -> Vec<u8> {
+    if repeating_payload {
+        (0..size).map(|i| (i % 256) as u8).collect()
+    } else {
+        vec![0u8; size]
+    }
+}
+
 /// Compute the stream ID for the given 0-based stream index.
 /// Matches iperf3's `iperf_add_stream()` assignment: 1, 3, 4, 5, 6, ...
 pub fn iperf3_stream_id(index: u32) -> i32 {

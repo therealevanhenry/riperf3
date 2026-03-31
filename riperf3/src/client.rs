@@ -64,6 +64,7 @@ pub struct Client {
     pub file: Option<String>,
     pub affinity: Option<String>,
     pub dscp: Option<String>,
+    pub format_char: char,
     pub pidfile: Option<String>,
     pub logfile: Option<String>,
 }
@@ -216,7 +217,7 @@ impl Client {
                     let raw_fd = data_stream.as_raw_fd();
 
                     let task = if is_sender {
-                        let buf = vec![0u8; self.blksize];
+                        let buf = make_send_buffer(self.blksize, self.repeating_payload);
                         let c = counters.clone();
                         let d = done.clone();
                         tokio::spawn(async move {
@@ -469,7 +470,7 @@ impl Client {
                     lost,
                     total_packets: total,
                 },
-                'a',
+                self.format_char,
             );
         }
     }
@@ -667,6 +668,7 @@ pub struct ClientBuilder {
     file: Option<String>,
     affinity: Option<String>,
     dscp: Option<String>,
+    format_char: char,
     pidfile: Option<String>,
     logfile: Option<String>,
 }
@@ -716,6 +718,7 @@ impl Default for ClientBuilder {
             file: None,
             affinity: None,
             dscp: None,
+            format_char: 'a',
             pidfile: None,
             logfile: None,
         }
@@ -937,6 +940,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn format_char(mut self, c: char) -> Self {
+        self.format_char = c;
+        self
+    }
+
     pub fn pidfile(mut self, path: &str) -> Self {
         self.pidfile = Some(path.to_string());
         self
@@ -998,6 +1006,7 @@ impl ClientBuilder {
             file: self.file,
             affinity: self.affinity,
             dscp: self.dscp,
+            format_char: self.format_char,
             pidfile: self.pidfile,
             logfile: self.logfile,
         })

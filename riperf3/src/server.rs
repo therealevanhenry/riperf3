@@ -175,7 +175,7 @@ impl Server {
                     let raw_fd = data_stream.as_raw_fd();
 
                     let task = if is_sender {
-                        let buf = vec![0u8; cfg.blksize];
+                        let buf = make_send_buffer(cfg.blksize, false);
                         let c = counters.clone();
                         let d = done.clone();
                         tokio::spawn(async move {

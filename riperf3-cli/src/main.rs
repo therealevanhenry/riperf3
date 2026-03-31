@@ -17,9 +17,23 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     set_verbose(cli.verbose);
     configure_log4rs(cli.debug.unwrap_or(0));
 
+    // Write PID file if requested
+    if let Some(ref path) = cli.pidfile {
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+    }
+
     if let Some(server_host) = cli.client {
         // ---- Client mode ----
         let mut builder = riperf3::ClientBuilder::new(&server_host);
+
+        // Format: K/M/G/T → lowercase char for bits, uppercase for bytes
+        let format_char = match cli.format {
+            cli::Format::K => 'k',
+            cli::Format::M => 'm',
+            cli::Format::G => 'g',
+            cli::Format::T => 't',
+        };
+        builder = builder.format_char(format_char);
 
         if let Some(port) = cli.port {
             builder = builder.port(Some(port));
