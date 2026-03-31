@@ -115,14 +115,15 @@ cargo clippy --all-targets -- -D warnings   # lint
 
 ## Status
 
-Early but functional. TCP and UDP throughput testing works end-to-end with full iperf3 interchange compatibility. Key areas for future work:
+Functional with full iperf3 interchange compatibility. TCP and UDP throughput testing works end-to-end with interval reporting, parallel streams, reverse/bidirectional modes, and JSON output.
 
-- [ ] Interval reporting during test (currently only final summary)
+Remaining work:
+
 - [ ] Zero-copy send mode (`-Z`)
-- [ ] Daemon mode (`-D`)
 - [ ] SCTP support
 - [ ] Authentication (RSA)
 - [ ] `libiperf` FFI compatibility library
+- [ ] Refactor output to `Write` trait (currently uses `println!` to stdout, which limits library use — `--logfile` redirects via `dup2` in the CLI binary only)
 
 ## License
 
