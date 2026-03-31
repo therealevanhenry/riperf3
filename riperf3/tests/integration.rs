@@ -1090,6 +1090,110 @@ mod implemented_flag_tests {
         assert!(result.is_ok(), "--cport failed: {result:?}");
         let _ = server_task.await;
     }
+
+    // -----------------------------------------------------------------------
+    // UDP-specific flag tests — verify Tier 2 flags work with UDP protocol
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn udp_dont_fragment() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .dont_fragment(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP --dont-fragment failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_dscp() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .dscp("ef")
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP --dscp ef failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_fq_rate() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .fq_rate(10_000_000)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP --fq-rate failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_ipv6() {
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .bind_address("::1")
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("::1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .ip_version(6)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP -6 failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_rcv_timeout() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(1)
+            .bandwidth(1_000_000)
+            .rcv_timeout(120_000)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP --rcv-timeout failed: {result:?}");
+        let _ = server_task.await;
+    }
 }
 
 // ===========================================================================

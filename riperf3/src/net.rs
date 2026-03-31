@@ -19,7 +19,7 @@ fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
 }
 
 /// Format host:port for SocketAddr parsing (brackets IPv6 addresses).
-fn format_addr(host: &str, port: u16) -> String {
+pub fn format_addr(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -190,8 +190,11 @@ pub fn configure_tcp_stream_full(
 // ---------------------------------------------------------------------------
 
 /// Bind a UDP socket. If `bind_addr` is `None`, binds to `0.0.0.0`.
-pub async fn udp_bind(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
-    let addr = format!("{}:{}", bind_addr.unwrap_or("0.0.0.0"), port);
+/// Bind a UDP socket. If `bind_addr` is `None`, uses 0.0.0.0 (or [::] for IPv6).
+pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
+    let default = if ipv6 { "::" } else { "0.0.0.0" };
+    let host = bind_addr.unwrap_or(default);
+    let addr = format_addr(host, port);
     Ok(UdpSocket::bind(&addr).await?)
 }
 
@@ -426,8 +429,10 @@ pub fn set_ipv6_flowlabel(_fd: i32, _label: i32) -> Result<()> {
 
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
-pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16) -> Result<UdpSocket> {
-    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or("0.0.0.0"), port)
+pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
+    let default = if ipv6 { "::" } else { "0.0.0.0" };
+    let host = bind_addr.unwrap_or(default);
+    let addr: SocketAddr = format_addr(host, port)
         .parse()
         .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
 
@@ -478,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_bind_ephemeral() {
-        let socket = udp_bind(Some("127.0.0.1"), 0).await.unwrap();
+        let socket = udp_bind(Some("127.0.0.1"), 0, false).await.unwrap();
         assert!(socket.local_addr().is_ok());
     }
 }

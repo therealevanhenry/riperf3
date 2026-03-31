@@ -275,9 +275,10 @@ impl Client {
             }
             TransportProtocol::Udp => {
                 for i in 0..total {
-                    let udp_sock = net::udp_bind(None, 0).await?;
+                    let is_ipv6 = self.host.contains(':');
+                    let udp_sock = net::udp_bind(None, 0, is_ipv6).await?;
                     udp_sock
-                        .connect(format!("{}:{}", self.host, self.port))
+                        .connect(net::format_addr(&self.host, self.port))
                         .await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
