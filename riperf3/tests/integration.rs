@@ -1368,8 +1368,22 @@ mod unimplemented_flags {
     // -i interval reporting moved to implemented_flag_tests
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --get-server-output"]
-    async fn get_server_output() {}
+    async fn get_server_output_runs() {
+        // --get-server-output: client requests server output. Just verify no crash.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .get_server_output(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--get-server-output failed: {result:?}");
+        let _ = server_task.await;
+    }
 
     // --pidfile, --logfile, --forceflush, --timestamps, -D: implemented and validated on sandbox
     // (can't test fork/file-redirect from library integration tests)
