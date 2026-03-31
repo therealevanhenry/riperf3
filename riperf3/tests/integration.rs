@@ -1103,9 +1103,25 @@ mod unimplemented_flags {
     // -- Tier 2: behavior not yet wired --
 
     #[tokio::test]
-    #[ignore = "not yet implemented: -6 requires IPv6 listener support"]
     async fn force_ipv6() {
-        // Needs server to listen on [::] and client to connect to [::1]
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .bind_address("::1")
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("::1")
+            .port(Some(port))
+            .duration(1)
+            .ip_version(6)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-6 IPv6 loopback failed: {result:?}");
+        let _ = server_task.await;
     }
 
     #[tokio::test]

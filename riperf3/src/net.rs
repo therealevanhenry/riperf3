@@ -18,6 +18,15 @@ fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
     }
 }
 
+/// Format host:port for SocketAddr parsing (brackets IPv6 addresses).
+fn format_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// MPTCP protocol number (not in libc/socket2 yet).
 const IPPROTO_MPTCP: i32 = 262;
 
@@ -31,7 +40,7 @@ pub async fn tcp_connect(
     mptcp: bool,
 ) -> Result<TcpStream> {
     if local_port.is_some() || mptcp {
-        let remote: SocketAddr = format!("{host}:{port}")
+        let remote: SocketAddr = format_addr(host, port)
             .parse()
             .map_err(|e| RiperfError::Protocol(format!("bad address: {e}")))?;
         let domain = if remote.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
@@ -64,7 +73,7 @@ pub async fn tcp_connect(
         }
         Ok(stream)
     } else {
-        let addr = format!("{host}:{port}");
+        let addr = format_addr(host, port);
         match timeout {
             Some(dur) => {
                 let stream = tokio::time::timeout(dur, TcpStream::connect(&addr))
@@ -85,7 +94,8 @@ pub async fn tcp_listen(
     port: u16,
     ip_version: Option<u8>,
 ) -> Result<TcpListener> {
-    let addr: SocketAddr = format!("{}:{}", bind_addr.unwrap_or(default_bind_addr(ip_version)), port)
+    let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
+    let addr: SocketAddr = format_addr(host, port)
         .parse()
         .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
 

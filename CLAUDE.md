@@ -42,10 +42,10 @@ Two QEMU/KVM sandbox VMs are available on Gandalf for isolated build and interch
 
 ### Quick Reference
 
-| Sandbox | IP | SSH |
-|---|---|---|
-| sandbox-server-1 | 172.20.0.20 | `ssh sandbox-server-1` |
-| sandbox-client-1 | 172.20.0.21 | `ssh sandbox-client-1` |
+| Sandbox | IPv4 | IPv6 | SSH |
+|---|---|---|---|
+| sandbox-server-1 | 172.20.0.20 | fd00:20::20 | `ssh sandbox-server-1` |
+| sandbox-client-1 | 172.20.0.21 | fd00:20::21 | `ssh sandbox-client-1` |
 
 Jumbo frames (MTU 9000) are auto-configured on all interfaces (host bridge, taps, and guest NICs via cloud-init). Baseline iperf3 throughput: ~70 Gbps normal, ~63 Gbps reverse, ~72 Gbps bidirectional aggregate.
 
