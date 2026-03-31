@@ -1032,6 +1032,14 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
+    #[tokio::test]
+    async fn mptcp_flag_accepted() {
+        // MPTCP may not be available on all kernels. Just verify the flag
+        // is wired and the client attempts to use it (may fail with EPROTONOSUPPORT).
+        let c = ClientBuilder::new("h").mptcp(true).build().unwrap();
+        assert!(c.mptcp);
+    }
+
     #[test]
     fn dscp_symbolic_and_numeric() {
         use riperf3::utils::parse_dscp;
@@ -1110,9 +1118,7 @@ mod unimplemented_flags {
 
     // --dscp moved to implemented_flag_tests
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: -m mptcp requires IPPROTO_MPTCP in socket creation"]
-    async fn mptcp_protocol() {}
+    // -m mptcp moved to implemented_flag_tests
 
     #[tokio::test]
     #[ignore = "not yet implemented: --skip-rx-copy requires MSG_TRUNC in recv loop"]

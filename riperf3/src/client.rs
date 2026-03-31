@@ -74,7 +74,7 @@ impl Client {
     pub async fn run(&self) -> Result<()> {
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
-        let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None).await?;
+        let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None, self.mptcp).await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
         // Apply control connection keepalive if requested
@@ -216,7 +216,7 @@ impl Client {
             TransportProtocol::Tcp => {
                 for i in 0..total {
                     let mut data_stream =
-                        net::tcp_connect(&self.host, self.port, self.connect_timeout, self.cport).await?;
+                        net::tcp_connect(&self.host, self.port, self.connect_timeout, self.cport, self.mptcp).await?;
                     protocol::send_cookie(&mut data_stream, cookie).await?;
                     net::configure_tcp_stream_full(
                         &data_stream,

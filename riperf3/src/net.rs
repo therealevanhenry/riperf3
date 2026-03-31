@@ -18,29 +18,39 @@ fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
     }
 }
 
-/// Connect to a TCP endpoint, optionally with a timeout and local port binding.
+/// MPTCP protocol number (not in libc/socket2 yet).
+const IPPROTO_MPTCP: i32 = 262;
+
+/// Connect to a TCP (or MPTCP) endpoint.
+/// Uses socket2 when local_port or mptcp is set; tokio's built-in connect otherwise.
 pub async fn tcp_connect(
     host: &str,
     port: u16,
     timeout: Option<Duration>,
     local_port: Option<u16>,
+    mptcp: bool,
 ) -> Result<TcpStream> {
-    if let Some(lport) = local_port {
-        // Use socket2 to bind to local port before connecting
+    if local_port.is_some() || mptcp {
         let remote: SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|e| RiperfError::Protocol(format!("bad address: {e}")))?;
         let domain = if remote.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
-        let socket = Socket::new(domain, Type::STREAM, None)?;
-        socket.set_reuse_address(true)?;
-        let local_addr: SocketAddr = if remote.is_ipv6() {
-            format!("[::]:{lport}").parse().unwrap()
+        let protocol = if mptcp {
+            Some(socket2::Protocol::from(IPPROTO_MPTCP))
         } else {
-            format!("0.0.0.0:{lport}").parse().unwrap()
+            None
         };
-        socket.bind(&local_addr.into())?;
+        let socket = Socket::new(domain, Type::STREAM, protocol)?;
+        socket.set_reuse_address(true)?;
+        if let Some(lport) = local_port {
+            let local_addr: SocketAddr = if remote.is_ipv6() {
+                format!("[::]:{lport}").parse().unwrap()
+            } else {
+                format!("0.0.0.0:{lport}").parse().unwrap()
+            };
+            socket.bind(&local_addr.into())?;
+        }
         socket.set_nonblocking(true)?;
-        // Initiate async connect
         match socket.connect(&remote.into()) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
@@ -48,9 +58,7 @@ pub async fn tcp_connect(
         }
         let std_stream: std::net::TcpStream = socket.into();
         let stream = TcpStream::from_std(std_stream)?;
-        // Wait for connect to complete
         stream.writable().await?;
-        // Check for connect error
         if let Some(e) = stream.take_error()? {
             return Err(RiperfError::Io(e));
         }
@@ -416,7 +424,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {
-            tcp_connect("127.0.0.1", port, None, None).await.unwrap()
+            tcp_connect("127.0.0.1", port, None, None, false).await.unwrap()
         });
 
         let (server_stream, _) = listener.accept().await.unwrap();
@@ -429,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_connect_timeout() {
         // Connect to a non-routable address with a short timeout
-        let result = tcp_connect("192.0.2.1", 12345, Some(Duration::from_millis(50)), None).await;
+        let result = tcp_connect("192.0.2.1", 12345, Some(Duration::from_millis(50)), None, false).await;
         assert!(result.is_err());
     }
 
