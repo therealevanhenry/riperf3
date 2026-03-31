@@ -343,9 +343,10 @@ impl Client {
         streams: &[DataStream],
         done: &Arc<AtomicBool>,
     ) -> Result<()> {
-        // Spawn interval reporter (unless JSON output or disabled)
+        // Spawn interval reporter (unless plain JSON output without streaming)
         let interval_secs = self.interval.unwrap_or(1.0);
-        let interval_handle = if !self.json_output && interval_secs > 0.0 {
+        let use_intervals = interval_secs > 0.0 && (!self.json_output || self.json_stream);
+        let interval_handle = if use_intervals {
             let stream_refs: Vec<_> = streams
                 .iter()
                 .map(|s| crate::reporter::IntervalStreamRef {
@@ -365,6 +366,7 @@ impl Client {
                     num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
+                    json_stream: self.json_stream,
                 },
                 stream_refs,
                 done.clone(),

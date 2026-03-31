@@ -324,6 +324,7 @@ impl Server {
                     num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
+                    json_stream: false, // server doesn't stream JSON
                 },
                 stream_refs,
                 done.clone(),

@@ -183,6 +183,7 @@ pub struct IntervalReporterConfig {
     pub num_streams: usize,
     pub forceflush: bool,
     pub timestamp_format: Option<String>,
+    pub json_stream: bool,
 }
 
 /// Spawn an async task that prints interval reports periodically.
@@ -316,7 +317,28 @@ pub fn spawn_interval_reporter(
                     omitted,
                 };
 
-                print_interval(&interval, config.format_char);
+                if config.json_stream {
+                    let seconds = end - start;
+                    let bps = if seconds > 0.0 { bytes as f64 * 8.0 / seconds } else { 0.0 };
+                    let mut j = serde_json::json!({
+                        "socket": stream.id,
+                        "start": start,
+                        "end": end,
+                        "seconds": seconds,
+                        "bytes": bytes,
+                        "bits_per_second": bps,
+                        "omitted": omitted,
+                        "sender": stream.is_sender,
+                    });
+                    if let Some(r) = retransmits { j["retransmits"] = serde_json::json!(r); }
+                    if let Some(c) = snd_cwnd { j["snd_cwnd"] = serde_json::json!(c); }
+                    if let Some(ji) = jitter { j["jitter_ms"] = serde_json::json!(ji * 1000.0); }
+                    if let Some(l) = lost { j["lost_packets"] = serde_json::json!(l); }
+                    if let Some(p) = total { j["packets"] = serde_json::json!(p); }
+                    println!("{}", serde_json::to_string(&j).unwrap());
+                } else {
+                    print_interval(&interval, config.format_char);
+                }
 
                 sum_bytes += bytes;
                 if let Some(r) = retransmits {

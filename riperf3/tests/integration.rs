@@ -1428,8 +1428,23 @@ mod unimplemented_flags {
     async fn file_transfer_mode() {}
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --json-stream"]
-    async fn json_stream_output() {}
+    async fn json_stream_runs() {
+        // --json-stream: each interval emitted as JSON. Just verify it doesn't crash.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(2)
+            .json_output(true)
+            .json_stream(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--json-stream failed: {result:?}");
+        let _ = server_task.await;
+    }
 
     #[tokio::test]
     #[ignore = "not yet implemented: --gsro"]
