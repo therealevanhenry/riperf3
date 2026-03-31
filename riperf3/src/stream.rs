@@ -323,18 +323,72 @@ pub async fn run_tcp_sender(
 }
 
 /// TCP receiver: reads until the peer closes the connection or `done` is set.
+/// If `skip_rx_copy` is true, uses MSG_TRUNC to avoid copying data (Linux only).
 pub async fn run_tcp_receiver(
     mut stream: TcpStream,
     counters: Arc<StreamCounters>,
     blksize: usize,
     done: Arc<AtomicBool>,
+    skip_rx_copy: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; blksize];
+
+    if skip_rx_copy {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            loop {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                stream.readable().await?;
+                let n = stream.try_io(tokio::io::Interest::READABLE, || {
+                    let ret = unsafe {
+                        libc::recv(
+                            fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            blksize,
+                            libc::MSG_TRUNC,
+                        )
+                    };
+                    if ret < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(ret as usize)
+                    }
+                });
+                match n {
+                    Ok(0) => break,
+                    Ok(n) => counters.record_received(n as u64),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Fallback: normal read path
+            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done).await;
+        }
+    } else {
+        return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done).await;
+    }
+    Ok(())
+}
+
+async fn run_tcp_receiver_normal(
+    stream: &mut TcpStream,
+    counters: &StreamCounters,
+    buf: &mut [u8],
+    done: &AtomicBool,
+) -> Result<()> {
     loop {
         if done.load(Ordering::Relaxed) {
             break;
         }
-        match stream.read(&mut buf).await {
+        match stream.read(buf).await {
             Ok(0) => break,
             Ok(n) => counters.record_received(n as u64),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
@@ -625,7 +679,7 @@ mod tests {
         let d2 = done.clone();
         let receiver = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            run_tcp_receiver(stream, rc, 1024, d2).await
+            run_tcp_receiver(stream, rc, 1024, d2, false).await
         });
 
         // Let data flow for a short time

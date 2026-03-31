@@ -196,7 +196,7 @@ impl Server {
                         let d = done.clone();
                         let bs = cfg.blksize;
                         tokio::spawn(async move {
-                            stream::run_tcp_receiver(data_stream, c, bs, d).await
+                            stream::run_tcp_receiver(data_stream, c, bs, d, false).await
                         })
                     };
 

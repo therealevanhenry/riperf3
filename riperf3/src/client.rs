@@ -257,8 +257,9 @@ impl Client {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = self.blksize;
+                        let srxc = self.skip_rx_copy;
                         tokio::spawn(async move {
-                            stream::run_tcp_receiver(data_stream, c, bs, d).await
+                            stream::run_tcp_receiver(data_stream, c, bs, d, srxc).await
                         })
                     };
 

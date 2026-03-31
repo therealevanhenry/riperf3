@@ -1158,8 +1158,24 @@ mod unimplemented_flags {
     // -m mptcp moved to implemented_flag_tests
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --skip-rx-copy requires MSG_TRUNC in recv loop"]
-    async fn skip_rx_copy() {}
+    async fn skip_rx_copy() {
+        // --skip-rx-copy uses MSG_TRUNC to avoid copying received data.
+        // Verify the test completes (data still counted even if not copied).
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .reverse(true)  // server sends, client receives with skip-rx-copy
+            .skip_rx_copy(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--skip-rx-copy -R failed: {result:?}");
+        let _ = server_task.await;
+    }
 
     // --rcv-timeout and --snd-timeout moved to implemented_flag_tests
 
