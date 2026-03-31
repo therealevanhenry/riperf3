@@ -289,6 +289,31 @@ impl Server {
         let cpu_start = CpuSnapshot::now();
         protocol::send_state(&mut ctrl, TestState::TestRunning).await?;
 
+        // Spawn interval reporter (server uses 1.0s default)
+        let interval_handle = {
+            let stream_refs: Vec<_> = streams
+                .iter()
+                .map(|s| crate::reporter::IntervalStreamRef {
+                    id: s.id,
+                    is_sender: s.is_sender,
+                    counters: s.counters.clone(),
+                    udp_recv_stats: s.udp_recv_stats.clone(),
+                    raw_fd: s.raw_fd,
+                })
+                .collect();
+            crate::reporter::spawn_interval_reporter(
+                crate::reporter::IntervalReporterConfig {
+                    interval_secs: 1.0,
+                    protocol: cfg.protocol,
+                    format_char: 'a',
+                    omit_secs: cfg.omit,
+                    num_streams: streams.len(),
+                },
+                stream_refs,
+                done.clone(),
+            )
+        };
+
         // ---- Wait for TEST_END from client ----
         loop {
             let state = protocol::recv_state(&mut ctrl).await?;
@@ -303,6 +328,10 @@ impl Server {
 
         // ---- Shut down streams ----
         done.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = interval_handle {
+            let _ = handle.await;
+        }
         let cpu_end = CpuSnapshot::now();
 
         // Wait briefly then join tasks (senders may be blocked on write)

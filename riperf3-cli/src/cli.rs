@@ -35,7 +35,7 @@ pub struct Cli {
 
     /// Seconds between periodic throughput reports
     #[arg(short, long, value_name = "interval")]
-    pub interval: Option<u8>,
+    pub interval: Option<f64>,
 
     /// Enable verbose output
     #[arg(short = 'V', long)]
@@ -482,6 +482,9 @@ mod cli_tests {
             }
             if let Some(o) = cli.omit {
                 b = b.omit(o);
+            }
+            if let Some(i) = cli.interval {
+                b = b.interval(i);
             }
             if let Some(ref t) = cli.title {
                 b = b.title(t);

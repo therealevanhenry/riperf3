@@ -104,6 +104,9 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(o) = cli.omit {
             builder = builder.omit(o);
         }
+        if let Some(i) = cli.interval {
+            builder = builder.interval(i);
+        }
         if let Some(ref t) = cli.title {
             builder = builder.title(t);
         }

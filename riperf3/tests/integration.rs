@@ -1092,6 +1092,46 @@ mod implemented_flag_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Interval reporting
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tcp_with_interval_reporting() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(2)
+            .interval(1.0)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-i 1 failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_with_interval_reporting() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(2)
+            .interval(1.0)
+            .bandwidth(1_000_000)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP -i 1 failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    // -----------------------------------------------------------------------
     // UDP-specific flag tests — verify Tier 2 flags work with UDP protocol
     // -----------------------------------------------------------------------
 
@@ -1287,9 +1327,7 @@ mod unimplemented_flags {
 
     // -- Tier 3: features requiring new logic --
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: -i interval reporting"]
-    async fn interval_reporting() {}
+    // -i interval reporting moved to implemented_flag_tests
 
     #[tokio::test]
     #[ignore = "not yet implemented: --get-server-output"]

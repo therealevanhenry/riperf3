@@ -65,6 +65,7 @@ pub struct Client {
     pub affinity: Option<String>,
     pub dscp: Option<String>,
     pub format_char: char,
+    pub interval: Option<f64>,
     pub cntl_ka: Option<String>,
     pub pidfile: Option<String>,
     pub logfile: Option<String>,
@@ -342,6 +343,34 @@ impl Client {
         streams: &[DataStream],
         done: &Arc<AtomicBool>,
     ) -> Result<()> {
+        // Spawn interval reporter (unless JSON output or disabled)
+        let interval_secs = self.interval.unwrap_or(1.0);
+        let interval_handle = if !self.json_output && interval_secs > 0.0 {
+            let stream_refs: Vec<_> = streams
+                .iter()
+                .map(|s| crate::reporter::IntervalStreamRef {
+                    id: s.id,
+                    is_sender: s.is_sender,
+                    counters: s.counters.clone(),
+                    udp_recv_stats: s.udp_recv_stats.clone(),
+                    raw_fd: s.raw_fd,
+                })
+                .collect();
+            crate::reporter::spawn_interval_reporter(
+                crate::reporter::IntervalReporterConfig {
+                    interval_secs,
+                    protocol: self.protocol,
+                    format_char: self.format_char,
+                    omit_secs: self.omit,
+                    num_streams: streams.len(),
+                },
+                stream_refs,
+                done.clone(),
+            )
+        } else {
+            None
+        };
+
         // Determine test end condition
         let end_condition = if let Some(bytes) = self.bytes_to_send {
             EndCondition::Bytes(bytes)
@@ -395,6 +424,12 @@ impl Client {
         }
 
         done.store(true, Ordering::Relaxed);
+
+        // Wait for interval reporter to finish its last tick
+        if let Some(handle) = interval_handle {
+            let _ = handle.await;
+        }
+
         Ok(())
     }
 
@@ -701,6 +736,7 @@ pub struct ClientBuilder {
     affinity: Option<String>,
     dscp: Option<String>,
     format_char: char,
+    interval: Option<f64>,
     cntl_ka: Option<String>,
     pidfile: Option<String>,
     logfile: Option<String>,
@@ -752,6 +788,7 @@ impl Default for ClientBuilder {
             affinity: None,
             dscp: None,
             format_char: 'a',
+            interval: None,
             cntl_ka: None,
             pidfile: None,
             logfile: None,
@@ -979,6 +1016,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn interval(mut self, secs: f64) -> Self {
+        self.interval = Some(secs);
+        self
+    }
+
     pub fn cntl_ka(mut self, spec: &str) -> Self {
         self.cntl_ka = Some(spec.to_string());
         self
@@ -1053,6 +1095,7 @@ impl ClientBuilder {
             affinity: self.affinity,
             dscp: self.dscp,
             format_char: self.format_char,
+            interval: self.interval,
             cntl_ka: self.cntl_ka,
             pidfile: self.pidfile,
             logfile: self.logfile,
