@@ -1307,8 +1307,55 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
-    #[ignore = "not yet implemented: --bind-dev requires CAP_NET_RAW"]
-    async fn bind_device() {}
+    async fn bind_device_loopback() {
+        // --bind-dev lo: bind all sockets to the loopback interface.
+        // Works unprivileged on Linux 5.7+.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .bind_dev("lo")
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        if let Err(ref e) = result {
+            let msg = format!("{e}");
+            if msg.contains("Operation not permitted") {
+                return; // old kernel, skip gracefully
+            }
+        }
+        assert!(result.is_ok(), "--bind-dev lo failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bind_device_invalid_rejects() {
+        // An invalid device name should cause an error, proving set_bind_dev is called.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .bind_dev("nonexistent_dev_xyz")
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        if let Err(ref e) = result {
+            let msg = format!("{e}");
+            if msg.contains("Operation not permitted") {
+                return; // old kernel, can't test
+            }
+        }
+        // Should fail: "No such device" (ENODEV)
+        assert!(result.is_err(), "--bind-dev nonexistent should fail but succeeded");
+        let _ = server_task.await;
+    }
 
     #[tokio::test]
     async fn ipv6_flowlabel() {

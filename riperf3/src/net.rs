@@ -297,7 +297,8 @@ pub fn set_fq_rate(_fd: i32, _rate: u64) -> Result<()> {
     Ok(())
 }
 
-/// Bind socket to a specific network device (SO_BINDTODEVICE, Linux only, needs CAP_NET_RAW).
+/// Bind socket to a specific network device (SO_BINDTODEVICE, Linux only).
+/// Unprivileged on Linux 5.7+ for sockets the caller owns.
 #[cfg(target_os = "linux")]
 pub fn set_bind_dev(fd: i32, dev: &str) -> Result<()> {
     let dev_bytes = dev.as_bytes();
@@ -485,5 +486,23 @@ mod tests {
     async fn udp_bind_ephemeral() {
         let socket = udp_bind(Some("127.0.0.1"), 0, false).await.unwrap();
         assert!(socket.local_addr().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_bind_dev_loopback() {
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let result = set_bind_dev(socket.as_raw_fd(), "lo");
+        // Succeeds on Linux 5.7+ (unprivileged SO_BINDTODEVICE)
+        // May fail with EPERM on older kernels — acceptable
+        if let Err(ref e) = result {
+            let msg = format!("{e}");
+            if msg.contains("Operation not permitted") {
+                return; // old kernel, skip
+            }
+            panic!("unexpected error from set_bind_dev: {e}");
+        }
+        assert!(result.is_ok());
     }
 }

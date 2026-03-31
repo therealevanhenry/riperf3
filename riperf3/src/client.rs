@@ -78,11 +78,16 @@ impl Client {
         let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None, self.mptcp).await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
-        // Apply control connection keepalive if requested
-        if let Some(ref spec) = self.cntl_ka {
-            let (idle, intv, cnt) = parse_keepalive(spec);
+        // Apply control connection options
+        {
             use std::os::unix::io::AsRawFd;
-            net::set_tcp_keepalive(ctrl.as_raw_fd(), idle, intv, cnt)?;
+            if let Some(ref dev) = self.bind_dev {
+                net::set_bind_dev(ctrl.as_raw_fd(), dev)?;
+            }
+            if let Some(ref spec) = self.cntl_ka {
+                let (idle, intv, cnt) = parse_keepalive(spec);
+                net::set_tcp_keepalive(ctrl.as_raw_fd(), idle, intv, cnt)?;
+            }
         }
 
         protocol::send_cookie(&mut ctrl, &cookie).await?;
@@ -242,6 +247,9 @@ impl Client {
                     if let Some(label) = self.flowlabel {
                         net::set_ipv6_flowlabel(raw_fd, label)?;
                     }
+                    if let Some(ref dev) = self.bind_dev {
+                        net::set_bind_dev(raw_fd, dev)?;
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
@@ -278,6 +286,10 @@ impl Client {
                 for i in 0..total {
                     let is_ipv6 = self.host.contains(':');
                     let udp_sock = net::udp_bind(None, 0, is_ipv6).await?;
+                    if let Some(ref dev) = self.bind_dev {
+                        use std::os::unix::io::AsRawFd;
+                        net::set_bind_dev(udp_sock.as_raw_fd(), dev)?;
+                    }
                     udp_sock
                         .connect(net::format_addr(&self.host, self.port))
                         .await?;
