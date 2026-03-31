@@ -28,6 +28,20 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
 
+/// Parse a `--cntl-ka` keepalive spec: `idle/interval/count`.
+/// Each component is optional (uses system defaults if empty).
+/// Examples: "10/5/3", "10//", "//3", ""
+pub fn parse_keepalive(s: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let parts: Vec<&str> = s.split('/').collect();
+    let parse = |i: usize| -> Option<u32> {
+        parts.get(i).and_then(|p| {
+            let p = p.trim();
+            if p.is_empty() { None } else { p.parse().ok() }
+        })
+    };
+    (parse(0), parse(1), parse(2))
+}
+
 /// Create a send buffer of `size` bytes.
 /// If `repeating_payload` is true, fills with a repeating 0x00..0xFF pattern (like iperf2).
 /// Otherwise returns a zero-filled buffer.

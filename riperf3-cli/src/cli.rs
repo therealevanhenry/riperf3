@@ -558,6 +558,9 @@ mod cli_tests {
             if let Some(ref spec) = cli.affinity {
                 b = b.affinity(spec);
             }
+            if let Some(ref spec) = cli.cntl_ka {
+                b = b.cntl_ka(spec);
+            }
             if let Some(ref val) = cli.dscp {
                 b = b.dscp(val);
             }

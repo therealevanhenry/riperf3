@@ -1016,6 +1016,23 @@ mod implemented_flag_tests {
     }
 
     #[tokio::test]
+    async fn control_keepalive_runs() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .cntl_ka("10/5/3")
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "--cntl-ka failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
     async fn client_port_binding() {
         let port = next_port();
         let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
@@ -1071,9 +1088,7 @@ mod unimplemented_flags {
 
     // --rcv-timeout and --snd-timeout moved to implemented_flag_tests
 
-    #[tokio::test]
-    #[ignore = "not yet implemented: --cntl-ka requires keepalive on control connection"]
-    async fn control_keepalive() {}
+    // --cntl-ka moved to implemented_flag_tests
 
     // -- Tier 3: features requiring new logic --
 

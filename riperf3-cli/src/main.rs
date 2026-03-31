@@ -182,6 +182,9 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(ref val) = cli.dscp {
             builder = builder.dscp(val);
         }
+        if let Some(ref spec) = cli.cntl_ka {
+            builder = builder.cntl_ka(spec);
+        }
         if let Some(ref path) = cli.pidfile {
             builder = builder.pidfile(path);
         }

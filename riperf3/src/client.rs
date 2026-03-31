@@ -65,6 +65,7 @@ pub struct Client {
     pub affinity: Option<String>,
     pub dscp: Option<String>,
     pub format_char: char,
+    pub cntl_ka: Option<String>,
     pub pidfile: Option<String>,
     pub logfile: Option<String>,
 }
@@ -75,6 +76,14 @@ impl Client {
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None).await?;
         net::configure_tcp_stream(&ctrl, true)?;
+
+        // Apply control connection keepalive if requested
+        if let Some(ref spec) = self.cntl_ka {
+            let (idle, intv, cnt) = parse_keepalive(spec);
+            use std::os::unix::io::AsRawFd;
+            net::set_tcp_keepalive(ctrl.as_raw_fd(), idle, intv, cnt)?;
+        }
+
         protocol::send_cookie(&mut ctrl, &cookie).await?;
 
         if self.verbose {
@@ -687,6 +696,7 @@ pub struct ClientBuilder {
     affinity: Option<String>,
     dscp: Option<String>,
     format_char: char,
+    cntl_ka: Option<String>,
     pidfile: Option<String>,
     logfile: Option<String>,
 }
@@ -737,6 +747,7 @@ impl Default for ClientBuilder {
             affinity: None,
             dscp: None,
             format_char: 'a',
+            cntl_ka: None,
             pidfile: None,
             logfile: None,
         }
@@ -963,6 +974,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn cntl_ka(mut self, spec: &str) -> Self {
+        self.cntl_ka = Some(spec.to_string());
+        self
+    }
+
     pub fn pidfile(mut self, path: &str) -> Self {
         self.pidfile = Some(path.to_string());
         self
@@ -1025,6 +1041,7 @@ impl ClientBuilder {
             affinity: self.affinity,
             dscp: self.dscp,
             format_char: self.format_char,
+            cntl_ka: self.cntl_ka,
             pidfile: self.pidfile,
             logfile: self.logfile,
         })
