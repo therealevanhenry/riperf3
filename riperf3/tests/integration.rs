@@ -835,6 +835,34 @@ mod error_tests {
     fn parse_bitrate_bad_burst() {
         assert!(parse_bitrate("100M/abc").is_err());
     }
+
+    // -- Error type display messages --
+
+    #[test]
+    fn error_display_variants() {
+        use riperf3::RiperfError;
+        assert_eq!(format!("{}", RiperfError::CookieMismatch), "cookie mismatch");
+        assert_eq!(format!("{}", RiperfError::AccessDenied), "access denied by server");
+        assert_eq!(format!("{}", RiperfError::PeerDisconnected), "peer disconnected");
+        assert_eq!(format!("{}", RiperfError::ServerBusy), "server is busy");
+        assert_eq!(format!("{}", RiperfError::ConnectionTimeout), "connection timed out");
+        assert!(format!("{}", RiperfError::Protocol("bad".into())).contains("bad"));
+        assert!(format!("{}", RiperfError::Aborted("reason".into())).contains("reason"));
+    }
+
+    // -- Edge cases --
+
+    #[tokio::test]
+    async fn connect_to_wrong_port_fails() {
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(1)) // port 1 — almost certainly not listening
+            .duration(1)
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "connecting to port 1 should fail");
+    }
 }
 
 // ---------------------------------------------------------------------------

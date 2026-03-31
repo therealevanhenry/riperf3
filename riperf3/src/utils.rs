@@ -223,4 +223,62 @@ mod tests {
     fn parse_bitrate_with_burst() {
         assert_eq!(parse_bitrate("100M/10").unwrap(), (100 * 1024 * 1024, 10));
     }
+
+    // -- parse_keepalive --
+
+    #[test]
+    fn parse_keepalive_all_values() {
+        assert_eq!(parse_keepalive("10/5/3"), (Some(10), Some(5), Some(3)));
+    }
+
+    #[test]
+    fn parse_keepalive_partial() {
+        assert_eq!(parse_keepalive("10//"), (Some(10), None, None));
+        assert_eq!(parse_keepalive("//3"), (None, None, Some(3)));
+        assert_eq!(parse_keepalive("/5/"), (None, Some(5), None));
+        assert_eq!(parse_keepalive("10/5"), (Some(10), Some(5), None));
+    }
+
+    #[test]
+    fn parse_keepalive_empty() {
+        assert_eq!(parse_keepalive(""), (None, None, None));
+    }
+
+    #[test]
+    fn parse_keepalive_single_value() {
+        assert_eq!(parse_keepalive("30"), (Some(30), None, None));
+    }
+
+    #[test]
+    fn parse_keepalive_invalid_ignored() {
+        // Non-numeric values parse as None (not an error)
+        assert_eq!(parse_keepalive("abc/def/ghi"), (None, None, None));
+    }
+
+    // -- parse_dscp edge cases --
+
+    #[test]
+    fn parse_dscp_all_classes() {
+        assert_eq!(parse_dscp("cs0").unwrap(), 0);
+        assert_eq!(parse_dscp("cs7").unwrap(), 56 << 2);
+        assert_eq!(parse_dscp("le").unwrap(), 1 << 2);
+        assert_eq!(parse_dscp("voice-admit").unwrap(), 44 << 2);
+    }
+
+    #[test]
+    fn parse_dscp_case_insensitive() {
+        assert_eq!(parse_dscp("EF").unwrap(), parse_dscp("ef").unwrap());
+        assert_eq!(parse_dscp("AF11").unwrap(), parse_dscp("af11").unwrap());
+    }
+
+    // -- make_send_buffer edge cases --
+
+    #[test]
+    fn make_send_buffer_wraps_at_256() {
+        let buf = make_send_buffer(512, true);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[255], 255);
+        assert_eq!(buf[256], 0); // wraps
+        assert_eq!(buf[511], 255);
+    }
 }

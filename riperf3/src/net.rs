@@ -488,6 +488,73 @@ mod tests {
         assert!(socket.local_addr().is_ok());
     }
 
+    #[test]
+    fn format_addr_ipv4() {
+        assert_eq!(format_addr("127.0.0.1", 5201), "127.0.0.1:5201");
+        assert_eq!(format_addr("0.0.0.0", 80), "0.0.0.0:80");
+    }
+
+    #[test]
+    fn format_addr_ipv6_brackets() {
+        assert_eq!(format_addr("::1", 5201), "[::1]:5201");
+        assert_eq!(format_addr("::", 0), "[::]:0");
+        assert_eq!(format_addr("fd00:20::20", 8080), "[fd00:20::20]:8080");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_keepalive_readback() {
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = socket.as_raw_fd();
+        set_tcp_keepalive(fd, Some(10), Some(5), Some(3)).unwrap();
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(
+                fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                &mut val as *mut _ as *mut libc::c_void, &mut len,
+            );
+        }
+        assert_eq!(val, 1, "SO_KEEPALIVE should be enabled");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rcv_timeout_readback() {
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = socket.as_raw_fd();
+        set_rcv_timeout(fd, 5000).unwrap(); // 5 seconds
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(
+                fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                &mut tv as *mut _ as *mut libc::c_void, &mut len,
+            );
+        }
+        assert_eq!(tv.tv_sec, 5, "SO_RCVTIMEO should be 5 seconds");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dont_fragment_readback() {
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = socket.as_raw_fd();
+        set_dont_fragment(fd).unwrap();
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(
+                fd, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER,
+                &mut val as *mut _ as *mut libc::c_void, &mut len,
+            );
+        }
+        assert_eq!(val, libc::IP_PMTUDISC_DO, "IP_MTU_DISCOVER should be DO");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn set_bind_dev_loopback() {
