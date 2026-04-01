@@ -20,6 +20,8 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 log = "0.4"
+nix = { version = "0.29", features = ["net", "sched", "process", "resource", "fs", "term"] }
+rpassword = "5"
 log4rs = { version = "1.3", features = ["toml_format"] }
 rand = "0.9"
 rsa = "0.9"
