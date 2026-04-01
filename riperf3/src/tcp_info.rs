@@ -54,14 +54,48 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Query TCP_CONNECTION_INFO for a connected TCP socket (macOS).
+#[cfg(target_os = "macos")]
+pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
+    use std::mem::{self, MaybeUninit};
+
+    // SAFETY: getsockopt(TCP_CONNECTION_INFO) is a read-only kernel query on a valid fd.
+    // Same irreducible kernel boundary as the Linux TCP_INFO variant.
+    let info = unsafe {
+        let mut info = MaybeUninit::<libc::tcp_connection_info>::uninit();
+        let mut len = mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            info.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        );
+        if ret < 0 {
+            return None;
+        }
+        info.assume_init()
+    };
+
+    Some(TcpInfoSnapshot {
+        total_retransmits: 0, // macOS only has tcpi_txretransmitbytes, not packet count
+        snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_maxseg as u64,
+        snd_wnd: info.tcpi_snd_wnd as u64,
+        rtt: info.tcpi_srtt,
+        rttvar: info.tcpi_rttvar,
+        snd_mss: info.tcpi_maxseg,
+        pmtu: 0, // not available in tcp_connection_info
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
     None
 }
 
 /// Whether this platform provides TCP retransmit information.
 pub fn has_retransmit_info() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 #[cfg(test)]

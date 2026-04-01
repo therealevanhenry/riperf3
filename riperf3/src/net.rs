@@ -354,8 +354,8 @@ pub fn set_fq_rate<F>(_fd: &F, _rate: u64) -> Result<()> {
     Ok(())
 }
 
-/// Bind socket to a specific network device (SO_BINDTODEVICE, Linux only).
-/// Unprivileged on Linux 5.7+ for sockets the caller owns.
+/// Bind socket to a specific network device.
+/// Linux: SO_BINDTODEVICE (by name). macOS: IP_BOUND_IF (by index).
 #[cfg(target_os = "linux")]
 pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
@@ -364,7 +364,29 @@ pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> 
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // Resolve device name to interface index (safe via nix)
+    let idx = nix::net::if_::if_nametoindex(dev)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+    // SAFETY: setsockopt on a valid fd with IP_BOUND_IF. No nix wrapper exists.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_fd().as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            &idx as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn set_bind_dev<F>(_fd: &F, _dev: &str) -> Result<()> {
     Ok(())
 }
