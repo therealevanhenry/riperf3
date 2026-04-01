@@ -9,7 +9,7 @@ use crate::protocol::{
     self, TestParams, TestResultsJson, TestState, TransportProtocol,
 };
 use crate::stream::{
-    self, DataStream, RateLimiter, StreamCounters, UdpRecvStats,
+    self, DataStream, StreamCounters, UdpRecvStats,
 };
 use crate::utils::*;
 
@@ -291,19 +291,21 @@ impl Server {
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
 
+                    let std_sock = data_sock.into_std()
+                        .map_err(RiperfError::Io)?;
+
                     if is_sender {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = cfg.blksize;
-                        let limiter = if cfg.bandwidth > 0 {
-                            Some(RateLimiter::new(cfg.bandwidth, 0, bs))
+                        let rate = if cfg.bandwidth > 0 {
+                            cfg.bandwidth
                         } else {
-                            Some(RateLimiter::new(DEFAULT_UDP_RATE, 0, bs))
+                            DEFAULT_UDP_RATE
                         };
                         let u64bit = cfg.udp_counters_64bit;
-                        let task = tokio::spawn(async move {
-                            stream::run_udp_sender(data_sock, c, bs, d, limiter, u64bit)
-                                .await
+                        let task = tokio::task::spawn_blocking(move || {
+                            stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
                         });
                         streams.push(DataStream {
                             id: stream_id,
@@ -320,9 +322,8 @@ impl Server {
                         let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                         let stats_clone = stats.clone();
                         let u64bit = cfg.udp_counters_64bit;
-                        let task = tokio::spawn(async move {
-                            stream::run_udp_receiver(data_sock, c, stats_clone, bs, d, u64bit)
-                                .await
+                        let task = tokio::task::spawn_blocking(move || {
+                            stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                         });
                         streams.push(DataStream {
                             id: stream_id,

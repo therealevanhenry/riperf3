@@ -595,6 +595,109 @@ pub async fn run_udp_receiver(
 }
 
 // ---------------------------------------------------------------------------
+// Blocking UDP send / recv (high-performance, no async overhead)
+// ---------------------------------------------------------------------------
+
+/// High-performance UDP sender using blocking I/O on a dedicated OS thread.
+/// No `unsafe` code — uses `std::net::UdpSocket` and `std::thread::sleep`
+/// with a spin-loop for sub-microsecond pacing precision.
+pub fn run_udp_sender_blocking(
+    socket: std::net::UdpSocket,
+    counters: Arc<StreamCounters>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    rate_bits_per_sec: u64,
+    use_64bit: bool,
+) -> Result<()> {
+    let mut buf = vec![0u8; blksize];
+    let mut seq: u64 = 0;
+    let inter_packet = if rate_bits_per_sec > 0 {
+        let rate_bytes = rate_bits_per_sec as f64 / 8.0;
+        Some(Duration::from_secs_f64(blksize as f64 / rate_bytes))
+    } else {
+        None
+    };
+    let mut next_send = Instant::now();
+
+    while !done.load(Ordering::Relaxed) {
+        seq += 1;
+        UdpHeader::new(seq).write_to(&mut buf, use_64bit);
+
+        match socket.send(&buf) {
+            Ok(n) => counters.record_sent(n as u64),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                seq -= 1;
+                continue;
+            }
+            Err(e) => {
+                log::debug!("UDP send error: {e}");
+                seq -= 1;
+            }
+        }
+
+        if let Some(interval) = inter_packet {
+            next_send += interval;
+            let now = Instant::now();
+            if next_send > now {
+                let remaining = next_send - now;
+                if remaining > Duration::from_micros(100) {
+                    std::thread::sleep(remaining - Duration::from_micros(50));
+                }
+                while Instant::now() < next_send {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// High-performance UDP receiver using blocking I/O on a dedicated OS thread.
+/// No `unsafe` code — uses `std::net::UdpSocket` with a read timeout.
+pub fn run_udp_receiver_blocking(
+    socket: std::net::UdpSocket,
+    counters: Arc<StreamCounters>,
+    udp_stats: Arc<Mutex<UdpRecvStats>>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    use_64bit: bool,
+) -> Result<()> {
+    let mut buf = vec![0u8; blksize.max(65536)];
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(crate::error::RiperfError::Io)?;
+
+    loop {
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+        match socket.recv(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                counters.record_received(n as u64);
+                if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {
+                    let arrival = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    if let Ok(mut stats) = udp_stats.lock() {
+                        stats.update(&header, arrival);
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

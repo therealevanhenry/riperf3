@@ -1537,6 +1537,50 @@ mod implemented_flag_tests {
     }
 
     // -----------------------------------------------------------------------
+    // UDP high-rate tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn udp_high_rate_completes() {
+        // 50G target rate — verify the test completes without error.
+        // Before fix: capped at ~11 Gbps. After fix: should approach 29+ Gbps.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(2)
+            .bandwidth(50_000_000_000) // 50 Gbps
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP 50G failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn udp_high_rate_reverse() {
+        // 50G reverse mode — server sends, client receives
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(2)
+            .bandwidth(50_000_000_000)
+            .reverse(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "UDP 50G reverse failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    // -----------------------------------------------------------------------
     // UDP-specific flag tests — verify Tier 2 flags work with UDP protocol
     // -----------------------------------------------------------------------
 

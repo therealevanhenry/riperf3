@@ -12,7 +12,7 @@ use crate::protocol::{
     self, TestParams, TestResultsJson, TestState, TransportProtocol,
 };
 use crate::stream::{
-    self, DataStream, RateLimiter, StreamCounters, UdpRecvStats,
+    self, DataStream, StreamCounters, UdpRecvStats,
 };
 use crate::utils::*;
 
@@ -339,6 +339,10 @@ impl Client {
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
 
+                    // Convert tokio UdpSocket to std for blocking I/O
+                    let std_sock = udp_sock.into_std()
+                        .map_err(RiperfError::Io)?;
+
                     let task = if is_sender {
                         let c = counters.clone();
                         let d = done.clone();
@@ -348,10 +352,9 @@ impl Client {
                         } else {
                             DEFAULT_UDP_RATE
                         };
-                        let limiter = Some(RateLimiter::new(rate, 0, bs));
                         let u64bit = self.udp_counters_64bit;
-                        tokio::spawn(async move {
-                            stream::run_udp_sender(udp_sock, c, bs, d, limiter, u64bit).await
+                        tokio::task::spawn_blocking(move || {
+                            stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
                         })
                     } else {
                         let c = counters.clone();
@@ -360,8 +363,8 @@ impl Client {
                         let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                         let sc = stats.clone();
                         let u64bit = self.udp_counters_64bit;
-                        let task = tokio::spawn(async move {
-                            stream::run_udp_receiver(udp_sock, c, sc, bs, d, u64bit).await
+                        let task = tokio::task::spawn_blocking(move || {
+                            stream::run_udp_receiver_blocking(std_sock, c, sc, bs, d, u64bit)
                         });
                         streams.push(DataStream {
                             id: stream_id,
