@@ -7,21 +7,6 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use crate::error::{Result, RiperfError};
 
 // ---------------------------------------------------------------------------
-// Raw fd helper
-// ---------------------------------------------------------------------------
-
-/// Wrap a raw file descriptor as a `BorrowedFd` for use with nix safe APIs.
-///
-/// This is a private helper — all call sites in this module obtain `fd` from
-/// live socket/stream objects that remain open for the duration of use.
-#[cfg(target_os = "linux")]
-fn borrow_fd(fd: i32) -> std::os::unix::io::BorrowedFd<'static> {
-    // SAFETY: All callers extract fd from valid, open socket objects and use
-    // the BorrowedFd only within the same function scope.
-    unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) }
-}
-
-// ---------------------------------------------------------------------------
 // Custom socket options not wrapped by nix
 // ---------------------------------------------------------------------------
 
@@ -287,109 +272,99 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<
 
 /// Set SO_RCVTIMEO on a socket (receive timeout in milliseconds).
 #[cfg(target_os = "linux")]
-pub fn set_rcv_timeout(fd: i32, ms: u64) -> Result<()> {
+pub fn set_rcv_timeout(fd: &impl std::os::unix::io::AsFd, ms: u64) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
-    let borrowed = borrow_fd(fd);
     let tv = TimeVal::new((ms / 1000) as i64, ((ms % 1000) * 1000) as i64);
-    socket::setsockopt(&borrowed, sockopt::ReceiveTimeout, &tv)
+    socket::setsockopt(fd, sockopt::ReceiveTimeout, &tv)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_rcv_timeout(_fd: i32, _ms: u64) -> Result<()> {
+pub fn set_rcv_timeout<F>(_fd: &F, _ms: u64) -> Result<()> {
     Ok(())
 }
 
 /// Set TCP_USER_TIMEOUT on a socket (send timeout in milliseconds).
 #[cfg(target_os = "linux")]
-pub fn set_snd_timeout(fd: i32, ms: u64) -> Result<()> {
+pub fn set_snd_timeout(fd: &impl std::os::unix::io::AsFd, ms: u64) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
-    let borrowed = borrow_fd(fd);
-    socket::setsockopt(&borrowed, sockopt::TcpUserTimeout, &(ms as u32))
+    socket::setsockopt(fd, sockopt::TcpUserTimeout, &(ms as u32))
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_snd_timeout(_fd: i32, _ms: u64) -> Result<()> {
+pub fn set_snd_timeout<F>(_fd: &F, _ms: u64) -> Result<()> {
     Ok(())
 }
 
 /// Set the IPv4 Don't Fragment bit on a socket.
 #[cfg(target_os = "linux")]
-pub fn set_dont_fragment(fd: i32) -> Result<()> {
+pub fn set_dont_fragment(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
     use nix::sys::socket;
-    let borrowed = borrow_fd(fd);
-    socket::setsockopt(
-        &borrowed,
-        custom_sockopt::IpMtuDiscover,
-        &libc::IP_PMTUDISC_DO,
-    )
-    .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn set_dont_fragment(_fd: i32) -> Result<()> {
-    Ok(()) // Not supported on this platform
-}
-
-/// Set SO_MAX_PACING_RATE for FQ-based socket pacing (Linux only).
-#[cfg(target_os = "linux")]
-pub fn set_fq_rate(fd: i32, rate_bits_per_sec: u64) -> Result<()> {
-    use nix::sys::socket;
-    let borrowed = borrow_fd(fd);
-    let rate_bytes = (rate_bits_per_sec / 8) as u32;
-    socket::setsockopt(&borrowed, custom_sockopt::MaxPacingRate, &rate_bytes)
+    socket::setsockopt(fd, custom_sockopt::IpMtuDiscover, &libc::IP_PMTUDISC_DO)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_fq_rate(_fd: i32, _rate: u64) -> Result<()> {
+pub fn set_dont_fragment<F>(_fd: &F) -> Result<()> {
+    Ok(())
+}
+
+/// Set SO_MAX_PACING_RATE for FQ-based socket pacing (Linux only).
+#[cfg(target_os = "linux")]
+pub fn set_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) -> Result<()> {
+    use nix::sys::socket;
+    let rate_bytes = (rate_bits_per_sec / 8) as u32;
+    socket::setsockopt(fd, custom_sockopt::MaxPacingRate, &rate_bytes)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_fq_rate<F>(_fd: &F, _rate: u64) -> Result<()> {
     Ok(())
 }
 
 /// Bind socket to a specific network device (SO_BINDTODEVICE, Linux only).
 /// Unprivileged on Linux 5.7+ for sockets the caller owns.
 #[cfg(target_os = "linux")]
-pub fn set_bind_dev(fd: i32, dev: &str) -> Result<()> {
+pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use std::ffi::OsString;
-    let borrowed = borrow_fd(fd);
-    socket::setsockopt(&borrowed, sockopt::BindToDevice, &OsString::from(dev))
+    socket::setsockopt(fd, sockopt::BindToDevice, &OsString::from(dev))
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_bind_dev(_fd: i32, _dev: &str) -> Result<()> {
+pub fn set_bind_dev<F>(_fd: &F, _dev: &str) -> Result<()> {
     Ok(())
 }
 
 /// Set TCP keepalive options on a socket.
 #[cfg(target_os = "linux")]
 pub fn set_tcp_keepalive(
-    fd: i32,
+    fd: &impl std::os::unix::io::AsFd,
     idle: Option<u32>,
     interval: Option<u32>,
     count: Option<u32>,
 ) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
-    let borrowed = borrow_fd(fd);
-    let _ = socket::setsockopt(&borrowed, sockopt::KeepAlive, &true);
+    let _ = socket::setsockopt(fd, sockopt::KeepAlive, &true);
     if let Some(val) = idle {
-        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepIdle, &val);
+        let _ = socket::setsockopt(fd, sockopt::TcpKeepIdle, &val);
     }
     if let Some(val) = interval {
-        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepInterval, &val);
+        let _ = socket::setsockopt(fd, sockopt::TcpKeepInterval, &val);
     }
     if let Some(val) = count {
-        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepCount, &val);
+        let _ = socket::setsockopt(fd, sockopt::TcpKeepCount, &val);
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_tcp_keepalive(
-    _fd: i32,
+pub fn set_tcp_keepalive<F>(
+    _fd: &F,
     _idle: Option<u32>,
     _interval: Option<u32>,
     _count: Option<u32>,
@@ -417,47 +392,43 @@ pub fn set_cpu_affinity(_core: usize) -> Result<()> {
 
 /// Set IPv6 flow label on a socket (Linux only).
 #[cfg(target_os = "linux")]
-pub fn set_ipv6_flowlabel(fd: i32, label: i32) -> Result<()> {
+pub fn set_ipv6_flowlabel(fd: &impl std::os::unix::io::AsFd, label: i32) -> Result<()> {
     use nix::sys::socket;
-    let borrowed = borrow_fd(fd);
-    if let Err(e) = socket::setsockopt(&borrowed, custom_sockopt::Ipv6FlowInfoSend, &label) {
-        // Flowlabel may require special kernel config; don't fail hard
+    if let Err(e) = socket::setsockopt(fd, custom_sockopt::Ipv6FlowInfoSend, &label) {
         log::debug!("IPV6_FLOWINFO_SEND failed: {e}");
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_ipv6_flowlabel(_fd: i32, _label: i32) -> Result<()> {
+pub fn set_ipv6_flowlabel<F>(_fd: &F, _label: i32) -> Result<()> {
     Ok(())
 }
 
 /// Enable UDP GSO (Generic Segmentation Offload) on a UDP socket.
 /// Sets UDP_SEGMENT to the datagram size so the kernel can batch sends.
 #[cfg(target_os = "linux")]
-pub fn set_udp_gso(fd: i32, segment_size: u16) -> Result<()> {
+pub fn set_udp_gso(fd: &impl std::os::unix::io::AsFd, segment_size: u16) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
-    let borrowed = borrow_fd(fd);
-    socket::setsockopt(&borrowed, sockopt::UdpGsoSegment, &(segment_size as i32))
+    socket::setsockopt(fd, sockopt::UdpGsoSegment, &(segment_size as i32))
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_udp_gso(_fd: i32, _segment_size: u16) -> Result<()> {
+pub fn set_udp_gso<F>(_fd: &F, _segment_size: u16) -> Result<()> {
     Ok(())
 }
 
 /// Enable UDP GRO (Generic Receive Offload) on a UDP socket.
 #[cfg(target_os = "linux")]
-pub fn set_udp_gro(fd: i32) -> Result<()> {
+pub fn set_udp_gro(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
-    let borrowed = borrow_fd(fd);
-    socket::setsockopt(&borrowed, sockopt::UdpGroSegment, &true)
+    socket::setsockopt(fd, sockopt::UdpGroSegment, &true)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_udp_gro(_fd: i32) -> Result<()> {
+pub fn set_udp_gro<F>(_fd: &F) -> Result<()> {
     Ok(())
 }
 
@@ -551,10 +522,8 @@ mod tests {
     #[test]
     fn tcp_keepalive_readback() {
         use nix::sys::socket::{self, sockopt};
-        use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = socket.as_raw_fd();
-        set_tcp_keepalive(fd, Some(10), Some(5), Some(3)).unwrap();
+        set_tcp_keepalive(&socket, Some(10), Some(5), Some(3)).unwrap();
         let enabled = socket::getsockopt(&socket, sockopt::KeepAlive).unwrap();
         assert!(enabled, "SO_KEEPALIVE should be enabled");
     }
@@ -563,10 +532,8 @@ mod tests {
     #[test]
     fn rcv_timeout_readback() {
         use nix::sys::socket::{self, sockopt};
-        use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = socket.as_raw_fd();
-        set_rcv_timeout(fd, 5000).unwrap(); // 5 seconds
+        set_rcv_timeout(&socket, 5000).unwrap(); // 5 seconds
         let tv = socket::getsockopt(&socket, sockopt::ReceiveTimeout).unwrap();
         assert_eq!(tv.tv_sec(), 5, "SO_RCVTIMEO should be 5 seconds");
     }
@@ -575,10 +542,8 @@ mod tests {
     #[test]
     fn dont_fragment_readback() {
         use nix::sys::socket;
-        use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = socket.as_raw_fd();
-        set_dont_fragment(fd).unwrap();
+        set_dont_fragment(&socket).unwrap();
         let val = socket::getsockopt(&socket, custom_sockopt::IpMtuDiscover).unwrap();
         assert_eq!(val, libc::IP_PMTUDISC_DO, "IP_MTU_DISCOVER should be DO");
     }
@@ -586,9 +551,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn set_bind_dev_loopback() {
-        use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let result = set_bind_dev(socket.as_raw_fd(), "lo");
+        let result = set_bind_dev(&socket, "lo");
         // Succeeds on Linux 5.7+ (unprivileged SO_BINDTODEVICE)
         // May fail with EPERM on older kernels — acceptable
         if let Err(ref e) = result {

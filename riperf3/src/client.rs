@@ -86,17 +86,13 @@ impl Client {
         .await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
-        // Apply control connection options (Unix only — requires raw fd access)
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            if let Some(ref dev) = self.bind_dev {
-                net::set_bind_dev(ctrl.as_raw_fd(), dev)?;
-            }
-            if let Some(ref spec) = self.cntl_ka {
-                let (idle, intv, cnt) = parse_keepalive(spec);
-                net::set_tcp_keepalive(ctrl.as_raw_fd(), idle, intv, cnt)?;
-            }
+        // Apply control connection options
+        if let Some(ref dev) = self.bind_dev {
+            net::set_bind_dev(&ctrl, dev)?;
+        }
+        if let Some(ref spec) = self.cntl_ka {
+            let (idle, intv, cnt) = parse_keepalive(spec);
+            net::set_tcp_keepalive(&ctrl, idle, intv, cnt)?;
         }
 
         protocol::send_cookie(&mut ctrl, &cookie).await?;
@@ -275,29 +271,31 @@ impl Client {
                         self.window,
                         self.congestion.as_deref(),
                     )?;
+                    // Apply socket options (no-ops on non-Linux)
+                    if self.dont_fragment {
+                        net::set_dont_fragment(&data_stream)?;
+                    }
+                    if let Some(rate) = self.fq_rate {
+                        net::set_fq_rate(&data_stream, rate)?;
+                    }
+                    if let Some(ms) = self.rcv_timeout {
+                        net::set_rcv_timeout(&data_stream, ms)?;
+                    }
+                    if let Some(ms) = self.snd_timeout {
+                        net::set_snd_timeout(&data_stream, ms)?;
+                    }
+                    if let Some(label) = self.flowlabel {
+                        net::set_ipv6_flowlabel(&data_stream, label)?;
+                    }
+                    if let Some(ref dev) = self.bind_dev {
+                        net::set_bind_dev(&data_stream, dev)?;
+                    }
+
+                    // Extract raw fd for TCP_INFO (Unix only)
                     #[cfg(unix)]
                     let raw_fd = {
                         use std::os::unix::io::AsRawFd;
-                        let fd = data_stream.as_raw_fd();
-                        if self.dont_fragment {
-                            net::set_dont_fragment(fd)?;
-                        }
-                        if let Some(rate) = self.fq_rate {
-                            net::set_fq_rate(fd, rate)?;
-                        }
-                        if let Some(ms) = self.rcv_timeout {
-                            net::set_rcv_timeout(fd, ms)?;
-                        }
-                        if let Some(ms) = self.snd_timeout {
-                            net::set_snd_timeout(fd, ms)?;
-                        }
-                        if let Some(label) = self.flowlabel {
-                            net::set_ipv6_flowlabel(fd, label)?;
-                        }
-                        if let Some(ref dev) = self.bind_dev {
-                            net::set_bind_dev(fd, dev)?;
-                        }
-                        Some(fd)
+                        Some(data_stream.as_raw_fd())
                     };
                     #[cfg(not(unix))]
                     let raw_fd: Option<i32> = None;
@@ -350,25 +348,18 @@ impl Client {
                 for i in 0..total {
                     let is_ipv6 = self.host.contains(':');
                     let udp_sock = net::udp_bind(None, 0, is_ipv6).await?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::io::AsRawFd;
-                        if let Some(ref dev) = self.bind_dev {
-                            net::set_bind_dev(udp_sock.as_raw_fd(), dev)?;
-                        }
+                    if let Some(ref dev) = self.bind_dev {
+                        net::set_bind_dev(&udp_sock, dev)?;
                     }
                     udp_sock
                         .connect(net::format_addr(&self.host, self.port))
                         .await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
-                    // Apply GSO/GRO if requested
-                    #[cfg(unix)]
+                    // Apply GSO/GRO if requested (no-ops on non-Linux)
                     if self.gsro {
-                        use std::os::unix::io::AsRawFd;
-                        let fd = udp_sock.as_raw_fd();
-                        let _ = net::set_udp_gso(fd, self.blksize as u16);
-                        let _ = net::set_udp_gro(fd);
+                        let _ = net::set_udp_gso(&udp_sock, self.blksize as u16);
+                        let _ = net::set_udp_gro(&udp_sock);
                     }
 
                     let stream_id = iperf3_stream_id(i);
