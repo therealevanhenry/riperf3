@@ -239,7 +239,22 @@ pub fn configure_tcp_stream_full(
         if let Some(mss_val) = mss {
             let _ = sock.set_mss(mss_val as u32);
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        if let Some(mss_val) = mss {
+            use std::os::windows::io::{AsRawSocket, AsSocket};
+            let raw = stream.as_socket().as_raw_socket();
+            // SAFETY: setsockopt on a valid socket with TCP_MAXSEG.
+            unsafe {
+                windows_sys::Win32::Networking::WinSock::setsockopt(
+                    raw as usize,
+                    windows_sys::Win32::Networking::WinSock::IPPROTO_TCP as i32,
+                    windows_sys::Win32::Networking::WinSock::TCP_MAXSEG as i32,
+                    &(mss_val as i32) as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = mss;
 
         if let Some(size) = window {
@@ -335,7 +350,28 @@ pub fn set_dont_fragment(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+#[cfg(windows)]
+pub fn set_dont_fragment(fd: &impl std::os::windows::io::AsSocket) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    let raw = fd.as_socket().as_raw_socket();
+    let val: i32 = 1;
+    // SAFETY: setsockopt on a valid socket with IP_DONTFRAGMENT.
+    let ret = unsafe {
+        windows_sys::Win32::Networking::WinSock::setsockopt(
+            raw as usize,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
+            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT as i32,
+            &val as *const i32 as *const u8,
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if ret != 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn set_dont_fragment<F>(_fd: &F) -> Result<()> {
     Ok(())
 }
@@ -441,7 +477,27 @@ pub fn set_cpu_affinity(core: usize) -> Result<()> {
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(windows)]
+pub fn set_cpu_affinity(core: usize) -> Result<()> {
+    if core >= usize::BITS as usize {
+        return Err(RiperfError::Protocol("core index too large".into()));
+    }
+    let mask: usize = 1 << core;
+    // SAFETY: GetCurrentThread returns a pseudo-handle (always valid).
+    // SetThreadAffinityMask is safe with a valid thread handle and mask.
+    let prev = unsafe {
+        windows_sys::Win32::System::Threading::SetThreadAffinityMask(
+            windows_sys::Win32::System::Threading::GetCurrentThread(),
+            mask,
+        )
+    };
+    if prev == 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
 pub fn set_cpu_affinity(_core: usize) -> Result<()> {
     Ok(())
 }
@@ -496,7 +552,14 @@ pub fn set_tos(fd: &impl std::os::unix::io::AsFd, tos: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn set_tos(fd: &impl std::os::windows::io::AsSocket, tos: u32) -> Result<()> {
+    let sock = socket2::SockRef::from(fd);
+    sock.set_tos(tos)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn set_tos<F>(_fd: &F, _tos: u32) -> Result<()> {
     Ok(())
 }

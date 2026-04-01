@@ -809,6 +809,7 @@ dependencies = [
  "socket2",
  "thiserror 2.0.3",
  "tokio",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
