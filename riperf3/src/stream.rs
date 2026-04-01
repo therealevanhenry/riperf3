@@ -599,8 +599,12 @@ pub async fn run_udp_receiver(
 // ---------------------------------------------------------------------------
 
 /// High-performance UDP sender using blocking I/O on a dedicated OS thread.
-/// No `unsafe` code — uses `std::net::UdpSocket` and `std::thread::sleep`
-/// with a spin-loop for sub-microsecond pacing precision.
+/// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
+/// `std::thread::sleep` + spin-loop for sub-microsecond precision.
+///
+/// Batch pacing: sends N packets in a tight loop, then does a single clock
+/// check and sleep/spin for the aggregate interval. This amortizes the cost
+/// of `Instant::now()` (~50ns) and atomic operations across multiple packets.
 pub fn run_udp_sender_blocking(
     socket: std::net::UdpSocket,
     counters: Arc<StreamCounters>,
@@ -611,42 +615,73 @@ pub fn run_udp_sender_blocking(
 ) -> Result<()> {
     let mut buf = vec![0u8; blksize];
     let mut seq: u64 = 0;
-    let inter_packet = if rate_bits_per_sec > 0 {
+
+    // Batch size scales with rate: 1 per Gbps, capped at 64, minimum 1
+    let batch_size: u32 = if rate_bits_per_sec > 0 {
+        (rate_bits_per_sec / 1_000_000_000).clamp(1, 64) as u32
+    } else {
+        1
+    };
+
+    let pacing = if rate_bits_per_sec > 0 {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
-        Some(Duration::from_secs_f64(blksize as f64 / rate_bytes))
+        let per_packet = Duration::from_secs_f64(blksize as f64 / rate_bytes);
+        Some(per_packet * batch_size)
     } else {
         None
     };
+
     let mut next_send = Instant::now();
 
     while !done.load(Ordering::Relaxed) {
-        seq += 1;
-        UdpHeader::new(seq).write_to(&mut buf, use_64bit);
+        // Cache timestamp once per batch (sufficient for jitter calculation)
+        let cached_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let cached_sec = cached_time.as_secs() as u32;
+        let cached_usec = cached_time.subsec_micros();
 
-        match socket.send(&buf) {
-            Ok(n) => counters.record_sent(n as u64),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                seq -= 1;
-                continue;
-            }
-            Err(e) => {
-                log::debug!("UDP send error: {e}");
-                seq -= 1;
+        let mut batch_bytes: u64 = 0;
+
+        for _ in 0..batch_size {
+            seq += 1;
+            let header = UdpHeader {
+                sec: cached_sec,
+                usec: cached_usec,
+                seq,
+            };
+            header.write_to(&mut buf, use_64bit);
+
+            match socket.send(&buf) {
+                Ok(n) => batch_bytes += n as u64,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    seq -= 1;
+                    break;
+                }
+                Err(e) => {
+                    log::debug!("UDP send error: {e}");
+                    seq -= 1;
+                }
             }
         }
 
-        if let Some(interval) = inter_packet {
-            next_send += interval;
+        counters.record_sent(batch_bytes);
+
+        // Rate pacing: one clock check per batch
+        if let Some(batch_interval) = pacing {
+            next_send += batch_interval;
             let now = Instant::now();
             if next_send > now {
                 let remaining = next_send - now;
-                if remaining > Duration::from_micros(100) {
-                    std::thread::sleep(remaining - Duration::from_micros(50));
+                if remaining > Duration::from_micros(50) {
+                    std::thread::sleep(remaining - Duration::from_micros(20));
                 }
                 while Instant::now() < next_send {
                     std::hint::spin_loop();
                 }
             }
+            // If behind schedule, next_send stays in the past — sends
+            // immediately until caught up (no accumulating debt)
         }
     }
     Ok(())
