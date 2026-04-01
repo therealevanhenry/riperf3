@@ -1,4 +1,3 @@
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -92,9 +91,15 @@ pub struct Server {
 impl Server {
     pub async fn run(&self) -> Result<()> {
         if self.daemon {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             nix::unistd::daemon(false, false)
                 .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(RiperfError::Protocol(
+                    "daemon mode is not supported on this platform".into(),
+                ));
+            }
         }
 
         let listener = net::tcp_listen(self.bind_address.as_deref(), self.port, None).await?;
@@ -231,7 +236,13 @@ impl Server {
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
-                    let raw_fd = data_stream.as_raw_fd();
+                    #[cfg(unix)]
+                    let raw_fd = {
+                        use std::os::unix::io::AsRawFd;
+                        Some(data_stream.as_raw_fd())
+                    };
+                    #[cfg(not(unix))]
+                    let raw_fd: Option<i32> = None;
                     let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
                     let task = if is_sender {
@@ -256,7 +267,7 @@ impl Server {
                         counters,
                         udp_recv_stats: None,
                         task,
-                        raw_fd: Some(raw_fd),
+                        raw_fd,
                     });
                 }
             }
@@ -675,6 +686,13 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
+        #[cfg(not(unix))]
+        if self.daemon {
+            return Err(ConfigError::Unsupported(
+                "daemon mode is not supported on this platform".into(),
+            ));
+        }
+
         Ok(Server {
             port: self.port.unwrap_or(DEFAULT_PORT),
             one_off: self.one_off,

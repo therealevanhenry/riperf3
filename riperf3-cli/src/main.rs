@@ -23,12 +23,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Redirect stdout to logfile if requested
     if let Some(ref path) = cli.logfile {
-        use std::fs::OpenOptions;
-        use std::os::unix::io::{AsRawFd, IntoRawFd};
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let fd = file.into_raw_fd();
-        nix::unistd::dup2(fd, std::io::stdout().as_raw_fd())?;
-        nix::unistd::close(fd)?;
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::io::{AsRawFd, IntoRawFd};
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            let fd = file.into_raw_fd();
+            nix::unistd::dup2(fd, std::io::stdout().as_raw_fd())?;
+            nix::unistd::close(fd)?;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("warning: --logfile uses dup2 and is not supported on this platform");
+            let _ = path;
+        }
     }
 
     // Set CPU affinity BEFORE building the tokio runtime so worker threads

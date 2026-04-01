@@ -352,13 +352,10 @@ pub async fn run_tcp_sender_zerocopy(
     done: Arc<AtomicBool>,
 ) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::io::AsRawFd;
 
     // Create temp file with buffer content
     let mut tmpfile = tempfile()?;
     tmpfile.write_all(&buf)?;
-    let file_fd = tmpfile.as_raw_fd();
-    let sock_fd = stream.as_raw_fd();
     let blksize = buf.len();
 
     loop {
@@ -371,14 +368,8 @@ pub async fn run_tcp_sender_zerocopy(
 
         let result = stream.try_io(tokio::io::Interest::WRITABLE, || {
             let mut offset: libc::off_t = 0;
-            let sent = unsafe {
-                libc::sendfile(sock_fd, file_fd, &mut offset, blksize)
-            };
-            if sent < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(sent as usize)
-            }
+            nix::sys::sendfile::sendfile(&stream, &tmpfile, Some(&mut offset), blksize)
+                .map_err(std::io::Error::from)
         });
 
         match result {
@@ -454,19 +445,8 @@ pub async fn run_tcp_receiver(
                 }
                 stream.readable().await?;
                 let n = stream.try_io(tokio::io::Interest::READABLE, || {
-                    let ret = unsafe {
-                        libc::recv(
-                            fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            blksize,
-                            libc::MSG_TRUNC,
-                        )
-                    };
-                    if ret < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(ret as usize)
-                    }
+                    nix::sys::socket::recv(fd, &mut buf, nix::sys::socket::MsgFlags::MSG_TRUNC)
+                        .map_err(std::io::Error::from)
                 });
                 match n {
                     Ok(0) => break,
@@ -483,7 +463,7 @@ pub async fn run_tcp_receiver(
             return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await;
         }
     } else {
-        return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await;
+        run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await?;
     }
     Ok(())
 }

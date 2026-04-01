@@ -1,7 +1,5 @@
 use std::time::Instant;
 
-use nix::sys::resource::{getrusage, UsageWho};
-
 /// A snapshot of process resource usage for computing CPU utilization.
 #[derive(Clone)]
 pub struct CpuSnapshot {
@@ -13,21 +11,34 @@ pub struct CpuSnapshot {
 impl CpuSnapshot {
     /// Take a snapshot of current wall time and process CPU usage.
     pub fn now() -> Self {
-        match getrusage(UsageWho::RUSAGE_SELF) {
-            Ok(usage) => {
-                let user = usage.user_time();
-                let system = usage.system_time();
-                Self {
-                    wall_time: Instant::now(),
-                    user_usec: user.tv_sec() * 1_000_000 + user.tv_usec(),
-                    system_usec: system.tv_sec() * 1_000_000 + system.tv_usec(),
+        #[cfg(unix)]
+        {
+            use nix::sys::resource::{getrusage, UsageWho};
+            match getrusage(UsageWho::RUSAGE_SELF) {
+                Ok(usage) => {
+                    let user = usage.user_time();
+                    let system = usage.system_time();
+                    #[allow(clippy::useless_conversion)] // tv_sec/tv_usec return i32 on macOS, i64 on Linux
+                    Self {
+                        wall_time: Instant::now(),
+                        user_usec: i64::from(user.tv_sec()) * 1_000_000 + i64::from(user.tv_usec()),
+                        system_usec: i64::from(system.tv_sec()) * 1_000_000 + i64::from(system.tv_usec()),
+                    }
                 }
+                Err(_) => Self {
+                    wall_time: Instant::now(),
+                    user_usec: 0,
+                    system_usec: 0,
+                },
             }
-            Err(_) => Self {
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
                 wall_time: Instant::now(),
                 user_usec: 0,
                 system_usec: 0,
-            },
+            }
         }
     }
 

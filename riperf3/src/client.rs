@@ -1,4 +1,3 @@
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -84,7 +83,8 @@ impl Client {
         let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None, self.mptcp).await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
-        // Apply control connection options
+        // Apply control connection options (Unix only — requires raw fd access)
+        #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             if let Some(ref dev) = self.bind_dev {
@@ -253,25 +253,32 @@ impl Client {
                         self.window,
                         self.congestion.as_deref(),
                     )?;
-                    let raw_fd = data_stream.as_raw_fd();
-                    if self.dont_fragment {
-                        net::set_dont_fragment(raw_fd)?;
-                    }
-                    if let Some(rate) = self.fq_rate {
-                        net::set_fq_rate(raw_fd, rate)?;
-                    }
-                    if let Some(ms) = self.rcv_timeout {
-                        net::set_rcv_timeout(raw_fd, ms)?;
-                    }
-                    if let Some(ms) = self.snd_timeout {
-                        net::set_snd_timeout(raw_fd, ms)?;
-                    }
-                    if let Some(label) = self.flowlabel {
-                        net::set_ipv6_flowlabel(raw_fd, label)?;
-                    }
-                    if let Some(ref dev) = self.bind_dev {
-                        net::set_bind_dev(raw_fd, dev)?;
-                    }
+                    #[cfg(unix)]
+                    let raw_fd = {
+                        use std::os::unix::io::AsRawFd;
+                        let fd = data_stream.as_raw_fd();
+                        if self.dont_fragment {
+                            net::set_dont_fragment(fd)?;
+                        }
+                        if let Some(rate) = self.fq_rate {
+                            net::set_fq_rate(fd, rate)?;
+                        }
+                        if let Some(ms) = self.rcv_timeout {
+                            net::set_rcv_timeout(fd, ms)?;
+                        }
+                        if let Some(ms) = self.snd_timeout {
+                            net::set_snd_timeout(fd, ms)?;
+                        }
+                        if let Some(label) = self.flowlabel {
+                            net::set_ipv6_flowlabel(fd, label)?;
+                        }
+                        if let Some(ref dev) = self.bind_dev {
+                            net::set_bind_dev(fd, dev)?;
+                        }
+                        Some(fd)
+                    };
+                    #[cfg(not(unix))]
+                    let raw_fd: Option<i32> = None;
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
@@ -309,7 +316,7 @@ impl Client {
                         counters,
                         udp_recv_stats: None,
                         task,
-                        raw_fd: Some(raw_fd),
+                        raw_fd,
                     });
                 }
             }
@@ -317,9 +324,12 @@ impl Client {
                 for i in 0..total {
                     let is_ipv6 = self.host.contains(':');
                     let udp_sock = net::udp_bind(None, 0, is_ipv6).await?;
-                    if let Some(ref dev) = self.bind_dev {
+                    #[cfg(unix)]
+                    {
                         use std::os::unix::io::AsRawFd;
-                        net::set_bind_dev(udp_sock.as_raw_fd(), dev)?;
+                        if let Some(ref dev) = self.bind_dev {
+                            net::set_bind_dev(udp_sock.as_raw_fd(), dev)?;
+                        }
                     }
                     udp_sock
                         .connect(net::format_addr(&self.host, self.port))
@@ -327,10 +337,10 @@ impl Client {
                     protocol::udp_connect_client(&udp_sock).await?;
 
                     // Apply GSO/GRO if requested
+                    #[cfg(unix)]
                     if self.gsro {
                         use std::os::unix::io::AsRawFd;
                         let fd = udp_sock.as_raw_fd();
-                        // GSO on sender, GRO on receiver
                         let _ = net::set_udp_gso(fd, self.blksize as u16);
                         let _ = net::set_udp_gro(fd);
                     }
@@ -1139,6 +1149,37 @@ impl ClientBuilder {
 
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
+
+        // Reject flags that require OS support not available on this platform.
+        // Matches iperf3 behavior: error at build/parse time, not at runtime.
+        #[cfg(not(unix))]
+        {
+            if self.zerocopy {
+                return Err(ConfigError::Unsupported(
+                    "this OS does not support sendfile".into(),
+                ));
+            }
+            if self.affinity.is_some() {
+                return Err(ConfigError::Unsupported(
+                    "CPU affinity is not supported on this platform".into(),
+                ));
+            }
+            if self.bind_dev.is_some() {
+                return Err(ConfigError::Unsupported(
+                    "SO_BINDTODEVICE is not supported on this platform".into(),
+                ));
+            }
+            if self.congestion.is_some() {
+                return Err(ConfigError::Unsupported(
+                    "TCP congestion control is not supported on this platform".into(),
+                ));
+            }
+            if self.gsro {
+                return Err(ConfigError::Unsupported(
+                    "UDP GSO/GRO is not supported on this platform".into(),
+                ));
+            }
+        }
 
         let default_blksize = match self.protocol {
             TransportProtocol::Tcp => DEFAULT_TCP_BLKSIZE,

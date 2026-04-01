@@ -24,24 +24,25 @@ pub struct TcpInfoSnapshot {
 pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     use std::mem::{self, MaybeUninit};
 
-    let mut info = MaybeUninit::<libc::tcp_info>::uninit();
-    let mut len = mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-
-    let ret = unsafe {
-        libc::getsockopt(
+    // SAFETY: getsockopt(TCP_INFO) is a read-only kernel query on a valid fd.
+    // MaybeUninit is fully initialized by getsockopt on success (ret >= 0).
+    // No nix wrapper exists for TCP_INFO — this is the minimal unsafe surface.
+    let info = unsafe {
+        let mut info = MaybeUninit::<libc::tcp_info>::uninit();
+        let mut len = mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let ret = libc::getsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_INFO,
             info.as_mut_ptr() as *mut libc::c_void,
             &mut len,
-        )
+        );
+        if ret < 0 {
+            return None;
+        }
+        info.assume_init()
     };
 
-    if ret < 0 {
-        return None;
-    }
-
-    let info = unsafe { info.assume_init() };
     Some(TcpInfoSnapshot {
         total_retransmits: info.tcpi_total_retrans,
         snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,

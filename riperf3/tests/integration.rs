@@ -385,21 +385,9 @@ async fn cpu_affinity_applied() {
     // Set affinity to CPU 0 on the current thread and verify
     set_cpu_affinity(0).unwrap();
 
-    unsafe {
-        let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init();
-        let ret = libc::sched_getaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &mut cpuset,
-        );
-        assert_eq!(ret, 0);
-        assert!(libc::CPU_ISSET(0, &cpuset));
-        // Verify we're NOT set on CPU 1 (unless machine only has 1 core)
-        let nproc = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
-        if nproc > 1 {
-            assert!(!libc::CPU_ISSET(1, &cpuset));
-        }
-    }
+    let cpuset = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+    assert!(cpuset.is_set(0).unwrap(), "CPU 0 should be in affinity set");
+    assert!(!cpuset.is_set(1).unwrap_or(false), "CPU 1 should NOT be set after pinning to CPU 0");
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,11 +1308,8 @@ mod implemented_flag_tests {
         // Verify set_cpu_affinity actually works via getaffinity readback
         use riperf3::net::set_cpu_affinity;
         set_cpu_affinity(0).unwrap();
-        unsafe {
-            let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init();
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpuset);
-            assert!(libc::CPU_ISSET(0, &cpuset));
-        }
+        let cpuset = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        assert!(cpuset.is_set(0).unwrap());
     }
 
     #[tokio::test]

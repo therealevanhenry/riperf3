@@ -11,6 +11,9 @@ pub enum ConfigError {
 
     #[error("invalid value for {0}: {1}")]
     InvalidValue(&'static str, String),
+
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Runtime errors covering I/O, protocol, and JSON failures.

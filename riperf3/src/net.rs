@@ -7,6 +7,118 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use crate::error::{Result, RiperfError};
 
 // ---------------------------------------------------------------------------
+// Raw fd helper
+// ---------------------------------------------------------------------------
+
+/// Wrap a raw file descriptor as a `BorrowedFd` for use with nix safe APIs.
+///
+/// This is a private helper — all call sites in this module obtain `fd` from
+/// live socket/stream objects that remain open for the duration of use.
+#[cfg(target_os = "linux")]
+fn borrow_fd(fd: i32) -> std::os::unix::io::BorrowedFd<'static> {
+    // SAFETY: All callers extract fd from valid, open socket objects and use
+    // the BorrowedFd only within the same function scope.
+    unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) }
+}
+
+// ---------------------------------------------------------------------------
+// Custom socket options not wrapped by nix
+// ---------------------------------------------------------------------------
+
+/// Custom socket option types for Linux-specific options that nix doesn't expose.
+/// Each impl contains a single unsafe block for the libc::setsockopt call;
+/// the public API via `nix::sys::socket::setsockopt()` remains safe.
+#[cfg(target_os = "linux")]
+mod custom_sockopt {
+    use nix::sys::socket::{GetSockOpt, SetSockOpt};
+    use std::os::fd::AsFd;
+
+    /// SO_MAX_PACING_RATE — FQ-based socket pacing.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MaxPacingRate;
+
+    impl SetSockOpt for MaxPacingRate {
+        type Val = u32;
+        fn set<F: AsFd>(&self, fd: &F, val: &u32) -> nix::Result<()> {
+            // SAFETY: setsockopt on a valid fd with correct level/optname/size.
+            unsafe {
+                let res = libc::setsockopt(
+                    fd.as_fd().as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_MAX_PACING_RATE,
+                    val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                );
+                nix::errno::Errno::result(res).map(drop)
+            }
+        }
+    }
+
+    /// IP_MTU_DISCOVER — path MTU discovery mode.
+    #[derive(Clone, Copy, Debug)]
+    pub struct IpMtuDiscover;
+
+    impl SetSockOpt for IpMtuDiscover {
+        type Val = libc::c_int;
+        fn set<F: AsFd>(&self, fd: &F, val: &libc::c_int) -> nix::Result<()> {
+            // SAFETY: setsockopt on a valid fd with correct level/optname/size.
+            unsafe {
+                let res = libc::setsockopt(
+                    fd.as_fd().as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_MTU_DISCOVER,
+                    val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                nix::errno::Errno::result(res).map(drop)
+            }
+        }
+    }
+
+    impl GetSockOpt for IpMtuDiscover {
+        type Val = libc::c_int;
+        fn get<F: AsFd>(&self, fd: &F) -> nix::Result<libc::c_int> {
+            // SAFETY: getsockopt on a valid fd with correct level/optname/size.
+            unsafe {
+                let mut val: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                let res = libc::getsockopt(
+                    fd.as_fd().as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_MTU_DISCOVER,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                );
+                nix::errno::Errno::result(res).map(|_| val)
+            }
+        }
+    }
+
+    /// IPV6_FLOWINFO_SEND — enable sending IPv6 flow label.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Ipv6FlowInfoSend;
+
+    impl SetSockOpt for Ipv6FlowInfoSend {
+        type Val = libc::c_int;
+        fn set<F: AsFd>(&self, fd: &F, val: &libc::c_int) -> nix::Result<()> {
+            // SAFETY: setsockopt on a valid fd with correct level/optname/size.
+            unsafe {
+                let res = libc::setsockopt(
+                    fd.as_fd().as_raw_fd(),
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_FLOWINFO_SEND,
+                    val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                nix::errno::Errno::result(res).map(drop)
+            }
+        }
+    }
+
+    use std::os::fd::AsRawFd;
+}
+
+// ---------------------------------------------------------------------------
 // TCP
 // ---------------------------------------------------------------------------
 
@@ -130,55 +242,26 @@ pub fn configure_tcp_stream_full(
 ) -> Result<()> {
     stream.set_nodelay(no_delay)?;
 
+    // Suppress unused-variable warnings on non-Linux where these are no-ops
+    #[cfg(not(target_os = "linux"))]
+    let _ = (mss, window, congestion);
+
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
+        use nix::sys::socket::{self, sockopt};
+        use std::ffi::OsString;
 
         if let Some(mss_val) = mss {
-            unsafe {
-                let val = mss_val as libc::c_int;
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_MAXSEG,
-                    &val as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+            let _ = socket::setsockopt(stream, sockopt::TcpMaxSeg, &(mss_val as u32));
         }
 
         if let Some(size) = window {
-            let size = size as libc::c_int;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    &size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    &size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+            let _ = socket::setsockopt(stream, sockopt::RcvBuf, &(size as usize));
+            let _ = socket::setsockopt(stream, sockopt::SndBuf, &(size as usize));
         }
 
         if let Some(algo) = congestion {
-            let algo_bytes = algo.as_bytes();
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_TCP,
-                    libc::TCP_CONGESTION,
-                    algo_bytes.as_ptr() as *const libc::c_void,
-                    algo_bytes.len() as libc::socklen_t,
-                );
-            }
+            let _ = socket::setsockopt(stream, sockopt::TcpCongestion, &OsString::from(algo));
         }
     }
 
@@ -201,23 +284,12 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<
 /// Set SO_RCVTIMEO on a socket (receive timeout in milliseconds).
 #[cfg(target_os = "linux")]
 pub fn set_rcv_timeout(fd: i32, ms: u64) -> Result<()> {
-    let tv = libc::timeval {
-        tv_sec: (ms / 1000) as libc::time_t,
-        tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t,
-    };
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket::{self, sockopt};
+    use nix::sys::time::TimeVal;
+    let borrowed = borrow_fd(fd);
+    let tv = TimeVal::new((ms / 1000) as i64, ((ms % 1000) * 1000) as i64);
+    socket::setsockopt(&borrowed, sockopt::ReceiveTimeout, &tv)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -228,20 +300,10 @@ pub fn set_rcv_timeout(_fd: i32, _ms: u64) -> Result<()> {
 /// Set TCP_USER_TIMEOUT on a socket (send timeout in milliseconds).
 #[cfg(target_os = "linux")]
 pub fn set_snd_timeout(fd: i32, ms: u64) -> Result<()> {
-    let val = ms as libc::c_uint;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_USER_TIMEOUT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket::{self, sockopt};
+    let borrowed = borrow_fd(fd);
+    socket::setsockopt(&borrowed, sockopt::TcpUserTimeout, &(ms as u32))
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -252,20 +314,10 @@ pub fn set_snd_timeout(_fd: i32, _ms: u64) -> Result<()> {
 /// Set the IPv4 Don't Fragment bit on a socket.
 #[cfg(target_os = "linux")]
 pub fn set_dont_fragment(fd: i32) -> Result<()> {
-    let val: libc::c_int = libc::IP_PMTUDISC_DO;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_MTU_DISCOVER,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket;
+    let borrowed = borrow_fd(fd);
+    socket::setsockopt(&borrowed, custom_sockopt::IpMtuDiscover, &libc::IP_PMTUDISC_DO)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -276,20 +328,11 @@ pub fn set_dont_fragment(_fd: i32) -> Result<()> {
 /// Set SO_MAX_PACING_RATE for FQ-based socket pacing (Linux only).
 #[cfg(target_os = "linux")]
 pub fn set_fq_rate(fd: i32, rate_bits_per_sec: u64) -> Result<()> {
-    let rate_bytes = (rate_bits_per_sec / 8) as libc::c_uint;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MAX_PACING_RATE,
-            &rate_bytes as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket;
+    let borrowed = borrow_fd(fd);
+    let rate_bytes = (rate_bits_per_sec / 8) as u32;
+    socket::setsockopt(&borrowed, custom_sockopt::MaxPacingRate, &rate_bytes)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -301,20 +344,11 @@ pub fn set_fq_rate(_fd: i32, _rate: u64) -> Result<()> {
 /// Unprivileged on Linux 5.7+ for sockets the caller owns.
 #[cfg(target_os = "linux")]
 pub fn set_bind_dev(fd: i32, dev: &str) -> Result<()> {
-    let dev_bytes = dev.as_bytes();
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            dev_bytes.as_ptr() as *const libc::c_void,
-            dev_bytes.len() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket::{self, sockopt};
+    use std::ffi::OsString;
+    let borrowed = borrow_fd(fd);
+    socket::setsockopt(&borrowed, sockopt::BindToDevice, &OsString::from(dev))
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -330,45 +364,17 @@ pub fn set_tcp_keepalive(
     interval: Option<u32>,
     count: Option<u32>,
 ) -> Result<()> {
-    let enable: libc::c_int = 1;
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
-            &enable as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        if let Some(val) = idle {
-            let val = val as libc::c_int;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPIDLE,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        if let Some(val) = interval {
-            let val = val as libc::c_int;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPINTVL,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        if let Some(val) = count {
-            let val = val as libc::c_int;
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_KEEPCNT,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+    use nix::sys::socket::{self, sockopt};
+    let borrowed = borrow_fd(fd);
+    let _ = socket::setsockopt(&borrowed, sockopt::KeepAlive, &true);
+    if let Some(val) = idle {
+        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepIdle, &val);
+    }
+    if let Some(val) = interval {
+        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepInterval, &val);
+    }
+    if let Some(val) = count {
+        let _ = socket::setsockopt(&borrowed, sockopt::TcpKeepCount, &val);
     }
     Ok(())
 }
@@ -386,16 +392,12 @@ pub fn set_tcp_keepalive(
 /// Set CPU affinity for the current thread (Linux only).
 #[cfg(target_os = "linux")]
 pub fn set_cpu_affinity(core: usize) -> Result<()> {
-    unsafe {
-        let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core, &mut cpuset);
-        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if ret < 0 {
-            return Err(RiperfError::Io(std::io::Error::last_os_error()));
-        }
-    }
-    Ok(())
+    use nix::sched::{sched_setaffinity, CpuSet};
+    use nix::unistd::Pid;
+    let mut cpuset = CpuSet::new();
+    cpuset.set(core).map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+    sched_setaffinity(Pid::from_raw(0), &cpuset)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -406,19 +408,11 @@ pub fn set_cpu_affinity(_core: usize) -> Result<()> {
 /// Set IPv6 flow label on a socket (Linux only).
 #[cfg(target_os = "linux")]
 pub fn set_ipv6_flowlabel(fd: i32, label: i32) -> Result<()> {
-    let val = label as libc::c_int;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_FLOWINFO_SEND,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
+    use nix::sys::socket;
+    let borrowed = borrow_fd(fd);
+    if let Err(e) = socket::setsockopt(&borrowed, custom_sockopt::Ipv6FlowInfoSend, &label) {
         // Flowlabel may require special kernel config; don't fail hard
-        log::debug!("IPV6_FLOWINFO_SEND failed: {}", std::io::Error::last_os_error());
+        log::debug!("IPV6_FLOWINFO_SEND failed: {e}");
     }
     Ok(())
 }
@@ -432,20 +426,10 @@ pub fn set_ipv6_flowlabel(_fd: i32, _label: i32) -> Result<()> {
 /// Sets UDP_SEGMENT to the datagram size so the kernel can batch sends.
 #[cfg(target_os = "linux")]
 pub fn set_udp_gso(fd: i32, segment_size: u16) -> Result<()> {
-    let val = segment_size as libc::c_int;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_UDP,
-            libc::UDP_SEGMENT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket::{self, sockopt};
+    let borrowed = borrow_fd(fd);
+    socket::setsockopt(&borrowed, sockopt::UdpGsoSegment, &(segment_size as i32))
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -456,20 +440,10 @@ pub fn set_udp_gso(_fd: i32, _segment_size: u16) -> Result<()> {
 /// Enable UDP GRO (Generic Receive Offload) on a UDP socket.
 #[cfg(target_os = "linux")]
 pub fn set_udp_gro(fd: i32) -> Result<()> {
-    let val: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_UDP,
-            libc::UDP_GRO,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret < 0 {
-        return Err(RiperfError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+    use nix::sys::socket::{self, sockopt};
+    let borrowed = borrow_fd(fd);
+    socket::setsockopt(&borrowed, sockopt::UdpGroSegment, &true)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -553,54 +527,36 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tcp_keepalive_readback() {
+        use nix::sys::socket::{self, sockopt};
         use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let fd = socket.as_raw_fd();
         set_tcp_keepalive(fd, Some(10), Some(5), Some(3)).unwrap();
-        let mut val: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        unsafe {
-            libc::getsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-                &mut val as *mut _ as *mut libc::c_void, &mut len,
-            );
-        }
-        assert_eq!(val, 1, "SO_KEEPALIVE should be enabled");
+        let enabled = socket::getsockopt(&socket, sockopt::KeepAlive).unwrap();
+        assert!(enabled, "SO_KEEPALIVE should be enabled");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn rcv_timeout_readback() {
+        use nix::sys::socket::{self, sockopt};
         use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let fd = socket.as_raw_fd();
         set_rcv_timeout(fd, 5000).unwrap(); // 5 seconds
-        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
-        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-        unsafe {
-            libc::getsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
-                &mut tv as *mut _ as *mut libc::c_void, &mut len,
-            );
-        }
-        assert_eq!(tv.tv_sec, 5, "SO_RCVTIMEO should be 5 seconds");
+        let tv = socket::getsockopt(&socket, sockopt::ReceiveTimeout).unwrap();
+        assert_eq!(tv.tv_sec(), 5, "SO_RCVTIMEO should be 5 seconds");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn dont_fragment_readback() {
+        use nix::sys::socket;
         use std::os::unix::io::AsRawFd;
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let fd = socket.as_raw_fd();
         set_dont_fragment(fd).unwrap();
-        let mut val: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        unsafe {
-            libc::getsockopt(
-                fd, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER,
-                &mut val as *mut _ as *mut libc::c_void, &mut len,
-            );
-        }
+        let val = socket::getsockopt(&socket, custom_sockopt::IpMtuDiscover).unwrap();
         assert_eq!(val, libc::IP_PMTUDISC_DO, "IP_MTU_DISCOVER should be DO");
     }
 
