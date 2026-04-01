@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use nix::sys::resource::{getrusage, UsageWho};
+
 /// A snapshot of process resource usage for computing CPU utilization.
 #[derive(Clone)]
 pub struct CpuSnapshot {
@@ -11,24 +13,21 @@ pub struct CpuSnapshot {
 impl CpuSnapshot {
     /// Take a snapshot of current wall time and process CPU usage.
     pub fn now() -> Self {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-
-        if ret < 0 {
-            return Self {
+        match getrusage(UsageWho::RUSAGE_SELF) {
+            Ok(usage) => {
+                let user = usage.user_time();
+                let system = usage.system_time();
+                Self {
+                    wall_time: Instant::now(),
+                    user_usec: user.tv_sec() * 1_000_000 + user.tv_usec(),
+                    system_usec: system.tv_sec() * 1_000_000 + system.tv_usec(),
+                }
+            }
+            Err(_) => Self {
                 wall_time: Instant::now(),
                 user_usec: 0,
                 system_usec: 0,
-            };
-        }
-
-        let usage = unsafe { usage.assume_init() };
-        Self {
-            wall_time: Instant::now(),
-            user_usec: usage.ru_utime.tv_sec * 1_000_000
-                + usage.ru_utime.tv_usec,
-            system_usec: usage.ru_stime.tv_sec * 1_000_000
-                + usage.ru_stime.tv_usec,
+            },
         }
     }
 
@@ -83,7 +82,6 @@ mod tests {
     #[test]
     fn utilization_over_interval() {
         let before = CpuSnapshot::now();
-        // Burn some CPU time
         let mut x: u64 = 0;
         for i in 0..1_000_000u64 {
             x = x.wrapping_add(i);
@@ -92,10 +90,8 @@ mod tests {
         let after = CpuSnapshot::now();
 
         let util = after.utilization_since(&before);
-        // We should have measurable user CPU usage
         assert!(util.host_user >= 0.0);
         assert!(util.host_total >= 0.0);
-        // Remote values should be default (0)
         assert_eq!(util.remote_total, 0.0);
     }
 
@@ -103,7 +99,6 @@ mod tests {
     fn utilization_zero_interval() {
         let snap = CpuSnapshot::now();
         let util = snap.utilization_since(&snap);
-        // Zero wall time → default zeros
         assert_eq!(util.host_total, 0.0);
     }
 }
