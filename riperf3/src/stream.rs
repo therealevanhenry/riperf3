@@ -310,10 +310,7 @@ pub async fn run_tcp_sender(
     file_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     use std::io::Read;
-    let mut file = file_path
-        .as_ref()
-        .map(std::fs::File::open)
-        .transpose()?;
+    let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
 
     while !done.load(Ordering::Relaxed) {
         // Refill buffer from file if specified
@@ -460,7 +457,8 @@ pub async fn run_tcp_receiver(
         #[cfg(not(target_os = "linux"))]
         {
             // Fallback: normal read path
-            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await;
+            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file)
+                .await;
         }
     } else {
         run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await?;
@@ -779,7 +777,11 @@ mod tests {
 
     #[test]
     fn udp_header_round_trip_32() {
-        let h = UdpHeader { sec: 1000, usec: 500_000, seq: 42 };
+        let h = UdpHeader {
+            sec: 1000,
+            usec: 500_000,
+            seq: 42,
+        };
         let mut buf = [0u8; 64];
         h.write_to(&mut buf, false);
         let h2 = UdpHeader::read_from(&buf, false).unwrap();
@@ -821,7 +823,11 @@ mod tests {
         let mut stats = UdpRecvStats::new();
         let t = 1000.0;
         for i in 1..=5 {
-            let h = UdpHeader { sec: 1000, usec: 0, seq: i };
+            let h = UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: i,
+            };
             stats.update(&h, t + i as f64 * 0.001);
         }
         assert_eq!(stats.packet_count, 5);
@@ -834,9 +840,30 @@ mod tests {
         let mut stats = UdpRecvStats::new();
         let t = 1000.0;
         // Receive packets 1, 2, 5 (missing 3, 4)
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 1 }, t);
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 2 }, t + 0.001);
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 5 }, t + 0.002);
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 1,
+            },
+            t,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 2,
+            },
+            t + 0.001,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 5,
+            },
+            t + 0.002,
+        );
         assert_eq!(stats.packet_count, 5);
         assert_eq!(stats.cnt_error, 2); // packets 3 and 4 missing
     }
@@ -846,11 +873,32 @@ mod tests {
         let mut stats = UdpRecvStats::new();
         let t = 1000.0;
         // Receive 1, 3, 2
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 1 }, t);
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 3 }, t + 0.001);
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 1,
+            },
+            t,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 3,
+            },
+            t + 0.001,
+        );
         // At this point: packet_count=3, cnt_error=1 (packet 2 "lost")
         assert_eq!(stats.cnt_error, 1);
-        stats.update(&UdpHeader { sec: 1000, usec: 0, seq: 2 }, t + 0.002);
+        stats.update(
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 2,
+            },
+            t + 0.002,
+        );
         // Packet 2 arrives late: OOO incremented, loss decremented
         assert_eq!(stats.outoforder_packets, 1);
         assert_eq!(stats.cnt_error, 0);
@@ -864,13 +912,21 @@ mod tests {
         // Transit times: 0.010, 0.011, 0.011
         // d values: -, 0.001, 0.000
         stats.update(
-            &UdpHeader { sec: 1000, usec: 0, seq: 1 },
+            &UdpHeader {
+                sec: 1000,
+                usec: 0,
+                seq: 1,
+            },
             1000.010,
         );
         assert_eq!(stats.jitter, 0.0); // first packet, no jitter yet
 
         stats.update(
-            &UdpHeader { sec: 1000, usec: 1000, seq: 2 },
+            &UdpHeader {
+                sec: 1000,
+                usec: 1000,
+                seq: 2,
+            },
             1000.012,
         );
         // d = |0.011 - 0.010| = 0.001
@@ -883,13 +939,27 @@ mod tests {
         let mut stats = UdpRecvStats::new();
         let t = 1000.0;
         for i in 1..=3 {
-            stats.update(&UdpHeader { sec: 1000, usec: 0, seq: i }, t);
+            stats.update(
+                &UdpHeader {
+                    sec: 1000,
+                    usec: 0,
+                    seq: i,
+                },
+                t,
+            );
         }
         stats.snapshot_omit();
         assert_eq!(stats.omitted_packet_count, 3);
 
         for i in 4..=6 {
-            stats.update(&UdpHeader { sec: 1000, usec: 0, seq: i }, t);
+            stats.update(
+                &UdpHeader {
+                    sec: 1000,
+                    usec: 0,
+                    seq: i,
+                },
+                t,
+            );
         }
         // Effective (post-omit) packet count: 6 - 3 = 3
         assert_eq!(stats.packet_count - stats.omitted_packet_count, 3);
@@ -997,7 +1067,9 @@ mod tests {
         let sc = send_counters.clone();
         let d = done.clone();
         let sender = tokio::spawn(async move {
-            let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+            let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
             let buf = vec![0u8; 1024];
             run_tcp_sender(stream, sc, buf, d, None).await
         });

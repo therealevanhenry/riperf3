@@ -2,14 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cpu::CpuSnapshot;
-use crate::error::{ConfigError, RiperfError, Result};
+use crate::error::{ConfigError, Result, RiperfError};
 use crate::net;
-use crate::protocol::{
-    self, TestParams, TestResultsJson, TestState, TransportProtocol,
-};
-use crate::stream::{
-    self, DataStream, StreamCounters, UdpRecvStats,
-};
+use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportProtocol};
+use crate::stream::{self, DataStream, StreamCounters, UdpRecvStats};
 use crate::utils::*;
 
 /// Shared test configuration derived from the client's parameter JSON.
@@ -131,10 +127,7 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_one_test(
-        &self,
-        listener: &tokio::net::TcpListener,
-    ) -> Result<()> {
+    async fn handle_one_test(&self, listener: &tokio::net::TcpListener) -> Result<()> {
         // ---- Accept control connection (with optional idle timeout) ----
         let (mut ctrl, peer_addr) = if let Some(secs) = self.idle_timeout {
             match tokio::time::timeout(
@@ -200,7 +193,10 @@ impl Server {
         if self.verbose {
             vprintln!(
                 "Test: {:?} {} stream(s) blksize={} duration={}s",
-                cfg.protocol, cfg.num_streams, cfg.blksize, cfg.duration
+                cfg.protocol,
+                cfg.num_streams,
+                cfg.blksize,
+                cfg.duration
             );
         }
 
@@ -210,8 +206,16 @@ impl Server {
 
         // Determine how many streams to accept and their roles.
         // Normal: server receives. Reverse: server sends. Bidir: both.
-        let recv_count = if cfg.reverse && !cfg.bidir { 0 } else { cfg.num_streams };
-        let send_count = if cfg.reverse || cfg.bidir { cfg.num_streams } else { 0 };
+        let recv_count = if cfg.reverse && !cfg.bidir {
+            0
+        } else {
+            cfg.num_streams
+        };
+        let send_count = if cfg.reverse || cfg.bidir {
+            cfg.num_streams
+        } else {
+            0
+        };
         let total = recv_count + send_count;
 
         match cfg.protocol {
@@ -276,20 +280,29 @@ impl Server {
                 // For each stream: accept the connect handshake on the listener,
                 // which locks that socket to the client. Then create a fresh
                 // listener for the next stream (iperf3's recycling pattern).
-                let mut udp_listener = net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.bind_address.as_ref().is_some_and(|a| a.contains(':'))).await?;
+                let mut udp_listener = net::udp_bind_reusable(
+                    self.bind_address.as_deref(),
+                    self.port,
+                    self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
+                )
+                .await?;
 
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
 
                 for i in 0..total {
                     // Accept: recv magic, connect() to client, send reply
-                    let _client_addr =
-                        protocol::udp_connect_server(&udp_listener).await?;
+                    let _client_addr = protocol::udp_connect_server(&udp_listener).await?;
                     // The listener is now locked to this client — use it as the data socket
                     let data_sock = udp_listener;
 
                     // Create a fresh listener for the next stream (if any)
                     if i + 1 < total {
-                        udp_listener = net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.bind_address.as_ref().is_some_and(|a| a.contains(':'))).await?;
+                        udp_listener = net::udp_bind_reusable(
+                            self.bind_address.as_deref(),
+                            self.port,
+                            self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
+                        )
+                        .await?;
                     } else {
                         // Last stream — create a dummy that won't be used
                         udp_listener = net::udp_bind(None, 0, false).await?;
@@ -299,8 +312,7 @@ impl Server {
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
 
-                    let std_sock = data_sock.into_std()
-                        .map_err(RiperfError::Io)?;
+                    let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
 
                     if is_sender {
                         let c = counters.clone();
@@ -331,7 +343,14 @@ impl Server {
                         let stats_clone = stats.clone();
                         let u64bit = cfg.udp_counters_64bit;
                         let task = tokio::task::spawn_blocking(move || {
-                            stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
+                            stream::run_udp_receiver_blocking(
+                                std_sock,
+                                c,
+                                stats_clone,
+                                bs,
+                                d,
+                                u64bit,
+                            )
                         });
                         streams.push(DataStream {
                             id: stream_id,

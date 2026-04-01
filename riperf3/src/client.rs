@@ -5,14 +5,10 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 use crate::cpu::CpuSnapshot;
-use crate::error::{ConfigError, RiperfError, Result};
+use crate::error::{ConfigError, Result, RiperfError};
 use crate::net;
-use crate::protocol::{
-    self, TestParams, TestResultsJson, TestState, TransportProtocol,
-};
-use crate::stream::{
-    self, DataStream, StreamCounters, UdpRecvStats,
-};
+use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportProtocol};
+use crate::stream::{self, DataStream, StreamCounters, UdpRecvStats};
 use crate::utils::*;
 
 // ---------------------------------------------------------------------------
@@ -80,7 +76,14 @@ impl Client {
     pub async fn run(&self) -> Result<()> {
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
-        let mut ctrl = net::tcp_connect(&self.host, self.port, self.connect_timeout, None, self.mptcp).await?;
+        let mut ctrl = net::tcp_connect(
+            &self.host,
+            self.port,
+            self.connect_timeout,
+            None,
+            self.mptcp,
+        )
+        .await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
         // Apply control connection options (Unix only — requires raw fd access)
@@ -216,12 +219,17 @@ impl Client {
             (&self.username, &self.rsa_public_key_path)
         {
             let pubkey_pem = std::fs::read(pubkey_path).unwrap_or_default();
-            let password = self.password.clone()
+            let password = self
+                .password
+                .clone()
                 .or_else(|| crate::auth::read_password().ok())
                 .unwrap_or_default();
-            if let Ok(token) =
-                crate::auth::encode_auth_token(username, &password, &pubkey_pem, self.use_pkcs1_padding)
-            {
+            if let Ok(token) = crate::auth::encode_auth_token(
+                username,
+                &password,
+                &pubkey_pem,
+                self.use_pkcs1_padding,
+            ) {
                 p.authtoken = Some(token);
             }
         }
@@ -237,14 +245,28 @@ impl Client {
         let mut streams = Vec::new();
 
         // In normal mode: client sends. Reverse: client receives. Bidir: both.
-        let send_count = if self.reverse && !self.bidir { 0 } else { self.num_streams };
-        let recv_count = if self.reverse || self.bidir { self.num_streams } else { 0 };
+        let send_count = if self.reverse && !self.bidir {
+            0
+        } else {
+            self.num_streams
+        };
+        let recv_count = if self.reverse || self.bidir {
+            self.num_streams
+        } else {
+            0
+        };
         let total = send_count + recv_count;
         match self.protocol {
             TransportProtocol::Tcp => {
                 for i in 0..total {
-                    let mut data_stream =
-                        net::tcp_connect(&self.host, self.port, self.connect_timeout, self.cport, self.mptcp).await?;
+                    let mut data_stream = net::tcp_connect(
+                        &self.host,
+                        self.port,
+                        self.connect_timeout,
+                        self.cport,
+                        self.mptcp,
+                    )
+                    .await?;
                     protocol::send_cookie(&mut data_stream, cookie).await?;
                     net::configure_tcp_stream_full(
                         &data_stream,
@@ -293,9 +315,13 @@ impl Client {
                         tokio::spawn(async move {
                             if zc {
                                 #[cfg(target_os = "linux")]
-                                { stream::run_tcp_sender_zerocopy(data_stream, c, buf, d).await }
+                                {
+                                    stream::run_tcp_sender_zerocopy(data_stream, c, buf, d).await
+                                }
                                 #[cfg(not(target_os = "linux"))]
-                                { stream::run_tcp_sender(data_stream, c, buf, d, fp).await }
+                                {
+                                    stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                                }
                             } else {
                                 stream::run_tcp_sender(data_stream, c, buf, d, fp).await
                             }
@@ -350,8 +376,7 @@ impl Client {
                     let counters = Arc::new(StreamCounters::new());
 
                     // Convert tokio UdpSocket to std for blocking I/O
-                    let std_sock = udp_sock.into_std()
-                        .map_err(RiperfError::Io)?;
+                    let std_sock = udp_sock.into_std().map_err(RiperfError::Io)?;
 
                     let task = if is_sender {
                         let c = counters.clone();
@@ -462,19 +487,17 @@ impl Client {
                     }
                 }
             }
-            EndCondition::Bytes(target) => {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let total: u64 = streams
-                        .iter()
-                        .filter(|s| s.is_sender)
-                        .map(|s| s.counters.bytes_sent())
-                        .sum();
-                    if total >= target {
-                        break;
-                    }
+            EndCondition::Bytes(target) => loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let total: u64 = streams
+                    .iter()
+                    .filter(|s| s.is_sender)
+                    .map(|s| s.counters.bytes_sent())
+                    .sum();
+                if total >= target {
+                    break;
                 }
-            }
+            },
             EndCondition::Blocks(target) => {
                 // For block-based, approximate by dividing bytes by blksize
                 loop {

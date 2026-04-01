@@ -60,9 +60,7 @@ pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
     match protocol {
         TransportProtocol::Tcp => {
             if has_retransmits {
-                println!(
-                    "[ ID] Interval           Transfer     Bitrate         Retr  Cwnd"
-                );
+                println!("[ ID] Interval           Transfer     Bitrate         Retr  Cwnd");
             } else {
                 println!("[ ID] Interval           Transfer     Bitrate");
             }
@@ -99,8 +97,15 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
         };
         println!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
-            interval.start, interval.end, transfer, rate,
-            jitter * 1000.0, lost, total, pct, omit_tag,
+            interval.start,
+            interval.end,
+            transfer,
+            rate,
+            jitter * 1000.0,
+            lost,
+            total,
+            pct,
+            omit_tag,
         );
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
@@ -132,7 +137,11 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
         0.0
     };
     let rate = units::format_rate(bits_per_sec, format_char);
-    let role = if summary.is_sender { "sender" } else { "receiver" };
+    let role = if summary.is_sender {
+        "sender"
+    } else {
+        "receiver"
+    };
 
     if let (Some(jitter), Some(lost), Some(total)) =
         (summary.jitter, summary.lost, summary.total_packets)
@@ -144,8 +153,15 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
         };
         println!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
-            summary.start, summary.end, transfer, rate,
-            jitter * 1000.0, lost, total, pct, role,
+            summary.start,
+            summary.end,
+            transfer,
+            rate,
+            jitter * 1000.0,
+            lost,
+            total,
+            pct,
+            role,
         );
     } else if let Some(retr) = summary.retransmits {
         println!(
@@ -271,8 +287,7 @@ pub fn spawn_interval_reporter(
                 let (retransmits, snd_cwnd, rtt) = if has_retransmits && stream.is_sender {
                     if let Some(fd) = stream.raw_fd {
                         if let Some(info) = tcp_info::get_tcp_info(fd) {
-                            let delta =
-                                info.total_retransmits.saturating_sub(prev_retransmits[i]);
+                            let delta = info.total_retransmits.saturating_sub(prev_retransmits[i]);
                             prev_retransmits[i] = info.total_retransmits;
                             (Some(delta as i64), Some(info.snd_cwnd), Some(info.rtt))
                         } else {
@@ -286,21 +301,20 @@ pub fn spawn_interval_reporter(
                 };
 
                 // UDP stats (compute deltas for loss/packets)
-                let (jitter, lost, total) =
-                    if let Some(ref udp_stats) = stream.udp_recv_stats {
-                        if let Ok(st) = udp_stats.lock() {
-                            let delta_error = st.cnt_error - prev_cnt_error[i];
-                            let delta_packets = st.packet_count - prev_packet_count[i];
-                            prev_cnt_error[i] = st.cnt_error;
-                            prev_packet_count[i] = st.packet_count;
-                            last_jitter = st.jitter;
-                            (Some(st.jitter), Some(delta_error), Some(delta_packets))
-                        } else {
-                            (None, None, None)
-                        }
+                let (jitter, lost, total) = if let Some(ref udp_stats) = stream.udp_recv_stats {
+                    if let Ok(st) = udp_stats.lock() {
+                        let delta_error = st.cnt_error - prev_cnt_error[i];
+                        let delta_packets = st.packet_count - prev_packet_count[i];
+                        prev_cnt_error[i] = st.cnt_error;
+                        prev_packet_count[i] = st.packet_count;
+                        last_jitter = st.jitter;
+                        (Some(st.jitter), Some(delta_error), Some(delta_packets))
                     } else {
                         (None, None, None)
-                    };
+                    }
+                } else {
+                    (None, None, None)
+                };
 
                 let interval = StreamInterval {
                     stream_id: stream.id,
@@ -319,7 +333,11 @@ pub fn spawn_interval_reporter(
 
                 if config.json_stream {
                     let seconds = end - start;
-                    let bps = if seconds > 0.0 { bytes as f64 * 8.0 / seconds } else { 0.0 };
+                    let bps = if seconds > 0.0 {
+                        bytes as f64 * 8.0 / seconds
+                    } else {
+                        0.0
+                    };
                     let mut j = serde_json::json!({
                         "socket": stream.id,
                         "start": start,
@@ -330,11 +348,21 @@ pub fn spawn_interval_reporter(
                         "omitted": omitted,
                         "sender": stream.is_sender,
                     });
-                    if let Some(r) = retransmits { j["retransmits"] = serde_json::json!(r); }
-                    if let Some(c) = snd_cwnd { j["snd_cwnd"] = serde_json::json!(c); }
-                    if let Some(ji) = jitter { j["jitter_ms"] = serde_json::json!(ji * 1000.0); }
-                    if let Some(l) = lost { j["lost_packets"] = serde_json::json!(l); }
-                    if let Some(p) = total { j["packets"] = serde_json::json!(p); }
+                    if let Some(r) = retransmits {
+                        j["retransmits"] = serde_json::json!(r);
+                    }
+                    if let Some(c) = snd_cwnd {
+                        j["snd_cwnd"] = serde_json::json!(c);
+                    }
+                    if let Some(ji) = jitter {
+                        j["jitter_ms"] = serde_json::json!(ji * 1000.0);
+                    }
+                    if let Some(l) = lost {
+                        j["lost_packets"] = serde_json::json!(l);
+                    }
+                    if let Some(p) = total {
+                        j["packets"] = serde_json::json!(p);
+                    }
                     println!("{}", serde_json::to_string(&j).unwrap());
                 } else {
                     print_interval(&interval, config.format_char);

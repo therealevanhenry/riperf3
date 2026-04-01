@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use crate::error::{RiperfError, Result, UnknownState};
+use crate::error::{Result, RiperfError, UnknownState};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -146,8 +146,7 @@ pub async fn recv_state(stream: &mut TcpStream) -> Result<TestState> {
     if n == 0 {
         return Err(RiperfError::PeerDisconnected);
     }
-    TestState::from_wire(buf[0] as i8)
-        .map_err(|u| RiperfError::Protocol(u.to_string()))
+    TestState::from_wire(buf[0] as i8).map_err(|u| RiperfError::Protocol(u.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -164,10 +163,7 @@ pub async fn json_write(stream: &mut TcpStream, value: &serde_json::Value) -> Re
 }
 
 /// Read a length-prefixed JSON value. If `max_len` is 0, no size limit is enforced.
-pub async fn json_read(
-    stream: &mut TcpStream,
-    max_len: usize,
-) -> Result<serde_json::Value> {
+pub async fn json_read(stream: &mut TcpStream, max_len: usize) -> Result<serde_json::Value> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -555,15 +551,30 @@ mod tests {
 
         let writer = tokio::spawn(async move {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            send_state(&mut stream, TestState::ParamExchange).await.unwrap();
-            send_state(&mut stream, TestState::CreateStreams).await.unwrap();
-            send_state(&mut stream, TestState::TestRunning).await.unwrap();
+            send_state(&mut stream, TestState::ParamExchange)
+                .await
+                .unwrap();
+            send_state(&mut stream, TestState::CreateStreams)
+                .await
+                .unwrap();
+            send_state(&mut stream, TestState::TestRunning)
+                .await
+                .unwrap();
         });
 
         let (mut stream, _) = listener.accept().await.unwrap();
-        assert_eq!(recv_state(&mut stream).await.unwrap(), TestState::ParamExchange);
-        assert_eq!(recv_state(&mut stream).await.unwrap(), TestState::CreateStreams);
-        assert_eq!(recv_state(&mut stream).await.unwrap(), TestState::TestRunning);
+        assert_eq!(
+            recv_state(&mut stream).await.unwrap(),
+            TestState::ParamExchange
+        );
+        assert_eq!(
+            recv_state(&mut stream).await.unwrap(),
+            TestState::CreateStreams
+        );
+        assert_eq!(
+            recv_state(&mut stream).await.unwrap(),
+            TestState::TestRunning
+        );
 
         writer.await.unwrap();
     }

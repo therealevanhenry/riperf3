@@ -59,7 +59,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
-
     if let Some(server_host) = cli.client {
         // ---- Client mode ----
         let mut builder = riperf3::ClientBuilder::new(&server_host);

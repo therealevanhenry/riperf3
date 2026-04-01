@@ -18,11 +18,13 @@ impl CpuSnapshot {
                 Ok(usage) => {
                     let user = usage.user_time();
                     let system = usage.system_time();
-                    #[allow(clippy::useless_conversion)] // tv_sec/tv_usec return i32 on macOS, i64 on Linux
+                    #[allow(clippy::useless_conversion)]
+                    // tv_sec/tv_usec return i32 on macOS, i64 on Linux
                     Self {
                         wall_time: Instant::now(),
                         user_usec: i64::from(user.tv_sec()) * 1_000_000 + i64::from(user.tv_usec()),
-                        system_usec: i64::from(system.tv_sec()) * 1_000_000 + i64::from(system.tv_usec()),
+                        system_usec: i64::from(system.tv_sec()) * 1_000_000
+                            + i64::from(system.tv_usec()),
                     }
                 }
                 Err(_) => Self {
@@ -44,10 +46,7 @@ impl CpuSnapshot {
 
     /// Compute CPU utilization between this snapshot and an earlier one.
     pub fn utilization_since(&self, earlier: &CpuSnapshot) -> CpuUtilization {
-        let wall_usec = self
-            .wall_time
-            .duration_since(earlier.wall_time)
-            .as_micros() as f64;
+        let wall_usec = self.wall_time.duration_since(earlier.wall_time).as_micros() as f64;
 
         if wall_usec == 0.0 {
             return CpuUtilization::default();

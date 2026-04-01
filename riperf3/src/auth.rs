@@ -7,7 +7,7 @@ use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 
-use crate::error::{RiperfError, Result};
+use crate::error::{Result, RiperfError};
 
 /// Encode an auth token: encrypt `user: {u}\npwd:  {p}\nts:   {ts}` with the
 /// server's RSA public key, then base64-encode the ciphertext.
@@ -129,9 +129,8 @@ pub fn check_credentials(
     let hash = hex::encode(digest.as_slice());
 
     // Read and search the authorized users file
-    let content = std::fs::read_to_string(users_file).map_err(|e| {
-        RiperfError::Protocol(format!("cannot read authorized users file: {e}"))
-    })?;
+    let content = std::fs::read_to_string(users_file)
+        .map_err(|e| RiperfError::Protocol(format!("cannot read authorized users file: {e}")))?;
 
     for line in content.lines() {
         let line = line.trim();
@@ -166,11 +165,7 @@ pub fn resolve_password(
 pub fn read_password() -> Result<String> {
     let riperf3_env = std::env::var("RIPERF3_PASSWORD").ok();
     let iperf3_env = std::env::var("IPERF3_PASSWORD").ok();
-    if let Some(pw) = resolve_password(
-        riperf3_env.as_deref(),
-        iperf3_env.as_deref(),
-        None,
-    ) {
+    if let Some(pw) = resolve_password(riperf3_env.as_deref(), iperf3_env.as_deref(), None) {
         return Ok(pw);
     }
 
@@ -200,8 +195,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_oaep() {
-        let token =
-            encode_auth_token("testuser", "testpass", TEST_PUBKEY, false).unwrap();
+        let token = encode_auth_token("testuser", "testpass", TEST_PUBKEY, false).unwrap();
         assert!(!token.is_empty());
 
         let (user, pass, ts) = decode_auth_token(&token, TEST_PRIVKEY, false).unwrap();
@@ -217,8 +211,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_pkcs1() {
-        let token =
-            encode_auth_token("alice", "secret123", TEST_PUBKEY, true).unwrap();
+        let token = encode_auth_token("alice", "secret123", TEST_PUBKEY, true).unwrap();
         let (user, pass, _ts) = decode_auth_token(&token, TEST_PRIVKEY, true).unwrap();
         assert_eq!(user, "alice");
         assert_eq!(pass, "secret123");
@@ -226,8 +219,7 @@ mod tests {
 
     #[test]
     fn wrong_padding_fails() {
-        let token =
-            encode_auth_token("user", "pass", TEST_PUBKEY, false).unwrap();
+        let token = encode_auth_token("user", "pass", TEST_PUBKEY, false).unwrap();
         // Try to decrypt with PKCS1 when encrypted with OAEP
         let result = decode_auth_token(&token, TEST_PRIVKEY, true);
         assert!(result.is_err());
@@ -286,7 +278,10 @@ mod tests {
         // iperf3: sha256("{testuser}testpass")
         let salted = "{testuser}testpass";
         let hash = hex::encode(Sha256::digest(salted.as_bytes()).as_slice());
-        assert_eq!(hash, "6d30222cf5cb9f09b0175e1dbfbc0b6fef34fc08c2fdf02682e0c2450c9c7170");
+        assert_eq!(
+            hash,
+            "6d30222cf5cb9f09b0175e1dbfbc0b6fef34fc08c2fdf02682e0c2450c9c7170"
+        );
     }
 
     // -- Password resolution priority --
@@ -303,11 +298,7 @@ mod tests {
 
     #[test]
     fn resolve_password_iperf3_env_fallback() {
-        let result = resolve_password(
-            None,
-            Some("from_iperf3"),
-            Some("from_prompt"),
-        );
+        let result = resolve_password(None, Some("from_iperf3"), Some("from_prompt"));
         assert_eq!(result, Some("from_iperf3".to_string()));
     }
 

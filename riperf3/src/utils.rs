@@ -88,7 +88,11 @@ pub fn parse_keepalive(s: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
     let parse = |i: usize| -> Option<u32> {
         parts.get(i).and_then(|p| {
             let p = p.trim();
-            if p.is_empty() { None } else { p.parse().ok() }
+            if p.is_empty() {
+                None
+            } else {
+                p.parse().ok()
+            }
         })
     };
     (parse(0), parse(1), parse(2))

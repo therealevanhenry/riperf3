@@ -75,9 +75,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let client = tokio::spawn(async move {
-            tokio::net::TcpStream::connect(addr).await.unwrap()
-        });
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
 
         let (server_stream, _) = listener.accept().await.unwrap();
         let client_stream = client.await.unwrap();

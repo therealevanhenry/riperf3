@@ -25,7 +25,11 @@ fn next_port() -> u16 {
 #[tokio::test]
 async fn regression_default_path_transfers_data() {
     let port = next_port();
-    let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
     let server_task = tokio::spawn(async move { server.run().await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -48,7 +52,11 @@ async fn regression_default_path_transfers_data() {
 #[tokio::test]
 async fn regression_udp_default_path() {
     let port = next_port();
-    let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
     let server_task = tokio::spawn(async move { server.run().await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let client = ClientBuilder::new("127.0.0.1")
@@ -334,10 +342,7 @@ async fn tcp_combined_socket_opts() {
         .unwrap();
 
     let result = client.run().await;
-    assert!(
-        result.is_ok(),
-        "Client failed with -P 2 -R -N: {result:?}"
-    );
+    assert!(result.is_ok(), "Client failed with -P 2 -R -N: {result:?}");
 
     let _ = server_task.await;
 }
@@ -387,7 +392,10 @@ async fn cpu_affinity_applied() {
 
     let cpuset = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
     assert!(cpuset.is_set(0).unwrap(), "CPU 0 should be in affinity set");
-    assert!(!cpuset.is_set(1).unwrap_or(false), "CPU 1 should NOT be set after pinning to CPU 0");
+    assert!(
+        !cpuset.is_set(1).unwrap_or(false),
+        "CPU 1 should NOT be set after pinning to CPU 0"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +483,10 @@ mod builder_tests {
 
     #[test]
     fn client_builder_bandwidth() {
-        let c = ClientBuilder::new("h").bandwidth(1_000_000).build().unwrap();
+        let c = ClientBuilder::new("h")
+            .bandwidth(1_000_000)
+            .build()
+            .unwrap();
         assert_eq!(c.bandwidth, 1_000_000);
     }
 
@@ -633,7 +644,7 @@ mod test_config_tests {
 // ---------------------------------------------------------------------------
 
 mod protocol_tests {
-    use riperf3::protocol::{self, TestParams, TestResultsJson, StreamResultJson};
+    use riperf3::protocol::{self, StreamResultJson, TestParams, TestResultsJson};
 
     #[tokio::test]
     async fn params_round_trip() {
@@ -657,7 +668,9 @@ mod protocol_tests {
         let params_clone = params.clone();
         let writer = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            protocol::send_params(&mut stream, &params_clone).await.unwrap();
+            protocol::send_params(&mut stream, &params_clone)
+                .await
+                .unwrap();
         });
 
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -721,7 +734,9 @@ mod protocol_tests {
         let results_clone = results.clone();
         let writer = tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-            protocol::send_results(&mut stream, &results_clone).await.unwrap();
+            protocol::send_results(&mut stream, &results_clone)
+                .await
+                .unwrap();
         });
 
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -790,7 +805,7 @@ mod protocol_tests {
 
 mod error_tests {
     use riperf3::error::ConfigError;
-    use riperf3::utils::{parse_kmg, parse_bitrate};
+    use riperf3::utils::{parse_bitrate, parse_kmg};
     use riperf3::ClientBuilder;
 
     #[test]
@@ -829,11 +844,23 @@ mod error_tests {
     #[test]
     fn error_display_variants() {
         use riperf3::RiperfError;
-        assert_eq!(format!("{}", RiperfError::CookieMismatch), "cookie mismatch");
-        assert_eq!(format!("{}", RiperfError::AccessDenied), "access denied by server");
-        assert_eq!(format!("{}", RiperfError::PeerDisconnected), "peer disconnected");
+        assert_eq!(
+            format!("{}", RiperfError::CookieMismatch),
+            "cookie mismatch"
+        );
+        assert_eq!(
+            format!("{}", RiperfError::AccessDenied),
+            "access denied by server"
+        );
+        assert_eq!(
+            format!("{}", RiperfError::PeerDisconnected),
+            "peer disconnected"
+        );
         assert!(format!("{}", RiperfError::Aborted("test".into())).contains("test"));
-        assert_eq!(format!("{}", RiperfError::ConnectionTimeout), "connection timed out");
+        assert_eq!(
+            format!("{}", RiperfError::ConnectionTimeout),
+            "connection timed out"
+        );
         assert!(format!("{}", RiperfError::Protocol("bad".into())).contains("bad"));
         assert!(format!("{}", RiperfError::Aborted("reason".into())).contains("reason"));
     }
@@ -870,9 +897,13 @@ mod protocol_error_tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             // Read cookie (37 bytes)
             let mut cookie = [0u8; 37];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
             // Send AccessDenied
-            protocol::send_state(&mut stream, TestState::AccessDenied).await.unwrap();
+            protocol::send_state(&mut stream, TestState::AccessDenied)
+                .await
+                .unwrap();
         });
 
         let client = riperf3::ClientBuilder::new("127.0.0.1")
@@ -898,8 +929,12 @@ mod protocol_error_tests {
         let server_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut cookie = [0u8; 37];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie).await.unwrap();
-            protocol::send_state(&mut stream, TestState::ServerError).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            protocol::send_state(&mut stream, TestState::ServerError)
+                .await
+                .unwrap();
         });
 
         let client = riperf3::ClientBuilder::new("127.0.0.1")
@@ -946,7 +981,11 @@ mod json_output_tests {
         // Run a test with JSON output and validate the structure
         // by building results directly (can't capture stdout easily)
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1000,7 +1039,7 @@ mod json_output_tests {
 
     #[test]
     fn test_results_json_structure() {
-        use riperf3::protocol::{TestResultsJson, StreamResultJson};
+        use riperf3::protocol::{StreamResultJson, TestResultsJson};
         let r = TestResultsJson {
             cpu_util_total: 50.0,
             cpu_util_user: 40.0,
@@ -1036,10 +1075,10 @@ mod json_output_tests {
 // ---------------------------------------------------------------------------
 
 mod interval_reporter_tests {
+    use riperf3::protocol::TransportProtocol;
+    use riperf3::reporter::{spawn_interval_reporter, IntervalReporterConfig};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use riperf3::protocol::TransportProtocol;
-    use riperf3::reporter::{IntervalReporterConfig, spawn_interval_reporter};
 
     #[tokio::test]
     async fn disabled_returns_none() {
@@ -1106,7 +1145,11 @@ mod udp_edge_tests {
 
     #[test]
     fn udp_header_32bit_sequence_max() {
-        let h = UdpHeader { sec: 0, usec: 0, seq: u32::MAX as u64 };
+        let h = UdpHeader {
+            sec: 0,
+            usec: 0,
+            seq: u32::MAX as u64,
+        };
         let mut buf = [0u8; 16];
         h.write_to(&mut buf, false);
         let h2 = UdpHeader::read_from(&buf, false).unwrap();
@@ -1115,7 +1158,11 @@ mod udp_edge_tests {
 
     #[test]
     fn udp_header_64bit_sequence_max() {
-        let h = UdpHeader { sec: 0, usec: 0, seq: u64::MAX };
+        let h = UdpHeader {
+            sec: 0,
+            usec: 0,
+            seq: u64::MAX,
+        };
         let mut buf = [0u8; 16];
         h.write_to(&mut buf, true);
         let h2 = UdpHeader::read_from(&buf, true).unwrap();
@@ -1126,8 +1173,22 @@ mod udp_edge_tests {
     fn udp_stats_massive_gap() {
         // Simulate losing 1000 packets at once
         let mut stats = UdpRecvStats::new();
-        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.0);
-        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1002 }, 1.0);
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.0,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1002,
+            },
+            1.0,
+        );
         assert_eq!(stats.cnt_error, 1000);
         assert_eq!(stats.packet_count, 1002);
     }
@@ -1135,10 +1196,31 @@ mod udp_edge_tests {
     #[test]
     fn udp_stats_duplicate_packet() {
         let mut stats = UdpRecvStats::new();
-        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.0);
-        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 2 }, 0.001);
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.0,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 2,
+            },
+            0.001,
+        );
         // Duplicate of packet 1
-        stats.update(&UdpHeader { sec: 0, usec: 0, seq: 1 }, 0.002);
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.002,
+        );
         assert_eq!(stats.outoforder_packets, 1);
         assert_eq!(stats.packet_count, 2);
     }
@@ -1189,7 +1271,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_counters_64bit_flag() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1201,7 +1287,10 @@ mod implemented_flag_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        assert!(result.is_ok(), "UDP with 64-bit counters failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "UDP with 64-bit counters failed: {result:?}"
+        );
         let _ = server_task.await;
     }
 
@@ -1220,7 +1309,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn repeating_payload_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1237,7 +1330,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn dont_fragment_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1254,7 +1351,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn force_ipv4_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1271,7 +1372,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn congestion_cubic_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1288,7 +1393,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn fq_rate_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1336,7 +1445,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn rcv_timeout_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1353,7 +1466,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn snd_timeout_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1370,7 +1487,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn control_keepalive_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1396,14 +1517,14 @@ mod implemented_flag_tests {
     fn dscp_symbolic_and_numeric() {
         use riperf3::utils::parse_dscp;
         // Symbolic names
-        assert_eq!(parse_dscp("ef").unwrap(), 46 << 2);    // EF = 184
-        assert_eq!(parse_dscp("af11").unwrap(), 10 << 2);  // AF11 = 40
-        assert_eq!(parse_dscp("cs1").unwrap(), 8 << 2);    // CS1 = 32
-        // Numeric
+        assert_eq!(parse_dscp("ef").unwrap(), 46 << 2); // EF = 184
+        assert_eq!(parse_dscp("af11").unwrap(), 10 << 2); // AF11 = 40
+        assert_eq!(parse_dscp("cs1").unwrap(), 8 << 2); // CS1 = 32
+                                                        // Numeric
         assert_eq!(parse_dscp("46").unwrap(), 46 << 2);
-        assert_eq!(parse_dscp("0x2e").unwrap(), 46 << 2);  // 0x2e = 46
-        assert_eq!(parse_dscp("056").unwrap(), 46 << 2);   // 056 octal = 46
-        // Out of range
+        assert_eq!(parse_dscp("0x2e").unwrap(), 46 << 2); // 0x2e = 46
+        assert_eq!(parse_dscp("056").unwrap(), 46 << 2); // 056 octal = 46
+                                                         // Out of range
         assert!(parse_dscp("64").is_err());
         assert!(parse_dscp("abc").is_err());
     }
@@ -1411,7 +1532,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn dscp_flag_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1429,7 +1554,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn client_port_binding() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1450,7 +1579,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn forceflush_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1467,7 +1600,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn timestamps_runs() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1488,7 +1625,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn tcp_with_interval_reporting() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1505,7 +1646,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_with_interval_reporting() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1530,7 +1675,11 @@ mod implemented_flag_tests {
         // 50G target rate — verify the test completes without error.
         // Before fix: capped at ~11 Gbps. After fix: should approach 29+ Gbps.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1549,7 +1698,11 @@ mod implemented_flag_tests {
     async fn udp_high_rate_reverse() {
         // 50G reverse mode — server sends, client receives
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1572,7 +1725,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_dont_fragment() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1591,7 +1748,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_dscp() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1610,7 +1771,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_fq_rate() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1653,7 +1818,11 @@ mod implemented_flag_tests {
     #[tokio::test]
     async fn udp_rcv_timeout() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1707,7 +1876,11 @@ mod unimplemented_flags {
         // --bind-dev lo: bind all sockets to the loopback interface.
         // Works unprivileged on Linux 5.7+.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1732,7 +1905,11 @@ mod unimplemented_flags {
     async fn bind_device_invalid_rejects() {
         // An invalid device name should cause an error, proving set_bind_dev is called.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1749,7 +1926,10 @@ mod unimplemented_flags {
             }
         }
         // Should fail: "No such device" (ENODEV)
-        assert!(result.is_err(), "--bind-dev nonexistent should fail but succeeded");
+        assert!(
+            result.is_err(),
+            "--bind-dev nonexistent should fail but succeeded"
+        );
         let _ = server_task.await;
     }
 
@@ -1787,13 +1967,17 @@ mod unimplemented_flags {
         // --skip-rx-copy uses MSG_TRUNC to avoid copying received data.
         // Verify the test completes (data still counted even if not copied).
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
             .duration(1)
-            .reverse(true)  // server sends, client receives with skip-rx-copy
+            .reverse(true) // server sends, client receives with skip-rx-copy
             .skip_rx_copy(true)
             .build()
             .unwrap();
@@ -1814,7 +1998,11 @@ mod unimplemented_flags {
     async fn get_server_output_runs() {
         // --get-server-output: client requests server output. Just verify no crash.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -1846,7 +2034,10 @@ mod unimplemented_flags {
         let result = server.run().await;
         let elapsed = start.elapsed();
         // Server should have timed out after ~2 seconds, not hung forever
-        assert!(elapsed.as_secs() < 5, "idle-timeout took too long: {elapsed:?}");
+        assert!(
+            elapsed.as_secs() < 5,
+            "idle-timeout took too long: {elapsed:?}"
+        );
         // Timeout is not an error in one-off mode — server just exits
         let _ = result;
     }
@@ -1872,7 +2063,10 @@ mod unimplemented_flags {
         let start = std::time::Instant::now();
         let _ = client.run().await;
         let elapsed = start.elapsed();
-        assert!(elapsed.as_secs() < 5, "server-max-duration didn't cut test: {elapsed:?}");
+        assert!(
+            elapsed.as_secs() < 5,
+            "server-max-duration didn't cut test: {elapsed:?}"
+        );
         let _ = server_task.await;
     }
 
@@ -1897,7 +2091,10 @@ mod unimplemented_flags {
         let _ = client.run().await; // may error — server terminates early
         let elapsed = start.elapsed();
         // Should terminate well before 10 seconds
-        assert!(elapsed.as_secs() < 5, "bitrate limit didn't cut test: {elapsed:?}");
+        assert!(
+            elapsed.as_secs() < 5,
+            "bitrate limit didn't cut test: {elapsed:?}"
+        );
         let _ = server_task.await;
     }
 
@@ -1910,7 +2107,11 @@ mod unimplemented_flags {
         let tmp = std::env::temp_dir().join(format!("riperf3-test-send-{port}"));
         std::fs::write(&tmp, vec![0xABu8; 1024 * 1024]).unwrap(); // 1 MB
 
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1933,7 +2134,11 @@ mod unimplemented_flags {
         let port = next_port();
         let tmp = std::env::temp_dir().join(format!("riperf3-test-recv-{port}"));
 
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1986,7 +2191,11 @@ mod unimplemented_flags {
         // Since the sender reads from our pattern file, the receiver
         // should get that pattern (repeated as many times as the test runs).
 
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2003,7 +2212,11 @@ mod unimplemented_flags {
 
         // Now test the receive path: server sends, client receives to file
         let port2 = next_port();
-        let server2 = ServerBuilder::new().port(Some(port2)).one_off(true).build().unwrap();
+        let server2 = ServerBuilder::new()
+            .port(Some(port2))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task2 = tokio::spawn(async move { server2.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2083,7 +2296,11 @@ mod unimplemented_flags {
     async fn json_stream_runs() {
         // --json-stream: each interval emitted as JSON. Just verify it doesn't crash.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -2103,7 +2320,11 @@ mod unimplemented_flags {
         // --gsro enables UDP GSO (send) and GRO (recv).
         // May not be available on all kernels — skip gracefully if ENOPROTOOPT.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")
@@ -2127,7 +2348,11 @@ mod unimplemented_flags {
         // -Z zerocopy: uses sendfile() to avoid userspace-to-kernel copy.
         // Verify the test completes and data flows.
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let client = ClientBuilder::new("127.0.0.1")

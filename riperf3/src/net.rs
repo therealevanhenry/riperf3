@@ -155,7 +155,11 @@ pub async fn tcp_connect(
         let remote: SocketAddr = format_addr(host, port)
             .parse()
             .map_err(|e| RiperfError::Protocol(format!("bad address: {e}")))?;
-        let domain = if remote.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+        let domain = if remote.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
         let protocol = if mptcp {
             Some(socket2::Protocol::from(IPPROTO_MPTCP))
         } else {
@@ -316,8 +320,12 @@ pub fn set_snd_timeout(_fd: i32, _ms: u64) -> Result<()> {
 pub fn set_dont_fragment(fd: i32) -> Result<()> {
     use nix::sys::socket;
     let borrowed = borrow_fd(fd);
-    socket::setsockopt(&borrowed, custom_sockopt::IpMtuDiscover, &libc::IP_PMTUDISC_DO)
-        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
+    socket::setsockopt(
+        &borrowed,
+        custom_sockopt::IpMtuDiscover,
+        &libc::IP_PMTUDISC_DO,
+    )
+    .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -395,7 +403,9 @@ pub fn set_cpu_affinity(core: usize) -> Result<()> {
     use nix::sched::{sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
     let mut cpuset = CpuSet::new();
-    cpuset.set(core).map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+    cpuset
+        .set(core)
+        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
     sched_setaffinity(Pid::from_raw(0), &cpuset)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
@@ -453,7 +463,11 @@ pub fn set_udp_gro(_fd: i32) -> Result<()> {
 
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
-pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
+pub async fn udp_bind_reusable(
+    bind_addr: Option<&str>,
+    port: u16,
+    ipv6: bool,
+) -> Result<UdpSocket> {
     let default = if ipv6 { "::" } else { "0.0.0.0" };
     let host = bind_addr.unwrap_or(default);
     let addr: SocketAddr = format_addr(host, port)
@@ -488,7 +502,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {
-            tcp_connect("127.0.0.1", port, None, None, false).await.unwrap()
+            tcp_connect("127.0.0.1", port, None, None, false)
+                .await
+                .unwrap()
         });
 
         let (server_stream, _) = listener.accept().await.unwrap();
@@ -501,7 +517,14 @@ mod tests {
     #[tokio::test]
     async fn tcp_connect_timeout() {
         // Connect to a non-routable address with a short timeout
-        let result = tcp_connect("192.0.2.1", 12345, Some(Duration::from_millis(50)), None, false).await;
+        let result = tcp_connect(
+            "192.0.2.1",
+            12345,
+            Some(Duration::from_millis(50)),
+            None,
+            false,
+        )
+        .await;
         assert!(result.is_err());
     }
 

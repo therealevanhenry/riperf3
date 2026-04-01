@@ -16,7 +16,6 @@ pub struct Cli {
     // -----------------------------------------------------------------------
     // Common arguments
     // -----------------------------------------------------------------------
-
     /// Run in server mode
     #[arg(short, long, group = "mode")]
     pub server: bool,
@@ -30,7 +29,14 @@ pub struct Cli {
     pub port: Option<u16>,
 
     /// Format to report: Kbits, Mbits, Gbits, Tbits
-    #[arg(short, long, ignore_case = true, value_enum, value_name = "format", default_value = "m")]
+    #[arg(
+        short,
+        long,
+        ignore_case = true,
+        value_enum,
+        value_name = "format",
+        default_value = "m"
+    )]
     pub format: Format,
 
     /// Seconds between periodic throughput reports
@@ -58,7 +64,6 @@ pub struct Cli {
     // -----------------------------------------------------------------------
     // Server-specific arguments
     // -----------------------------------------------------------------------
-
     /// Write PID to file
     #[arg(short = 'I', long, value_name = "file")]
     pub pidfile: Option<String>,
@@ -78,7 +83,6 @@ pub struct Cli {
     // -----------------------------------------------------------------------
     // Server-specific arguments
     // -----------------------------------------------------------------------
-
     /// Handle one client connection then exit
     #[arg(short = '1', long)]
     pub one_off: bool,
@@ -102,7 +106,6 @@ pub struct Cli {
     // -----------------------------------------------------------------------
     // Client-specific arguments
     // -----------------------------------------------------------------------
-
     /// Use UDP rather than TCP
     #[arg(short = 'u', long)]
     pub udp: bool,
@@ -377,9 +380,8 @@ mod cli_tests {
         #[test]
         fn test_client_flags() {
             let cli = Cli::parse_from([
-                "riperf3", "-c", "10.0.0.1",
-                "-u", "-t", "30", "-P", "4", "-R", "--bidir",
-                "-N", "-l", "1460", "-b", "100M",
+                "riperf3", "-c", "10.0.0.1", "-u", "-t", "30", "-P", "4", "-R", "--bidir", "-N",
+                "-l", "1460", "-b", "100M",
             ]);
             assert!(cli.udp);
             assert_eq!(cli.time, Some(30));
@@ -403,8 +405,7 @@ mod cli_tests {
         #[test]
         fn test_client_window_mss_congestion() {
             let cli = Cli::parse_from([
-                "riperf3", "-c", "host",
-                "-w", "512K", "-M", "1400", "-C", "bbr",
+                "riperf3", "-c", "host", "-w", "512K", "-M", "1400", "-C", "bbr",
             ]);
             assert_eq!(cli.window, Some("512K".to_string()));
             assert_eq!(cli.mss, Some(1400));
@@ -728,12 +729,39 @@ mod cli_tests {
         #[test]
         fn all_flags_combined() {
             let cli = Cli::parse_from([
-                "riperf3", "-c", "host",
-                "-u", "-t", "30", "-P", "4", "-R", "--bidir",
-                "-N", "-l", "1460", "-b", "100M", "-J", "-V",
-                "-w", "512K", "-M", "1400", "-C", "bbr",
-                "-S", "16", "-O", "2", "-T", "test",
-                "--extra-data", "x", "--connect-timeout", "500",
+                "riperf3",
+                "-c",
+                "host",
+                "-u",
+                "-t",
+                "30",
+                "-P",
+                "4",
+                "-R",
+                "--bidir",
+                "-N",
+                "-l",
+                "1460",
+                "-b",
+                "100M",
+                "-J",
+                "-V",
+                "-w",
+                "512K",
+                "-M",
+                "1400",
+                "-C",
+                "bbr",
+                "-S",
+                "16",
+                "-O",
+                "2",
+                "-T",
+                "test",
+                "--extra-data",
+                "x",
+                "--connect-timeout",
+                "500",
             ]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c.protocol, TransportProtocol::Udp);
@@ -934,7 +962,9 @@ mod cli_tests {
         fn server_daemon_wired() {
             let cli = Cli::parse_from(["riperf3", "-s", "-D"]);
             let mut b = riperf3::ServerBuilder::new();
-            if cli.daemon { b = b.daemon(true); }
+            if cli.daemon {
+                b = b.daemon(true);
+            }
             let s = b.build().unwrap();
             assert!(s.daemon);
         }
@@ -943,7 +973,9 @@ mod cli_tests {
         fn server_idle_timeout_wired() {
             let cli = Cli::parse_from(["riperf3", "-s", "--idle-timeout", "30"]);
             let mut b = riperf3::ServerBuilder::new();
-            if let Some(secs) = cli.idle_timeout { b = b.idle_timeout(secs); }
+            if let Some(secs) = cli.idle_timeout {
+                b = b.idle_timeout(secs);
+            }
             let s = b.build().unwrap();
             assert_eq!(s.idle_timeout, Some(30));
         }
@@ -952,7 +984,9 @@ mod cli_tests {
         fn server_max_duration_wired() {
             let cli = Cli::parse_from(["riperf3", "-s", "--server-max-duration", "60"]);
             let mut b = riperf3::ServerBuilder::new();
-            if let Some(secs) = cli.server_max_duration { b = b.server_max_duration(secs); }
+            if let Some(secs) = cli.server_max_duration {
+                b = b.server_max_duration(secs);
+            }
             let s = b.build().unwrap();
             assert_eq!(s.server_max_duration, Some(60));
         }

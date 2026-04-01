@@ -3,18 +3,18 @@
 mod macros;
 
 pub mod error;
-pub use error::{ConfigError, RiperfError, Result};
+pub use error::{ConfigError, Result, RiperfError};
 
-pub mod utils;
 pub mod units;
+pub mod utils;
 
 pub mod auth;
-pub mod protocol;
+pub mod cpu;
 pub mod net;
+pub mod protocol;
+pub mod reporter;
 pub mod stream;
 pub mod tcp_info;
-pub mod cpu;
-pub mod reporter;
 
 // The iperf_api module contains reference type definitions mirroring iperf3's C API.
 pub mod iperf_api;
