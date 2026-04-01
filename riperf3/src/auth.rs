@@ -174,46 +174,10 @@ pub fn read_password() -> Result<String> {
         return Ok(pw);
     }
 
-    // Interactive prompt with echo disabled
+    // Interactive prompt with echo disabled — safe, cross-platform
     eprint!("Password: ");
-    #[cfg(unix)]
-    {
-        use std::io::{BufRead, Write};
-        std::io::stderr().flush().ok();
-
-        // Disable echo
-        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-        let stdin_fd = libc::STDIN_FILENO;
-        unsafe {
-            libc::tcgetattr(stdin_fd, termios.as_mut_ptr());
-        }
-        let mut termios = unsafe { termios.assume_init() };
-        let old_lflag = termios.c_lflag;
-        termios.c_lflag &= !libc::ECHO;
-        unsafe {
-            libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
-        }
-
-        let mut password = String::new();
-        std::io::stdin().lock().read_line(&mut password).ok();
-
-        // Restore echo
-        termios.c_lflag = old_lflag;
-        unsafe {
-            libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
-        }
-        eprintln!(); // newline after password
-
-        Ok(password.trim_end().to_string())
-    }
-
-    #[cfg(not(unix))]
-    {
-        use std::io::BufRead;
-        let mut password = String::new();
-        std::io::stdin().lock().read_line(&mut password).ok();
-        Ok(password.trim_end().to_string())
-    }
+    rpassword::read_password()
+        .map_err(|e| RiperfError::Protocol(format!("password read failed: {e}")))
 }
 
 /// Helper: format hex string (avoid pulling in the `hex` crate)
