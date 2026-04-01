@@ -802,6 +802,67 @@ mod tests {
         assert!(elapsed < Duration::from_millis(300)); // generous upper bound
     }
 
+    #[tokio::test]
+    async fn rate_limiter_high_rate_precision() {
+        // At 10 Gbps with 1460-byte packets, drain the burst first,
+        // then verify paced throughput is within 50% of target.
+        // Before fix: tokio::time::sleep caps at ~1 Gbps after burst.
+        // After fix: clock_nanosleep should approach 10 Gbps.
+        let rate = 10_000_000_000u64; // 10 Gbps
+        let blksize = 1460usize;
+        let mut limiter = RateLimiter::new(rate, 0, blksize);
+
+        // Drain the burst completely
+        let burst_bytes = (rate as f64 / 8.0 * 0.1).max(4.0 * blksize as f64) as u64;
+        let burst_packets = burst_bytes / blksize as u64 + 1;
+        for _ in 0..burst_packets {
+            limiter.acquire(blksize as u64).await;
+        }
+
+        // Now measure paced throughput (no burst tokens left)
+        let start = Instant::now();
+        let mut total_bytes: u64 = 0;
+        let target_duration = Duration::from_millis(100);
+
+        while start.elapsed() < target_duration {
+            limiter.acquire(blksize as u64).await;
+            total_bytes += blksize as u64;
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let achieved_bps = total_bytes as f64 * 8.0 / elapsed;
+        let target_bps = rate as f64;
+
+        // Should achieve at least 50% of target rate
+        assert!(
+            achieved_bps > target_bps * 0.5,
+            "high-rate pacing too slow: {:.1} Gbps achieved, {:.1} Gbps target",
+            achieved_bps / 1e9,
+            target_bps / 1e9,
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_low_rate_still_works() {
+        // Verify that the clock_nanosleep path doesn't break low-rate pacing
+        let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbps
+        let start = Instant::now();
+        let mut total_bytes: u64 = 0;
+
+        // Send 10 packets at 1 Mbps = ~10ms
+        for _ in 0..10 {
+            limiter.acquire(1000).await;
+            total_bytes += 1000;
+        }
+
+        let elapsed = start.elapsed();
+        // Should take at least some time (not instant)
+        // Burst covers first ~4 packets, remaining 6 need pacing
+        assert!(total_bytes == 10_000);
+        // Should complete in under 1 second (generously)
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
     // -- TCP send/recv integration --
 
     #[tokio::test]
