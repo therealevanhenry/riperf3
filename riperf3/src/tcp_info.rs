@@ -88,14 +88,48 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Query TCP_INFO for a connected TCP socket (FreeBSD).
+/// Same option name as Linux but different struct field names.
+#[cfg(target_os = "freebsd")]
+pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
+    use std::mem::{self, MaybeUninit};
+
+    // SAFETY: getsockopt(TCP_INFO) is a read-only kernel query on a valid fd.
+    let info = unsafe {
+        let mut info = MaybeUninit::<libc::tcp_info>::uninit();
+        let mut len = mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        );
+        if ret < 0 {
+            return None;
+        }
+        info.assume_init()
+    };
+
+    Some(TcpInfoSnapshot {
+        total_retransmits: info.tcpi_snd_rexmitpack,
+        snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,
+        snd_wnd: info.tcpi_snd_wnd as u64,
+        rtt: info.tcpi_rtt,
+        rttvar: info.tcpi_rttvar,
+        snd_mss: info.tcpi_snd_mss,
+        pmtu: info.__tcpi_pmtu,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
     None
 }
 
 /// Whether this platform provides TCP retransmit information.
 pub fn has_retransmit_info() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
 }
 
 #[cfg(test)]
