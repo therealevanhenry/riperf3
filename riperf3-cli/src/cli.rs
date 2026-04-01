@@ -513,6 +513,9 @@ mod cli_tests {
             if cli.zerocopy {
                 b = b.zerocopy(true);
             }
+            if cli.gsro {
+                b = b.gsro(true);
+            }
             if cli.dont_fragment {
                 b = b.dont_fragment(true);
             }

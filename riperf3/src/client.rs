@@ -48,6 +48,7 @@ pub struct Client {
     pub blocks_to_send: Option<u64>,
     pub repeating_payload: bool,
     pub zerocopy: bool,
+    pub gsro: bool,
     pub dont_fragment: bool,
     pub cport: Option<u16>,
     pub get_server_output: bool,
@@ -304,6 +305,15 @@ impl Client {
                         .connect(net::format_addr(&self.host, self.port))
                         .await?;
                     protocol::udp_connect_client(&udp_sock).await?;
+
+                    // Apply GSO/GRO if requested
+                    if self.gsro {
+                        use std::os::unix::io::AsRawFd;
+                        let fd = udp_sock.as_raw_fd();
+                        // GSO on sender, GRO on receiver
+                        let _ = net::set_udp_gso(fd, self.blksize as u16);
+                        let _ = net::set_udp_gro(fd);
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
@@ -745,6 +755,7 @@ pub struct ClientBuilder {
     blocks_to_send: Option<u64>,
     repeating_payload: bool,
     zerocopy: bool,
+    gsro: bool,
     dont_fragment: bool,
     cport: Option<u16>,
     get_server_output: bool,
@@ -798,6 +809,7 @@ impl Default for ClientBuilder {
             blocks_to_send: None,
             repeating_payload: false,
             zerocopy: false,
+            gsro: false,
             dont_fragment: false,
             cport: None,
             get_server_output: false,
@@ -959,6 +971,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn gsro(mut self, enabled: bool) -> Self {
+        self.gsro = enabled;
+        self
+    }
+
     pub fn dont_fragment(mut self, enabled: bool) -> Self {
         self.dont_fragment = enabled;
         self
@@ -1111,6 +1128,7 @@ impl ClientBuilder {
             blocks_to_send: self.blocks_to_send,
             repeating_payload: self.repeating_payload,
             zerocopy: self.zerocopy,
+            gsro: self.gsro,
             dont_fragment: self.dont_fragment,
             cport: self.cport,
             get_server_output: self.get_server_output,

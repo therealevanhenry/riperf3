@@ -428,6 +428,55 @@ pub fn set_ipv6_flowlabel(_fd: i32, _label: i32) -> Result<()> {
     Ok(())
 }
 
+/// Enable UDP GSO (Generic Segmentation Offload) on a UDP socket.
+/// Sets UDP_SEGMENT to the datagram size so the kernel can batch sends.
+#[cfg(target_os = "linux")]
+pub fn set_udp_gso(fd: i32, segment_size: u16) -> Result<()> {
+    let val = segment_size as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_UDP,
+            libc::UDP_SEGMENT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_udp_gso(_fd: i32, _segment_size: u16) -> Result<()> {
+    Ok(())
+}
+
+/// Enable UDP GRO (Generic Receive Offload) on a UDP socket.
+#[cfg(target_os = "linux")]
+pub fn set_udp_gro(fd: i32) -> Result<()> {
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_udp_gro(_fd: i32) -> Result<()> {
+    Ok(())
+}
+
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
 pub async fn udp_bind_reusable(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
