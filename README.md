@@ -73,6 +73,33 @@ Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
 
 TCP performance is at parity with iperf3. The UDP 50G gap is due to safe Rust's `send()` overhead vs C's raw `write()` syscall — a deliberate trade-off for memory safety.
 
+## Platform Support
+
+riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specific features use safe Rust wrappers where available, with graceful degradation or clear error messages on unsupported platforms.
+
+| Feature | Linux | macOS | FreeBSD | Windows |
+|---|:---:|:---:|:---:|:---:|
+| TCP/UDP core | yes | yes | yes | yes |
+| `-w` window size | yes | yes | yes | yes |
+| `-N` no-delay | yes | yes | yes | yes |
+| `-M` MSS | yes | yes | yes | |
+| `-S` TOS | yes | yes | yes | |
+| `-Z` zerocopy (sendfile) | yes | yes | yes | |
+| `-C` congestion control | yes | | yes | |
+| `-A` CPU affinity | yes | | yes | |
+| `-D` daemon | yes | | yes | |
+| `--dont-fragment` | yes | yes | yes | |
+| `--bind-dev` | yes | yes | | |
+| `--rcv-timeout` | yes | yes | yes | |
+| `--cntl-ka` keepalive | yes | yes | yes | |
+| TCP_INFO stats | yes | yes | yes | |
+| `--snd-timeout` | yes | | | |
+| `--fq-rate` pacing | yes | | | |
+| `--flowlabel` IPv6 | yes | | | |
+| `--gsro` UDP GSO/GRO | yes | | | |
+
+Blank cells indicate the feature is not available on that platform (matching iperf3's support matrix). Flags that aren't supported on the current OS return a clear error at startup rather than silently failing.
+
 ## CLI Reference
 
 ```
