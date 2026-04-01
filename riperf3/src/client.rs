@@ -315,11 +315,11 @@ impl Client {
                         let zc = self.zerocopy;
                         tokio::spawn(async move {
                             if zc {
-                                #[cfg(target_os = "linux")]
+                                #[cfg(unix)]
                                 {
                                     stream::run_tcp_sender_zerocopy(data_stream, c, buf, d).await
                                 }
-                                #[cfg(not(target_os = "linux"))]
+                                #[cfg(not(unix))]
                                 {
                                     stream::run_tcp_sender(data_stream, c, buf, d, fp).await
                                 }

@@ -385,8 +385,126 @@ pub async fn run_tcp_sender_zerocopy(
     Ok(())
 }
 
+/// Zerocopy sender for macOS — uses macOS sendfile (reversed fd order, returns bytes via tuple).
+#[cfg(target_os = "macos")]
+pub async fn run_tcp_sender_zerocopy(
+    stream: TcpStream,
+    counters: Arc<StreamCounters>,
+    buf: Vec<u8>,
+    done: Arc<AtomicBool>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut tmpfile = tempfile()?;
+    tmpfile.write_all(&buf)?;
+    let blksize = buf.len();
+
+    loop {
+        stream.writable().await?;
+
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = stream.try_io(tokio::io::Interest::WRITABLE, || {
+            let (res, bytes_sent) = nix::sys::sendfile::sendfile(
+                &tmpfile,
+                &stream,
+                0, // offset
+                Some(blksize as libc::off_t),
+                None, // headers
+                None, // trailers
+            );
+            match res {
+                Ok(()) => Ok(bytes_sent as usize),
+                Err(e) => {
+                    if bytes_sent > 0 {
+                        Ok(bytes_sent as usize)
+                    } else {
+                        Err(std::io::Error::from(e))
+                    }
+                }
+            }
+        });
+
+        match result {
+            Ok(n) if n > 0 => counters.record_sent(n as u64),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                break
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Zerocopy sender for FreeBSD — uses FreeBSD sendfile (reversed fd order, SfFlags).
+#[cfg(target_os = "freebsd")]
+pub async fn run_tcp_sender_zerocopy(
+    stream: TcpStream,
+    counters: Arc<StreamCounters>,
+    buf: Vec<u8>,
+    done: Arc<AtomicBool>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut tmpfile = tempfile()?;
+    tmpfile.write_all(&buf)?;
+    let blksize = buf.len();
+
+    loop {
+        stream.writable().await?;
+
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = stream.try_io(tokio::io::Interest::WRITABLE, || {
+            let (res, bytes_sent) = nix::sys::sendfile::sendfile(
+                &tmpfile,
+                &stream,
+                0, // offset
+                Some(blksize),
+                None, // headers
+                None, // trailers
+                nix::sys::sendfile::SfFlags::empty(),
+                0, // readahead
+            );
+            match res {
+                Ok(()) => Ok(bytes_sent as usize),
+                Err(e) => {
+                    if bytes_sent > 0 {
+                        Ok(bytes_sent as usize)
+                    } else {
+                        Err(std::io::Error::from(e))
+                    }
+                }
+            }
+        });
+
+        match result {
+            Ok(n) if n > 0 => counters.record_sent(n as u64),
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                break
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Create a temporary file for zerocopy sends.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn tempfile() -> std::io::Result<std::fs::File> {
     use std::io::Seek;
     let mut f = tempfile_in(std::env::temp_dir())?;
@@ -394,7 +512,7 @@ fn tempfile() -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn tempfile_in(dir: std::path::PathBuf) -> std::io::Result<std::fs::File> {
     let path = dir.join(format!(".riperf3-zc-{}", std::process::id()));
     let f = std::fs::OpenOptions::new()
