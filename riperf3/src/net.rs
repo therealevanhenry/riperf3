@@ -231,26 +231,21 @@ pub fn configure_tcp_stream_full(
 ) -> Result<()> {
     stream.set_nodelay(no_delay)?;
 
-    // MSS and window use socket2's cross-platform API
-    #[cfg(unix)]
+    // Window sizes via socket2 (cross-platform). MSS via socket2 (Unix only).
     {
         let sock = socket2::SockRef::from(&stream);
 
+        #[cfg(unix)]
         if let Some(mss_val) = mss {
             let _ = sock.set_mss(mss_val as u32);
         }
+        #[cfg(not(unix))]
+        let _ = mss;
 
         if let Some(size) = window {
             let _ = sock.set_recv_buffer_size(size as usize);
             let _ = sock.set_send_buffer_size(size as usize);
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        // socket2::SockRef requires AsRawFd (Unix) or AsRawSocket (Windows).
-        // Windows support would need AsRawSocket path — left as future work.
-        let _ = (mss, window);
     }
 
     // Congestion control: Linux + FreeBSD (iperf3 uses HAVE_TCP_CONGESTION)
@@ -411,8 +406,8 @@ pub fn set_tcp_keepalive<F>(
     Ok(())
 }
 
-/// Set CPU affinity for the current thread (Linux only).
-#[cfg(target_os = "linux")]
+/// Set CPU affinity for the current thread (Linux + FreeBSD).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_cpu_affinity(core: usize) -> Result<()> {
     use nix::sched::{sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
@@ -424,7 +419,7 @@ pub fn set_cpu_affinity(core: usize) -> Result<()> {
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub fn set_cpu_affinity(_core: usize) -> Result<()> {
     Ok(())
 }
@@ -468,6 +463,19 @@ pub fn set_udp_gro(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn set_udp_gro<F>(_fd: &F) -> Result<()> {
+    Ok(())
+}
+
+/// Set IP_TOS on a socket. Cross-platform via socket2.
+#[cfg(unix)]
+pub fn set_tos(fd: &impl std::os::unix::io::AsFd, tos: u32) -> Result<()> {
+    let sock = socket2::SockRef::from(fd);
+    sock.set_tos(tos)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn set_tos<F>(_fd: &F, _tos: u32) -> Result<()> {
     Ok(())
 }
 

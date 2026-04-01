@@ -290,6 +290,9 @@ impl Client {
                     if let Some(ref dev) = self.bind_dev {
                         net::set_bind_dev(&data_stream, dev)?;
                     }
+                    if self.tos != 0 {
+                        net::set_tos(&data_stream, self.tos as u32)?;
+                    }
 
                     // Extract raw fd for TCP_INFO (Unix only)
                     #[cfg(unix)]
@@ -360,6 +363,9 @@ impl Client {
                     if self.gsro {
                         let _ = net::set_udp_gso(&udp_sock, self.blksize as u16);
                         let _ = net::set_udp_gro(&udp_sock);
+                    }
+                    if self.tos != 0 {
+                        let _ = net::set_tos(&udp_sock, self.tos as u32);
                     }
 
                     let stream_id = iperf3_stream_id(i);

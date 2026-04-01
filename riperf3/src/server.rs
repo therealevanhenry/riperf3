@@ -236,6 +236,9 @@ impl Server {
                         cfg.window,
                         cfg.congestion.as_deref(),
                     )?;
+                    if cfg.tos != 0 {
+                        let _ = net::set_tos(&data_stream, cfg.tos as u32);
+                    }
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
