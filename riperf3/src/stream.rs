@@ -341,6 +341,85 @@ pub async fn run_tcp_sender(
     Ok(())
 }
 
+/// TCP sender using sendfile() for zero-copy transmission (Linux only).
+/// Creates a temp file with the send buffer content, then uses sendfile()
+/// to transfer directly from the page cache to the socket.
+#[cfg(target_os = "linux")]
+pub async fn run_tcp_sender_zerocopy(
+    stream: TcpStream,
+    counters: Arc<StreamCounters>,
+    buf: Vec<u8>,
+    done: Arc<AtomicBool>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    // Create temp file with buffer content
+    let mut tmpfile = tempfile()?;
+    tmpfile.write_all(&buf)?;
+    let file_fd = tmpfile.as_raw_fd();
+    let sock_fd = stream.as_raw_fd();
+    let blksize = buf.len();
+
+    loop {
+        // Wait for socket to be writable
+        stream.writable().await?;
+
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = stream.try_io(tokio::io::Interest::WRITABLE, || {
+            let mut offset: libc::off_t = 0;
+            let sent = unsafe {
+                libc::sendfile(sock_fd, file_fd, &mut offset, blksize)
+            };
+            if sent < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
+            }
+        });
+
+        match result {
+            Ok(n) if n > 0 => counters.record_sent(n as u64),
+            Ok(_) => break, // 0 = closed
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                break
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Create a temporary file for zerocopy sends.
+#[cfg(target_os = "linux")]
+fn tempfile() -> std::io::Result<std::fs::File> {
+    use std::io::Seek;
+    let mut f = tempfile_in(std::env::temp_dir())?;
+    f.seek(std::io::SeekFrom::Start(0))?;
+    Ok(f)
+}
+
+#[cfg(target_os = "linux")]
+fn tempfile_in(dir: std::path::PathBuf) -> std::io::Result<std::fs::File> {
+    let path = dir.join(format!(".riperf3-zc-{}", std::process::id()));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    // Unlink immediately — file stays open but invisible
+    let _ = std::fs::remove_file(&path);
+    Ok(f)
+}
+
 /// TCP receiver: reads until the peer closes the connection or `done` is set.
 /// If `skip_rx_copy` is true, uses MSG_TRUNC to avoid copying data (Linux only).
 /// If `file_path` is set, writes received data to the file.

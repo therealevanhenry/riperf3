@@ -2076,8 +2076,23 @@ mod unimplemented_flags {
     // -- Deferred --
 
     #[tokio::test]
-    #[ignore = "deferred: -Z zerocopy requires sendfile/splice"]
-    async fn zerocopy_send() {}
+    async fn zerocopy_send() {
+        // -Z zerocopy: uses sendfile() to avoid userspace-to-kernel copy.
+        // Verify the test completes and data flows.
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).one_off(true).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .bytes(10 * 1024 * 1024) // 10 MB
+            .zerocopy(true)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "-Z zerocopy failed: {result:?}");
+        let _ = server_task.await;
+    }
 
     #[tokio::test]
     #[ignore = "deferred: auth requires RSA key handling"]

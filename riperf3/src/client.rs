@@ -47,6 +47,7 @@ pub struct Client {
     pub bytes_to_send: Option<u64>,
     pub blocks_to_send: Option<u64>,
     pub repeating_payload: bool,
+    pub zerocopy: bool,
     pub dont_fragment: bool,
     pub cport: Option<u16>,
     pub get_server_output: bool,
@@ -260,8 +261,16 @@ impl Client {
                         let buf = make_send_buffer(self.blksize, self.repeating_payload);
                         let c = counters.clone();
                         let d = done.clone();
+                        let zc = self.zerocopy;
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                            if zc {
+                                #[cfg(target_os = "linux")]
+                                { stream::run_tcp_sender_zerocopy(data_stream, c, buf, d).await }
+                                #[cfg(not(target_os = "linux"))]
+                                { stream::run_tcp_sender(data_stream, c, buf, d, fp).await }
+                            } else {
+                                stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                            }
                         })
                     } else {
                         let c = counters.clone();
@@ -735,6 +744,7 @@ pub struct ClientBuilder {
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
     repeating_payload: bool,
+    zerocopy: bool,
     dont_fragment: bool,
     cport: Option<u16>,
     get_server_output: bool,
@@ -787,6 +797,7 @@ impl Default for ClientBuilder {
             bytes_to_send: None,
             blocks_to_send: None,
             repeating_payload: false,
+            zerocopy: false,
             dont_fragment: false,
             cport: None,
             get_server_output: false,
@@ -943,6 +954,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn zerocopy(mut self, enabled: bool) -> Self {
+        self.zerocopy = enabled;
+        self
+    }
+
     pub fn dont_fragment(mut self, enabled: bool) -> Self {
         self.dont_fragment = enabled;
         self
@@ -1094,6 +1110,7 @@ impl ClientBuilder {
             bytes_to_send: self.bytes_to_send,
             blocks_to_send: self.blocks_to_send,
             repeating_payload: self.repeating_payload,
+            zerocopy: self.zerocopy,
             dont_fragment: self.dont_fragment,
             cport: self.cport,
             get_server_output: self.get_server_output,

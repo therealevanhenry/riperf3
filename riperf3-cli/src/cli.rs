@@ -510,6 +510,9 @@ mod cli_tests {
             if cli.repeating_payload {
                 b = b.repeating_payload(true);
             }
+            if cli.zerocopy {
+                b = b.zerocopy(true);
+            }
             if cli.dont_fragment {
                 b = b.dont_fragment(true);
             }

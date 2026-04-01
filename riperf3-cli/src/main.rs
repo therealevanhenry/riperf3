@@ -143,6 +143,9 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if cli.repeating_payload {
             builder = builder.repeating_payload(true);
         }
+        if cli.zerocopy {
+            builder = builder.zerocopy(true);
+        }
         if cli.dont_fragment {
             builder = builder.dont_fragment(true);
         }
