@@ -93,11 +93,8 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         if self.daemon {
             #[cfg(unix)]
-            unsafe {
-                if libc::daemon(0, 0) != 0 {
-                    return Err(RiperfError::Io(std::io::Error::last_os_error()));
-                }
-            }
+            nix::unistd::daemon(false, false)
+                .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
         }
 
         let listener = net::tcp_listen(self.bind_address.as_deref(), self.port, None).await?;
