@@ -616,9 +616,13 @@ pub fn run_udp_sender_blocking(
     let mut buf = vec![0u8; blksize];
     let mut seq: u64 = 0;
 
-    // Batch size scales with rate: 1 per Gbps, capped at 64, minimum 1
+    // Batch size: target ~5ms worth of packets per batch, capped at 256.
+    // This ensures thread::sleep overhead (~50-100µs) is <2% of the batch window.
     let batch_size: u32 = if rate_bits_per_sec > 0 {
-        (rate_bits_per_sec / 1_000_000_000).clamp(1, 64) as u32
+        let rate_bytes = rate_bits_per_sec as f64 / 8.0;
+        let packets_per_sec = rate_bytes / blksize as f64;
+        let packets_per_5ms = (packets_per_sec * 0.005) as u64;
+        packets_per_5ms.clamp(1, 256) as u32
     } else {
         1
     };
