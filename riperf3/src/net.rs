@@ -253,15 +253,15 @@ pub fn configure_tcp_stream_full(
         let _ = (mss, window);
     }
 
-    // Congestion control is Linux+FreeBSD only (iperf3 uses HAVE_TCP_CONGESTION)
-    #[cfg(target_os = "linux")]
+    // Congestion control: Linux + FreeBSD (iperf3 uses HAVE_TCP_CONGESTION)
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if let Some(algo) = congestion {
         use nix::sys::socket::{self, sockopt};
         use std::ffi::OsString;
         let _ = socket::setsockopt(stream, sockopt::TcpCongestion, &OsString::from(algo));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let _ = congestion;
 
     Ok(())
@@ -281,16 +281,19 @@ pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<
 }
 
 /// Set SO_RCVTIMEO on a socket (receive timeout in milliseconds).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn set_rcv_timeout(fd: &impl std::os::unix::io::AsFd, ms: u64) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
-    let tv = TimeVal::new((ms / 1000) as i64, ((ms % 1000) * 1000) as i64);
+    let tv = TimeVal::new(
+        (ms / 1000) as libc::time_t,
+        ((ms % 1000) * 1000) as libc::suseconds_t,
+    );
     socket::setsockopt(fd, sockopt::ReceiveTimeout, &tv)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn set_rcv_timeout<F>(_fd: &F, _ms: u64) -> Result<()> {
     Ok(())
 }
@@ -372,7 +375,8 @@ pub fn set_bind_dev<F>(_fd: &F, _dev: &str) -> Result<()> {
 }
 
 /// Set TCP keepalive options on a socket.
-#[cfg(target_os = "linux")]
+/// SO_KEEPALIVE works everywhere; idle/interval/count need platform support.
+#[cfg(unix)]
 pub fn set_tcp_keepalive(
     fd: &impl std::os::unix::io::AsFd,
     idle: Option<u32>,
@@ -381,9 +385,13 @@ pub fn set_tcp_keepalive(
 ) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     let _ = socket::setsockopt(fd, sockopt::KeepAlive, &true);
+    // TcpKeepIdle: Linux, FreeBSD (not macOS — uses TCP_KEEPALIVE instead)
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if let Some(val) = idle {
         let _ = socket::setsockopt(fd, sockopt::TcpKeepIdle, &val);
     }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    let _ = idle;
     if let Some(val) = interval {
         let _ = socket::setsockopt(fd, sockopt::TcpKeepInterval, &val);
     }
@@ -393,7 +401,7 @@ pub fn set_tcp_keepalive(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn set_tcp_keepalive<F>(
     _fd: &F,
     _idle: Option<u32>,

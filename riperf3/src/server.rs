@@ -87,10 +87,10 @@ pub struct Server {
 impl Server {
     pub async fn run(&self) -> Result<()> {
         if self.daemon {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
             nix::unistd::daemon(false, false)
                 .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
             {
                 return Err(RiperfError::Protocol(
                     "daemon mode is not supported on this platform".into(),
