@@ -2113,6 +2113,81 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
-    #[ignore = "deferred: auth requires RSA key handling"]
-    async fn rsa_authentication() {}
+    async fn rsa_auth_success() {
+        let port = next_port();
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .rsa_private_key_path(&format!("{fixtures}/test_private.pem"))
+            .authorized_users_path(&format!("{fixtures}/test_users.csv"))
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .username("testuser")
+            .password("testpass")
+            .rsa_public_key_path(&format!("{fixtures}/test_public.pem"))
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "RSA auth failed: {result:?}");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn rsa_auth_wrong_password() {
+        let port = next_port();
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .rsa_private_key_path(&format!("{fixtures}/test_private.pem"))
+            .authorized_users_path(&format!("{fixtures}/test_users.csv"))
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .username("testuser")
+            .password("wrongpass")
+            .rsa_public_key_path(&format!("{fixtures}/test_public.pem"))
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "wrong password should fail");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn rsa_auth_no_token_rejected() {
+        let port = next_port();
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .rsa_private_key_path(&format!("{fixtures}/test_private.pem"))
+            .authorized_users_path(&format!("{fixtures}/test_users.csv"))
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Client without auth — should be rejected
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "no auth token should be rejected");
+        let _ = server_task.await;
+    }
 }

@@ -71,6 +71,10 @@ pub struct Client {
     pub cntl_ka: Option<String>,
     pub pidfile: Option<String>,
     pub logfile: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub rsa_public_key_path: Option<String>,
+    pub use_pkcs1_padding: bool,
 }
 
 impl Client {
@@ -206,6 +210,22 @@ impl Client {
         if let Some(blocks) = self.blocks_to_send {
             p.blockcount = Some(blocks);
         }
+
+        // Auth: encrypt credentials if username and public key are set
+        if let (Some(ref username), Some(ref pubkey_path)) =
+            (&self.username, &self.rsa_public_key_path)
+        {
+            let pubkey_pem = std::fs::read(pubkey_path).unwrap_or_default();
+            let password = self.password.clone()
+                .or_else(|| crate::auth::read_password().ok())
+                .unwrap_or_default();
+            if let Ok(token) =
+                crate::auth::encode_auth_token(username, &password, &pubkey_pem, self.use_pkcs1_padding)
+            {
+                p.authtoken = Some(token);
+            }
+        }
+
         p
     }
 
@@ -778,6 +798,10 @@ pub struct ClientBuilder {
     cntl_ka: Option<String>,
     pidfile: Option<String>,
     logfile: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    rsa_public_key_path: Option<String>,
+    use_pkcs1_padding: bool,
 }
 
 impl Default for ClientBuilder {
@@ -832,6 +856,10 @@ impl Default for ClientBuilder {
             cntl_ka: None,
             pidfile: None,
             logfile: None,
+            username: None,
+            password: None,
+            rsa_public_key_path: None,
+            use_pkcs1_padding: false,
         }
     }
 }
@@ -1086,6 +1114,26 @@ impl ClientBuilder {
         self
     }
 
+    pub fn username(mut self, name: &str) -> Self {
+        self.username = Some(name.to_string());
+        self
+    }
+
+    pub fn password(mut self, pass: &str) -> Self {
+        self.password = Some(pass.to_string());
+        self
+    }
+
+    pub fn rsa_public_key_path(mut self, path: &str) -> Self {
+        self.rsa_public_key_path = Some(path.to_string());
+        self
+    }
+
+    pub fn use_pkcs1_padding(mut self, enabled: bool) -> Self {
+        self.use_pkcs1_padding = enabled;
+        self
+    }
+
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
 
@@ -1151,6 +1199,10 @@ impl ClientBuilder {
             cntl_ka: self.cntl_ka,
             pidfile: self.pidfile,
             logfile: self.logfile,
+            username: self.username,
+            password: self.password,
+            rsa_public_key_path: self.rsa_public_key_path,
+            use_pkcs1_padding: self.use_pkcs1_padding,
         })
     }
 }

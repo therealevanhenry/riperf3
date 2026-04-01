@@ -83,6 +83,10 @@ pub struct Server {
     pub bind_address: Option<String>,
     pub timestamps: Option<String>,
     pub file: Option<String>,
+    pub rsa_private_key_path: Option<String>,
+    pub authorized_users_path: Option<String>,
+    pub time_skew_threshold: u32,
+    pub use_pkcs1_padding: bool,
 }
 
 impl Server {
@@ -157,6 +161,39 @@ impl Server {
         protocol::send_state(&mut ctrl, TestState::ParamExchange).await?;
         let params = protocol::recv_params(&mut ctrl).await?;
         let cfg = TestConfig::from_params(&params);
+
+        // ---- Auth validation (after params, before streams) ----
+        if let (Some(ref privkey_path), Some(ref users_path)) =
+            (&self.rsa_private_key_path, &self.authorized_users_path)
+        {
+            if let Some(ref token) = params.authtoken {
+                let privkey_pem = std::fs::read(privkey_path).map_err(|e| {
+                    RiperfError::Protocol(format!("cannot read RSA private key: {e}"))
+                })?;
+                match crate::auth::decode_auth_token(token, &privkey_pem, self.use_pkcs1_padding) {
+                    Ok((username, password, ts)) => {
+                        crate::auth::check_credentials(
+                            &username,
+                            &password,
+                            ts,
+                            users_path,
+                            self.time_skew_threshold,
+                        )?;
+                        if self.verbose {
+                            vprintln!("Authenticated user: {username}");
+                        }
+                    }
+                    Err(e) => {
+                        protocol::send_state(&mut ctrl, TestState::AccessDenied).await?;
+                        return Err(e);
+                    }
+                }
+            } else {
+                // Server requires auth but client didn't send token
+                protocol::send_state(&mut ctrl, TestState::AccessDenied).await?;
+                return Err(RiperfError::AccessDenied);
+            }
+        }
 
         if self.verbose {
             vprintln!(
@@ -519,6 +556,10 @@ pub struct ServerBuilder {
     bind_address: Option<String>,
     timestamps: Option<String>,
     file: Option<String>,
+    rsa_private_key_path: Option<String>,
+    authorized_users_path: Option<String>,
+    time_skew_threshold: u32,
+    use_pkcs1_padding: bool,
 }
 
 impl Default for ServerBuilder {
@@ -537,6 +578,10 @@ impl Default for ServerBuilder {
             bind_address: None,
             timestamps: None,
             file: None,
+            rsa_private_key_path: None,
+            authorized_users_path: None,
+            time_skew_threshold: 10,
+            use_pkcs1_padding: false,
         }
     }
 }
@@ -611,6 +656,26 @@ impl ServerBuilder {
         self
     }
 
+    pub fn rsa_private_key_path(mut self, path: &str) -> Self {
+        self.rsa_private_key_path = Some(path.to_string());
+        self
+    }
+
+    pub fn authorized_users_path(mut self, path: &str) -> Self {
+        self.authorized_users_path = Some(path.to_string());
+        self
+    }
+
+    pub fn time_skew_threshold(mut self, secs: u32) -> Self {
+        self.time_skew_threshold = secs;
+        self
+    }
+
+    pub fn use_pkcs1_padding(mut self, enabled: bool) -> Self {
+        self.use_pkcs1_padding = enabled;
+        self
+    }
+
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
         Ok(Server {
             port: self.port.unwrap_or(DEFAULT_PORT),
@@ -626,6 +691,10 @@ impl ServerBuilder {
             bind_address: self.bind_address,
             timestamps: self.timestamps,
             file: self.file,
+            rsa_private_key_path: self.rsa_private_key_path,
+            authorized_users_path: self.authorized_users_path,
+            time_skew_threshold: self.time_skew_threshold,
+            use_pkcs1_padding: self.use_pkcs1_padding,
         })
     }
 }

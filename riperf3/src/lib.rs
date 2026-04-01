@@ -8,6 +8,7 @@ pub use error::{ConfigError, RiperfError, Result};
 pub mod utils;
 pub mod units;
 
+pub mod auth;
 pub mod protocol;
 pub mod net;
 pub mod stream;

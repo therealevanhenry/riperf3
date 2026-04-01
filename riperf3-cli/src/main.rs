@@ -212,6 +212,15 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(ref path) = cli.logfile {
             builder = builder.logfile(path);
         }
+        if let Some(ref name) = cli.username {
+            builder = builder.username(name);
+        }
+        if let Some(ref path) = cli.rsa_public_key_path {
+            builder = builder.rsa_public_key_path(path);
+        }
+        if cli.use_pkcs1_padding {
+            builder = builder.use_pkcs1_padding(true);
+        }
 
         let client = builder.build()?;
         client.run().await?;
@@ -254,6 +263,19 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         }
         if let Some(ref fmt) = cli.timestamps {
             builder = builder.timestamps(fmt);
+        }
+
+        if let Some(ref path) = cli.rsa_private_key_path {
+            builder = builder.rsa_private_key_path(path);
+        }
+        if let Some(ref path) = cli.authorized_users_path {
+            builder = builder.authorized_users_path(path);
+        }
+        if let Some(secs) = cli.time_skew_threshold {
+            builder = builder.time_skew_threshold(secs);
+        }
+        if cli.use_pkcs1_padding {
+            builder = builder.use_pkcs1_padding(true);
         }
 
         let server = builder.build()?;
