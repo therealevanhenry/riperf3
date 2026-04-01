@@ -148,13 +148,29 @@ pub fn check_credentials(
     Err(RiperfError::AccessDenied)
 }
 
+/// Resolve password from multiple sources in priority order.
+/// Returns the first non-None value, or None if all are absent.
+pub fn resolve_password(
+    riperf3_env: Option<&str>,
+    iperf3_env: Option<&str>,
+    interactive: Option<&str>,
+) -> Option<String> {
+    riperf3_env
+        .or(iperf3_env)
+        .or(interactive)
+        .map(|s| s.to_string())
+}
+
 /// Read password from environment or interactive prompt.
-/// Checks RIPERF3_PASSWORD first, then IPERF3_PASSWORD, then prompts.
+/// Priority: RIPERF3_PASSWORD env → IPERF3_PASSWORD env → interactive prompt.
 pub fn read_password() -> Result<String> {
-    if let Ok(pw) = std::env::var("RIPERF3_PASSWORD") {
-        return Ok(pw);
-    }
-    if let Ok(pw) = std::env::var("IPERF3_PASSWORD") {
+    let riperf3_env = std::env::var("RIPERF3_PASSWORD").ok();
+    let iperf3_env = std::env::var("IPERF3_PASSWORD").ok();
+    if let Some(pw) = resolve_password(
+        riperf3_env.as_deref(),
+        iperf3_env.as_deref(),
+        None,
+    ) {
         return Ok(pw);
     }
 
@@ -307,5 +323,46 @@ mod tests {
         let salted = "{testuser}testpass";
         let hash = hex::encode(Sha256::digest(salted.as_bytes()).as_slice());
         assert_eq!(hash, "6d30222cf5cb9f09b0175e1dbfbc0b6fef34fc08c2fdf02682e0c2450c9c7170");
+    }
+
+    // -- Password resolution priority --
+
+    #[test]
+    fn resolve_password_riperf3_env_wins() {
+        let result = resolve_password(
+            Some("from_riperf3"),
+            Some("from_iperf3"),
+            Some("from_prompt"),
+        );
+        assert_eq!(result, Some("from_riperf3".to_string()));
+    }
+
+    #[test]
+    fn resolve_password_iperf3_env_fallback() {
+        let result = resolve_password(
+            None,
+            Some("from_iperf3"),
+            Some("from_prompt"),
+        );
+        assert_eq!(result, Some("from_iperf3".to_string()));
+    }
+
+    #[test]
+    fn resolve_password_prompt_fallback() {
+        let result = resolve_password(None, None, Some("from_prompt"));
+        assert_eq!(result, Some("from_prompt".to_string()));
+    }
+
+    #[test]
+    fn resolve_password_none_when_all_absent() {
+        let result = resolve_password(None, None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_password_riperf3_takes_priority_over_iperf3() {
+        // Even if both are set, RIPERF3 wins
+        let result = resolve_password(Some("riperf3_pw"), Some("iperf3_pw"), None);
+        assert_eq!(result, Some("riperf3_pw".to_string()));
     }
 }
