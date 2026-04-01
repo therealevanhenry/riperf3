@@ -231,28 +231,38 @@ pub fn configure_tcp_stream_full(
 ) -> Result<()> {
     stream.set_nodelay(no_delay)?;
 
-    // Suppress unused-variable warnings on non-Linux where these are no-ops
-    #[cfg(not(target_os = "linux"))]
-    let _ = (mss, window, congestion);
-
-    #[cfg(target_os = "linux")]
+    // MSS and window use socket2's cross-platform API
+    #[cfg(unix)]
     {
-        use nix::sys::socket::{self, sockopt};
-        use std::ffi::OsString;
+        let sock = socket2::SockRef::from(&stream);
 
         if let Some(mss_val) = mss {
-            let _ = socket::setsockopt(stream, sockopt::TcpMaxSeg, &(mss_val as u32));
+            let _ = sock.set_mss(mss_val as u32);
         }
 
         if let Some(size) = window {
-            let _ = socket::setsockopt(stream, sockopt::RcvBuf, &(size as usize));
-            let _ = socket::setsockopt(stream, sockopt::SndBuf, &(size as usize));
-        }
-
-        if let Some(algo) = congestion {
-            let _ = socket::setsockopt(stream, sockopt::TcpCongestion, &OsString::from(algo));
+            let _ = sock.set_recv_buffer_size(size as usize);
+            let _ = sock.set_send_buffer_size(size as usize);
         }
     }
+
+    #[cfg(not(unix))]
+    {
+        // socket2::SockRef requires AsRawFd (Unix) or AsRawSocket (Windows).
+        // Windows support would need AsRawSocket path — left as future work.
+        let _ = (mss, window);
+    }
+
+    // Congestion control is Linux+FreeBSD only (iperf3 uses HAVE_TCP_CONGESTION)
+    #[cfg(target_os = "linux")]
+    if let Some(algo) = congestion {
+        use nix::sys::socket::{self, sockopt};
+        use std::ffi::OsString;
+        let _ = socket::setsockopt(stream, sockopt::TcpCongestion, &OsString::from(algo));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = congestion;
 
     Ok(())
 }
@@ -299,6 +309,7 @@ pub fn set_snd_timeout<F>(_fd: &F, _ms: u64) -> Result<()> {
 }
 
 /// Set the IPv4 Don't Fragment bit on a socket.
+/// Uses IP_MTU_DISCOVER on Linux, IP_DONTFRAG on macOS/FreeBSD.
 #[cfg(target_os = "linux")]
 pub fn set_dont_fragment(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
     use nix::sys::socket;
@@ -306,7 +317,27 @@ pub fn set_dont_fragment(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn set_dont_fragment(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let val: libc::c_int = 1;
+    // SAFETY: setsockopt on a valid fd with IP_DONTFRAG.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_fd().as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_DONTFRAG,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(RiperfError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn set_dont_fragment<F>(_fd: &F) -> Result<()> {
     Ok(())
 }
