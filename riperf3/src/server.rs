@@ -82,6 +82,7 @@ pub struct Server {
     pub forceflush: bool,
     pub bind_address: Option<String>,
     pub timestamps: Option<String>,
+    pub file: Option<String>,
 }
 
 impl Server {
@@ -197,20 +198,21 @@ impl Server {
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
                     let raw_fd = data_stream.as_raw_fd();
+                    let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
                     let task = if is_sender {
                         let buf = make_send_buffer(cfg.blksize, false);
                         let c = counters.clone();
                         let d = done.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, None).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp).await
                         })
                     } else {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = cfg.blksize;
                         tokio::spawn(async move {
-                            stream::run_tcp_receiver(data_stream, c, bs, d, false, None).await
+                            stream::run_tcp_receiver(data_stream, c, bs, d, false, fp).await
                         })
                     };
 
@@ -516,6 +518,7 @@ pub struct ServerBuilder {
     forceflush: bool,
     bind_address: Option<String>,
     timestamps: Option<String>,
+    file: Option<String>,
 }
 
 impl Default for ServerBuilder {
@@ -533,6 +536,7 @@ impl Default for ServerBuilder {
             forceflush: false,
             bind_address: None,
             timestamps: None,
+            file: None,
         }
     }
 }
@@ -602,6 +606,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn file(mut self, path: &str) -> Self {
+        self.file = Some(path.to_string());
+        self
+    }
+
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
         Ok(Server {
             port: self.port.unwrap_or(DEFAULT_PORT),
@@ -616,6 +625,7 @@ impl ServerBuilder {
             forceflush: self.forceflush,
             bind_address: self.bind_address,
             timestamps: self.timestamps,
+            file: self.file,
         })
     }
 }

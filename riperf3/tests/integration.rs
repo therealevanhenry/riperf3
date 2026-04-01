@@ -2000,6 +2000,57 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
+    async fn file_transfer_end_to_end_content_match() {
+        // True end-to-end: client sends from file, server receives to file,
+        // verify the received file contains the sent pattern.
+        let port = next_port();
+        let send_file = std::env::temp_dir().join(format!("riperf3-e2e-send-{port}"));
+        let recv_file = std::env::temp_dir().join(format!("riperf3-e2e-recv-{port}"));
+
+        // Write a known pattern: repeating DEADBEEF, exactly 128KB
+        let pattern: Vec<u8> = (0..128 * 1024)
+            .map(|i| [0xDE, 0xAD, 0xBE, 0xEF][i % 4])
+            .collect();
+        std::fs::write(&send_file, &pattern).unwrap();
+
+        // Server receives to file (normal mode: client sends, server receives)
+        let recv_path = recv_file.to_str().unwrap().to_string();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .file(&recv_path)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Client sends from file, byte-limited to exactly 128KB
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .bytes(128 * 1024)
+            .file(send_file.to_str().unwrap())
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_ok(), "e2e file send failed: {result:?}");
+        let _ = server_task.await;
+
+        // Verify: received file should start with our pattern
+        let recv_data = std::fs::read(&recv_file).unwrap();
+        assert!(!recv_data.is_empty(), "received file should have data");
+        // Check the first 128KB matches (server may receive more due to timing)
+        let check_len = pattern.len().min(recv_data.len());
+        assert_eq!(
+            &recv_data[..check_len],
+            &pattern[..check_len],
+            "received content doesn't match sent pattern"
+        );
+
+        let _ = std::fs::remove_file(&send_file);
+        let _ = std::fs::remove_file(&recv_file);
+    }
+
+    #[tokio::test]
     async fn json_stream_runs() {
         // --json-stream: each interval emitted as JSON. Just verify it doesn't crash.
         let port = next_port();
