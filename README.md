@@ -9,7 +9,7 @@ A ground-up Rust implementation of [iperf3](https://github.com/esnet/iperf), the
 - **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](riperf3/src/lib.rs) for the full inventory.
 - **Single static binary** with no runtime dependencies.
 - **Idiomatic Rust** — not a C port. Uses tokio for async I/O, serde for JSON, clap for CLI parsing, nix for safe Unix syscalls.
-- **263 tests** — unit, integration, and full client-server loopback with interchange verification.
+- **269 tests** — unit, integration, and full client-server loopback with interchange verification.
 
 ## Quick Start
 
@@ -71,7 +71,7 @@ Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
 | UDP 10G | 10.0 Gbps | 10.7 Gbps | +7% |
 | UDP 50G | 29.9 Gbps | 17.5 Gbps | -41% |
 
-TCP performance is at parity with iperf3. The UDP 50G gap is due to safe Rust's `send()` overhead vs C's raw `write()` syscall — a deliberate trade-off for memory safety.
+TCP performance is at parity with iperf3. The UDP high-rate gap reflects the cost of safe Rust's `send()` path vs C's raw `write()` syscall — a deliberate trade-off for memory safety. The experimental `--sendmmsg` flag reduces this gap by batching packets into a single kernel crossing (see below).
 
 ## Platform Support
 
@@ -97,8 +97,9 @@ riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specif
 | `--fq-rate` pacing | yes | | | |
 | `--flowlabel` IPv6 | yes | | | |
 | `--gsro` UDP GSO/GRO | yes | | | |
+| `--sendmmsg` batched UDP | yes | | yes | |
 
-All platform-specific flags match iperf3's support matrix exactly. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
+All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
 
 ## CLI Reference
 
@@ -149,6 +150,7 @@ TCP options:
 
 UDP options:
       --gsro                         Enable UDP GSO/GRO
+      --sendmmsg                     Batched UDP sends via sendmmsg (experimental)
       --udp-counters-64bit           Use 64-bit UDP counters
       --repeating-payload            Repeating pattern payload
       --dont-fragment                Set IPv4 Don't Fragment
@@ -203,16 +205,16 @@ riperf3/            Core library
     reporter.rs     Human-readable and JSON output formatting
     auth.rs         RSA authentication (OAEP/PKCS#1, credential validation)
     units.rs        Byte/bit unit formatting
-    tcp_info.rs     Linux TCP_INFO via getsockopt
+    tcp_info.rs     TCP_INFO (Linux/FreeBSD) / TCP_CONNECTION_INFO (macOS)
     cpu.rs          CPU utilization via getrusage
     error.rs        Error types
     utils.rs        Constants, KMG parser, DSCP parser
   tests/
-    integration.rs  114 client-server loopback tests
+    integration.rs  Client-server loopback tests
 
 riperf3-cli/        CLI binary
   src/
-    cli.rs          clap argument definitions + 55 wiring tests
+    cli.rs          clap argument definitions + wiring tests
     main.rs         CLI-to-library wiring, CPU affinity, pidfile/logfile
 ```
 
@@ -220,17 +222,20 @@ riperf3-cli/        CLI binary
 
 ```bash
 cargo build --release                          # optimized binary
-cargo test --workspace                         # 263 tests
+cargo test --workspace                         # unit + integration tests
 cargo clippy --all-targets -- -D warnings      # lint
 ```
 
 ## Status
 
-Feature-complete for the core iperf3 flag set. Full interchange compatibility verified across all modes.
+Feature-complete for the core iperf3 flag set. Full interchange compatibility verified across all modes. Full platform parity across Linux, macOS, FreeBSD, and Windows.
 
 Not yet implemented:
 - SCTP transport
 - `libiperf`-compatible FFI library
+
+Experimental:
+- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux, FreeBSD, NetBSD. Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
 
 ## License
 
