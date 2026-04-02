@@ -1,7 +1,15 @@
 [package]
 name = "riperf3"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Wire-compatible Rust implementation of iperf3 — safe, cross-platform network performance testing library"
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["network-programming", "command-line-utilities"]
+license = "MIT OR Apache-2.0"
+readme = "../README.md"
 
 [dependencies]
 base64.workspace = true

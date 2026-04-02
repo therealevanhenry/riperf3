@@ -39,9 +39,6 @@ pub mod reporter;
 pub mod stream;
 pub mod tcp_info;
 
-// The iperf_api module contains reference type definitions mirroring iperf3's C API.
-pub mod iperf_api;
-
 pub mod client;
 pub use client::{Client, ClientBuilder};
 
