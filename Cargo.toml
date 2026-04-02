@@ -12,7 +12,7 @@ authors = ["Evan Henry"]
 edition = "2021"
 homepage = "https://github.com/therealevanhenry/riperf3"
 repository = "https://github.com/therealevanhenry/riperf3"
-keywords = ["riperf3", "riperf", "iperf3", "iperf", "network", "networking", "speedtest", "speed", "test", "bandwidth"]
+keywords = ["riperf3", "iperf3", "iperf", "network", "speedtest"]
 description = "A Rust library and CLI for running iperf3 speed tests."
 
 [workspace.dependencies]
