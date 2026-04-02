@@ -698,8 +698,9 @@ pub async fn run_udp_receiver(
 /// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
 /// `std::thread::sleep` + spin-loop for sub-microsecond precision.
 ///
-/// Batched UDP sender using sendmmsg (one kernel crossing per batch).
-/// Stub: delegates to run_udp_sender_blocking until sendmmsg is implemented.
+/// Batched UDP sender using sendmmsg — one kernel crossing per batch.
+/// Safe Rust only (nix wraps sendmmsg). Available on Linux, FreeBSD, NetBSD.
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub fn run_udp_sender_sendmmsg(
     socket: std::net::UdpSocket,
     counters: Arc<StreamCounters>,
@@ -708,7 +709,105 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     use_64bit: bool,
 ) -> Result<()> {
-    // TODO: implement actual sendmmsg path
+    use nix::sys::socket::{self, MsgFlags, MultiHeaders, SockaddrIn};
+    use std::io::IoSlice;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let batch_size: usize = if rate_bits_per_sec > 0 { 32 } else { 1 };
+
+    // Pre-allocate one buffer per packet in the batch
+    let mut bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; blksize]).collect();
+
+    // Addresses: all None (connected socket)
+    let addrs: Vec<Option<SockaddrIn>> = vec![None; batch_size];
+    let cmsgs: Vec<socket::ControlMessage> = vec![];
+
+    let mut seq: u64 = 0;
+
+    let pacing = if rate_bits_per_sec > 0 {
+        let rate_bytes = rate_bits_per_sec as f64 / 8.0;
+        let per_packet = Duration::from_secs_f64(blksize as f64 / rate_bytes);
+        Some(per_packet * batch_size as u32)
+    } else {
+        None
+    };
+
+    let mut next_send = Instant::now();
+
+    while !done.load(Ordering::Relaxed) {
+        // Cache timestamp once per batch
+        let cached_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let cached_sec = cached_time.as_secs() as u32;
+        let cached_usec = cached_time.subsec_micros();
+
+        // Write headers into each buffer
+        for buf in bufs.iter_mut() {
+            seq += 1;
+            let header = UdpHeader {
+                sec: cached_sec,
+                usec: cached_usec,
+                seq,
+            };
+            header.write_to(buf, use_64bit);
+        }
+
+        // Build IoSlice arrays (one per message, each pointing to its buffer)
+        let slices: Vec<[IoSlice; 1]> = bufs.iter().map(|b| [IoSlice::new(b)]).collect();
+
+        // Pre-allocate headers for this batch
+        let mut headers = MultiHeaders::<SockaddrIn>::preallocate(batch_size, None);
+
+        // Send all packets in one kernel crossing
+        match socket::sendmmsg(fd, &mut headers, &slices, &addrs, &cmsgs, MsgFlags::empty()) {
+            Ok(results) => {
+                let sent_count = results.count(); // consumes iterator, releases borrow
+                let batch_bytes = sent_count as u64 * blksize as u64;
+                counters.record_sent(batch_bytes);
+                // Rewind seq for unsent packets
+                let unsent = batch_size - sent_count;
+                seq -= unsent as u64;
+            }
+            Err(nix::errno::Errno::EAGAIN) => {
+                // All packets failed — rewind entire batch
+                seq -= batch_size as u64;
+            }
+            Err(e) => {
+                log::debug!("sendmmsg error: {e}");
+                seq -= batch_size as u64;
+            }
+        }
+
+        // Rate pacing: one clock check per batch
+        if let Some(batch_interval) = pacing {
+            next_send += batch_interval;
+            let now = Instant::now();
+            if next_send > now {
+                let remaining = next_send - now;
+                if remaining > Duration::from_micros(50) {
+                    std::thread::sleep(remaining - Duration::from_micros(20));
+                }
+                while Instant::now() < next_send {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fallback for platforms without sendmmsg.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
+pub fn run_udp_sender_sendmmsg(
+    socket: std::net::UdpSocket,
+    counters: Arc<StreamCounters>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    rate_bits_per_sec: u64,
+    use_64bit: bool,
+) -> Result<()> {
     run_udp_sender_blocking(socket, counters, blksize, done, rate_bits_per_sec, use_64bit)
 }
 
