@@ -6,7 +6,7 @@ A ground-up Rust implementation of [iperf3](https://github.com/esnet/iperf), the
 
 - **Wire-protocol compatible** with iperf3. Passes interchange tests in both directions across all modes.
 - **Comprehensive flag support** — 60+ flags covering TCP, UDP, parallel streams, reverse/bidir, zerocopy, GSO/GRO, RSA authentication, IPv6, MPTCP, and more.
-- **Safe Rust** — only 6 isolated `unsafe` blocks remain (kernel socket options with no safe wrapper). No unsafe in any public API.
+- **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](riperf3/src/lib.rs) for the full inventory.
 - **Single static binary** with no runtime dependencies.
 - **Idiomatic Rust** — not a C port. Uses tokio for async I/O, serde for JSON, clap for CLI parsing, nix for safe Unix syscalls.
 - **263 tests** — unit, integration, and full client-server loopback with interchange verification.
@@ -82,13 +82,13 @@ riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specif
 | TCP/UDP core | yes | yes | yes | yes |
 | `-w` window size | yes | yes | yes | yes |
 | `-N` no-delay | yes | yes | yes | yes |
-| `-M` MSS | yes | yes | yes | |
-| `-S` TOS | yes | yes | yes | |
+| `-M` MSS | yes | yes | yes | yes |
+| `-S` TOS | yes | yes | yes | yes |
+| `-A` CPU affinity | yes | | yes | yes |
+| `--dont-fragment` | yes | yes | yes | yes |
 | `-Z` zerocopy (sendfile) | yes | yes | yes | |
 | `-C` congestion control | yes | | yes | |
-| `-A` CPU affinity | yes | | yes | |
 | `-D` daemon | yes | | yes | |
-| `--dont-fragment` | yes | yes | yes | |
 | `--bind-dev` | yes | yes | | |
 | `--rcv-timeout` | yes | yes | yes | |
 | `--cntl-ka` keepalive | yes | yes | yes | |
@@ -98,7 +98,7 @@ riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specif
 | `--flowlabel` IPv6 | yes | | | |
 | `--gsro` UDP GSO/GRO | yes | | | |
 
-Blank cells indicate the feature is not available on that platform (matching iperf3's support matrix). Flags that aren't supported on the current OS return a clear error at startup rather than silently failing.
+All platform-specific flags match iperf3's support matrix exactly. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
 
 ## CLI Reference
 
