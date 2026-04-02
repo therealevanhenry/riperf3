@@ -698,6 +698,20 @@ pub async fn run_udp_receiver(
 /// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
 /// `std::thread::sleep` + spin-loop for sub-microsecond precision.
 ///
+/// Batched UDP sender using sendmmsg (one kernel crossing per batch).
+/// Stub: delegates to run_udp_sender_blocking until sendmmsg is implemented.
+pub fn run_udp_sender_sendmmsg(
+    socket: std::net::UdpSocket,
+    counters: Arc<StreamCounters>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    rate_bits_per_sec: u64,
+    use_64bit: bool,
+) -> Result<()> {
+    // TODO: implement actual sendmmsg path
+    run_udp_sender_blocking(socket, counters, blksize, done, rate_bits_per_sec, use_64bit)
+}
+
 /// Batch pacing: sends N packets in a tight loop, then does a single clock
 /// check and sleep/spin for the aggregate interval. This amortizes the cost
 /// of `Instant::now()` (~50ns) and atomic operations across multiple packets.

@@ -2445,3 +2445,101 @@ mod unimplemented_flags {
         let _ = server_task.await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// sendmmsg tests (experimental batched UDP sends)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[tokio::test]
+async fn udp_sendmmsg_normal() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .protocol(TransportProtocol::Udp)
+        .duration(1)
+        .bandwidth(10_000_000) // 10 Mbps
+        .sendmmsg(true)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(result.is_ok(), "UDP sendmmsg client failed: {result:?}");
+
+    let _ = server_task.await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[tokio::test]
+async fn udp_sendmmsg_high_rate() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .protocol(TransportProtocol::Udp)
+        .duration(1)
+        .bandwidth(1_000_000_000) // 1 Gbps
+        .sendmmsg(true)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(
+        result.is_ok(),
+        "UDP sendmmsg high-rate client failed: {result:?}"
+    );
+
+    let _ = server_task.await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[tokio::test]
+async fn udp_sendmmsg_with_64bit_counters() {
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .protocol(TransportProtocol::Udp)
+        .duration(1)
+        .bandwidth(10_000_000)
+        .sendmmsg(true)
+        .udp_counters_64bit(true)
+        .build()
+        .unwrap();
+
+    let result = client.run().await;
+    assert!(
+        result.is_ok(),
+        "UDP sendmmsg + 64bit counters failed: {result:?}"
+    );
+
+    let _ = server_task.await;
+}

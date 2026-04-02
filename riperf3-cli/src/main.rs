@@ -154,6 +154,9 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if cli.gsro {
             builder = builder.gsro(true);
         }
+        if cli.sendmmsg {
+            builder = builder.sendmmsg(true);
+        }
         if cli.dont_fragment {
             builder = builder.dont_fragment(true);
         }

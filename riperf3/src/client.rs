@@ -44,6 +44,7 @@ pub struct Client {
     pub repeating_payload: bool,
     pub zerocopy: bool,
     pub gsro: bool,
+    pub sendmmsg: bool,
     pub dont_fragment: bool,
     pub cport: Option<u16>,
     pub get_server_output: bool,
@@ -385,8 +386,17 @@ impl Client {
                             DEFAULT_UDP_RATE
                         };
                         let u64bit = self.udp_counters_64bit;
+                        let use_sendmmsg = self.sendmmsg;
                         tokio::task::spawn_blocking(move || {
-                            stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
+                            if use_sendmmsg {
+                                stream::run_udp_sender_sendmmsg(
+                                    std_sock, c, bs, d, rate, u64bit,
+                                )
+                            } else {
+                                stream::run_udp_sender_blocking(
+                                    std_sock, c, bs, d, rate, u64bit,
+                                )
+                            }
                         })
                     } else {
                         let c = counters.clone();
@@ -809,6 +819,7 @@ pub struct ClientBuilder {
     repeating_payload: bool,
     zerocopy: bool,
     gsro: bool,
+    sendmmsg: bool,
     dont_fragment: bool,
     cport: Option<u16>,
     get_server_output: bool,
@@ -867,6 +878,7 @@ impl Default for ClientBuilder {
             repeating_payload: false,
             zerocopy: false,
             gsro: false,
+            sendmmsg: false,
             dont_fragment: false,
             cport: None,
             get_server_output: false,
@@ -1037,6 +1049,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn sendmmsg(mut self, enabled: bool) -> Self {
+        self.sendmmsg = enabled;
+        self
+    }
+
     pub fn dont_fragment(mut self, enabled: bool) -> Self {
         self.dont_fragment = enabled;
         self
@@ -1199,6 +1216,11 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
+            if self.sendmmsg {
+                return Err(ConfigError::Unsupported(
+                    "sendmmsg is not supported on this platform".into(),
+                ));
+            }
         }
 
         let default_blksize = match self.protocol {
@@ -1241,6 +1263,7 @@ impl ClientBuilder {
             repeating_payload: self.repeating_payload,
             zerocopy: self.zerocopy,
             gsro: self.gsro,
+            sendmmsg: self.sendmmsg,
             dont_fragment: self.dont_fragment,
             cport: self.cport,
             get_server_output: self.get_server_output,

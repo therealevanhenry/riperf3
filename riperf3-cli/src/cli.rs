@@ -266,6 +266,10 @@ pub struct Cli {
     #[arg(long)]
     pub gsro: bool,
 
+    /// Use sendmmsg for batched UDP sends (experimental, Linux/FreeBSD/NetBSD)
+    #[arg(long)]
+    pub sendmmsg: bool,
+
     /// Use control connection TCP keepalive
     #[arg(long, value_name = "idle/intv/cnt")]
     pub cntl_ka: Option<String>,
@@ -516,6 +520,9 @@ mod cli_tests {
             }
             if cli.gsro {
                 b = b.gsro(true);
+            }
+            if cli.sendmmsg {
+                b = b.sendmmsg(true);
             }
             if cli.dont_fragment {
                 b = b.dont_fragment(true);
@@ -955,6 +962,22 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--logfile", "/tmp/log"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c.logfile, Some("/tmp/log".to_string()));
+        }
+
+        #[test]
+        fn sendmmsg_flag_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-u", "--sendmmsg"]);
+            assert!(cli.sendmmsg);
+            let c = build_client_from_cli(&cli);
+            assert!(c.sendmmsg);
+        }
+
+        #[test]
+        fn sendmmsg_default_false() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-u"]);
+            assert!(!cli.sendmmsg);
+            let c = build_client_from_cli(&cli);
+            assert!(!c.sendmmsg);
         }
 
         // Server new flags
