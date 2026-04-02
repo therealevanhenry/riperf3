@@ -404,8 +404,8 @@ pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> 
 pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     // Resolve device name to interface index (safe via nix)
-    let idx = nix::net::if_::if_nametoindex(dev)
-        .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+    let idx =
+        nix::net::if_::if_nametoindex(dev).map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
     // SAFETY: setsockopt on a valid fd with IP_BOUND_IF. No nix wrapper exists.
     let ret = unsafe {
         libc::setsockopt(

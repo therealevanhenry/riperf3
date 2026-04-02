@@ -129,7 +129,11 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
 
 /// Whether this platform provides TCP retransmit information.
 pub fn has_retransmit_info() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd"
+    ))
 }
 
 #[cfg(test)]

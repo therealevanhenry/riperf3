@@ -990,5 +990,118 @@ mod cli_tests {
             let s = b.build().unwrap();
             assert_eq!(s.server_max_duration, Some(60));
         }
+
+        /// Verify every short flag alias parses identically to its long form.
+        /// Clap guarantees this, but this test catches typos in the arg declarations.
+        #[test]
+        fn short_and_long_flags_equivalent() {
+            // (short_args, long_args, description)
+            let pairs: Vec<(&[&str], &[&str], &str)> = vec![
+                // Boolean client flags
+                (&["-c", "h", "-u"], &["-c", "h", "--udp"], "udp"),
+                (&["-c", "h", "-R"], &["-c", "h", "--reverse"], "reverse"),
+                (&["-c", "h", "-N"], &["-c", "h", "--no-delay"], "no-delay"),
+                (&["-c", "h", "-Z"], &["-c", "h", "--zerocopy"], "zerocopy"),
+                (&["-c", "h", "-m"], &["-c", "h", "--mptcp"], "mptcp"),
+                (&["-c", "h", "-J"], &["-c", "h", "--json"], "json"),
+                (&["-c", "h", "-V"], &["-c", "h", "--verbose"], "verbose"),
+                (&["-c", "h", "-4"], &["-c", "h", "--version4"], "version4"),
+                (&["-c", "h", "-6"], &["-c", "h", "--version6"], "version6"),
+                // Value client flags
+                (&["-c", "h", "-t", "5"], &["-c", "h", "--time", "5"], "time"),
+                (
+                    &["-c", "h", "-n", "1M"],
+                    &["-c", "h", "--bytes", "1M"],
+                    "bytes",
+                ),
+                (
+                    &["-c", "h", "-k", "10"],
+                    &["-c", "h", "--blockcount", "10"],
+                    "blockcount",
+                ),
+                (
+                    &["-c", "h", "-l", "8K"],
+                    &["-c", "h", "--length", "8K"],
+                    "length",
+                ),
+                (
+                    &["-c", "h", "-P", "4"],
+                    &["-c", "h", "--parallel", "4"],
+                    "parallel",
+                ),
+                (
+                    &["-c", "h", "-w", "1M"],
+                    &["-c", "h", "--window", "1M"],
+                    "window",
+                ),
+                (
+                    &["-c", "h", "-C", "bbr"],
+                    &["-c", "h", "--congestion", "bbr"],
+                    "congestion",
+                ),
+                (
+                    &["-c", "h", "-M", "1400"],
+                    &["-c", "h", "--set-mss", "1400"],
+                    "set-mss",
+                ),
+                (
+                    &["-c", "h", "-b", "1G"],
+                    &["-c", "h", "--bitrate", "1G"],
+                    "bitrate",
+                ),
+                (&["-c", "h", "-S", "16"], &["-c", "h", "--tos", "16"], "tos"),
+                (&["-c", "h", "-O", "3"], &["-c", "h", "--omit", "3"], "omit"),
+                (
+                    &["-c", "h", "-T", "hi"],
+                    &["-c", "h", "--title", "hi"],
+                    "title",
+                ),
+                (
+                    &["-c", "h", "-B", "lo"],
+                    &["-c", "h", "--bind", "lo"],
+                    "bind",
+                ),
+                (
+                    &["-c", "h", "-L", "42"],
+                    &["-c", "h", "--flowlabel", "42"],
+                    "flowlabel",
+                ),
+                (
+                    &["-c", "h", "-F", "/tmp/f"],
+                    &["-c", "h", "--file", "/tmp/f"],
+                    "file",
+                ),
+                (
+                    &["-c", "h", "-A", "0"],
+                    &["-c", "h", "--affinity", "0"],
+                    "affinity",
+                ),
+                (
+                    &["-c", "h", "-I", "/tmp/p"],
+                    &["-c", "h", "--pidfile", "/tmp/p"],
+                    "pidfile",
+                ),
+                // Server flags
+                (&["-s", "-1"], &["-s", "--one-off"], "one-off"),
+                (&["-s", "-D"], &["-s", "--daemon"], "daemon"),
+            ];
+
+            for (short_args, long_args, desc) in &pairs {
+                let mut s: Vec<&str> = vec!["riperf3"];
+                s.extend_from_slice(short_args);
+                let mut l: Vec<&str> = vec!["riperf3"];
+                l.extend_from_slice(long_args);
+
+                let short = Cli::parse_from(&s);
+                let long = Cli::parse_from(&l);
+
+                // Compare the fields that matter for each flag
+                assert_eq!(
+                    format!("{:?}", short),
+                    format!("{:?}", long),
+                    "short vs long mismatch for '{desc}': {short_args:?} vs {long_args:?}"
+                );
+            }
+        }
     }
 }
