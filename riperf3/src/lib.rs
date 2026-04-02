@@ -25,22 +25,38 @@
 #[macro_use]
 mod macros;
 
-pub mod error;
+// --- Public API: what library consumers should use ---
+
+mod error;
 pub use error::{ConfigError, Result, RiperfError};
 
-pub mod units;
-pub mod utils;
-
-pub mod auth;
-pub mod cpu;
-pub mod net;
-pub mod protocol;
-pub mod reporter;
-pub mod stream;
-pub mod tcp_info;
-
-pub mod client;
+mod client;
 pub use client::{Client, ClientBuilder};
 
-pub mod server;
+mod server;
 pub use server::{Server, ServerBuilder, TestConfig};
+
+pub use protocol::TransportProtocol;
+
+// --- Internal modules: exposed for the CLI crate and integration tests ---
+// These are implementation details, not part of the stable library API.
+// Use `#[doc(hidden)]` to keep them out of rustdoc while remaining accessible.
+
+#[doc(hidden)]
+pub mod utils;
+#[doc(hidden)]
+pub mod net;
+#[doc(hidden)]
+pub mod protocol;
+#[doc(hidden)]
+pub mod stream;
+#[doc(hidden)]
+pub mod reporter;
+#[doc(hidden)]
+pub mod auth;
+#[doc(hidden)]
+pub mod units;
+#[doc(hidden)]
+pub mod cpu;
+#[doc(hidden)]
+pub mod tcp_info;

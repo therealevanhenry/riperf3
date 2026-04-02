@@ -804,7 +804,7 @@ mod protocol_tests {
 // ---------------------------------------------------------------------------
 
 mod error_tests {
-    use riperf3::error::ConfigError;
+    use riperf3::ConfigError;
     use riperf3::utils::{parse_bitrate, parse_kmg};
     use riperf3::ClientBuilder;
 

@@ -281,8 +281,7 @@ pub fn configure_tcp_stream_full(
 // UDP
 // ---------------------------------------------------------------------------
 
-/// Bind a UDP socket. If `bind_addr` is `None`, binds to `0.0.0.0`.
-/// Bind a UDP socket. If `bind_addr` is `None`, uses 0.0.0.0 (or [::] for IPv6).
+/// Bind a UDP socket. If `bind_addr` is `None`, uses `0.0.0.0` (or `[::]` for IPv6).
 pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
     let default = if ipv6 { "::" } else { "0.0.0.0" };
     let host = bind_addr.unwrap_or(default);
