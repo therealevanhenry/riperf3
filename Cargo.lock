@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "riperf3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "libc",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "riperf3-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "libc",
