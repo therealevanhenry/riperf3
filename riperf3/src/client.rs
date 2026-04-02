@@ -389,13 +389,9 @@ impl Client {
                         let use_sendmmsg = self.sendmmsg;
                         tokio::task::spawn_blocking(move || {
                             if use_sendmmsg {
-                                stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, u64bit,
-                                )
+                                stream::run_udp_sender_sendmmsg(std_sock, c, bs, d, rate, u64bit)
                             } else {
-                                stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, u64bit,
-                                )
+                                stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
                             }
                         })
                     } else {

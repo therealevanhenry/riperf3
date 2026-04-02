@@ -714,14 +714,15 @@ pub fn run_udp_sender_sendmmsg(
     use std::os::unix::io::AsRawFd;
 
     let fd = socket.as_raw_fd();
-    let batch_size: usize = if rate_bits_per_sec > 0 { 32 } else { 1 };
+    // Larger batch than the per-packet sender: sendmmsg amortizes syscall
+    // overhead so bigger batches help more than with individual send() calls.
+    let batch_size: usize = if rate_bits_per_sec > 0 { 128 } else { 1 };
 
-    // Pre-allocate one buffer per packet in the batch
+    // Pre-allocate everything outside the hot loop
     let mut bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; blksize]).collect();
-
-    // Addresses: all None (connected socket)
     let addrs: Vec<Option<SockaddrIn>> = vec![None; batch_size];
     let cmsgs: Vec<socket::ControlMessage> = vec![];
+    let mut headers = MultiHeaders::<SockaddrIn>::preallocate(batch_size, None);
 
     let mut seq: u64 = 0;
 
@@ -754,11 +755,8 @@ pub fn run_udp_sender_sendmmsg(
             header.write_to(buf, use_64bit);
         }
 
-        // Build IoSlice arrays (one per message, each pointing to its buffer)
+        // Build IoSlice refs (points into pre-allocated bufs — no heap alloc)
         let slices: Vec<[IoSlice; 1]> = bufs.iter().map(|b| [IoSlice::new(b)]).collect();
-
-        // Pre-allocate headers for this batch
-        let mut headers = MultiHeaders::<SockaddrIn>::preallocate(batch_size, None);
 
         // Send all packets in one kernel crossing
         match socket::sendmmsg(fd, &mut headers, &slices, &addrs, &cmsgs, MsgFlags::empty()) {
@@ -808,7 +806,14 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     use_64bit: bool,
 ) -> Result<()> {
-    run_udp_sender_blocking(socket, counters, blksize, done, rate_bits_per_sec, use_64bit)
+    run_udp_sender_blocking(
+        socket,
+        counters,
+        blksize,
+        done,
+        rate_bits_per_sec,
+        use_64bit,
+    )
 }
 
 /// Batch pacing: sends N packets in a tight loop, then does a single clock
