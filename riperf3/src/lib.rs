@@ -38,25 +38,27 @@ pub use server::{Server, ServerBuilder, TestConfig};
 
 pub use protocol::TransportProtocol;
 
+pub use net::set_cpu_affinity;
+
 // --- Internal modules: exposed for the CLI crate and integration tests ---
 // These are implementation details, not part of the stable library API.
 // Use `#[doc(hidden)]` to keep them out of rustdoc while remaining accessible.
 
 #[doc(hidden)]
-pub mod utils;
+pub mod auth;
+#[doc(hidden)]
+pub mod cpu;
 #[doc(hidden)]
 pub mod net;
 #[doc(hidden)]
 pub mod protocol;
 #[doc(hidden)]
-pub mod stream;
-#[doc(hidden)]
 pub mod reporter;
 #[doc(hidden)]
-pub mod auth;
+pub mod stream;
+#[doc(hidden)]
+pub mod tcp_info;
 #[doc(hidden)]
 pub mod units;
 #[doc(hidden)]
-pub mod cpu;
-#[doc(hidden)]
-pub mod tcp_info;
+pub mod utils;

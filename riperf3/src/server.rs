@@ -707,6 +707,11 @@ impl ServerBuilder {
         self
     }
 
+    pub fn server_bitrate_limit_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        use crate::utils::parse_kmg;
+        Ok(self.server_bitrate_limit(parse_kmg(s)?))
+    }
+
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
         #[cfg(not(unix))]
         if self.daemon {

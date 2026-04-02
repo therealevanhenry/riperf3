@@ -1,16 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::error::ConfigError;
-
-// ---------------------------------------------------------------------------
-// Verbose flag
-// ---------------------------------------------------------------------------
-
-pub static VERBOSE: AtomicBool = AtomicBool::new(false);
-
-pub fn set_verbose(verbose: bool) {
-    VERBOSE.store(verbose, Ordering::Relaxed);
-}
 
 // ---------------------------------------------------------------------------
 // Default values

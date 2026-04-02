@@ -432,8 +432,7 @@ mod cli_tests {
     /// would have caught the -J flag not being wired up.
     mod cli_wiring_tests {
         use super::*;
-        use riperf3::protocol::TransportProtocol;
-        use riperf3::utils::{parse_bitrate, parse_kmg};
+        use riperf3::TransportProtocol;
 
         /// Simulate the main.rs client builder wiring for a parsed CLI.
         fn build_client_from_cli(cli: &Cli) -> riperf3::Client {
@@ -449,13 +448,13 @@ mod cli_tests {
                 b = b.duration(t);
             }
             if let Some(ref s) = cli.bytes {
-                b = b.bytes(parse_kmg(s).unwrap());
+                b = b.bytes_str(s).unwrap();
             }
             if let Some(ref s) = cli.blockcount {
-                b = b.blocks(parse_kmg(s).unwrap());
+                b = b.blocks_str(s).unwrap();
             }
             if let Some(ref s) = cli.length {
-                b = b.blksize(parse_kmg(s).unwrap() as usize);
+                b = b.blksize_str(s).unwrap();
             }
             if let Some(n) = cli.parallel {
                 b = b.num_streams(n);
@@ -467,7 +466,7 @@ mod cli_tests {
                 b = b.bidir(true);
             }
             if let Some(ref s) = cli.window {
-                b = b.window(parse_kmg(s).unwrap() as i32);
+                b = b.window_str(s).unwrap();
             }
             if let Some(ref algo) = cli.congestion {
                 b = b.congestion(algo);
@@ -479,8 +478,7 @@ mod cli_tests {
                 b = b.no_delay(true);
             }
             if let Some(ref s) = cli.bitrate {
-                let (rate, _) = parse_bitrate(s).unwrap();
-                b = b.bandwidth(rate);
+                b = b.bandwidth_str(s).unwrap();
             }
             if let Some(tos) = cli.tos {
                 b = b.tos(tos);
@@ -546,7 +544,7 @@ mod cli_tests {
                 b = b.bind_dev(dev);
             }
             if let Some(ref s) = cli.fq_rate {
-                b = b.fq_rate(parse_kmg(s).unwrap());
+                b = b.fq_rate_str(s).unwrap();
             }
             if let Some(label) = cli.flowlabel {
                 b = b.flowlabel(label);

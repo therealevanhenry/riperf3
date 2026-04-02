@@ -1180,6 +1180,34 @@ impl ClientBuilder {
         self
     }
 
+    // String-accepting variants — parse KMG suffixes (e.g., "1M", "512K", "10G")
+    // so callers don't need to import parse_kmg/parse_bitrate.
+
+    pub fn bytes_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.bytes(parse_kmg(s)?))
+    }
+
+    pub fn blocks_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.blocks(parse_kmg(s)?))
+    }
+
+    pub fn blksize_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.blksize(parse_kmg(s)? as usize))
+    }
+
+    pub fn window_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.window(parse_kmg(s)? as i32))
+    }
+
+    pub fn bandwidth_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        let (rate, _burst) = parse_bitrate(s)?;
+        Ok(self.bandwidth(rate))
+    }
+
+    pub fn fq_rate_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.fq_rate(parse_kmg(s)?))
+    }
+
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
 

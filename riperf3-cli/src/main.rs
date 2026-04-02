@@ -4,8 +4,7 @@ use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Config, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 
-use riperf3::protocol::TransportProtocol;
-use riperf3::utils::{parse_bitrate, parse_kmg, set_verbose};
+use riperf3::TransportProtocol;
 
 mod cli;
 use cli::Cli;
@@ -13,7 +12,6 @@ use cli::Cli;
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    set_verbose(cli.verbose);
     configure_log4rs(cli.debug.unwrap_or(0));
 
     // Write PID file if requested
@@ -44,7 +42,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if let Some(ref spec) = cli.affinity {
         if let Some(core_str) = spec.split(',').next() {
             if let Ok(core) = core_str.parse::<usize>() {
-                riperf3::net::set_cpu_affinity(core)?;
+                riperf3::set_cpu_affinity(core)?;
             }
         }
     }
@@ -82,13 +80,13 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
             builder = builder.duration(t);
         }
         if let Some(ref s) = cli.bytes {
-            builder = builder.bytes(parse_kmg(s)?);
+            builder = builder.bytes_str(s)?;
         }
         if let Some(ref s) = cli.blockcount {
-            builder = builder.blocks(parse_kmg(s)?);
+            builder = builder.blocks_str(s)?;
         }
         if let Some(ref s) = cli.length {
-            builder = builder.blksize(parse_kmg(s)? as usize);
+            builder = builder.blksize_str(s)?;
         }
         if let Some(n) = cli.parallel {
             builder = builder.num_streams(n);
@@ -100,7 +98,7 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
             builder = builder.bidir(true);
         }
         if let Some(ref s) = cli.window {
-            builder = builder.window(parse_kmg(s)? as i32);
+            builder = builder.window_str(s)?;
         }
         if let Some(ref algo) = cli.congestion {
             builder = builder.congestion(algo);
@@ -112,8 +110,7 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
             builder = builder.no_delay(true);
         }
         if let Some(ref s) = cli.bitrate {
-            let (rate, _burst) = parse_bitrate(s)?;
-            builder = builder.bandwidth(rate);
+            builder = builder.bandwidth_str(s)?;
         }
         if let Some(tos) = cli.tos {
             builder = builder.tos(tos);
@@ -179,7 +176,7 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
             builder = builder.bind_dev(dev);
         }
         if let Some(ref s) = cli.fq_rate {
-            builder = builder.fq_rate(parse_kmg(s)?);
+            builder = builder.fq_rate_str(s)?;
         }
         if let Some(label) = cli.flowlabel {
             builder = builder.flowlabel(label);
@@ -252,7 +249,7 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
             builder = builder.idle_timeout(secs);
         }
         if let Some(ref s) = cli.server_bitrate_limit {
-            builder = builder.server_bitrate_limit(parse_kmg(s)?);
+            builder = builder.server_bitrate_limit_str(s)?;
         }
         if let Some(secs) = cli.server_max_duration {
             builder = builder.server_max_duration(secs);
