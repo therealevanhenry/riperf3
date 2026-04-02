@@ -6,7 +6,7 @@ A ground-up Rust implementation of [iperf3](https://github.com/esnet/iperf), the
 
 - **Wire-protocol compatible** with iperf3. Passes interchange tests in both directions across all modes.
 - **Comprehensive flag support** — 60+ flags covering TCP, UDP, parallel streams, reverse/bidir, zerocopy, GSO/GRO, RSA authentication, IPv6, MPTCP, and more.
-- **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](riperf3/src/lib.rs) for the full inventory.
+- **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](https://github.com/therealevanhenry/riperf3/blob/main/riperf3/src/lib.rs) for the full inventory.
 - **Single static binary** with no runtime dependencies.
 - **Idiomatic Rust** — not a C port. Uses tokio for async I/O, serde for JSON, clap for CLI parsing, nix for safe Unix syscalls.
 - **269 tests** — unit, integration, and full client-server loopback with interchange verification.
