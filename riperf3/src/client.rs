@@ -74,7 +74,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> Result<TestResultsJson> {
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(
@@ -167,7 +167,9 @@ impl Client {
             let _ = s.task.await;
         }
 
-        Ok(())
+        server_results.ok_or_else(|| {
+            RiperfError::Protocol("missing server results in control exchange".into())
+        })
     }
 
     fn build_params(&self) -> TestParams {
