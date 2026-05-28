@@ -679,6 +679,77 @@ mod tests {
         assert_eq!(val, libc::IP_PMTUDISC_DO, "IP_MTU_DISCOVER should be DO");
     }
 
+    // ---- Regression tests for issue #1: server binds IPv4 only ------------
+    //
+    // These tests are written before the implementation. They MUST fail on
+    // `main`'s default-IPv4 behavior and pass after the dual-stack fix lands.
+
+    /// Default listener (`ip_version=None`) must accept both IPv4 and IPv6
+    /// clients on the same port — matches iperf3's dual-stack default.
+    #[tokio::test]
+    async fn tcp_listen_dual_stack_default() {
+        let listener = tcp_listen(None, 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // IPv4 connect must succeed.
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        assert!(v4.is_ok(), "IPv4 connect failed: {v4:?}");
+        let _ = listener.accept().await.unwrap();
+
+        // IPv6 connect must also succeed against the same listener.
+        let v6 = tcp_connect("::1", port, None, None, false).await;
+        match v6 {
+            Ok(_) => {
+                let _ = listener.accept().await.unwrap();
+            }
+            Err(RiperfError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::AddrNotAvailable =>
+            {
+                // No IPv6 loopback available — soft-skip.
+            }
+            Err(e) => panic!("IPv6 connect to default listener failed: {e:?}"),
+        }
+    }
+
+    /// `ip_version=Some(4)` restricts the listener to IPv4 only.
+    #[tokio::test]
+    async fn tcp_listen_ipv4_only() {
+        let listener = tcp_listen(None, 0, Some(4)).await.unwrap();
+        let local = listener.local_addr().unwrap();
+        assert!(local.is_ipv4(), "expected IPv4 local_addr, got {local}");
+        let port = local.port();
+
+        // IPv6 connect must be refused.
+        let v6 = tcp_connect("::1", port, None, None, false).await;
+        match v6 {
+            Err(RiperfError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    || e.kind() == std::io::ErrorKind::AddrNotAvailable => {}
+            Ok(_) => panic!("IPv6 connect should fail against IPv4-only listener"),
+            Err(e) => panic!("unexpected error from IPv6 connect: {e:?}"),
+        }
+    }
+
+    /// `ip_version=Some(6)` restricts the listener to IPv6 only (sets
+    /// IPV6_V6ONLY). On Linux without this, `::` accepts IPv4 via v4-mapped
+    /// addresses; the test guards against that regression.
+    #[tokio::test]
+    async fn tcp_listen_ipv6_only() {
+        let listener = tcp_listen(None, 0, Some(6)).await.unwrap();
+        let local = listener.local_addr().unwrap();
+        assert!(local.is_ipv6(), "expected IPv6 local_addr, got {local}");
+        let port = local.port();
+
+        // IPv4 connect must be refused.
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        match v4 {
+            Err(RiperfError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Ok(_) => panic!("IPv4 connect should fail against IPv6-only listener"),
+            Err(e) => panic!("unexpected error from IPv4 connect: {e:?}"),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn set_bind_dev_loopback() {

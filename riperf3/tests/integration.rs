@@ -72,6 +72,37 @@ async fn regression_udp_default_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1: dual-stack server bind regression
+// ---------------------------------------------------------------------------
+
+/// Server must accept IPv6 clients by default (matches iperf3's dual-stack
+/// `getaddrinfo`+`AI_PASSIVE` behavior). Pre-fix the server binds `0.0.0.0`
+/// only, so this fails with ConnectionRefused.
+#[tokio::test]
+async fn server_accepts_ipv6_client_by_default() {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("::1")
+        .port(Some(port))
+        .duration(1)
+        .build()
+        .unwrap();
+    let result = client.run().await;
+    assert!(
+        result.is_ok(),
+        "IPv6 client to default server failed: {result:?}"
+    );
+    let _ = server_task.await;
+}
+
+// ---------------------------------------------------------------------------
 // TCP loopback tests
 // ---------------------------------------------------------------------------
 
