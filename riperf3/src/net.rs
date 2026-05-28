@@ -108,10 +108,12 @@ mod custom_sockopt {
 // ---------------------------------------------------------------------------
 
 /// Resolve the default bind address for the given IP version preference.
+/// `None` → `::` (dual-stack via IPV6_V6ONLY=0); `Some(4)` → IPv4 only;
+/// `Some(6)` → IPv6 only.
 fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
     match ip_version {
-        Some(6) => "::",
-        _ => "0.0.0.0",
+        Some(4) => "0.0.0.0",
+        _ => "::",
     }
 }
 
@@ -189,7 +191,10 @@ pub async fn tcp_connect(
 }
 
 /// Create a TCP listener with SO_REUSEADDR.
-/// If `bind_addr` is `None`, binds to 0.0.0.0 (or :: if `ip_version` is 6).
+/// If `bind_addr` is `None`, binds dual-stack (`::` with IPV6_V6ONLY=0) by
+/// default, matching iperf3's `getaddrinfo`+`AI_PASSIVE` behavior.
+/// `ip_version=Some(4)` restricts to IPv4 (`0.0.0.0`); `Some(6)` restricts to
+/// IPv6 only (sets IPV6_V6ONLY=1).
 pub async fn tcp_listen(
     bind_addr: Option<&str>,
     port: u16,
@@ -207,6 +212,12 @@ pub async fn tcp_listen(
     };
     let socket = Socket::new(domain, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() && bind_addr.is_none() {
+        // Explicit dual-stack control: only-v6 when the caller asked for it,
+        // dual-stack otherwise. BSDs default V6ONLY=1, so we can't rely on
+        // /proc/sys/net/ipv6/bindv6only.
+        socket.set_only_v6(ip_version == Some(6))?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(128)?;
@@ -565,13 +576,14 @@ pub fn set_tos<F>(_fd: &F, _tos: u32) -> Result<()> {
 
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
+/// `ip_version=None` binds dual-stack (`::` with IPV6_V6ONLY=0); `Some(4)`
+/// restricts to IPv4; `Some(6)` restricts to IPv6 only.
 pub async fn udp_bind_reusable(
     bind_addr: Option<&str>,
     port: u16,
-    ipv6: bool,
+    ip_version: Option<u8>,
 ) -> Result<UdpSocket> {
-    let default = if ipv6 { "::" } else { "0.0.0.0" };
-    let host = bind_addr.unwrap_or(default);
+    let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
         .parse()
         .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
@@ -583,6 +595,9 @@ pub async fn udp_bind_reusable(
     };
     let socket = Socket::new(domain, Type::DGRAM, None)?;
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() && bind_addr.is_none() {
+        socket.set_only_v6(ip_version == Some(6))?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
 
@@ -702,9 +717,7 @@ mod tests {
             Ok(_) => {
                 let _ = listener.accept().await.unwrap();
             }
-            Err(RiperfError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::AddrNotAvailable =>
-            {
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
                 // No IPv6 loopback available — soft-skip.
             }
             Err(e) => panic!("IPv6 connect to default listener failed: {e:?}"),
@@ -743,8 +756,7 @@ mod tests {
         // IPv4 connect must be refused.
         let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
         match v4 {
-            Err(RiperfError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
             Ok(_) => panic!("IPv4 connect should fail against IPv6-only listener"),
             Err(e) => panic!("unexpected error from IPv4 connect: {e:?}"),
         }

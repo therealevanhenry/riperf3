@@ -283,12 +283,8 @@ impl Server {
                 // For each stream: accept the connect handshake on the listener,
                 // which locks that socket to the client. Then create a fresh
                 // listener for the next stream (iperf3's recycling pattern).
-                let mut udp_listener = net::udp_bind_reusable(
-                    self.bind_address.as_deref(),
-                    self.port,
-                    self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
-                )
-                .await?;
+                let mut udp_listener =
+                    net::udp_bind_reusable(self.bind_address.as_deref(), self.port, None).await?;
 
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
 
@@ -300,12 +296,9 @@ impl Server {
 
                     // Create a fresh listener for the next stream (if any)
                     if i + 1 < total {
-                        udp_listener = net::udp_bind_reusable(
-                            self.bind_address.as_deref(),
-                            self.port,
-                            self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
-                        )
-                        .await?;
+                        udp_listener =
+                            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, None)
+                                .await?;
                     } else {
                         // Last stream — create a dummy that won't be used
                         udp_listener = net::udp_bind(None, 0, false).await?;
