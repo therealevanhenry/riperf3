@@ -266,6 +266,11 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(ref addr) = cli.bind {
             builder = builder.bind_address(addr);
         }
+        if cli.version4 {
+            builder = builder.ip_version(Some(4));
+        } else if cli.version6 {
+            builder = builder.ip_version(Some(6));
+        }
         if let Some(ref fmt) = cli.timestamps {
             builder = builder.timestamps(fmt);
         }
