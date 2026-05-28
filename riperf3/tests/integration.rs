@@ -2619,7 +2619,10 @@ mod client_run_return_value {
             .duration(1)
             .build()
             .unwrap();
-        let err = client.run().await.expect_err("expected missing-results error");
+        let err = client
+            .run()
+            .await
+            .expect_err("expected missing-results error");
         match err {
             RiperfError::Protocol(msg) => assert!(
                 msg.contains("missing server results"),
