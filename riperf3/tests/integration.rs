@@ -2543,3 +2543,91 @@ async fn udp_sendmmsg_with_64bit_counters() {
 
     let _ = server_task.await;
 }
+
+// ---------------------------------------------------------------------------
+// Client::run return-value tests (added with the Result<TestResultsJson> change)
+// ---------------------------------------------------------------------------
+
+mod client_run_return_value {
+    use super::*;
+    use riperf3::RiperfError;
+
+    /// Happy path: a normal TCP exchange yields a populated `TestResultsJson`,
+    /// proving the library now exposes what `print_results` used to consume internally.
+    #[tokio::test]
+    async fn run_returns_populated_results() {
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .bytes(1024 * 1024)
+            .build()
+            .unwrap();
+
+        let results = client.run().await.expect("client run failed");
+
+        assert!(
+            !results.streams.is_empty(),
+            "expected at least one stream in returned results"
+        );
+        let total_bytes: i64 = results.streams.iter().map(|s| s.bytes as i64).sum();
+        assert!(
+            total_bytes > 0,
+            "expected non-zero bytes across streams, got {total_bytes}"
+        );
+        assert!(
+            results.cpu_util_total.is_finite() && results.cpu_util_total >= 0.0,
+            "cpu_util_total not a sane non-negative number: {}",
+            results.cpu_util_total
+        );
+
+        let _ = server_task.await;
+    }
+
+    /// Error path: a server that ends the session via `IperfDone` without an
+    /// `ExchangeResults` round now yields `Protocol("missing server results...")`
+    /// instead of the previous `Ok(())`. Uses a mock TCP server because the real
+    /// riperf3 server always performs `ExchangeResults`.
+    #[tokio::test]
+    async fn run_errors_when_server_skips_results_exchange() {
+        use riperf3::protocol::{self, TestState};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            // Skip ExchangeResults / DisplayResults entirely.
+            protocol::send_state(&mut stream, TestState::IperfDone)
+                .await
+                .unwrap();
+        });
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let err = client.run().await.expect_err("expected missing-results error");
+        match err {
+            RiperfError::Protocol(msg) => assert!(
+                msg.contains("missing server results"),
+                "unexpected protocol message: {msg}"
+            ),
+            other => panic!("expected RiperfError::Protocol, got {other:?}"),
+        }
+
+        let _ = server_task.await;
+    }
+}
