@@ -176,6 +176,56 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
     }
 }
 
+/// Derive the aggregate `[SUM]` rows for the final report from the per-stream
+/// summaries. Returns one SUM per direction (sender / receiver) that has more
+/// than one stream — matching iperf3, which prints a `[SUM]` for parallel
+/// streams and omits it for a single stream. Bidir runs yield up to two SUM
+/// rows (one per direction). UDP SUM rows aggregate lost/total datagrams and
+/// carry the worst-case (max) jitter across the grouped streams.
+pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
+    let mut out = Vec::new();
+    for is_sender in [true, false] {
+        let group: Vec<&StreamSummary> = streams
+            .iter()
+            .filter(|s| s.is_sender == is_sender)
+            .collect();
+        if group.len() <= 1 {
+            continue;
+        }
+        let bytes = group.iter().map(|s| s.bytes).sum();
+        let is_udp = group.iter().any(|s| s.total_packets.is_some());
+        let (jitter, lost, total_packets) = if is_udp {
+            let lost = group.iter().filter_map(|s| s.lost).sum();
+            let total = group.iter().filter_map(|s| s.total_packets).sum();
+            // Jitter doesn't sum; report the worst stream's jitter on the SUM.
+            let jitter = group
+                .iter()
+                .filter_map(|s| s.jitter)
+                .fold(None, |acc, j| Some(acc.map_or(j, |a: f64| a.max(j))));
+            (jitter, Some(lost), Some(total))
+        } else {
+            (None, None, None)
+        };
+        let retransmits = if group.iter().any(|s| s.retransmits.is_some()) {
+            Some(group.iter().filter_map(|s| s.retransmits).sum())
+        } else {
+            None
+        };
+        out.push(StreamSummary {
+            stream_id: -1, // renders as "SUM"
+            start: group[0].start,
+            end: group[0].end,
+            bytes,
+            is_sender,
+            retransmits,
+            jitter,
+            lost,
+            total_packets,
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Interval reporter — spawned async task for periodic stats
 // ---------------------------------------------------------------------------
@@ -474,5 +524,103 @@ mod tests {
         };
         // Should print [SUM] instead of a number
         print_interval(&interval, 'm');
+    }
+
+    // ---- sum_summaries (issue #4: final [SUM] row for -P > 1) ----------------
+
+    fn tcp_summary(id: i32, is_sender: bool, bytes: u64) -> StreamSummary {
+        StreamSummary {
+            stream_id: id,
+            start: 0.0,
+            end: 10.0,
+            bytes,
+            is_sender,
+            retransmits: None,
+            jitter: None,
+            lost: None,
+            total_packets: None,
+        }
+    }
+
+    #[test]
+    fn sum_summaries_single_stream_no_sum() {
+        // One stream → no [SUM] row, matching iperf3.
+        let streams = vec![tcp_summary(1, true, 1_000_000)];
+        assert!(sum_summaries(&streams).is_empty());
+    }
+
+    #[test]
+    fn sum_summaries_multi_sender_aggregates_bytes() {
+        let streams = vec![
+            tcp_summary(1, true, 1_000),
+            tcp_summary(3, true, 2_000),
+            tcp_summary(4, true, 3_000),
+        ];
+        let sums = sum_summaries(&streams);
+        assert_eq!(sums.len(), 1, "one SUM row for the sender group");
+        assert_eq!(sums[0].stream_id, -1, "SUM renders from id -1");
+        assert!(sums[0].is_sender);
+        assert_eq!(sums[0].bytes, 6_000, "bytes summed across streams");
+        assert_eq!(sums[0].start, 0.0);
+        assert_eq!(sums[0].end, 10.0);
+    }
+
+    #[test]
+    fn sum_summaries_bidir_yields_two_rows() {
+        // Bidir: senders and receivers each >1 → one SUM per direction.
+        let streams = vec![
+            tcp_summary(1, true, 1_000),
+            tcp_summary(3, true, 1_000),
+            tcp_summary(5, false, 2_000),
+            tcp_summary(7, false, 2_000),
+        ];
+        let sums = sum_summaries(&streams);
+        assert_eq!(sums.len(), 2);
+        let sender = sums.iter().find(|s| s.is_sender).unwrap();
+        let receiver = sums.iter().find(|s| !s.is_sender).unwrap();
+        assert_eq!(sender.bytes, 2_000);
+        assert_eq!(receiver.bytes, 4_000);
+    }
+
+    #[test]
+    fn sum_summaries_bidir_single_per_direction_no_sum() {
+        // Bidir -P 1: one sender + one receiver → neither direction gets a SUM.
+        let streams = vec![tcp_summary(1, true, 1_000), tcp_summary(3, false, 2_000)];
+        assert!(sum_summaries(&streams).is_empty());
+    }
+
+    #[test]
+    fn sum_summaries_udp_aggregates_loss_and_max_jitter() {
+        let streams = vec![
+            StreamSummary {
+                stream_id: 1,
+                start: 0.0,
+                end: 10.0,
+                bytes: 100_000,
+                is_sender: false,
+                retransmits: None,
+                jitter: Some(0.010),
+                lost: Some(2),
+                total_packets: Some(1000),
+            },
+            StreamSummary {
+                stream_id: 3,
+                start: 0.0,
+                end: 10.0,
+                bytes: 200_000,
+                is_sender: false,
+                retransmits: None,
+                jitter: Some(0.025),
+                lost: Some(5),
+                total_packets: Some(2000),
+            },
+        ];
+        let sums = sum_summaries(&streams);
+        assert_eq!(sums.len(), 1);
+        let s = &sums[0];
+        assert_eq!(s.bytes, 300_000);
+        assert_eq!(s.lost, Some(7), "lost datagrams summed");
+        assert_eq!(s.total_packets, Some(3000), "total datagrams summed");
+        assert_eq!(s.jitter, Some(0.025), "SUM carries worst-case jitter");
     }
 }

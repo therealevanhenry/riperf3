@@ -606,24 +606,25 @@ impl Client {
         let test_duration = self.duration as f64;
         crate::reporter::print_separator();
 
-        for s in streams {
-            let bytes = if s.is_sender {
-                s.counters.bytes_sent()
-            } else {
-                s.counters.bytes_received()
-            };
+        let summaries: Vec<crate::reporter::StreamSummary> = streams
+            .iter()
+            .map(|s| {
+                let bytes = if s.is_sender {
+                    s.counters.bytes_sent()
+                } else {
+                    s.counters.bytes_received()
+                };
 
-            let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                udp_stats
-                    .lock()
-                    .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
-                    .unwrap_or((None, None, None))
-            } else {
-                (None, None, None)
-            };
+                let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                    udp_stats
+                        .lock()
+                        .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                        .unwrap_or((None, None, None))
+                } else {
+                    (None, None, None)
+                };
 
-            crate::reporter::print_summary(
-                &crate::reporter::StreamSummary {
+                crate::reporter::StreamSummary {
                     stream_id: s.id,
                     start: 0.0,
                     end: test_duration,
@@ -633,9 +634,18 @@ impl Client {
                     jitter,
                     lost,
                     total_packets: total,
-                },
-                self.format_char,
-            );
+                }
+            })
+            .collect();
+
+        for summary in &summaries {
+            crate::reporter::print_summary(summary, self.format_char);
+        }
+
+        // Aggregate [SUM] row(s) for parallel streams (issue #4), matching
+        // iperf3. One per direction; omitted for single-stream directions.
+        for sum in crate::reporter::sum_summaries(&summaries) {
+            crate::reporter::print_summary(&sum, self.format_char);
         }
     }
 
