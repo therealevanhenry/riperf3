@@ -694,6 +694,23 @@ pub async fn run_udp_receiver(
 // Blocking UDP send / recv (high-performance, no async overhead)
 // ---------------------------------------------------------------------------
 
+/// Block until the start barrier is released so a UDP sender does not transmit
+/// during stream setup (issue #5). The UDP create-streams handshake is sent on
+/// the same port as the data and is silently lost under a high-rate flood, so
+/// if early streams start blasting while later streams are still handshaking,
+/// setup stalls forever. Holding all senders until every stream is created
+/// keeps the handshake clean. Returns `false` if the test was torn down before
+/// starting (the caller should just return).
+fn await_start(start: &AtomicBool, done: &AtomicBool) -> bool {
+    while !start.load(Ordering::Relaxed) {
+        if done.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// High-performance UDP sender using blocking I/O on a dedicated OS thread.
 /// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
 /// `std::thread::sleep` + spin-loop for sub-microsecond precision.
@@ -701,6 +718,7 @@ pub async fn run_udp_receiver(
 /// Batched UDP sender using sendmmsg — one kernel crossing per batch.
 /// Safe Rust only (nix wraps sendmmsg). Available on Linux, FreeBSD, NetBSD.
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[allow(clippy::too_many_arguments)] // hot-path sender: socket + tuning + lifecycle
 pub fn run_udp_sender_sendmmsg(
     socket: std::net::UdpSocket,
     counters: Arc<StreamCounters>,
@@ -708,10 +726,20 @@ pub fn run_udp_sender_sendmmsg(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     use_64bit: bool,
+    start: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
 ) -> Result<()> {
     use nix::sys::socket::{self, MsgFlags, MultiHeaders, SockaddrIn};
     use std::io::IoSlice;
     use std::os::unix::io::AsRawFd;
+
+    if !await_start(&start, &done) {
+        return Ok(());
+    }
+    // Deadline measured from the actual start of data (issue #5): at a high
+    // `-b` the CPU-bound senders can starve the async runtime so `done` is
+    // never set; the sender must stop itself at `-t`.
+    let deadline = max_duration.map(|d| Instant::now() + d);
 
     let fd = socket.as_raw_fd();
     // Larger batch than the per-packet sender: sendmmsg amortizes syscall
@@ -737,6 +765,9 @@ pub fn run_udp_sender_sendmmsg(
     let mut next_send = Instant::now();
 
     while !done.load(Ordering::Relaxed) {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         // Cache timestamp once per batch
         let cached_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -798,6 +829,7 @@ pub fn run_udp_sender_sendmmsg(
 
 /// Fallback for platforms without sendmmsg.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
+#[allow(clippy::too_many_arguments)] // hot-path sender: socket + tuning + lifecycle
 pub fn run_udp_sender_sendmmsg(
     socket: std::net::UdpSocket,
     counters: Arc<StreamCounters>,
@@ -805,6 +837,8 @@ pub fn run_udp_sender_sendmmsg(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     use_64bit: bool,
+    start: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
 ) -> Result<()> {
     run_udp_sender_blocking(
         socket,
@@ -813,12 +847,15 @@ pub fn run_udp_sender_sendmmsg(
         done,
         rate_bits_per_sec,
         use_64bit,
+        start,
+        max_duration,
     )
 }
 
 /// Batch pacing: sends N packets in a tight loop, then does a single clock
 /// check and sleep/spin for the aggregate interval. This amortizes the cost
 /// of `Instant::now()` (~50ns) and atomic operations across multiple packets.
+#[allow(clippy::too_many_arguments)] // hot-path sender: socket + tuning + lifecycle
 pub fn run_udp_sender_blocking(
     socket: std::net::UdpSocket,
     counters: Arc<StreamCounters>,
@@ -826,7 +863,16 @@ pub fn run_udp_sender_blocking(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     use_64bit: bool,
+    start: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
 ) -> Result<()> {
+    if !await_start(&start, &done) {
+        return Ok(());
+    }
+    // Deadline measured from the actual start of data — see the note in
+    // run_udp_sender_sendmmsg (issue #5).
+    let deadline = max_duration.map(|d| Instant::now() + d);
+
     let mut buf = vec![0u8; blksize];
     let mut seq: u64 = 0;
 
@@ -850,6 +896,9 @@ pub fn run_udp_sender_blocking(
     let mut next_send = Instant::now();
 
     while !done.load(Ordering::Relaxed) {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         // Cache timestamp once per batch (sufficient for jitter calculation)
         let cached_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1329,5 +1378,177 @@ mod tests {
 
         assert!(send_counters.bytes_sent() > 0);
         assert!(recv_counters.bytes_received() > 0);
+    }
+
+    // ---- issue #5: UDP senders self-enforce the wall-clock deadline ---------
+
+    /// Connected UDP socket pair on loopback. The receiver is never drained,
+    /// but UDP send() doesn't block on a full receive buffer (datagrams are
+    /// dropped), so the sender loops freely — exactly like the real bug where
+    /// senders spin at a high `-b`.
+    fn udp_pair() -> (std::net::UdpSocket, std::net::UdpSocket) {
+        let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        send.connect(recv.local_addr().unwrap()).unwrap();
+        (send, recv)
+    }
+
+    /// A released start barrier.
+    fn started() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+
+    /// The core regression: with `done` never set, the max-duration alone must
+    /// stop the loop. Before the fix this spun forever (issue #5).
+    #[test]
+    fn udp_sender_blocking_honors_deadline_without_done() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false)); // intentionally never set
+        let counters = Arc::new(StreamCounters::new());
+
+        let t0 = Instant::now();
+        run_udp_sender_blocking(
+            send,
+            counters.clone(),
+            1400,
+            done.clone(),
+            0,
+            false,
+            started(),
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            !done.load(Ordering::Relaxed),
+            "done was never set — the deadline alone must terminate the loop"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "sender should stop near its 200ms deadline, took {elapsed:?}"
+        );
+        assert!(
+            counters.bytes_sent() > 0,
+            "should have sent before stopping"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    #[test]
+    fn udp_sender_sendmmsg_honors_deadline_without_done() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false)); // intentionally never set
+        let counters = Arc::new(StreamCounters::new());
+
+        let t0 = Instant::now();
+        run_udp_sender_sendmmsg(
+            send,
+            counters.clone(),
+            1400,
+            done.clone(),
+            0,
+            false,
+            started(),
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(!done.load(Ordering::Relaxed));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "sendmmsg sender should stop near its 200ms deadline, took {elapsed:?}"
+        );
+        assert!(counters.bytes_sent() > 0);
+    }
+
+    /// `max_duration = None` preserves the original behavior: the loop runs
+    /// until `done` is set (byte/block-limited tests and the control path).
+    #[test]
+    fn udp_sender_blocking_no_deadline_stops_on_done() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(StreamCounters::new());
+        let d2 = done.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            d2.store(true, Ordering::Relaxed);
+        });
+
+        let t0 = Instant::now();
+        run_udp_sender_blocking(send, counters, 1400, done, 0, false, started(), None).unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "should stop shortly after done is set"
+        );
+    }
+
+    /// The start barrier (issue #5): a sender must not transmit until `start`
+    /// is released, so the create-streams handshake isn't flooded.
+    #[test]
+    fn udp_sender_blocking_waits_for_start_barrier() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false)); // held closed
+        let counters = Arc::new(StreamCounters::new());
+
+        let c2 = counters.clone();
+        let d2 = done.clone();
+        let s2 = start.clone();
+        let h = std::thread::spawn(move || {
+            run_udp_sender_blocking(
+                send,
+                c2,
+                1400,
+                d2,
+                0,
+                false,
+                s2,
+                Some(Duration::from_secs(10)),
+            )
+        });
+
+        // While the barrier is closed, nothing should be sent.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            counters.bytes_sent(),
+            0,
+            "sender must not transmit before the start barrier is released"
+        );
+
+        // Release, let it run briefly, then stop it.
+        start.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        done.store(true, Ordering::Relaxed);
+        h.join().unwrap().unwrap();
+        assert!(
+            counters.bytes_sent() > 0,
+            "sender should transmit after the barrier opens"
+        );
+    }
+
+    /// If torn down before the barrier opens, the sender exits without sending.
+    #[test]
+    fn udp_sender_blocking_exits_if_done_before_start() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(true)); // already done
+        let start = Arc::new(AtomicBool::new(false)); // never released
+        let counters = Arc::new(StreamCounters::new());
+
+        let t0 = Instant::now();
+        run_udp_sender_blocking(
+            send,
+            counters.clone(),
+            1400,
+            done,
+            0,
+            false,
+            start,
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(counters.bytes_sent(), 0);
     }
 }
