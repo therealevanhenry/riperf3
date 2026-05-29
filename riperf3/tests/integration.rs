@@ -1694,11 +1694,17 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
-    /// Regression for issue #5: UDP bidirectional with parallel streams at a
-    /// high target rate must complete and honor `-t` (it deadlocked before the
-    /// start-barrier + self-deadline fix). The outer timeout turns a hang into
-    /// a test failure rather than a wedged run. This also exercises the
-    /// start-barrier release and the in-loop deadline end-to-end.
+    /// Smoke test for issue #5: UDP bidirectional with parallel streams runs
+    /// the full wired-up path (barrier release at TestStart, self-deadline,
+    /// teardown) without deadlocking, and the outer timeout turns any hang into
+    /// a failure rather than a wedged run.
+    ///
+    /// NOTE: this does not by itself reproduce the original hang on fast
+    /// hardware — that needs real per-core starvation plus lossy handshake
+    /// delivery (an 8-vCPU VM), conditions loopback on a workstation doesn't
+    /// create, so it can pass even with the fix disabled. The deadline and
+    /// start-barrier mechanisms are pinned directly by the `stream.rs` unit
+    /// tests; this is the end-to-end "doesn't wedge" guard.
     #[tokio::test]
     async fn udp_bidir_parallel_completes() {
         let port = next_port();
