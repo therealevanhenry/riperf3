@@ -66,8 +66,7 @@ campaign puts riperf3 **at or above iperf3** throughput across the board:
 
 [**BENCHMARKS.md**](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md)
 has the authoritative numbers — per-cell 95% confidence intervals, significance
-tests, the compatibility matrix, and full methodology. (Kept there rather than
-duplicated here, so it can't drift out of sync.)
+tests, the compatibility matrix, and full methodology.
 
 ## Platform Support
 
