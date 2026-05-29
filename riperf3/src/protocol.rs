@@ -356,25 +356,40 @@ const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Sends the magic word and waits for the server's reply.
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
 ///
-/// The handshake is over UDP, so a lost magic word or reply would otherwise
-/// stall setup forever (issue #11). The client resends its magic every
+/// The handshake is over UDP, so a lost magic word would otherwise stall setup
+/// forever (issue #11). The client resends its magic at most once per
 /// `UDP_CONNECT_RETRY_INTERVAL` until it gets the reply or the overall
 /// `UDP_CONNECT_TOTAL_TIMEOUT` (~iperf3's read-timeout budget) elapses, then
 /// errors instead of hanging. A non-reply datagram (a stray/early packet) is
-/// ignored rather than treated fatally — like iperf3, which drains packets
-/// while waiting for the reply. The retransmit is a riperf3 addition (iperf3's
-/// own client sends the magic once and relies on a long read timeout);
-/// resending a magic the server already received just yields a duplicate reply,
-/// which is harmless, so it stays interoperable with an iperf3 server.
+/// drained and ignored rather than treated fatally — like iperf3, which drains
+/// packets while waiting for the reply. The resend is rate-limited by the
+/// interval floor so a flood of stray datagrams can't be amplified into a flood
+/// of resends.
+///
+/// This recovers a *lost magic* (the server is still waiting on the same
+/// listener and replies to the resend). It does not recover a *lost reply*:
+/// by then the server has connected its data socket and moved on, so the
+/// resent magic lands harmlessly on that data socket and no second reply comes
+/// — the client then fails cleanly at the deadline instead of hanging forever.
+/// The retransmit is a riperf3 addition (iperf3's own client sends the magic
+/// once and relies on a long read timeout); it stays interoperable with an
+/// iperf3 server, which replies on first receipt.
 pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     let mut buf = [0u8; 4];
     let deadline = tokio::time::Instant::now() + UDP_CONNECT_TOTAL_TIMEOUT;
     let mut saw_traffic = false;
+    // Resend no more than once per interval, even while draining strays, so a
+    // stray-datagram flood can't turn into a magic-send flood (amplification).
+    let mut next_send = tokio::time::Instant::now();
     while tokio::time::Instant::now() < deadline {
-        socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
-        let wait = deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .min(UDP_CONNECT_RETRY_INTERVAL);
+        if tokio::time::Instant::now() >= next_send {
+            socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
+            next_send = tokio::time::Instant::now() + UDP_CONNECT_RETRY_INTERVAL;
+        }
+        // Wait until the next resend is due (or the deadline), whichever first.
+        let wait = next_send
+            .min(deadline)
+            .saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
             Ok(Ok(n))
                 if n >= 4 && {
@@ -384,14 +399,15 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
             {
                 return Ok(())
             }
-            // A stray/short datagram that isn't the reply: ignore and resend
-            // (the real reply may be a stream-setup or late packet behind it).
+            // A stray/short datagram that isn't the reply: drain and ignore
+            // (the real reply may be behind it). Don't resend here — the
+            // interval floor gates the next send.
             Ok(Ok(_)) => {
                 saw_traffic = true;
                 continue;
             }
             Ok(Err(e)) => return Err(RiperfError::Io(e)),
-            Err(_) => continue, // timed out waiting for reply — resend the magic
+            Err(_) => continue, // interval elapsed with no reply — loop resends
         }
     }
     Err(RiperfError::Protocol(if saw_traffic {
@@ -770,5 +786,61 @@ mod tests {
 
         udp_connect_client(&client_sock).await.unwrap();
         server_task.await.unwrap();
+    }
+
+    /// Issue #11 round-3: a flood of stray datagrams must NOT be amplified into
+    /// a flood of magic resends — the per-interval floor caps the resend rate.
+    /// (A prior revision resent on every drained stray, sending millions.)
+    #[tokio::test]
+    async fn udp_connect_client_rate_limits_resends_under_stray_flood() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let magics = Arc::new(AtomicUsize::new(0));
+        let m2 = magics.clone();
+        // For ~1.1s, count each magic and flood junk back (never the reply).
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let end = tokio::time::Instant::now() + std::time::Duration::from_millis(1100);
+            loop {
+                let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, server_sock.recv_from(&mut buf)).await {
+                    Ok(Ok((n, addr))) => {
+                        if n >= 4
+                            && u32::from_ne_bytes(buf[..4].try_into().unwrap()) == UDP_CONNECT_MSG
+                        {
+                            m2.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = server_sock
+                            .send_to(&0xdead_beef_u32.to_ne_bytes(), addr)
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Client never gets a valid reply; let it run ~1.1s then stop.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(1100),
+            udp_connect_client(&client_sock),
+        )
+        .await;
+        server_task.await.unwrap();
+
+        let n = magics.load(Ordering::Relaxed);
+        // ~1.1s / 500ms ≈ 2–3 resends; a regression would send thousands.
+        assert!(
+            (1..=6).contains(&n),
+            "client sent {n} magics in ~1.1s under a stray flood; expected ~2–3 (rate-limited)"
+        );
     }
 }
