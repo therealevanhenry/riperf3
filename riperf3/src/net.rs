@@ -777,6 +777,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ---- client -B local bind address (issue #15) ------------------------
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_connect_binds_local_address() {
+        // Bind the client source to 127.0.0.2 (loopback /8 on Linux). The OS
+        // would otherwise pick 127.0.0.1, so observing 127.0.0.2 proves -B
+        // actually took effect rather than being silently ignored (#15).
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, None, Some("127.0.0.2"), false, None)
+                .await
+                .unwrap()
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+        assert_eq!(
+            client.local_addr().unwrap().ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap(),
+            "client should have bound its source to -B 127.0.0.2"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_rejects_bind_family_mismatch() {
+        // A -B with a v6 literal while connecting to a v4 target must error,
+        // not silently ignore it (#15 family validation, mirroring #12).
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result =
+            tcp_connect("127.0.0.1", port, None, None, Some("::1"), false, None).await;
+        assert!(
+            result.is_err(),
+            "v6 bind address against a v4 target must be rejected"
+        );
+    }
+
     #[tokio::test]
     async fn udp_bind_ephemeral() {
         let socket = udp_bind(Some("127.0.0.1"), 0, false).await.unwrap();
