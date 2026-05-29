@@ -185,8 +185,9 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
 /// Build the full set of final-report lines for a set of per-stream summaries:
 /// the per-stream lines followed by aggregate `[SUM]` rows. Pure and testable.
 /// Both the client and the server route their final report through this so the
-/// two sides stay consistent (issue #4 was caused by the server omitting the
-/// SUM row that the client emitted).
+/// two sides stay consistent: issue #4 was the final `[SUM]` row being omitted
+/// for `-P > 1` (the client fix landed first, then the server), and a single
+/// shared path keeps either side from regressing independently.
 pub fn final_report_lines(per_stream: &[StreamSummary], format_char: char) -> Vec<String> {
     let mut lines: Vec<String> = per_stream
         .iter()
@@ -690,7 +691,16 @@ mod tests {
             "exactly one [SUM] line; got:\n{}",
             lines.join("\n")
         );
-        assert!(lines.last().unwrap().contains("[SUM]"));
+        let sum_line = lines.last().unwrap();
+        assert!(sum_line.contains("[SUM]"));
+        // Pin the rendered aggregate value, not just the presence of a SUM
+        // row: the SUM line must render the summed bytes (6000), so a
+        // regression that printed a per-stream or zero value would be caught.
+        let expected_transfer = units::format_bytes(6_000.0, 'M');
+        assert!(
+            sum_line.contains(&expected_transfer),
+            "SUM must render summed transfer {expected_transfer:?}; got {sum_line:?}"
+        );
     }
 
     #[test]
