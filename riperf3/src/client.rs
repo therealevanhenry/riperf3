@@ -87,6 +87,7 @@ impl Client {
             self.port,
             self.connect_timeout,
             None,
+            self.bind_address.as_deref(),
             self.mptcp,
             self.ip_version,
         )
@@ -302,6 +303,7 @@ impl Client {
                         self.port,
                         self.connect_timeout,
                         self.cport,
+                        self.bind_address.as_deref(),
                         self.mptcp,
                         self.ip_version,
                     )
@@ -394,8 +396,19 @@ impl Client {
                 // Resolve once, honoring -4/-6, so the bind family matches the
                 // peer and the connection respects the version preference (#10).
                 let remote = net::resolve_host(&self.host, self.port, self.ip_version).await?;
+                // Honor -B: resolve the UDP source address once (family-validated
+                // against the target), then bind every stream's socket to it,
+                // mirroring the TCP path (#15).
+                let bind_ip = match self.bind_address.as_deref() {
+                    Some(b) => Some(
+                        net::resolve_bind_ip(b, remote.is_ipv6(), &self.host)
+                            .await?
+                            .to_string(),
+                    ),
+                    None => None,
+                };
                 for i in 0..total {
-                    let udp_sock = net::udp_bind(None, 0, remote.is_ipv6()).await?;
+                    let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
                         net::set_bind_dev(&udp_sock, dev)?;
                     }
@@ -1277,6 +1290,21 @@ impl ClientBuilder {
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
 
+        // Reject a -B literal whose family contradicts -4/-6 at config time,
+        // mirroring the server-side check (#12); a bind hostname is validated
+        // against the target family at connect time instead (#15).
+        if let (Some(v), Some(addr)) = (self.ip_version, self.bind_address.as_deref()) {
+            let addr = addr.split('%').next().unwrap_or(addr);
+            if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+                if (v == 4 && ip.is_ipv6()) || (v == 6 && ip.is_ipv4()) {
+                    return Err(ConfigError::InvalidValue(
+                        "bind_address",
+                        format!("-{v} conflicts with bind address {addr}"),
+                    ));
+                }
+            }
+        }
+
         // Reject flags that require OS support not available on this platform.
         // Matches iperf3 behavior: error at build/parse time, not at runtime.
         #[cfg(not(unix))]
@@ -1466,6 +1494,27 @@ mod tests {
             assert!(c.no_delay);
             assert_eq!(c.bandwidth, 100_000_000);
             assert_eq!(c.tos, 0x10);
+        }
+
+        #[test]
+        fn bind_address_family_conflict_rejected_at_build() {
+            // A -B literal contradicting -4/-6 is rejected at config time,
+            // mirroring the server (#12); matching families build fine (#15).
+            assert!(ClientBuilder::new("h")
+                .ip_version(6)
+                .bind_address("10.0.0.1")
+                .build()
+                .is_err());
+            assert!(ClientBuilder::new("h")
+                .ip_version(4)
+                .bind_address("::1")
+                .build()
+                .is_err());
+            assert!(ClientBuilder::new("h")
+                .ip_version(4)
+                .bind_address("10.0.0.1")
+                .build()
+                .is_ok());
         }
     }
 }
