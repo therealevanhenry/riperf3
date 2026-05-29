@@ -204,6 +204,12 @@ impl Server {
 
         // ---- CreateStreams ----
         let done = Arc::new(AtomicBool::new(false));
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        let _done_guard = stream::DoneOnDrop(done.clone());
+        // Released at TestStart so UDP senders don't transmit during stream
+        // setup (issue #5): the create-streams handshake is lost under a flood.
+        let start = Arc::new(AtomicBool::new(false));
         let mut streams: Vec<DataStream> = Vec::new();
 
         // Determine how many streams to accept and their roles.
@@ -294,6 +300,14 @@ impl Server {
 
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
 
+                // Max send duration the server's UDP senders self-enforce
+                // (issue #5): in bidir/reverse the server sends too, and at a
+                // high `-b` those CPU-bound senders can starve this side's
+                // runtime so it never processes the client's TestEnd. Only in
+                // duration mode; byte/block-limited tests stop on `done`.
+                let max_duration = (params.num.is_none() && params.blockcount.is_none())
+                    .then(|| std::time::Duration::from_secs(cfg.duration as u64));
+
                 for i in 0..total {
                     // Accept: recv magic, connect() to client, send reply
                     let _client_addr = protocol::udp_connect_server(&udp_listener).await?;
@@ -329,8 +343,12 @@ impl Server {
                             DEFAULT_UDP_RATE
                         };
                         let u64bit = cfg.udp_counters_64bit;
+                        let st = start.clone();
+                        let md = max_duration;
                         let task = tokio::task::spawn_blocking(move || {
-                            stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
+                            stream::run_udp_sender_blocking(
+                                std_sock, c, bs, d, rate, u64bit, st, md,
+                            )
                         });
                         streams.push(DataStream {
                             id: stream_id,
@@ -371,6 +389,8 @@ impl Server {
         }
 
         // ---- TestStart / TestRunning ----
+        // All streams are set up — release the UDP senders.
+        start.store(true, Ordering::Relaxed);
         protocol::send_state(&mut ctrl, TestState::TestStart).await?;
         let cpu_start = CpuSnapshot::now();
         protocol::send_state(&mut ctrl, TestState::TestRunning).await?;

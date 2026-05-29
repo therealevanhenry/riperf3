@@ -103,6 +103,12 @@ impl Client {
         }
 
         let done = Arc::new(AtomicBool::new(false));
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        let _done_guard = stream::DoneOnDrop(done.clone());
+        // Released at TestStart so UDP senders don't transmit during stream
+        // setup (issue #5): the create-streams handshake is lost under a flood.
+        let start = Arc::new(AtomicBool::new(false));
         let mut streams: Vec<DataStream> = Vec::new();
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
@@ -118,10 +124,12 @@ impl Client {
                 }
 
                 TestState::CreateStreams => {
-                    streams = self.create_streams(&cookie, &done).await?;
+                    streams = self.create_streams(&cookie, &done, &start).await?;
                 }
 
                 TestState::TestStart => {
+                    // All streams are set up — release the UDP senders.
+                    start.store(true, Ordering::Relaxed);
                     cpu_start = Some(CpuSnapshot::now());
                 }
 
@@ -240,6 +248,7 @@ impl Client {
         &self,
         cookie: &[u8; protocol::COOKIE_SIZE],
         done: &Arc<AtomicBool>,
+        start: &Arc<AtomicBool>,
     ) -> Result<Vec<DataStream>> {
         let mut streams = Vec::new();
 
@@ -255,6 +264,14 @@ impl Client {
             0
         };
         let total = send_count + recv_count;
+
+        // Max send duration the UDP senders self-enforce (issue #5): the
+        // sender stops itself at `-t` so termination never depends on `done`
+        // being set by a CPU-starved runtime. Only in duration mode;
+        // byte/block-limited tests stop on `done`.
+        let max_duration = (self.bytes_to_send.is_none() && self.blocks_to_send.is_none())
+            .then(|| Duration::from_secs(self.duration as u64));
+
         match self.protocol {
             TransportProtocol::Tcp => {
                 for i in 0..total {
@@ -389,11 +406,17 @@ impl Client {
                         };
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
+                        let st = start.clone();
+                        let md = max_duration;
                         tokio::task::spawn_blocking(move || {
                             if use_sendmmsg {
-                                stream::run_udp_sender_sendmmsg(std_sock, c, bs, d, rate, u64bit)
+                                stream::run_udp_sender_sendmmsg(
+                                    std_sock, c, bs, d, rate, u64bit, st, md,
+                                )
                             } else {
-                                stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit)
+                                stream::run_udp_sender_blocking(
+                                    std_sock, c, bs, d, rate, u64bit, st, md,
+                                )
                             }
                         })
                     } else {
@@ -481,7 +504,14 @@ impl Client {
 
         match end_condition {
             EndCondition::Duration(dur) => {
-                // Use select to handle both timer and control socket
+                // Use select to handle both timer and control socket.
+                //
+                // The UDP senders also enforce this deadline themselves inside
+                // their loop (see the `deadline` passed at stream creation):
+                // at a high `-b` the CPU-bound senders can saturate every core
+                // and starve this async timer, so they must not depend on it to
+                // stop (issue #5). Once they self-terminate, CPU frees and this
+                // timer fires normally to drive the rest of the shutdown.
                 tokio::select! {
                     _ = tokio::time::sleep(dur) => {}
                     state = protocol::recv_state(ctrl) => {

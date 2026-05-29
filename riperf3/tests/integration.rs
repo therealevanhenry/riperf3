@@ -1787,6 +1787,46 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
+    /// Smoke test for issue #5: UDP bidirectional with parallel streams runs
+    /// the full wired-up path (barrier release at TestStart, self-deadline,
+    /// teardown) without deadlocking, and the outer timeout turns any hang into
+    /// a failure rather than a wedged run.
+    ///
+    /// NOTE: this does not by itself reproduce the original hang on fast
+    /// hardware — that needs real per-core starvation plus lossy handshake
+    /// delivery (an 8-vCPU VM), conditions loopback on a workstation doesn't
+    /// create, so it can pass even with the fix disabled. The deadline and
+    /// start-barrier mechanisms are pinned directly by the `stream.rs` unit
+    /// tests; this is the end-to-end "doesn't wedge" guard.
+    #[tokio::test]
+    async fn udp_bidir_parallel_completes() {
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(2)
+            .num_streams(4)
+            .bidir(true)
+            .bandwidth(50_000_000_000) // 50 Gbps/stream target
+            .build()
+            .unwrap();
+        // -t is 2s; allow generous slack, but fail (not hang) on a regression.
+        let result = tokio::time::timeout(Duration::from_secs(20), client.run()).await;
+        assert!(
+            result.is_ok(),
+            "UDP --bidir -P 4 hung — issue #5 regression"
+        );
+        assert!(result.unwrap().is_ok(), "UDP --bidir -P 4 errored");
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn udp_high_rate_reverse() {
         // 50G reverse mode — server sends, client receives
