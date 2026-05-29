@@ -91,20 +91,29 @@ p<0.05.
   p<1e-4), the result of the 0.4.0 UDP rebuild ([#6](https://github.com/therealevanhenry/riperf3/issues/6): MSS-derived datagram size + blocking sockets).
 - No cell where iperf3 is significantly faster.
 
-### UDP loss (%) — directional asymmetry
+### UDP loss (%) at `-b 0`
 
 | direction | riperf3 | iperf3 |
 |---|--:|--:|
-| forward (server receives) | **0.00** (P8) | 0.8–1.2 |
-| reverse (server sends) | **1.2–1.8** | 0.4–0.8 |
+| forward (server receives), P8 | 2.4–2.8 | 0.9–1.0 |
+| reverse (server sends), P8 | 1.2–1.6 | 0.6–0.7 |
 
-Forward, riperf3 is faster **and** loss-free even at P8. Reverse, riperf3 is
-faster but drops 2–3× more than iperf3. The asymmetry tracks the sender: forward
-uses the client's `sendmmsg` path (loss-free); reverse uses the server's
-per-packet blocking sender, which bursts harder into the receiver. Goodput still
-favors riperf3 (≈31.1 vs 28.3 Gbps reverse P8 v6), so it's a characteristic, not
-a regression — tracked in
-[#25](https://github.com/therealevanhenry/riperf3/issues/25).
+UDP loss at `-b 0` is receiver-side socket-buffer overflow on a saturated link —
+kernel `RcvbufErrors` on the receiving host, while sender `SndbufErrors` stay 0
+(the sender never drops). It is roughly symmetric by direction; if anything,
+forward drops a touch more. riperf3 loses somewhat more than iperf3 in both
+directions because it pushes ~10–15% more throughput, so it overruns the
+receiver's buffer harder — higher goodput, slightly higher loss, a
+characteristic rather than a regression.
+
+> **Correction (0.5.4).** Earlier editions reported forward as "0.00 / loss-free"
+> and attributed the gap to a `sendmmsg`-vs-per-packet sender split. Both were
+> wrong. riperf3 had a reporting bug — forward UDP never printed the
+> server-measured receiver loss, so it *looked* loss-free
+> ([#25](https://github.com/therealevanhenry/riperf3/issues/25), fixed in 0.5.4)
+> — and the campaign never passed `--sendmmsg`, so both directions used the same
+> per-packet sender. Kernel counters confirm forward drops the same ~2–3% as
+> reverse; the "asymmetry" was measurement, not packet loss.
 
 ## Single-run supplements
 
@@ -122,7 +131,9 @@ TCP bidir is at parity (~80 Gbps aggregate); UDP bidir aggregate is comparable.
 ### UDP datagram-size sweep (IPv6 forward, P1)
 
 Throughput scales with datagram size; the default (no `-l`) lands at the MSS
-(~8928 B). riperf3's `sendmmsg` batching pulls ahead once datagrams are large.
+(~8928 B). riperf3's UDP path — blocking sockets and MSS-derived datagram sizing
+([#6](https://github.com/therealevanhenry/riperf3/issues/6)) — pulls ahead once
+datagrams are large.
 
 | `-l` (bytes) | riperf3 | iperf3 |
 |-------------:|--------:|-------:|
