@@ -78,6 +78,34 @@ pub struct Client {
     pub use_pkcs1_padding: bool,
 }
 
+/// Build receiver-perspective summaries from the server's results. In a forward
+/// test the local streams are senders, so the receiver's view — most importantly
+/// UDP loss — lives only in the results the server returned. Surfacing it as a
+/// `receiver` line matches iperf3; without it, forward UDP looks loss-free even
+/// when the link is dropping packets (issue #25). `is_udp` gates the datagram
+/// loss/jitter columns so a forward TCP run shows a plain receiver byte line.
+fn server_receiver_summaries(
+    server: &TestResultsJson,
+    end: f64,
+    is_udp: bool,
+) -> Vec<crate::reporter::StreamSummary> {
+    server
+        .streams
+        .iter()
+        .map(|s| crate::reporter::StreamSummary {
+            stream_id: s.id,
+            start: 0.0,
+            end,
+            bytes: s.bytes,
+            is_sender: false,
+            retransmits: None,
+            jitter: is_udp.then_some(s.jitter),
+            lost: is_udp.then_some(s.errors),
+            total_packets: is_udp.then_some(s.packets),
+        })
+        .collect()
+}
+
 impl Client {
     pub async fn run(&self) -> Result<TestResultsJson> {
         // ---- Generate cookie and connect ----
@@ -666,15 +694,15 @@ impl Client {
         if self.json_output {
             self.print_results_json(streams, cpu_start, remote_cpu, blksize);
         } else {
-            self.print_results_text(streams);
+            self.print_results_text(streams, remote_cpu);
         }
     }
 
-    fn print_results_text(&self, streams: &[DataStream]) {
+    fn print_results_text(&self, streams: &[DataStream], server_results: Option<&TestResultsJson>) {
         let test_duration = self.duration as f64;
         crate::reporter::print_separator();
 
-        let summaries: Vec<crate::reporter::StreamSummary> = streams
+        let mut summaries: Vec<crate::reporter::StreamSummary> = streams
             .iter()
             .map(|s| {
                 let bytes = if s.is_sender {
@@ -706,6 +734,18 @@ impl Client {
             })
             .collect();
 
+        // Forward: the server is the receiver, so its loss/throughput lives only
+        // in the results it returned — surface it as the receiver line iperf3
+        // prints, otherwise forward UDP looks loss-free even when the link drops
+        // packets (issue #25). Reverse already reports the receiver locally;
+        // bidir's server-receive half isn't split out of the aggregate results.
+        if !self.reverse && !self.bidir {
+            if let Some(server) = server_results {
+                let is_udp = matches!(self.protocol, TransportProtocol::Udp);
+                summaries.extend(server_receiver_summaries(server, test_duration, is_udp));
+            }
+        }
+
         // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
         // (issue #4), via the shared path the server also uses.
         crate::reporter::print_final_summaries(&summaries, self.format_char);
@@ -728,6 +768,11 @@ impl Client {
             TransportProtocol::Tcp => "TCP",
             TransportProtocol::Udp => "UDP",
         };
+
+        // Forward UDP: the server is the receiver, so its loss lives only in the
+        // results it returned. Surface it in `-J` too, mirroring the text path (#25).
+        let is_forward_udp =
+            matches!(self.protocol, TransportProtocol::Udp) && !self.reverse && !self.bidir;
 
         // Build per-stream end results
         let mut j_streams = Vec::new();
@@ -769,6 +814,21 @@ impl Client {
                     };
                     stream_obj["lost_percent"] = serde_json::json!(pct);
                 }
+            } else if is_forward_udp && s.is_sender {
+                // Forward UDP: the loss was measured by the server (receiver), so
+                // attach it from its results — otherwise `-J` forward looks
+                // loss-free too, the machine-readable twin of the text gap (#25).
+                if let Some(rs) = remote_cpu.and_then(|r| r.streams.iter().find(|x| x.id == s.id)) {
+                    stream_obj["jitter_ms"] = serde_json::json!(rs.jitter * 1000.0);
+                    stream_obj["lost_packets"] = serde_json::json!(rs.errors);
+                    stream_obj["packets"] = serde_json::json!(rs.packets);
+                    let pct = if rs.packets > 0 {
+                        rs.errors as f64 / rs.packets as f64 * 100.0
+                    } else {
+                        0.0
+                    };
+                    stream_obj["lost_percent"] = serde_json::json!(pct);
+                }
             }
 
             j_streams.push(stream_obj);
@@ -786,7 +846,7 @@ impl Client {
             .map(|r| (r.cpu_util_total, r.cpu_util_user, r.cpu_util_system))
             .unwrap_or((0.0, 0.0, 0.0));
 
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "start": {
                 "connected": streams.iter().map(|s| {
                     serde_json::json!({
@@ -847,6 +907,29 @@ impl Client {
                 }
             }
         });
+
+        // Forward UDP: fold the server-measured loss into the aggregate
+        // `sum_received` so `-J` reports it alongside the per-stream lines (#25).
+        if is_forward_udp {
+            if let Some(server) = remote_cpu {
+                let lost: i64 = server.streams.iter().map(|s| s.errors).sum();
+                let packets: i64 = server.streams.iter().map(|s| s.packets).sum();
+                let jitter = server
+                    .streams
+                    .iter()
+                    .map(|s| s.jitter)
+                    .fold(0.0_f64, f64::max);
+                let sr = &mut output["end"]["sum_received"];
+                sr["jitter_ms"] = serde_json::json!(jitter * 1000.0);
+                sr["lost_packets"] = serde_json::json!(lost);
+                sr["packets"] = serde_json::json!(packets);
+                sr["lost_percent"] = serde_json::json!(if packets > 0 {
+                    lost as f64 / packets as f64 * 100.0
+                } else {
+                    0.0
+                });
+            }
+        }
 
         println!("{}", serde_json::to_string_pretty(&output).unwrap());
     }
@@ -1551,6 +1634,53 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(c.build_params(1460).bandwidth, Some(0));
+        }
+
+        // -- forward UDP receiver-loss reporting (issue #25) --
+
+        #[test]
+        fn forward_udp_surfaces_server_receiver_loss() {
+            // Forward UDP: the client is the sender, so the receiver's loss lives
+            // only in the server's results. riperf3 must surface it as a receiver
+            // line, like iperf3 — otherwise forward looks artificially loss-free
+            // even when the link drops packets (issue #25).
+            let server = TestResultsJson {
+                cpu_util_total: 0.0,
+                cpu_util_user: 0.0,
+                cpu_util_system: 0.0,
+                sender_has_retransmits: -1,
+                congestion_used: None,
+                streams: vec![protocol::StreamResultJson {
+                    id: 1,
+                    bytes: 2_000_000,
+                    retransmits: -1,
+                    jitter: 0.000_03,
+                    errors: 4258,
+                    omitted_errors: 0,
+                    packets: 267_190,
+                    omitted_packets: 0,
+                    start_time: 0.0,
+                    end_time: 5.0,
+                }],
+            };
+
+            let recv = server_receiver_summaries(&server, 5.0, true);
+            assert_eq!(recv.len(), 1);
+            assert!(!recv[0].is_sender, "server is the receiver in forward mode");
+            assert_eq!(recv[0].lost, Some(4258));
+            assert_eq!(recv[0].total_packets, Some(267_190));
+            assert_eq!(recv[0].jitter, Some(0.000_03));
+
+            // Renders as a receiver line carrying the loss iperf3 would print.
+            let line = crate::reporter::format_summary_line(&recv[0], 'a');
+            assert!(line.contains("receiver"), "{line}");
+            assert!(line.contains("4258/267190"), "{line}");
+
+            // TCP forward: no datagram-loss columns, just a receiver byte line.
+            let tcp = server_receiver_summaries(&server, 5.0, false);
+            assert_eq!(tcp[0].lost, None);
+            assert_eq!(tcp[0].total_packets, None);
+            assert_eq!(tcp[0].jitter, None);
         }
 
         // -- client -B vs -4/-6 build-time validation (issue #15) --
