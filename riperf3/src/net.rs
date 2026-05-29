@@ -172,24 +172,27 @@ pub async fn resolve_host(host: &str, port: u16, ip_version: Option<u8>) -> Resu
         .ok_or_else(|| RiperfError::Protocol(format!("no {} address found for {host}", want())))
 }
 
-/// Resolve a client `-B` bind address to a local source IP. Honors `-4`/`-6`
-/// (via `ip_version`) and requires the result to share the target's address
-/// family, mirroring the server-side validation (#12); a mismatch is a clear
-/// error rather than a silent fallback. `host%dev` keeps only the address part
-/// — device binding is `--bind-dev`'s job (#15).
+/// Resolve a client `-B` bind address to a local source IP in the target's
+/// address family. The bind family must match the connection, and the target
+/// was already resolved honoring `-4`/`-6`, so `target_is_ipv6` is authoritative
+/// — resolving the bind host in that family makes a dual-stack bind *hostname*
+/// pick the matching address (rather than the resolver's first result) and
+/// rejects a wrong-family bind *literal* with a clear message. `host%dev` keeps
+/// only the address part (device binding is `--bind-dev`); note an IPv6
+/// link-local zone id like `fe80::1%eth0` is therefore not supported here.
 pub async fn resolve_bind_ip(
     bind_address: &str,
     target_is_ipv6: bool,
     target_host: &str,
-    ip_version: Option<u8>,
 ) -> Result<std::net::IpAddr> {
     let addr = bind_address.split('%').next().unwrap_or(bind_address);
-    let resolved = resolve_host(addr, 0, ip_version).await?;
-    if resolved.is_ipv6() != target_is_ipv6 {
-        return Err(RiperfError::Protocol(format!(
-            "bind address {addr} family does not match target {target_host}"
-        )));
-    }
+    let family = if target_is_ipv6 { 6 } else { 4 };
+    let resolved = resolve_host(addr, 0, Some(family)).await.map_err(|_| {
+        RiperfError::Protocol(format!(
+            "bind address {addr} has no {} address to match target {target_host}",
+            if target_is_ipv6 { "IPv6" } else { "IPv4" }
+        ))
+    })?;
     Ok(resolved.ip())
 }
 
@@ -227,11 +230,14 @@ pub async fn tcp_connect(
         if bind_address.is_some() || local_port.is_some() {
             let lport = local_port.unwrap_or(0);
             let local_ip = match bind_address {
-                Some(b) => resolve_bind_ip(b, remote.is_ipv6(), host, ip_version).await?,
+                Some(b) => resolve_bind_ip(b, remote.is_ipv6(), host).await?,
                 None if remote.is_ipv6() => std::net::Ipv6Addr::UNSPECIFIED.into(),
                 None => std::net::Ipv4Addr::UNSPECIFIED.into(),
             };
-            socket.bind(&SocketAddr::new(local_ip, lport).into())?;
+            let local = SocketAddr::new(local_ip, lport);
+            socket.bind(&local.into()).map_err(|e| {
+                RiperfError::Protocol(format!("failed to bind local address {local}: {e}"))
+            })?;
         }
         socket.set_nonblocking(true)?;
         match socket.connect(&remote.into()) {
@@ -855,6 +861,30 @@ mod tests {
         assert!(
             result.is_err(),
             "v6 bind address against a v4 target must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_socket2_path_honors_timeout() {
+        // A bind address forces the socket2 path; a connect to a non-routable
+        // target with a short timeout must fail fast, not hang — this path
+        // previously ignored connect_timeout (#15 review).
+        let start = std::time::Instant::now();
+        let result = tcp_connect(
+            "192.0.2.1", // TEST-NET-1, non-routable
+            12345,
+            Some(Duration::from_millis(150)),
+            None,
+            Some("0.0.0.0"),
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "non-routable connect must fail");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "socket2 path must honor the timeout, not hang (took {:?})",
+            start.elapsed()
         );
     }
 

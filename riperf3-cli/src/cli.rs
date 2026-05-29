@@ -210,7 +210,7 @@ pub struct Cli {
     #[arg(short = '6', long)]
     pub version6: bool,
 
-    /// Bind to the interface associated with the address
+    /// Bind to a local source address (device binding is `--bind-dev`)
     #[arg(short = 'B', long, value_name = "host[%dev]")]
     pub bind: Option<String>,
 
