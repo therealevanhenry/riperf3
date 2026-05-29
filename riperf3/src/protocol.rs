@@ -346,31 +346,59 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
 /// Client-side UDP connect handshake.
 /// Sends the magic word and waits for the server's reply.
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
-pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
-    socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
+///
+/// The handshake is over UDP, so a lost magic word or reply would otherwise
+/// stall setup forever (issue #11). The client resends its magic and waits a
+/// bounded time per attempt, up to a few retries, before giving up. Resending
+/// a magic the server already received just yields a duplicate reply, which is
+/// harmless and keeps wire-compatibility with iperf3.
+const UDP_CONNECT_RETRIES: usize = 5;
+const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     let mut buf = [0u8; 4];
-    let n = socket.recv(&mut buf).await?;
-    if n < 4 {
-        return Err(RiperfError::Protocol("UDP connect reply too short".into()));
+    for _ in 0..UDP_CONNECT_RETRIES {
+        socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
+        match tokio::time::timeout(UDP_CONNECT_RETRY_INTERVAL, socket.recv(&mut buf)).await {
+            Ok(Ok(n)) if n >= 4 => {
+                let reply = u32::from_ne_bytes(buf);
+                // Accept both the current and legacy reply values.
+                if reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a {
+                    return Ok(());
+                }
+                return Err(RiperfError::Protocol(format!(
+                    "unexpected UDP connect reply: {reply:#x}"
+                )));
+            }
+            Ok(Ok(_)) => return Err(RiperfError::Protocol("UDP connect reply too short".into())),
+            Ok(Err(e)) => return Err(RiperfError::Io(e)),
+            Err(_) => continue, // timed out waiting for reply — resend the magic
+        }
     }
-    let reply = u32::from_ne_bytes(buf);
-    // Accept both the current and legacy reply values
-    if reply != UDP_CONNECT_REPLY && reply != 0xb168_de3a {
-        return Err(RiperfError::Protocol(format!(
-            "unexpected UDP connect reply: {reply:#x}"
-        )));
-    }
-    Ok(())
+    Err(RiperfError::Protocol(format!(
+        "UDP connect handshake timed out after {UDP_CONNECT_RETRIES} retries"
+    )))
 }
 
 /// Server-side UDP connect handshake.
-/// Waits for the client's magic word, "connects" the socket to the client,
-/// sends the reply, and returns the client address.
+/// Waits (up to `timeout`) for the client's magic word, "connects" the socket
+/// to the client, sends the reply, and returns the client address. The bounded
+/// wait means a client that never connects — or whose magic is lost on a real
+/// network — fails the test instead of hanging setup forever (issue #11).
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
-pub async fn udp_connect_server(socket: &UdpSocket) -> Result<SocketAddr> {
+pub async fn udp_connect_server(
+    socket: &UdpSocket,
+    timeout: std::time::Duration,
+) -> Result<SocketAddr> {
     let mut buf = [0u8; 65536];
-    let (n, addr) = socket.recv_from(&mut buf).await?;
+    let (n, addr) = match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(RiperfError::Aborted(
+                "timed out waiting for UDP stream connect".into(),
+            ))
+        }
+    };
     if n < 4 {
         return Err(RiperfError::Protocol(
             "UDP connect message too short".into(),
@@ -607,10 +635,74 @@ mod tests {
         client_sock.connect(server_addr).await.unwrap();
 
         let server_task = tokio::spawn(async move {
-            let addr = udp_connect_server(&server_sock).await.unwrap();
-            addr
+            udp_connect_server(&server_sock, std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
         });
 
+        udp_connect_client(&client_sock).await.unwrap();
+        let client_addr = server_task.await.unwrap();
+        assert_eq!(client_addr, client_sock.local_addr().unwrap());
+    }
+
+    /// Issue #11: the server must give up (not hang forever) if no client
+    /// magic ever arrives.
+    #[tokio::test]
+    async fn udp_connect_server_times_out_when_no_client() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let start = std::time::Instant::now();
+        let res = udp_connect_server(&server_sock, std::time::Duration::from_millis(150)).await;
+        assert!(
+            matches!(res, Err(RiperfError::Aborted(_))),
+            "expected a timeout abort, got {res:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "should not hang"
+        );
+    }
+
+    /// Issue #11: the client gives up (not hangs) if the server never replies,
+    /// after retransmitting its magic a bounded number of times.
+    #[tokio::test]
+    async fn udp_connect_client_times_out_when_no_reply() {
+        // A bound socket that never replies (nothing recv_from's it).
+        let dead_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_server.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(dead_addr).await.unwrap();
+
+        let start = std::time::Instant::now();
+        let res = udp_connect_client(&client_sock).await;
+        assert!(res.is_err(), "expected handshake to fail, got {res:?}");
+        // 5 retries × 500ms ≈ 2.5s; bound generously but finite.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(6),
+            "client should give up after bounded retries, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Issue #11: a lost first reply is recovered by the client's retransmit —
+    /// the server replies on the second magic and the handshake completes.
+    #[tokio::test]
+    async fn udp_connect_recovers_from_lost_first_magic() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        // Server drains and drops the first datagram, then handshakes normally
+        // on the client's retransmit.
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let _ = server_sock.recv_from(&mut buf).await.unwrap(); // drop #1
+            udp_connect_server(&server_sock, std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+        });
+
+        // Client must succeed despite the dropped first magic (it resends).
         udp_connect_client(&client_sock).await.unwrap();
         let client_addr = server_task.await.unwrap();
         assert_eq!(client_addr, client_sock.local_addr().unwrap());

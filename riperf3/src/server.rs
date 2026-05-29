@@ -309,8 +309,15 @@ impl Server {
                     .then(|| std::time::Duration::from_secs(cfg.duration as u64));
 
                 for i in 0..total {
-                    // Accept: recv magic, connect() to client, send reply
-                    let _client_addr = protocol::udp_connect_server(&udp_listener).await?;
+                    // Accept: recv magic, connect() to client, send reply.
+                    // Bounded so a client that never connects fails the test
+                    // instead of hanging setup forever (#11); generous enough
+                    // to cover the client's handshake retransmits.
+                    let _client_addr = protocol::udp_connect_server(
+                        &udp_listener,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await?;
                     // The listener is now locked to this client — use it as the data socket
                     let data_sock = udp_listener;
 
