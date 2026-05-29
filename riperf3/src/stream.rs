@@ -1886,7 +1886,10 @@ mod tests {
             let _ = send.send(&buf);
         }
         std::thread::sleep(Duration::from_millis(50));
-        assert!(counters.bytes_received() > 0, "should count during the test");
+        assert!(
+            counters.bytes_received() > 0,
+            "should count during the test"
+        );
 
         // Duration ends.
         done.store(true, Ordering::Relaxed);
