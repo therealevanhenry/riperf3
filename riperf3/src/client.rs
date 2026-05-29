@@ -807,12 +807,10 @@ impl Client {
                     stream_obj["jitter_ms"] = serde_json::json!(stats.jitter * 1000.0);
                     stream_obj["lost_packets"] = serde_json::json!(stats.cnt_error);
                     stream_obj["packets"] = serde_json::json!(stats.packet_count);
-                    let pct = if stats.packet_count > 0 {
-                        stats.cnt_error as f64 / stats.packet_count as f64 * 100.0
-                    } else {
-                        0.0
-                    };
-                    stream_obj["lost_percent"] = serde_json::json!(pct);
+                    stream_obj["lost_percent"] = serde_json::json!(crate::reporter::lost_percent(
+                        stats.cnt_error,
+                        stats.packet_count
+                    ));
                 }
             } else if is_forward_udp && s.is_sender {
                 // Forward UDP: the loss was measured by the server (receiver), so
@@ -822,12 +820,8 @@ impl Client {
                     stream_obj["jitter_ms"] = serde_json::json!(rs.jitter * 1000.0);
                     stream_obj["lost_packets"] = serde_json::json!(rs.errors);
                     stream_obj["packets"] = serde_json::json!(rs.packets);
-                    let pct = if rs.packets > 0 {
-                        rs.errors as f64 / rs.packets as f64 * 100.0
-                    } else {
-                        0.0
-                    };
-                    stream_obj["lost_percent"] = serde_json::json!(pct);
+                    stream_obj["lost_percent"] =
+                        serde_json::json!(crate::reporter::lost_percent(rs.errors, rs.packets));
                 }
             }
 
@@ -923,11 +917,8 @@ impl Client {
                 sr["jitter_ms"] = serde_json::json!(jitter * 1000.0);
                 sr["lost_packets"] = serde_json::json!(lost);
                 sr["packets"] = serde_json::json!(packets);
-                sr["lost_percent"] = serde_json::json!(if packets > 0 {
-                    lost as f64 / packets as f64 * 100.0
-                } else {
-                    0.0
-                });
+                sr["lost_percent"] =
+                    serde_json::json!(crate::reporter::lost_percent(lost, packets));
             }
         }
 
