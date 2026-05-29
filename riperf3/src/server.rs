@@ -52,12 +52,13 @@ impl TestConfig {
             no_delay: params.nodelay.unwrap_or(false),
             mss: params.mss,
             window: params.window,
-            // Mirror the client's resolution (#17): a present rate (incl. 0 =
-            // unlimited) is used verbatim; when absent (older peer, or TCP),
-            // default to 1 Mbit/s for UDP and unlimited for TCP. 0 = unlimited.
-            bandwidth: params
-                .bandwidth
-                .unwrap_or(if is_udp { DEFAULT_UDP_RATE } else { 0 }),
+            // A present rate (incl. 0 = unlimited) is used verbatim. An ABSENT
+            // rate means unlimited (0), matching iperf3: it omits the param only
+            // for -b 0 and sends it explicitly otherwise (incl. its 1 Mbit/s UDP
+            // default), as do riperf3 clients. Defaulting an absent UDP rate to
+            // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
+            // 1 Mbit/s UDP default is a client-side concern, resolved at build.
+            bandwidth: params.bandwidth.unwrap_or(0),
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
