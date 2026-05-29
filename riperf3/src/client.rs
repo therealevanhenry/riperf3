@@ -87,6 +87,7 @@ impl Client {
             self.port,
             self.connect_timeout,
             None,
+            self.bind_address.as_deref(),
             self.mptcp,
             self.ip_version,
         )
@@ -302,6 +303,7 @@ impl Client {
                         self.port,
                         self.connect_timeout,
                         self.cport,
+                        self.bind_address.as_deref(),
                         self.mptcp,
                         self.ip_version,
                     )
@@ -395,7 +397,17 @@ impl Client {
                 // peer and the connection respects the version preference (#10).
                 let remote = net::resolve_host(&self.host, self.port, self.ip_version).await?;
                 for i in 0..total {
-                    let udp_sock = net::udp_bind(None, 0, remote.is_ipv6()).await?;
+                    // Honor -B: bind the UDP source address (family-validated
+                    // against the target), mirroring the TCP path (#15).
+                    let bind_ip = match self.bind_address.as_deref() {
+                        Some(b) => Some(
+                            net::resolve_bind_ip(b, remote.is_ipv6(), &self.host, self.ip_version)
+                                .await?
+                                .to_string(),
+                        ),
+                        None => None,
+                    };
+                    let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
                         net::set_bind_dev(&udp_sock, dev)?;
                     }
