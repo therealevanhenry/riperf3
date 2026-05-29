@@ -912,6 +912,58 @@ mod tests {
         }
     }
 
+    // ---- tcp_maxseg + UDP sender socket tuning (issue #6) -----------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_maxseg_reports_mss_for_connected_stream() {
+        // A connected TCP stream exposes a positive MSS via TCP_MAXSEG — this
+        // is what the UDP datagram-size default is derived from (iperf3 parity).
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task =
+            tokio::spawn(
+                async move { tcp_connect("127.0.0.1", port, None, None, false, None).await.unwrap() },
+            );
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+
+        let mss = tcp_maxseg(&client);
+        assert!(
+            mss.is_some(),
+            "TCP_MAXSEG should be readable on a connected socket"
+        );
+        assert!(mss.unwrap() > 0, "MSS should be positive, got {mss:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_switches_to_blocking() {
+        // tokio sockets are non-blocking and into_std() keeps that flag; the
+        // blocking sender thread needs a blocking socket so sendmmsg
+        // backpressures in-kernel instead of busy-spinning on EAGAIN (#6).
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        assert!(
+            is_nonblocking(socket.as_raw_fd()),
+            "precondition: socket starts non-blocking"
+        );
+
+        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        assert!(
+            !is_nonblocking(socket.as_raw_fd()),
+            "sender socket must be switched to blocking"
+        );
+    }
+
+    #[cfg(unix)]
+    fn is_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
+        // SAFETY: F_GETFL on a valid fd returns the file status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags & libc::O_NONBLOCK) != 0
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn set_bind_dev_loopback() {

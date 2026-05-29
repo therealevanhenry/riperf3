@@ -263,6 +263,37 @@ mod tests {
         assert_eq!(parse_dscp("AF11").unwrap(), parse_dscp("af11").unwrap());
     }
 
+    // -- resolve_udp_blksize: MSS-derived default (issue #6) --
+
+    #[test]
+    fn resolve_udp_blksize_explicit_wins() {
+        // An explicit -l always takes precedence, even when an MSS is known.
+        assert_eq!(resolve_udp_blksize(Some(2000), Some(8928)), 2000);
+        assert_eq!(resolve_udp_blksize(Some(1460), None), 1460);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_derives_from_mss() {
+        // No -l: track the control-connection MSS, like iperf3. On a jumbo path
+        // this yields large datagrams instead of the conservative 1460 floor.
+        assert_eq!(resolve_udp_blksize(None, Some(8928)), 8928);
+        assert_eq!(resolve_udp_blksize(None, Some(1448)), 1448);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_falls_back_without_mss() {
+        // No -l and no MSS available (e.g. non-Unix): historical 1460 default.
+        assert_eq!(resolve_udp_blksize(None, None), DEFAULT_UDP_BLKSIZE);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_clamps_to_udp_bounds() {
+        // A bogus huge MSS is clamped to the max UDP payload; a sub-header MSS
+        // falls back to the safe default rather than producing tiny datagrams.
+        assert_eq!(resolve_udp_blksize(None, Some(70_000)), MAX_UDP_BLKSIZE);
+        assert_eq!(resolve_udp_blksize(None, Some(8)), DEFAULT_UDP_BLKSIZE);
+    }
+
     // -- make_send_buffer edge cases --
 
     #[test]
