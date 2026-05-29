@@ -129,6 +129,25 @@ async fn server_accepts_ipv6_udp_client_by_default() {
     let _ = server_task.await;
 }
 
+/// Client `-6` against an IPv4-literal host must fail fast at address
+/// resolution rather than silently connecting over IPv4 (issue #10). No
+/// server needed — it errors before any connection is attempted.
+#[tokio::test]
+async fn client_ip_version_conflicts_with_literal_host() {
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(next_port()))
+        .ip_version(6)
+        .duration(1)
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let result = client.run().await;
+    assert!(
+        result.is_err(),
+        "-6 against an IPv4-literal host must error, not connect over IPv4"
+    );
+}
+
 /// `ServerBuilder::ip_version(6)` must restrict the listener to IPv6, so an
 /// IPv4 client is refused — exercises the builder→net pass-through end-to-end.
 #[tokio::test]
@@ -659,6 +678,33 @@ mod builder_tests {
     fn server_builder_verbose() {
         let s = ServerBuilder::new().verbose(true).build().unwrap();
         assert!(s.verbose);
+    }
+
+    #[test]
+    fn server_builder_rejects_version_bind_conflict() {
+        // -4/-6 contradicting an explicit -B of the opposite family is an
+        // error, not silently honored (issue #12).
+        assert!(ServerBuilder::new()
+            .ip_version(6)
+            .bind_address("127.0.0.1")
+            .build()
+            .is_err());
+        assert!(ServerBuilder::new()
+            .ip_version(4)
+            .bind_address("::")
+            .build()
+            .is_err());
+        // Matching family, or a non-literal bind, is fine.
+        assert!(ServerBuilder::new()
+            .ip_version(6)
+            .bind_address("::")
+            .build()
+            .is_ok());
+        assert!(ServerBuilder::new()
+            .ip_version(4)
+            .bind_address("0.0.0.0")
+            .build()
+            .is_ok());
     }
 }
 
