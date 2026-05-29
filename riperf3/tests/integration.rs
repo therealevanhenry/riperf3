@@ -141,11 +141,17 @@ async fn client_ip_version_conflicts_with_literal_host() {
         .connect_timeout(Duration::from_millis(500))
         .build()
         .unwrap();
-    let result = client.run().await;
-    assert!(
-        result.is_err(),
-        "-6 against an IPv4-literal host must error, not connect over IPv4"
-    );
+    // Assert the *family-conflict* path fired, not just any connect error
+    // (no server is listening, so a bare is_err() could pass vacuously).
+    match client.run().await {
+        Err(riperf3::RiperfError::Protocol(msg)) => {
+            assert!(
+                msg.contains("is not IPv6"),
+                "expected a family-conflict error, got: {msg}"
+            );
+        }
+        other => panic!("expected a family-conflict Protocol error, got {other:?}"),
+    }
 }
 
 /// `ServerBuilder::ip_version(6)` must restrict the listener to IPv6, so an

@@ -1134,6 +1134,10 @@ impl ClientBuilder {
     }
 
     pub fn ip_version(mut self, version: u8) -> Self {
+        debug_assert!(
+            matches!(version, 4 | 6),
+            "ip_version must be 4 or 6, got {version}"
+        );
         self.ip_version = Some(version);
         self
     }
