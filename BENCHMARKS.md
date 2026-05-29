@@ -48,9 +48,10 @@ forward numbers are the client's *send* rate. UDP runs target `-b 100G` (i.e.
 
 **Takeaway:** riperf3 is at parity with iperf3 single-stream. At `-P 8`
 *forward* it pulls ahead ~21–25% (61.6 vs 50.8 Gbps IPv4; 63.5 vs 51.0 IPv6);
-at `-P 8` *reverse* the two are roughly at parity (~4–5% ahead). iperf3 shows no
-IPv4/IPv6 difference; riperf3 is consistently 2–3% faster on IPv6 — small but
-directionally consistent, not a penalty either way.
+at `-P 8` *reverse* the two are roughly at parity (~4–5% ahead). IPv4/IPv6
+differences are within run-to-run noise for both tools (the largest single
+delta, iperf3 forward `-P 4`, is ~5%); riperf3 trends slightly faster on IPv6
+in the forward direction, but there's no penalty either way.
 
 ## UDP (Gbps)
 
