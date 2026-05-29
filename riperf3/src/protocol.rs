@@ -343,41 +343,45 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
 // UDP "connect" handshake
 // ---------------------------------------------------------------------------
 
+const UDP_CONNECT_RETRIES: usize = 5;
+const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Client-side UDP connect handshake.
 /// Sends the magic word and waits for the server's reply.
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
 ///
 /// The handshake is over UDP, so a lost magic word or reply would otherwise
 /// stall setup forever (issue #11). The client resends its magic and waits a
-/// bounded time per attempt, up to a few retries, before giving up. Resending
-/// a magic the server already received just yields a duplicate reply, which is
-/// harmless and keeps wire-compatibility with iperf3.
-const UDP_CONNECT_RETRIES: usize = 5;
-const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
+/// bounded interval per attempt, giving up after a few retries. A non-reply
+/// datagram (a stray/early packet) is ignored rather than treated as a fatal
+/// error — like iperf3, which drains a couple of packets while waiting for the
+/// reply. This is a riperf3 addition (iperf3's own client sends the magic once
+/// and relies on a long socket read timeout); resending a magic the server
+/// already received just yields a duplicate reply, which is harmless, so it
+/// stays interoperable with an iperf3 server either way.
 pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     let mut buf = [0u8; 4];
     for _ in 0..UDP_CONNECT_RETRIES {
         socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
         match tokio::time::timeout(UDP_CONNECT_RETRY_INTERVAL, socket.recv(&mut buf)).await {
-            Ok(Ok(n)) if n >= 4 => {
-                let reply = u32::from_ne_bytes(buf);
-                // Accept both the current and legacy reply values.
-                if reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a {
-                    return Ok(());
-                }
-                return Err(RiperfError::Protocol(format!(
-                    "unexpected UDP connect reply: {reply:#x}"
-                )));
+            Ok(Ok(n))
+                if n >= 4 && {
+                    let reply = u32::from_ne_bytes(buf);
+                    reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a
+                } =>
+            {
+                return Ok(())
             }
-            Ok(Ok(_)) => return Err(RiperfError::Protocol("UDP connect reply too short".into())),
+            // A stray/short datagram that isn't the reply: ignore and resend
+            // (the real reply may be a stream-setup or late packet behind it).
+            Ok(Ok(_)) => continue,
             Ok(Err(e)) => return Err(RiperfError::Io(e)),
             Err(_) => continue, // timed out waiting for reply — resend the magic
         }
     }
-    Err(RiperfError::Protocol(format!(
-        "UDP connect handshake timed out after {UDP_CONNECT_RETRIES} retries"
-    )))
+    Err(RiperfError::Protocol(
+        "UDP connect handshake timed out (no server reply)".into(),
+    ))
 }
 
 /// Server-side UDP connect handshake.
@@ -703,8 +707,45 @@ mod tests {
         });
 
         // Client must succeed despite the dropped first magic (it resends).
+        let start = std::time::Instant::now();
         udp_connect_client(&client_sock).await.unwrap();
+        // Success can only have come via the retransmit, which fires one
+        // retry-interval after the dropped magic — assert that path was taken.
+        assert!(
+            start.elapsed() >= UDP_CONNECT_RETRY_INTERVAL,
+            "should have recovered via the retransmit (>= one interval), took {:?}",
+            start.elapsed()
+        );
         let client_addr = server_task.await.unwrap();
         assert_eq!(client_addr, client_sock.local_addr().unwrap());
+    }
+
+    /// Issue #11: a stray non-reply datagram during the handshake is ignored,
+    /// not treated as a fatal error (matches iperf3's drain behavior).
+    #[tokio::test]
+    async fn udp_connect_client_tolerates_stray_datagram() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            // First magic: reply with junk (not the connect reply value).
+            let (_, caddr) = server_sock.recv_from(&mut buf).await.unwrap();
+            server_sock
+                .send_to(&0xdead_beef_u32.to_ne_bytes(), caddr)
+                .await
+                .unwrap();
+            // Client ignores the junk and resends; reply properly this time.
+            let (_, caddr) = server_sock.recv_from(&mut buf).await.unwrap();
+            server_sock
+                .send_to(&UDP_CONNECT_REPLY.to_ne_bytes(), caddr)
+                .await
+                .unwrap();
+        });
+
+        udp_connect_client(&client_sock).await.unwrap();
+        server_task.await.unwrap();
     }
 }
