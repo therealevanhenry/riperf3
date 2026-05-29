@@ -582,6 +582,23 @@ mod tests {
         assert_eq!(decoded.streams[0].bytes, 1_000_000);
     }
 
+    #[test]
+    fn results_json_from_iperf_3_12_decodes() {
+        // iperf 3.12 (e.g. the networkstatic/iperf3 Docker image) serializes its
+        // -1 "retransmit info unavailable" sentinel as u64::MAX, and omits
+        // omitted_errors/omitted_packets from the stream object. riperf3 must
+        // tolerate both rather than failing the whole test at result decode
+        // (issue #24). Verbatim results JSON captured from the 3.12 server.
+        let json = r#"{"congestion_used":"bbr","cpu_util_system":78.41548529516153,"cpu_util_total":85.9062232248101,"cpu_util_user":7.490704603857994,"sender_has_retransmits":18446744073709551615,"streams":[{"bytes":25371082752,"end_time":3.000672,"errors":0,"id":1,"jitter":0,"packets":0,"retransmits":18446744073709551615,"start_time":0}]}"#;
+        let r: TestResultsJson =
+            serde_json::from_str(json).expect("must decode iperf 3.12 results JSON");
+        assert_eq!(r.sender_has_retransmits, -1, "u64::MAX sentinel maps to -1");
+        assert_eq!(r.streams[0].retransmits, -1, "u64::MAX sentinel maps to -1");
+        assert_eq!(r.streams[0].bytes, 25_371_082_752);
+        assert_eq!(r.streams[0].omitted_errors, 0, "absent field defaults to 0");
+        assert_eq!(r.streams[0].omitted_packets, 0, "absent field defaults to 0");
+    }
+
     #[tokio::test]
     async fn json_framing_round_trip() {
         let (client, server) = tokio::io::duplex(1024);
