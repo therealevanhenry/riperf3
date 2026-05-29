@@ -211,7 +211,7 @@ pub struct Cli {
     pub version6: bool,
 
     /// Bind to a local source address (device binding is `--bind-dev`)
-    #[arg(short = 'B', long, value_name = "host[%dev]")]
+    #[arg(short = 'B', long, value_name = "host")]
     pub bind: Option<String>,
 
     /// Bind to the network interface with SO_BINDTODEVICE

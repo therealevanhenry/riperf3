@@ -889,6 +889,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_bind_ip_literals_and_wildcards() {
+        use std::net::IpAddr;
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Matching-family literal / wildcard → returned as-is.
+        assert_eq!(
+            resolve_bind_ip("10.0.0.1", false, "1.2.3.4").await.unwrap(),
+            v4("10.0.0.1")
+        );
+        assert_eq!(
+            resolve_bind_ip("0.0.0.0", false, "1.2.3.4").await.unwrap(),
+            v4("0.0.0.0")
+        );
+        assert_eq!(
+            resolve_bind_ip("::1", true, "::2").await.unwrap(),
+            v4("::1")
+        );
+        // A `%dev` suffix is stripped; the address part is bound.
+        assert_eq!(
+            resolve_bind_ip("10.0.0.1%eth0", false, "1.2.3.4")
+                .await
+                .unwrap(),
+            v4("10.0.0.1")
+        );
+        // Wrong-family literal → error (either direction).
+        assert!(resolve_bind_ip("::1", false, "1.2.3.4").await.is_err());
+        assert!(resolve_bind_ip("10.0.0.1", true, "::2").await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_connect_binds_local_address_and_port() {
+        // -B and --cport together: the source IP is applied through the same
+        // socket2 bind path that also handles the local port (#15).
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            // local_port Some(0) = ephemeral, exercised alongside the -B bind.
+            tcp_connect(
+                "127.0.0.1",
+                port,
+                None,
+                Some(0),
+                Some("127.0.0.2"),
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+        assert_eq!(
+            client.local_addr().unwrap().ip(),
+            "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn udp_bind_ephemeral() {
         let socket = udp_bind(Some("127.0.0.1"), 0, false).await.unwrap();
         assert!(socket.local_addr().is_ok());
