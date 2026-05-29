@@ -751,7 +751,10 @@ pub fn run_udp_sender_sendmmsg(
     }
     // Deadline measured from the actual start of data (issue #5): at a high
     // `-b` the CPU-bound senders can starve the async runtime so `done` is
-    // never set; the sender must stop itself at `-t`.
+    // never set; the sender must stop itself at `-t`. The deadline is checked
+    // once per batch, so worst-case overshoot is one batch interval — sub-ms at
+    // the high `-b` this guards against, larger at a low paced rate (where the
+    // runtime isn't starved and `done` fires normally anyway).
     let deadline = max_duration.map(|d| Instant::now() + d);
 
     let fd = socket.as_raw_fd();
@@ -1445,6 +1448,38 @@ mod tests {
             counters.bytes_sent() > 0,
             "should have sent before stopping"
         );
+    }
+
+    /// Same deadline guarantee, but with a non-zero rate so `batch_size > 1`
+    /// and the paced send loop runs — production never uses rate 0, so this
+    /// covers the batched regime where the deadline is checked once per batch
+    /// rather than per packet.
+    #[test]
+    fn udp_sender_blocking_honors_deadline_when_paced() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false)); // never set
+        let counters = Arc::new(StreamCounters::new());
+
+        let t0 = Instant::now();
+        run_udp_sender_blocking(
+            send,
+            counters.clone(),
+            1400,
+            done.clone(),
+            100_000_000, // 100 Mbps → rate>0 → batched + paced
+            false,
+            started(),
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap();
+
+        assert!(!done.load(Ordering::Relaxed));
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "paced sender should stop near its 200ms deadline, took {:?}",
+            t0.elapsed()
+        );
+        assert!(counters.bytes_sent() > 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
