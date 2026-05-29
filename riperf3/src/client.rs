@@ -638,15 +638,9 @@ impl Client {
             })
             .collect();
 
-        for summary in &summaries {
-            crate::reporter::print_summary(summary, self.format_char);
-        }
-
-        // Aggregate [SUM] row(s) for parallel streams (issue #4), matching
-        // iperf3. One per direction; omitted for single-stream directions.
-        for sum in crate::reporter::sum_summaries(&summaries) {
-            crate::reporter::print_summary(&sum, self.format_char);
-        }
+        // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
+        // (issue #4), via the shared path the server also uses.
+        crate::reporter::print_final_summaries(&summaries, self.format_char);
     }
 
     fn print_results_json(

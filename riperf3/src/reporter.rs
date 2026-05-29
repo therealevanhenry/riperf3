@@ -126,8 +126,9 @@ pub fn print_separator() {
     println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
 }
 
-/// Print a final summary line.
-pub fn print_summary(summary: &StreamSummary, format_char: char) {
+/// Format a single final-summary line (no trailing newline). Pure, so the
+/// rendered output can be unit-tested without capturing stdout.
+pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String {
     let id = fmt_id(summary.stream_id);
     let transfer = units::format_bytes(summary.bytes as f64, format_char.to_ascii_uppercase());
     let seconds = summary.end - summary.start;
@@ -151,7 +152,7 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
         } else {
             0.0
         };
-        println!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
             summary.start,
             summary.end,
@@ -162,17 +163,45 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
             total,
             pct,
             role,
-        );
+        )
     } else if let Some(retr) = summary.retransmits {
-        println!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}             {}",
             summary.start, summary.end, transfer, rate, retr, role,
-        );
+        )
     } else {
-        println!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}                    {}",
             summary.start, summary.end, transfer, rate, role,
-        );
+        )
+    }
+}
+
+/// Print a single final summary line.
+pub fn print_summary(summary: &StreamSummary, format_char: char) {
+    println!("{}", format_summary_line(summary, format_char));
+}
+
+/// Build the full set of final-report lines for a set of per-stream summaries:
+/// the per-stream lines followed by aggregate `[SUM]` rows. Pure and testable.
+/// Both the client and the server route their final report through this so the
+/// two sides stay consistent (issue #4 was caused by the server omitting the
+/// SUM row that the client emitted).
+pub fn final_report_lines(per_stream: &[StreamSummary], format_char: char) -> Vec<String> {
+    let mut lines: Vec<String> = per_stream
+        .iter()
+        .map(|s| format_summary_line(s, format_char))
+        .collect();
+    for sum in sum_summaries(per_stream) {
+        lines.push(format_summary_line(&sum, format_char));
+    }
+    lines
+}
+
+/// Print the final report (per-stream summaries + aggregate `[SUM]` rows).
+pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
+    for line in final_report_lines(per_stream, format_char) {
+        println!("{line}");
     }
 }
 
@@ -206,6 +235,10 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
         } else {
             (None, None, None)
         };
+        // Aggregate per-stream retransmits when present. The final per-stream
+        // summaries don't yet carry retransmits (the producers pass `None`, so
+        // this is dormant today), but the math is kept correct and tested so
+        // the SUM stays right if/when end-of-test TCP_INFO is plumbed in.
         let retransmits = if group.iter().any(|s| s.retransmits.is_some()) {
             Some(group.iter().filter_map(|s| s.retransmits).sum())
         } else {
@@ -622,5 +655,72 @@ mod tests {
         assert_eq!(s.lost, Some(7), "lost datagrams summed");
         assert_eq!(s.total_packets, Some(3000), "total datagrams summed");
         assert_eq!(s.jitter, Some(0.025), "SUM carries worst-case jitter");
+    }
+
+    #[test]
+    fn sum_summaries_aggregates_retransmits() {
+        // Forward-compat: when per-stream summaries carry retransmits, the SUM
+        // must sum them (the producers don't set this yet — see sum_summaries).
+        let mut a = tcp_summary(1, true, 1_000);
+        a.retransmits = Some(3);
+        let mut b = tcp_summary(3, true, 1_000);
+        b.retransmits = Some(4);
+        let sums = sum_summaries(&[a, b]);
+        assert_eq!(sums.len(), 1);
+        assert_eq!(sums[0].retransmits, Some(7), "retransmits summed on SUM");
+    }
+
+    // ---- final_report_lines: the rendered output both client & server emit ---
+
+    /// The blocker behind issue #4: parallel streams must produce a rendered
+    /// `[SUM]` line. Both the client and server route through final_report_lines,
+    /// so this pins the rendered behavior for both sides without stdout capture.
+    #[test]
+    fn final_report_lines_includes_sum_for_multistream() {
+        let streams = vec![
+            tcp_summary(1, true, 1_000),
+            tcp_summary(3, true, 2_000),
+            tcp_summary(4, true, 3_000),
+        ];
+        let lines = final_report_lines(&streams, 'm');
+        assert_eq!(lines.len(), 4, "3 per-stream lines + 1 SUM");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("[SUM]")).count(),
+            1,
+            "exactly one [SUM] line; got:\n{}",
+            lines.join("\n")
+        );
+        assert!(lines.last().unwrap().contains("[SUM]"));
+    }
+
+    #[test]
+    fn final_report_lines_no_sum_for_single_stream() {
+        let lines = final_report_lines(&[tcp_summary(1, true, 1_000)], 'm');
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("[SUM]"));
+    }
+
+    #[test]
+    fn final_report_lines_bidir_has_two_sums() {
+        let streams = vec![
+            tcp_summary(1, true, 1_000),
+            tcp_summary(3, true, 1_000),
+            tcp_summary(5, false, 2_000),
+            tcp_summary(7, false, 2_000),
+        ];
+        let lines = final_report_lines(&streams, 'm');
+        let sum_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[SUM]")).collect();
+        assert_eq!(sum_lines.len(), 2, "one SUM per direction");
+        assert!(sum_lines.iter().any(|l| l.ends_with("sender")));
+        assert!(sum_lines.iter().any(|l| l.ends_with("receiver")));
+    }
+
+    #[test]
+    fn format_summary_line_renders_retransmits_column() {
+        let mut s = tcp_summary(1, true, 1_000_000);
+        s.retransmits = Some(12);
+        let line = format_summary_line(&s, 'm');
+        assert!(line.contains(" 12 "), "Retr value should appear: {line}");
+        assert!(line.ends_with("sender"));
     }
 }
