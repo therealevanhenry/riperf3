@@ -282,16 +282,47 @@ pub struct TestParams {
 // Test results — exchanged as JSON during ExchangeResults
 // ---------------------------------------------------------------------------
 
+/// Deserialize an integer that iperf3 may report as a "-1 = unavailable"
+/// sentinel (e.g. retransmit info when the OS doesn't expose it). iperf3 ≤ 3.12
+/// serializes that -1 as `u64::MAX` in the results JSON, which overflows the
+/// signed Rust type and would otherwise fail the whole test at result decode
+/// (issue #24). Normalize any value past `i64::MAX` (incl. `u64::MAX`) to -1.
+/// No `visit_u128` is needed: these counts derive from a `u32`
+/// (`tcpi_total_retrans`), so a JSON integer above `u64::MAX` never occurs.
+fn de_retransmit_sentinel<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SentinelVisitor;
+    impl serde::de::Visitor<'_> for SentinelVisitor {
+        type Value = i64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an integer (iperf3 may send u64::MAX or -1 for \"unavailable\")")
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<i64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<i64, E> {
+            Ok(if v > i64::MAX as u64 { -1 } else { v as i64 })
+        }
+    }
+    deserializer.deserialize_any(SentinelVisitor)
+}
+
 /// Per-stream result data included in the results JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResultJson {
     pub id: i32,
     pub bytes: u64,
+    #[serde(deserialize_with = "de_retransmit_sentinel")]
     pub retransmits: i64,
     pub jitter: f64,
     pub errors: i64,
+    // iperf 3.12 omits the omitted_* fields from the stream object (#24).
+    #[serde(default)]
     pub omitted_errors: i64,
     pub packets: i64,
+    #[serde(default)]
     pub omitted_packets: i64,
     pub start_time: f64,
     pub end_time: f64,
@@ -303,7 +334,8 @@ pub struct TestResultsJson {
     pub cpu_util_total: f64,
     pub cpu_util_user: f64,
     pub cpu_util_system: f64,
-    pub sender_has_retransmits: i32,
+    #[serde(deserialize_with = "de_retransmit_sentinel")]
+    pub sender_has_retransmits: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub congestion_used: Option<String>,
     pub streams: Vec<StreamResultJson>,
@@ -580,6 +612,59 @@ mod tests {
         let decoded: TestResultsJson = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.streams.len(), 1);
         assert_eq!(decoded.streams[0].bytes, 1_000_000);
+    }
+
+    #[test]
+    fn results_json_from_iperf_3_12_decodes() {
+        // iperf 3.12 (e.g. the networkstatic/iperf3 Docker image) serializes its
+        // -1 "retransmit info unavailable" sentinel as u64::MAX, and omits
+        // omitted_errors/omitted_packets from the stream object. riperf3 must
+        // tolerate both rather than failing the whole test at result decode
+        // (issue #24). Verbatim results JSON captured from the 3.12 server.
+        let json = r#"{"congestion_used":"bbr","cpu_util_system":78.41548529516153,"cpu_util_total":85.9062232248101,"cpu_util_user":7.490704603857994,"sender_has_retransmits":18446744073709551615,"streams":[{"bytes":25371082752,"end_time":3.000672,"errors":0,"id":1,"jitter":0,"packets":0,"retransmits":18446744073709551615,"start_time":0}]}"#;
+        let r: TestResultsJson =
+            serde_json::from_str(json).expect("must decode iperf 3.12 results JSON");
+        assert_eq!(r.sender_has_retransmits, -1, "u64::MAX sentinel maps to -1");
+        assert_eq!(r.streams[0].retransmits, -1, "u64::MAX sentinel maps to -1");
+        assert_eq!(r.streams[0].bytes, 25_371_082_752);
+        assert_eq!(r.streams[0].omitted_errors, 0, "absent field defaults to 0");
+        assert_eq!(
+            r.streams[0].omitted_packets, 0,
+            "absent field defaults to 0"
+        );
+    }
+
+    #[test]
+    fn results_json_serializes_sentinel_as_signed_minus_one() {
+        // When riperf3 is the server sending results to an (older) iperf3 client,
+        // the -1 "unavailable" sentinel must go on the wire as signed -1 (what
+        // iperf3's reader expects), never u64::MAX — the send side of #24.
+        let results = TestResultsJson {
+            cpu_util_total: 0.0,
+            cpu_util_user: 0.0,
+            cpu_util_system: 0.0,
+            sender_has_retransmits: -1,
+            congestion_used: None,
+            streams: vec![StreamResultJson {
+                id: 1,
+                bytes: 0,
+                retransmits: -1,
+                jitter: 0.0,
+                errors: 0,
+                omitted_errors: 0,
+                packets: 0,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: 1.0,
+            }],
+        };
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(json.contains("\"sender_has_retransmits\":-1"), "{json}");
+        assert!(json.contains("\"retransmits\":-1"), "{json}");
+        assert!(
+            !json.contains("18446744073709551615"),
+            "must serialize -1 signed, not as u64::MAX: {json}"
+        );
     }
 
     #[tokio::test]
