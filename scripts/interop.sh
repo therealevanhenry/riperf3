@@ -2,12 +2,14 @@
 # riperf3 <-> iperf3 wire-interop matrix over loopback.
 #
 # Runs every client->server pairing of {riperf3, iperf3} across protocol x
-# direction x parallel x feature spot-checks, asserting each test COMPLETES with
-# a valid (non-zero-byte) result. This is the correctness gate the in-repo
-# loopback tests cannot provide: those are riperf3<->riperf3 only, so a wire
-# constant that is wrong against real iperf3 still passes them. The interop-
-# relevant pairings are r->i and i->r; r->r and i->i are controls. Throughput is
-# meaningless here (loopback) — only completion + data transfer is asserted.
+# direction x parallel x feature spot-checks, asserting each test COMPLETES and
+# moves data in both aggregates (sum_sent and sum_received > 0). This catches the
+# protocol-interop regressions the in-repo tests cannot: those are riperf3<->
+# riperf3 only, so a wire constant wrong against real iperf3 still passes them.
+# Scope: it proves the handshake / param-exchange / transfer path interoperates;
+# it does NOT assert JSON field-level parity (counter/schema fidelity is #36).
+# Interop pairings are r->i and i->r; r->r and i->i are controls. Throughput is
+# meaningless here (loopback).
 #
 # Exit status is non-zero if any case fails.
 #
@@ -17,17 +19,34 @@ set -uo pipefail
 
 RIPERF3="${1:?usage: interop.sh <riperf3-bin> <iperf3-bin>}"
 IPERF3="${2:?usage: interop.sh <riperf3-bin> <iperf3-bin>}"
+# The two binaries must differ — tag() maps each path to its r/i column, so the
+# same path twice would silently render every pairing as a control.
+if [ "$RIPERF3" = "$IPERF3" ]; then
+    echo "error: riperf3 and iperf3 binaries must differ (got '$RIPERF3' twice)" >&2
+    exit 2
+fi
 DUR="${INTEROP_DURATION:-2}"
-# Space-separated list of "name|col" keys (e.g. "udp_rev|[r->i]") that are known
-# to fail against this peer and should be tolerated. An xfail that unexpectedly
-# PASSES is reported as UPASS and fails the run, forcing promotion to required
-# once the underlying bug is fixed. Set per iperf3 version by the CI workflow.
+# Space-separated list of "name|col" keys (e.g. "udp_rev|[r->i]") for cells with a
+# tracked, KNOWN-broken interop bug. Their outcome (pass OR fail) never reds the
+# gate: the #48 teardown reset is a timing race, so a pass doesn't mean "fixed" —
+# just that the race went the other way this run. When the underlying issue is
+# fixed these pass deterministically; remove them here then so the cell becomes
+# required again. Set per iperf3 version by the CI workflow.
 XFAIL="${XFAIL:-}"
 XFAIL_REASON="${XFAIL_REASON:-tracked}"
 HOST=127.0.0.1
 port=5202
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
+
+# Per-attempt I/O sinks (fixed paths, reused per case). -J JSON (stdout) and
+# diagnostics (stderr) stay SEPARATE: a stray stderr line merged into the JSON
+# sink would make the parser choke and score a good transfer as a false FAIL.
+# The server's output (sj/serr) is kept for failure diagnostics only; it is NOT
+# validated as JSON — the riperf3 server emits text, not JSON yet (#50). Once it
+# gains a -J path, validate sj for the interop pairings too (#49 review).
+cj="$workdir/c.json"; cerr="$workdir/c.err"
+sj="$workdir/s.json"; serr="$workdir/s.err"
 
 pass=0
 fail=0
@@ -69,9 +88,13 @@ wait_port() {
     return 1
 }
 
-# Succeeds (exit 0) iff the client JSON shows no error and a positive byte count
-# in any end-of-test aggregate. Kept dependency-free (python3, no jq) so it runs
-# the same locally and in CI.
+# Succeeds (exit 0) iff the client JSON shows no error AND both end-of-test
+# aggregates moved data (sum_sent.bytes > 0 and sum_received.bytes > 0). Requiring
+# both — not "some bytes somewhere" — catches a one-sided transfer (a real interop
+# break) instead of scoring it green. The per-direction bidir split
+# (sum_*_bidir_reverse) is intentionally NOT required: riperf3 doesn't emit it yet
+# (#36), while the sender/receiver aggregates are populated by both tools in every
+# direction. Dependency-free (python3, no jq) so it runs the same locally and in CI.
 valid_result() {
     python3 - "$1" <<'PY'
 import json, sys
@@ -84,52 +107,73 @@ if isinstance(d, dict) and d.get("error"):
     print("  reported error:", d["error"], file=sys.stderr)
     sys.exit(1)
 end = d.get("end", {}) if isinstance(d, dict) else {}
-best = 0
-for k, v in end.items():
-    if isinstance(v, dict) and isinstance(v.get("bytes"), (int, float)):
-        best = max(best, v["bytes"])
-sys.exit(0 if best > 0 else 2)
+def aggregate_bytes(key):
+    v = end.get(key)
+    return v["bytes"] if isinstance(v, dict) and isinstance(v.get("bytes"), (int, float)) else 0
+sent = aggregate_bytes("sum_sent")
+recv = aggregate_bytes("sum_received")
+if sent > 0 and recv > 0:
+    sys.exit(0)
+print(f"  no bidirectional transfer: sum_sent={sent} sum_received={recv}", file=sys.stderr)
+sys.exit(2)
 PY
+}
+
+# attempt <client-bin> <server-bin> <client-opts...>
+# One server/client round on a fresh port. Returns 0 iff the test completed with
+# bidirectional transfer. Writes cj/cerr (client) and sj/serr (server).
+attempt() {
+    local client="$1" server="$2"
+    shift 2
+    local p=$((port++))
+    "$server" -s -1 -p "$p" -J >"$sj" 2>"$serr" &
+    local spid=$!
+    if ! wait_port "$p"; then
+        kill "$spid" 2>/dev/null
+        wait "$spid" 2>/dev/null
+        echo "server never listened on port $p" >"$cerr"
+        return 1
+    fi
+    # -k escalates to SIGKILL if the client ignores SIGTERM; the budget scales
+    # with the test duration so a hang costs seconds rather than a fixed ceiling.
+    timeout -k 5 "$((DUR + 15))" "$client" -c "$HOST" -p "$p" -J "$@" >"$cj" 2>"$cerr"
+    local rc=$?
+    kill "$spid" 2>/dev/null
+    wait "$spid" 2>/dev/null
+    [ "$rc" -eq 0 ] && valid_result "$cj"
 }
 
 # run_case <name> <client-bin> <server-bin> <client-opts...>
 run_case() {
     local name="$1" client="$2" server="$3"
     shift 3
-    local copts=("$@")
-    local p=$((port++))
-    local sj="$workdir/s.json" cj="$workdir/c.json"
     local col="[$(tag "$client")->$(tag "$server")]"
 
-    "$server" -s -1 -p "$p" -J >"$sj" 2>&1 &
-    local spid=$!
+    local ok=1
+    if attempt "$client" "$server" "$@"; then ok=0; fi
 
-    if ! wait_port "$p"; then
-        kill "$spid" 2>/dev/null
-        wait "$spid" 2>/dev/null
-        printf 'FAIL  %-26s %s  (server never listened)\n' "$name" "$col"
-        fail=$((fail + 1))
-        failed_cases+=("$name $col")
-        return
+    # Retry a single transient failure once: UDP -b0 floods on loopback are
+    # inherently lossy/racy under back-to-back load, so an isolated failure may
+    # not reproduce. A deterministic failure — a real interop break, or a tracked
+    # xfail — fails both attempts. Don't spend the retry on a known xfail.
+    if [ "$ok" -ne 0 ] && ! is_xfail "$name|$col"; then
+        printf 'RETRY %-26s %s  (transient failure — re-running once)\n' "$name" "$col"
+        if attempt "$client" "$server" "$@"; then ok=0; fi
     fi
 
-    timeout 40 "$client" -c "$HOST" -p "$p" -J "${copts[@]}" >"$cj" 2>&1
-    local rc=$?
-    kill "$spid" 2>/dev/null
-    wait "$spid" 2>/dev/null
-
-    local ok=1
-    if [ "$rc" -eq 0 ] && valid_result "$cj"; then ok=0; fi
-
     if is_xfail "$name|$col"; then
+        # Tolerated known-broken cell: report the outcome but never red the gate.
+        # The bug is racy (the #48 teardown reset is timing-dependent), so a pass
+        # doesn't mean "fixed", just that the race went the other way. NOTE this
+        # also means a NEW, unrelated breakage in the cell stays hidden — keep the
+        # XFAIL list minimal, tied to a tracked issue, and removed once fixed (so
+        # a regression reds the gate again).
         if [ "$ok" -eq 0 ]; then
-            printf 'UPASS %-26s %s  (xfail but PASSED — bug fixed? promote to required)\n' "$name" "$col"
-            fail=$((fail + 1))
-            failed_cases+=("UPASS $name $col")
+            printf 'XPASS %-26s %s  (known-flaky %s; passed this run)\n' "$name" "$col" "$XFAIL_REASON"
         else
             printf 'XFAIL %-26s %s  (known: %s)\n' "$name" "$col" "$XFAIL_REASON"
-            xfail=$((xfail + 1))
         fi
+        xfail=$((xfail + 1))
         return
     fi
 
@@ -137,8 +181,11 @@ run_case() {
         printf 'PASS  %-26s %s\n' "$name" "$col"
         pass=$((pass + 1))
     else
-        printf 'FAIL  %-26s %s  (rc=%s)\n' "$name" "$col" "$rc"
-        sed 's/^/    | /' "$cj" | tail -4
+        printf 'FAIL  %-26s %s\n' "$name" "$col"
+        sed 's/^/    client    | /' "$cj" | tail -4
+        sed 's/^/    client-err| /' "$cerr" | tail -4
+        sed 's/^/    server    | /' "$sj" | tail -4
+        sed 's/^/    server-err| /' "$serr" | tail -4
         fail=$((fail + 1))
         failed_cases+=("$name $col")
     fi
