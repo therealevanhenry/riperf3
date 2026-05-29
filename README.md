@@ -73,7 +73,7 @@ Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
 
 TCP performance is at parity with iperf3. Part of the UDP high-rate gap is the cost of safe Rust's `send()` path vs C's raw `write()` syscall, which the experimental `--sendmmsg` flag narrows by batching packets into a single kernel crossing (see below). Profiling also found an efficiency bug, though: the busy-spin pacing loop wastes CPU at high `-b`, so UDP throughput *falls* as `-P` rises instead of scaling — this is under investigation, not an inherent trade-off ([#6](https://github.com/therealevanhenry/riperf3/issues/6)).
 
-See [BENCHMARKS.md](BENCHMARKS.md) for a fuller per-`-P`, per-direction sweep.
+See [BENCHMARKS.md](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md) for a fuller per-`-P`, per-direction sweep.
 
 ## Platform Support
 

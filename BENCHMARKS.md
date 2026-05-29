@@ -48,8 +48,9 @@ forward numbers are the client's *send* rate. UDP runs target `-b 100G` (i.e.
 
 **Takeaway:** riperf3 is at parity with iperf3 single-stream. At `-P 8`
 *forward* it pulls ahead ~21–25% (61.6 vs 50.8 Gbps IPv4; 63.5 vs 51.0 IPv6);
-at `-P 8` *reverse* the two are roughly at parity (~4–5% ahead). No measurable
-IPv4/IPv6 difference for either tool.
+at `-P 8` *reverse* the two are roughly at parity (~4–5% ahead). iperf3 shows no
+IPv4/IPv6 difference; riperf3 is consistently 2–3% faster on IPv6 — small but
+directionally consistent, not a penalty either way.
 
 ## UDP (Gbps)
 
@@ -72,8 +73,9 @@ IPv4/IPv6 difference for either tool.
 **Takeaway:** riperf3's UDP send path delivers roughly half of iperf3
 single-stream, and total throughput falls as `-P` rises rather than scaling —
 from ~17 Gbps at `-P 1` to ~8 Gbps at `-P 8` (per-stream rate craters to
-~1 Gbps), while iperf3 holds ~30 Gbps across all `-P`. (`-P 4` is flat-to-noise
-vs `-P 1`; the drop is pronounced by `-P 8`.) This is a real efficiency bug in
+~1 Gbps), while iperf3 holds ~30 Gbps across all `-P`. The drop is already
+visible at `-P 4` (−12% to −21% per column, except forward-IPv6 which is flat)
+and pronounced by `-P 8`. This is a real efficiency bug in
 the busy-spin pacing path, not the memory-safety trade-off described in the
 README — tracked in [#6](https://github.com/therealevanhenry/riperf3/issues/6).
 
