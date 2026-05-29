@@ -786,15 +786,18 @@ mod test_config_tests {
     // -- server mirrors the client's rate resolution (#17) --
 
     #[test]
-    fn udp_absent_bandwidth_defaults_to_1m() {
-        // A peer that omits the rate (older riperf3 / some iperf3 paths) → the
-        // 1 Mbit/s UDP default, not unlimited.
+    fn udp_absent_bandwidth_is_unlimited() {
+        // iperf3 omits the `bandwidth` param only for -b 0 (unlimited) and sends
+        // it explicitly otherwise (incl. its 1 Mbit/s default); riperf3 clients
+        // always send it. So an ABSENT bandwidth means unlimited (0), matching
+        // iperf3 — NOT the 1 Mbit/s default. Defaulting to 1M throttled an
+        // iperf3 `-b 0` reverse/bidir client's server-side sender (#21).
         let p = TestParams {
             udp: Some(true),
             ..Default::default()
         };
         let cfg = TestConfig::from_params(&p);
-        assert_eq!(cfg.bandwidth, 1024 * 1024); // DEFAULT_UDP_RATE
+        assert_eq!(cfg.bandwidth, 0);
     }
 
     #[test]
