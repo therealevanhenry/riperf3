@@ -287,6 +287,8 @@ pub struct TestParams {
 /// serializes that -1 as `u64::MAX` in the results JSON, which overflows the
 /// signed Rust type and would otherwise fail the whole test at result decode
 /// (issue #24). Normalize any value past `i64::MAX` (incl. `u64::MAX`) to -1.
+/// No `visit_u128` is needed: these counts derive from a `u32`
+/// (`tcpi_total_retrans`), so a JSON integer above `u64::MAX` never occurs.
 fn de_retransmit_sentinel<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -629,6 +631,39 @@ mod tests {
         assert_eq!(
             r.streams[0].omitted_packets, 0,
             "absent field defaults to 0"
+        );
+    }
+
+    #[test]
+    fn results_json_serializes_sentinel_as_signed_minus_one() {
+        // When riperf3 is the server sending results to an (older) iperf3 client,
+        // the -1 "unavailable" sentinel must go on the wire as signed -1 (what
+        // iperf3's reader expects), never u64::MAX — the send side of #24.
+        let results = TestResultsJson {
+            cpu_util_total: 0.0,
+            cpu_util_user: 0.0,
+            cpu_util_system: 0.0,
+            sender_has_retransmits: -1,
+            congestion_used: None,
+            streams: vec![StreamResultJson {
+                id: 1,
+                bytes: 0,
+                retransmits: -1,
+                jitter: 0.0,
+                errors: 0,
+                omitted_errors: 0,
+                packets: 0,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: 1.0,
+            }],
+        };
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(json.contains("\"sender_has_retransmits\":-1"), "{json}");
+        assert!(json.contains("\"retransmits\":-1"), "{json}");
+        assert!(
+            !json.contains("18446744073709551615"),
+            "must serialize -1 signed, not as u64::MAX: {json}"
         );
     }
 
