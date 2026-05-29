@@ -752,9 +752,10 @@ pub fn run_udp_sender_sendmmsg(
     // Deadline measured from the actual start of data (issue #5): at a high
     // `-b` the CPU-bound senders can starve the async runtime so `done` is
     // never set; the sender must stop itself at `-t`. The deadline is checked
-    // once per batch, so worst-case overshoot is one batch interval — sub-ms at
-    // the high `-b` this guards against, larger at a low paced rate (where the
-    // runtime isn't starved and `done` fires normally anyway).
+    // once per batch — between blocking sendmmsg calls — so overshoot is bounded
+    // by how long one batch can block. On a draining link that's sub-ms; on a
+    // wedged link it's the SO_SNDTIMEO set by configure_udp_sender (~1s) before
+    // sendmmsg returns EAGAIN and the loop re-checks the deadline.
     let deadline = max_duration.map(|d| Instant::now() + d);
 
     // Larger batch than the per-packet sender: sendmmsg amortizes syscall

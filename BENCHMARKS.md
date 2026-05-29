@@ -14,7 +14,7 @@ host's virtio bridge.
 | Host | Intel i9-13900K, Linux 7.0.10-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.74-cloud, 8 vCPU, 8 GB RAM each |
 | NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
-| riperf3 | 0.4.0 |
+| riperf3 | 0.3.0 + #6 fix (`perf/udp-sender-throughput`; ships as 0.4.0) |
 | iperf3 | 3.20+ (cJSON 1.7.15), built from source |
 | Per-run | `-t 10` (10 s), client→server unless noted |
 

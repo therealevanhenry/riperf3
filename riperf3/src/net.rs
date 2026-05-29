@@ -413,6 +413,9 @@ pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) 
     Ok(())
 }
 
+// Non-Unix: switch to blocking only. There's no portable SO_SNDTIMEO here, so a
+// wedged send can block until the link recovers; the per-batch deadline can't
+// fire mid-block. Acceptable given the sendmmsg fast path is Unix-only anyway.
 #[cfg(not(unix))]
 pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
     socket.set_nonblocking(false)?;
