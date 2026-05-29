@@ -148,12 +148,18 @@ pub async fn resolve_host(host: &str, port: u16, ip_version: Option<u8>) -> Resu
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         let addr = SocketAddr::new(ip, port);
-        if !family_ok(&addr) {
-            return Err(RiperfError::Protocol(format!(
-                "address {host} is not {} (conflicts with -{})",
-                want(),
-                ip_version.unwrap_or(0)
-            )));
+        match ip_version {
+            Some(4) if !addr.is_ipv4() => {
+                return Err(RiperfError::Protocol(format!(
+                    "address {host} is not IPv4 (conflicts with -4)"
+                )))
+            }
+            Some(6) if !addr.is_ipv6() => {
+                return Err(RiperfError::Protocol(format!(
+                    "address {host} is not IPv6 (conflicts with -6)"
+                )))
+            }
+            _ => {}
         }
         return Ok(addr);
     }
