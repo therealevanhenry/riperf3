@@ -76,6 +76,7 @@ pub struct Server {
     pub logfile: Option<String>,
     pub forceflush: bool,
     pub bind_address: Option<String>,
+    pub ip_version: Option<u8>,
     pub timestamps: Option<String>,
     pub file: Option<String>,
     pub rsa_private_key_path: Option<String>,
@@ -98,7 +99,8 @@ impl Server {
             }
         }
 
-        let listener = net::tcp_listen(self.bind_address.as_deref(), self.port, None).await?;
+        let listener =
+            net::tcp_listen(self.bind_address.as_deref(), self.port, self.ip_version).await?;
         let sep = "-----------------------------------------------------------";
         println!("{sep}");
         println!("Server listening on {}", self.port);
@@ -286,7 +288,7 @@ impl Server {
                 let mut udp_listener = net::udp_bind_reusable(
                     self.bind_address.as_deref(),
                     self.port,
-                    self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
+                    self.ip_version,
                 )
                 .await?;
 
@@ -303,7 +305,7 @@ impl Server {
                         udp_listener = net::udp_bind_reusable(
                             self.bind_address.as_deref(),
                             self.port,
-                            self.bind_address.as_ref().is_some_and(|a| a.contains(':')),
+                            self.ip_version,
                         )
                         .await?;
                     } else {
@@ -587,6 +589,7 @@ pub struct ServerBuilder {
     logfile: Option<String>,
     forceflush: bool,
     bind_address: Option<String>,
+    ip_version: Option<u8>,
     timestamps: Option<String>,
     file: Option<String>,
     rsa_private_key_path: Option<String>,
@@ -609,6 +612,7 @@ impl Default for ServerBuilder {
             logfile: None,
             forceflush: false,
             bind_address: None,
+            ip_version: None,
             timestamps: None,
             file: None,
             rsa_private_key_path: None,
@@ -679,6 +683,14 @@ impl ServerBuilder {
         self
     }
 
+    /// Restrict the listener to a specific IP version: `4` → IPv4 only, `6` →
+    /// IPv6 only. Leave unset for dual-stack (the default). Signature matches
+    /// `ClientBuilder::ip_version` for consistency.
+    pub fn ip_version(mut self, version: u8) -> Self {
+        self.ip_version = Some(version);
+        self
+    }
+
     pub fn timestamps(mut self, fmt: &str) -> Self {
         self.timestamps = Some(fmt.to_string());
         self
@@ -734,6 +746,7 @@ impl ServerBuilder {
             logfile: self.logfile,
             forceflush: self.forceflush,
             bind_address: self.bind_address,
+            ip_version: self.ip_version,
             timestamps: self.timestamps,
             file: self.file,
             rsa_private_key_path: self.rsa_private_key_path,

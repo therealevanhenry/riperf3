@@ -108,10 +108,12 @@ mod custom_sockopt {
 // ---------------------------------------------------------------------------
 
 /// Resolve the default bind address for the given IP version preference.
+/// `None` → `::` (dual-stack via IPV6_V6ONLY=0); `Some(4)` → IPv4 only;
+/// `Some(6)` → IPv6 only.
 fn default_bind_addr(ip_version: Option<u8>) -> &'static str {
     match ip_version {
-        Some(6) => "::",
-        _ => "0.0.0.0",
+        Some(4) => "0.0.0.0",
+        _ => "::",
     }
 }
 
@@ -189,7 +191,10 @@ pub async fn tcp_connect(
 }
 
 /// Create a TCP listener with SO_REUSEADDR.
-/// If `bind_addr` is `None`, binds to 0.0.0.0 (or :: if `ip_version` is 6).
+/// If `bind_addr` is `None`, binds dual-stack (`::` with IPV6_V6ONLY=0) by
+/// default, matching iperf3's `getaddrinfo`+`AI_PASSIVE` behavior.
+/// `ip_version=Some(4)` restricts to IPv4 (`0.0.0.0`); `Some(6)` restricts to
+/// IPv6 only (sets IPV6_V6ONLY=1).
 pub async fn tcp_listen(
     bind_addr: Option<&str>,
     port: u16,
@@ -207,6 +212,14 @@ pub async fn tcp_listen(
     };
     let socket = Socket::new(domain, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        // Set V6ONLY explicitly on every IPv6 bind, including when an explicit
+        // `-B` address is given: `-6 -B ::` must be IPv6-only and `-B ::` alone
+        // must be dual-stack. BSDs default V6ONLY=1 and Linux defaults 0, so we
+        // can't rely on the platform default. For a non-wildcard IPv6 address
+        // (e.g. `::1`) the flag is moot but harmless.
+        socket.set_only_v6(ip_version == Some(6))?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(128)?;
@@ -565,13 +578,14 @@ pub fn set_tos<F>(_fd: &F, _tos: u32) -> Result<()> {
 
 /// Bind a UDP socket with SO_REUSEADDR, allowing multiple sockets on the same port.
 /// Used by the server to recycle the UDP listener after each stream connect.
+/// `ip_version=None` binds dual-stack (`::` with IPV6_V6ONLY=0); `Some(4)`
+/// restricts to IPv4; `Some(6)` restricts to IPv6 only.
 pub async fn udp_bind_reusable(
     bind_addr: Option<&str>,
     port: u16,
-    ipv6: bool,
+    ip_version: Option<u8>,
 ) -> Result<UdpSocket> {
-    let default = if ipv6 { "::" } else { "0.0.0.0" };
-    let host = bind_addr.unwrap_or(default);
+    let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
         .parse()
         .map_err(|e| RiperfError::Protocol(format!("bad bind address: {e}")))?;
@@ -583,6 +597,10 @@ pub async fn udp_bind_reusable(
     };
     let socket = Socket::new(domain, Type::DGRAM, None)?;
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        // Set V6ONLY on every IPv6 bind, explicit `-B` included — see tcp_listen.
+        socket.set_only_v6(ip_version == Some(6))?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
 
@@ -677,6 +695,123 @@ mod tests {
         set_dont_fragment(&socket).unwrap();
         let val = socket::getsockopt(&socket, custom_sockopt::IpMtuDiscover).unwrap();
         assert_eq!(val, libc::IP_PMTUDISC_DO, "IP_MTU_DISCOVER should be DO");
+    }
+
+    // ---- Regression tests for issue #1: server binds IPv4 only ------------
+    //
+    // `tcp_listen_dual_stack_default` and `tcp_listen_ipv6_only` are genuine
+    // regressions: they fail on `main`'s default-IPv4 behavior and pass after
+    // the dual-stack fix. `tcp_listen_ipv4_only` is a guard for behavior that
+    // was already correct on `main` (`Some(4)` always meant `0.0.0.0`); it's
+    // kept to lock that in.
+
+    /// Default listener (`ip_version=None`) must accept both IPv4 and IPv6
+    /// clients on the same port — matches iperf3's dual-stack default.
+    #[tokio::test]
+    async fn tcp_listen_dual_stack_default() {
+        let listener = tcp_listen(None, 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // IPv4 connect must succeed.
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        assert!(v4.is_ok(), "IPv4 connect failed: {v4:?}");
+        let _ = listener.accept().await.unwrap();
+
+        // IPv6 connect must also succeed against the same listener.
+        let v6 = tcp_connect("::1", port, None, None, false).await;
+        match v6 {
+            Ok(_) => {
+                let _ = listener.accept().await.unwrap();
+            }
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                // No IPv6 loopback on this host — the IPv6 half can't be
+                // exercised. Make the skip visible so it isn't a silent vacuous
+                // pass (run with `--nocapture` to see it).
+                eprintln!(
+                    "SKIP tcp_listen_dual_stack_default: ::1 unavailable, IPv6 path not exercised"
+                );
+            }
+            Err(e) => panic!("IPv6 connect to default listener failed: {e:?}"),
+        }
+    }
+
+    /// `ip_version=Some(4)` restricts the listener to IPv4 only.
+    #[tokio::test]
+    async fn tcp_listen_ipv4_only() {
+        let listener = tcp_listen(None, 0, Some(4)).await.unwrap();
+        let local = listener.local_addr().unwrap();
+        assert!(local.is_ipv4(), "expected IPv4 local_addr, got {local}");
+        let port = local.port();
+
+        // IPv6 connect must be refused.
+        let v6 = tcp_connect("::1", port, None, None, false).await;
+        match v6 {
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                // ::1 unavailable: this confirms "no IPv6 reach" but not
+                // specifically that the listener rejected it. Flag the weaker
+                // assertion rather than pass silently.
+                eprintln!(
+                    "SKIP tcp_listen_ipv4_only: ::1 unavailable, refusal not specifically verified"
+                );
+            }
+            Ok(_) => panic!("IPv6 connect should fail against IPv4-only listener"),
+            Err(e) => panic!("unexpected error from IPv6 connect: {e:?}"),
+        }
+    }
+
+    /// `ip_version=Some(6)` restricts the listener to IPv6 only (sets
+    /// IPV6_V6ONLY). On Linux without this, `::` accepts IPv4 via v4-mapped
+    /// addresses; the test guards against that regression.
+    #[tokio::test]
+    async fn tcp_listen_ipv6_only() {
+        let listener = tcp_listen(None, 0, Some(6)).await.unwrap();
+        let local = listener.local_addr().unwrap();
+        assert!(local.is_ipv6(), "expected IPv6 local_addr, got {local}");
+        let port = local.port();
+
+        // IPv4 connect must be refused.
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        match v4 {
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                // No IPv4 loopback on this host — can't exercise the refusal.
+                eprintln!("SKIP tcp_listen_ipv6_only: 127.0.0.1 unavailable");
+            }
+            Ok(_) => panic!("IPv4 connect should fail against IPv6-only listener"),
+            Err(e) => panic!("unexpected error from IPv4 connect: {e:?}"),
+        }
+    }
+
+    /// Regression for the cold-review should-fix: `-6`/`-4` must be honored
+    /// even when an explicit `-B` bind address is given. `-B :: -6` is
+    /// IPv6-only; `-B ::` alone is dual-stack. Previously V6ONLY was only set
+    /// on the implicit-default path, so `-B :: -6` silently stayed dual-stack.
+    #[tokio::test]
+    async fn tcp_listen_explicit_bind_respects_ip_version() {
+        // `-B :: -6`  → IPv6-only: an IPv4 client must be refused.
+        let v6only = tcp_listen(Some("::"), 0, Some(6)).await.unwrap();
+        let port = v6only.local_addr().unwrap().port();
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        assert!(
+            matches!(&v4, Err(RiperfError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "`-B :: -6` must refuse IPv4, got {v4:?}"
+        );
+        drop(v6only);
+
+        // `-B ::` alone → dual-stack: an IPv4 client connects via v4-mapped.
+        let dual = tcp_listen(Some("::"), 0, None).await.unwrap();
+        let port = dual.local_addr().unwrap().port();
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        match v4 {
+            Ok(_) => {
+                let _ = dual.accept().await.unwrap();
+            }
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                eprintln!("SKIP tcp_listen_explicit_bind: v4-mapped unavailable on this host");
+            }
+            Err(e) => panic!("`-B ::` (dual-stack) must accept IPv4, got {e:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
