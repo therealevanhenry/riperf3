@@ -346,9 +346,81 @@ pub fn configure_tcp_stream_full(
     Ok(())
 }
 
+/// Read the TCP maximum segment size (`TCP_MAXSEG`) of a connected stream.
+///
+/// iperf3 uses this to size UDP datagrams when `-l` is not given (issue #6): on
+/// a jumbo-frame path the control connection negotiates a large MSS, so UDP
+/// datagrams should be sized to match rather than pinned at 1460. Returns
+/// `None` when the option can't be read (non-Unix, or a getsockopt error).
+#[cfg(unix)]
+pub fn tcp_maxseg(stream: &TcpStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut mss: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a valid connected TCP socket for the lifetime of `stream`;
+    // TCP_MAXSEG yields a single c_int and `len` matches the buffer size.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mut mss as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && mss > 0).then_some(mss as u32)
+}
+
+#[cfg(not(unix))]
+pub fn tcp_maxseg(_stream: &TcpStream) -> Option<u32> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // UDP
 // ---------------------------------------------------------------------------
+
+/// Wall-clock bound a blocking UDP `sendmmsg`/`send` so a wedged link can't park
+/// the sender thread forever (the per-batch `done`/deadline checks only run
+/// between blocking calls). On expiry the syscall returns `EAGAIN`, which the
+/// sender treats as a zero-progress batch and loops to re-check those flags.
+#[cfg(unix)]
+const UDP_SEND_TIMEOUT_MS: u64 = 1000;
+
+/// Prepare a UDP socket for the blocking batched sender (issue #6).
+///
+/// tokio sockets are non-blocking, and `into_std()` preserves that flag. A
+/// non-blocking socket makes `sendmmsg` busy-spin on `EAGAIN` once the (small)
+/// send buffer fills, redundantly re-staging the whole batch and starving the
+/// async runtime. Switching to blocking lets the kernel backpressure the
+/// sender thread instead. The `SO_SNDBUF` bump is best-effort (clamped by
+/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link (see
+/// [`UDP_SEND_TIMEOUT_MS`]). Note: this is `SO_SNDTIMEO`, *not* the
+/// `TCP_USER_TIMEOUT` of [`set_snd_timeout`] (which is a no-op on UDP).
+#[cfg(unix)]
+pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) -> Result<()> {
+    use nix::sys::socket::{self, sockopt};
+    use nix::sys::time::TimeVal;
+    socket.set_nonblocking(false)?;
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_send_buffer_size(sndbuf_target);
+    let tv = TimeVal::new(
+        (UDP_SEND_TIMEOUT_MS / 1000) as libc::time_t,
+        ((UDP_SEND_TIMEOUT_MS % 1000) * 1000) as libc::suseconds_t,
+    );
+    let _ = socket::setsockopt(socket, sockopt::SendTimeout, &tv);
+    Ok(())
+}
+
+// Non-Unix: switch to blocking only. There's no portable SO_SNDTIMEO here, so a
+// wedged send can block until the link recovers; the per-batch deadline can't
+// fire mid-block. Acceptable given the sendmmsg fast path is Unix-only anyway.
+#[cfg(not(unix))]
+pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
+    socket.set_nonblocking(false)?;
+    Ok(())
+}
 
 /// Bind a UDP socket. If `bind_addr` is `None`, uses `0.0.0.0` (or `[::]` for IPv6).
 pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
@@ -910,6 +982,77 @@ mod tests {
             }
             Err(e) => panic!("`-B ::` (dual-stack) must accept IPv4, got {e:?}"),
         }
+    }
+
+    // ---- tcp_maxseg + UDP sender socket tuning (issue #6) -----------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_maxseg_reports_mss_for_connected_stream() {
+        // A connected TCP stream exposes a positive MSS via TCP_MAXSEG — this
+        // is what the UDP datagram-size default is derived from (iperf3 parity).
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, None, false, None)
+                .await
+                .unwrap()
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+
+        let mss = tcp_maxseg(&client);
+        assert!(
+            mss.is_some(),
+            "TCP_MAXSEG should be readable on a connected socket"
+        );
+        assert!(mss.unwrap() > 0, "MSS should be positive, got {mss:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_switches_to_blocking() {
+        // tokio sockets are non-blocking and into_std() keeps that flag; the
+        // blocking sender thread needs a blocking socket so sendmmsg
+        // backpressures in-kernel instead of busy-spinning on EAGAIN (#6).
+        use std::os::unix::io::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        assert!(
+            is_nonblocking(socket.as_raw_fd()),
+            "precondition: socket starts non-blocking"
+        );
+
+        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        assert!(
+            !is_nonblocking(socket.as_raw_fd()),
+            "sender socket must be switched to blocking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_sets_real_send_timeout() {
+        // Regression: a blocking sender needs a real SO_SNDTIMEO so a wedged
+        // link can't park the thread forever. TCP_USER_TIMEOUT (set_snd_timeout)
+        // is a no-op on UDP and would leave the timeout unset (#6 review).
+        use nix::sys::socket::{getsockopt, sockopt};
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        let tv = getsockopt(&socket, sockopt::SendTimeout).unwrap();
+        assert!(
+            tv.tv_sec() > 0 || tv.tv_usec() > 0,
+            "SO_SNDTIMEO must be non-zero, got {}.{:06}",
+            tv.tv_sec(),
+            tv.tv_usec()
+        );
+    }
+
+    #[cfg(unix)]
+    fn is_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
+        // SAFETY: F_GETFL on a valid fd returns the file status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && (flags & libc::O_NONBLOCK) != 0
     }
 
     #[cfg(target_os = "linux")]

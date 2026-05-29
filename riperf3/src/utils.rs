@@ -110,6 +110,24 @@ pub fn iperf3_stream_id(index: u32) -> i32 {
 /// Maximum UDP payload: 65535 - 8 (UDP header) - 20 (IP header)
 pub const MAX_UDP_BLKSIZE: usize = 65507;
 
+/// Resolve the effective UDP datagram size.
+///
+/// Mirrors iperf3 (`iperf_client_api.c`): an explicit `-l` always wins;
+/// otherwise the size tracks the control-connection MSS, so a jumbo-frame path
+/// uses large datagrams instead of the conservative 1460 floor. The MSS is
+/// clamped to the valid UDP payload range, and falls back to
+/// [`DEFAULT_UDP_BLKSIZE`] when no usable MSS is available (e.g. non-Unix, or a
+/// nonsensically small value).
+pub fn resolve_udp_blksize(explicit: Option<usize>, ctrl_mss: Option<u32>) -> usize {
+    if let Some(size) = explicit {
+        return size;
+    }
+    match ctrl_mss {
+        Some(mss) if (mss as usize) >= MIN_UDP_BLKSIZE => (mss as usize).min(MAX_UDP_BLKSIZE),
+        _ => DEFAULT_UDP_BLKSIZE,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KMG suffix parser
 // ---------------------------------------------------------------------------
@@ -261,6 +279,37 @@ mod tests {
     fn parse_dscp_case_insensitive() {
         assert_eq!(parse_dscp("EF").unwrap(), parse_dscp("ef").unwrap());
         assert_eq!(parse_dscp("AF11").unwrap(), parse_dscp("af11").unwrap());
+    }
+
+    // -- resolve_udp_blksize: MSS-derived default (issue #6) --
+
+    #[test]
+    fn resolve_udp_blksize_explicit_wins() {
+        // An explicit -l always takes precedence, even when an MSS is known.
+        assert_eq!(resolve_udp_blksize(Some(2000), Some(8928)), 2000);
+        assert_eq!(resolve_udp_blksize(Some(1460), None), 1460);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_derives_from_mss() {
+        // No -l: track the control-connection MSS, like iperf3. On a jumbo path
+        // this yields large datagrams instead of the conservative 1460 floor.
+        assert_eq!(resolve_udp_blksize(None, Some(8928)), 8928);
+        assert_eq!(resolve_udp_blksize(None, Some(1448)), 1448);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_falls_back_without_mss() {
+        // No -l and no MSS available (e.g. non-Unix): historical 1460 default.
+        assert_eq!(resolve_udp_blksize(None, None), DEFAULT_UDP_BLKSIZE);
+    }
+
+    #[test]
+    fn resolve_udp_blksize_clamps_to_udp_bounds() {
+        // A bogus huge MSS is clamped to the max UDP payload; a sub-header MSS
+        // falls back to the safe default rather than producing tiny datagrams.
+        assert_eq!(resolve_udp_blksize(None, Some(70_000)), MAX_UDP_BLKSIZE);
+        assert_eq!(resolve_udp_blksize(None, Some(8)), DEFAULT_UDP_BLKSIZE);
     }
 
     // -- make_send_buffer edge cases --

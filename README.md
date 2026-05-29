@@ -68,10 +68,10 @@ Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
 | TCP zerocopy | 73.6 Gbps | 76.1 Gbps | +3% |
 | TCP BBR | 63.1 Gbps | 60.6 Gbps | -4% |
 | TCP IPv6 | 78.7 Gbps | 76.0 Gbps | -3% |
-| UDP 10G | 10.0 Gbps | 10.7 Gbps | +7% |
-| UDP 50G | 29.9 Gbps | 17.5 Gbps | -41% |
+| UDP P1 | 34.0 Gbps | 38.8 Gbps | +14% |
+| UDP P8 | 30.7 Gbps | 35.4 Gbps | +15% |
 
-TCP performance is at parity with iperf3. Part of the UDP high-rate gap is the cost of safe Rust's `send()` path vs C's raw `write()` syscall, which the experimental `--sendmmsg` flag narrows by batching packets into a single kernel crossing (see below). Profiling also found an efficiency bug, though: the busy-spin pacing loop wastes CPU at high `-b`, so UDP throughput *falls* as `-P` rises instead of scaling — this is under investigation, not an inherent trade-off ([#6](https://github.com/therealevanhenry/riperf3/issues/6)).
+TCP and UDP are both at or above parity with iperf3. UDP single-stream and high-`-P` throughput were rebuilt to close [#6](https://github.com/therealevanhenry/riperf3/issues/6): with no `-l`, the datagram size now tracks the control-socket MSS (matching iperf3) instead of a 1460-byte floor, and the UDP sockets are blocking so the sender backpressures in-kernel rather than busy-spinning on `EAGAIN`. Throughput now holds steady across `-P` (at `-P 8`, 0.00% loss vs iperf3's ~0.5%) instead of collapsing. The experimental `--sendmmsg` batching extends the lead at large datagrams (see below).
 
 See [BENCHMARKS.md](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md) for a fuller per-`-P`, per-direction sweep.
 
@@ -135,7 +135,7 @@ Test parameters:
   -t, --time <secs>                  Test duration (default: 10)
   -n, --bytes <N[KMG]>              Bytes to transmit (instead of -t)
   -k, --blockcount <N[KMG]>         Blocks to transmit (instead of -t)
-  -l, --length <N[KMG]>             Buffer size (default: 128K TCP, 1460 UDP)
+  -l, --length <N[KMG]>             Buffer size (default: 128K TCP; UDP tracks MSS, else 1460)
   -P, --parallel <N>                 Parallel streams
   -R, --reverse                      Server sends, client receives
       --bidir                        Bidirectional test
