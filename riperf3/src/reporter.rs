@@ -90,11 +90,7 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
     if let (Some(jitter), Some(lost), Some(total)) =
         (interval.jitter, interval.lost, interval.total_packets)
     {
-        let pct = if total > 0 {
-            lost as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
+        let pct = lost_percent(lost, total);
         println!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
             interval.start,
@@ -126,6 +122,17 @@ pub fn print_separator() {
     println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
 }
 
+/// UDP loss as a percentage of total datagrams, guarding the zero-total case
+/// (no packets ⇒ 0%, not NaN). Single source of truth for the `(x.xx%)` figure
+/// across interval lines, final summaries, and JSON output.
+pub fn lost_percent(lost: i64, total: i64) -> f64 {
+    if total > 0 {
+        lost as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// Format a single final-summary line (no trailing newline). Pure, so the
 /// rendered output can be unit-tested without capturing stdout.
 pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String {
@@ -147,11 +154,7 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
     if let (Some(jitter), Some(lost), Some(total)) =
         (summary.jitter, summary.lost, summary.total_packets)
     {
-        let pct = if total > 0 {
-            lost as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
+        let pct = lost_percent(lost, total);
         format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
             summary.start,
@@ -621,6 +624,15 @@ mod tests {
         // Bidir -P 1: one sender + one receiver → neither direction gets a SUM.
         let streams = vec![tcp_summary(1, true, 1_000), tcp_summary(3, false, 2_000)];
         assert!(sum_summaries(&streams).is_empty());
+    }
+
+    #[test]
+    fn lost_percent_guards_zero_total() {
+        assert_eq!(lost_percent(0, 0), 0.0, "no datagrams ⇒ 0%, not NaN");
+        assert_eq!(lost_percent(5, 0), 0.0, "zero total never divides");
+        assert_eq!(lost_percent(0, 1000), 0.0, "loss-free");
+        assert!((lost_percent(4258, 267_190) - 1.5936).abs() < 1e-3);
+        assert_eq!(lost_percent(1000, 1000), 100.0, "total loss");
     }
 
     #[test]
