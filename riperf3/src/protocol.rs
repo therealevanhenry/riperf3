@@ -282,16 +282,45 @@ pub struct TestParams {
 // Test results — exchanged as JSON during ExchangeResults
 // ---------------------------------------------------------------------------
 
+/// Deserialize an integer that iperf3 may report as a "-1 = unavailable"
+/// sentinel (e.g. retransmit info when the OS doesn't expose it). iperf3 ≤ 3.12
+/// serializes that -1 as `u64::MAX` in the results JSON, which overflows the
+/// signed Rust type and would otherwise fail the whole test at result decode
+/// (issue #24). Normalize any value past `i64::MAX` (incl. `u64::MAX`) to -1.
+fn de_retransmit_sentinel<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SentinelVisitor;
+    impl serde::de::Visitor<'_> for SentinelVisitor {
+        type Value = i64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an integer (iperf3 may send u64::MAX or -1 for \"unavailable\")")
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<i64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<i64, E> {
+            Ok(if v > i64::MAX as u64 { -1 } else { v as i64 })
+        }
+    }
+    deserializer.deserialize_any(SentinelVisitor)
+}
+
 /// Per-stream result data included in the results JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamResultJson {
     pub id: i32,
     pub bytes: u64,
+    #[serde(deserialize_with = "de_retransmit_sentinel")]
     pub retransmits: i64,
     pub jitter: f64,
     pub errors: i64,
+    // iperf 3.12 omits the omitted_* fields from the stream object (#24).
+    #[serde(default)]
     pub omitted_errors: i64,
     pub packets: i64,
+    #[serde(default)]
     pub omitted_packets: i64,
     pub start_time: f64,
     pub end_time: f64,
@@ -303,7 +332,8 @@ pub struct TestResultsJson {
     pub cpu_util_total: f64,
     pub cpu_util_user: f64,
     pub cpu_util_system: f64,
-    pub sender_has_retransmits: i32,
+    #[serde(deserialize_with = "de_retransmit_sentinel")]
+    pub sender_has_retransmits: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub congestion_used: Option<String>,
     pub streams: Vec<StreamResultJson>,
@@ -596,7 +626,10 @@ mod tests {
         assert_eq!(r.streams[0].retransmits, -1, "u64::MAX sentinel maps to -1");
         assert_eq!(r.streams[0].bytes, 25_371_082_752);
         assert_eq!(r.streams[0].omitted_errors, 0, "absent field defaults to 0");
-        assert_eq!(r.streams[0].omitted_packets, 0, "absent field defaults to 0");
+        assert_eq!(
+            r.streams[0].omitted_packets, 0,
+            "absent field defaults to 0"
+        );
     }
 
     #[tokio::test]
