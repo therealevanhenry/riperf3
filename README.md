@@ -57,23 +57,17 @@ Verified across TCP (normal, reverse, bidir, parallel, zerocopy, BBR, file mode)
 
 ## Performance
 
-Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
+On a two-VM QEMU/KVM sandbox (virtio-net, MTU 9000, 8 vCPU), a 30-run-per-cell
+campaign puts riperf3 **at or above iperf3** throughput across the board:
 
-| Mode | iperf3 | riperf3 | Gap |
-|---|---|---|---|
-| TCP P1 | 78.1 Gbps | 74.0 Gbps | -5% |
-| TCP P4 | 69.0 Gbps | 67.4 Gbps | -2% |
-| TCP reverse | 75.3 Gbps | 77.6 Gbps | +3% |
-| TCP bidir | 42.9 Gbps | 42.4 Gbps | -1% |
-| TCP zerocopy | 73.6 Gbps | 76.1 Gbps | +3% |
-| TCP BBR | 63.1 Gbps | 60.6 Gbps | -4% |
-| TCP IPv6 | 78.7 Gbps | 76.0 Gbps | -3% |
-| UDP P1 | 34.0 Gbps | 38.8 Gbps | +14% |
-| UDP P8 | 30.7 Gbps | 35.4 Gbps | +15% |
+- **TCP** — statistical parity single-stream (~75 Gbps); a few percent ahead at `-P 8`.
+- **UDP** — significantly faster in every cell (~+10–18%), and holds steady across `-P` instead of collapsing.
+- **Wire-compatible** with iperf3 (current and 3.12) in both directions.
 
-TCP and UDP are both at or above parity with iperf3. UDP single-stream and high-`-P` throughput were rebuilt to close [#6](https://github.com/therealevanhenry/riperf3/issues/6): with no `-l`, the datagram size now tracks the control-socket MSS (matching iperf3) instead of a 1460-byte floor, and the UDP sockets are blocking so the sender backpressures in-kernel rather than busy-spinning on `EAGAIN`. Throughput now holds steady across `-P` (at `-P 8`, 0.00% loss vs iperf3's ~0.5%) instead of collapsing. The experimental `--sendmmsg` batching extends the lead at large datagrams (see below).
-
-See [BENCHMARKS.md](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md) for a fuller per-`-P`, per-direction sweep.
+[**BENCHMARKS.md**](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md)
+has the authoritative numbers — per-cell 95% confidence intervals, significance
+tests, the compatibility matrix, and full methodology. (Kept there rather than
+duplicated here, so it can't drift out of sync.)
 
 ## Platform Support
 
