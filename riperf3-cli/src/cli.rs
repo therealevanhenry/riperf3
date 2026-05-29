@@ -122,7 +122,7 @@ pub struct Cli {
     #[arg(short = 'k', long, value_name = "count")]
     pub blockcount: Option<String>,
 
-    /// Length of buffer to read or write (default 128 KB for TCP, 1460 for UDP)
+    /// Length of buffer to read or write (default 128 KB for TCP; UDP tracks the connection MSS, else 1460)
     #[arg(short = 'l', long, value_name = "size")]
     pub length: Option<String>,
 
