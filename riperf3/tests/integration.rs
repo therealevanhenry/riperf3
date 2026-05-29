@@ -1694,6 +1694,40 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
+    /// Regression for issue #5: UDP bidirectional with parallel streams at a
+    /// high target rate must complete and honor `-t` (it deadlocked before the
+    /// start-barrier + self-deadline fix). The outer timeout turns a hang into
+    /// a test failure rather than a wedged run. This also exercises the
+    /// start-barrier release and the in-loop deadline end-to-end.
+    #[tokio::test]
+    async fn udp_bidir_parallel_completes() {
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .protocol(TransportProtocol::Udp)
+            .duration(2)
+            .num_streams(4)
+            .bidir(true)
+            .bandwidth(50_000_000_000) // 50 Gbps/stream target
+            .build()
+            .unwrap();
+        // -t is 2s; allow generous slack, but fail (not hang) on a regression.
+        let result = tokio::time::timeout(Duration::from_secs(20), client.run()).await;
+        assert!(
+            result.is_ok(),
+            "UDP --bidir -P 4 hung — issue #5 regression"
+        );
+        assert!(result.unwrap().is_ok(), "UDP --bidir -P 4 errored");
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn udp_high_rate_reverse() {
         // 50G reverse mode — server sends, client receives

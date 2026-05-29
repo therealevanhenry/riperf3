@@ -202,6 +202,9 @@ impl Server {
 
         // ---- CreateStreams ----
         let done = Arc::new(AtomicBool::new(false));
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        let _done_guard = stream::DoneOnDrop(done.clone());
         // Released at TestStart so UDP senders don't transmit during stream
         // setup (issue #5): the create-streams handshake is lost under a flood.
         let start = Arc::new(AtomicBool::new(false));

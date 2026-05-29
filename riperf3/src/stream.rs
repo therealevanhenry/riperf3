@@ -711,6 +711,19 @@ fn await_start(start: &AtomicBool, done: &AtomicBool) -> bool {
     true
 }
 
+/// Sets `done` when dropped, so every exit path of a test handler — including
+/// early `?` error returns before the normal `done.store(true)` — signals the
+/// data tasks to stop. Without this, a UDP sender parked in `await_start`
+/// (start=false, done=false) on a failed/aborted setup would never observe a
+/// stop and would leak on a long-running server (issue #5 follow-up).
+pub struct DoneOnDrop(pub Arc<AtomicBool>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// High-performance UDP sender using blocking I/O on a dedicated OS thread.
 /// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
 /// `std::thread::sleep` + spin-loop for sub-microsecond precision.
@@ -1549,6 +1562,41 @@ mod tests {
         )
         .unwrap();
         assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(counters.bytes_sent(), 0);
+    }
+
+    /// DoneOnDrop releases a sender parked on the start barrier: on a failed
+    /// setup the guard drops, sets `done`, and the parked sender exits instead
+    /// of leaking (issue #5 follow-up).
+    #[test]
+    fn done_on_drop_releases_parked_sender() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false)); // never released
+        let counters = Arc::new(StreamCounters::new());
+
+        let c = counters.clone();
+        let d = done.clone();
+        let s = start.clone();
+        let h = std::thread::spawn(move || {
+            run_udp_sender_blocking(send, c, 1400, d, 0, false, s, Some(Duration::from_secs(10)))
+        });
+
+        // Parked on the barrier — nothing transmitted.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(counters.bytes_sent(), 0);
+
+        // Simulate a handler tearing down: the guard drops and sets `done`.
+        drop(DoneOnDrop(done.clone()));
+
+        // The parked sender must observe `done` and return (no leak, no send).
+        let t0 = Instant::now();
+        h.join().unwrap().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "sender should exit promptly"
+        );
+        assert!(done.load(Ordering::Relaxed));
         assert_eq!(counters.bytes_sent(), 0);
     }
 }
