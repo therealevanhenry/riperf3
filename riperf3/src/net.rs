@@ -381,6 +381,13 @@ pub fn tcp_maxseg(_stream: &TcpStream) -> Option<u32> {
 // UDP
 // ---------------------------------------------------------------------------
 
+/// Wall-clock bound a blocking UDP `sendmmsg`/`send` so a wedged link can't park
+/// the sender thread forever (the per-batch `done`/deadline checks only run
+/// between blocking calls). On expiry the syscall returns `EAGAIN`, which the
+/// sender treats as a zero-progress batch and loops to re-check those flags.
+#[cfg(unix)]
+const UDP_SEND_TIMEOUT_MS: u64 = 1000;
+
 /// Prepare a UDP socket for the blocking batched sender (issue #6).
 ///
 /// tokio sockets are non-blocking, and `into_std()` preserves that flag. A
@@ -388,14 +395,21 @@ pub fn tcp_maxseg(_stream: &TcpStream) -> Option<u32> {
 /// send buffer fills, redundantly re-staging the whole batch and starving the
 /// async runtime. Switching to blocking lets the kernel backpressure the
 /// sender thread instead. The `SO_SNDBUF` bump is best-effort (clamped by
-/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link to 1s so the
-/// sender's per-batch `done`/deadline checks still fire.
+/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link (see
+/// [`UDP_SEND_TIMEOUT_MS`]). Note: this is `SO_SNDTIMEO`, *not* the
+/// `TCP_USER_TIMEOUT` of [`set_snd_timeout`] (which is a no-op on UDP).
 #[cfg(unix)]
 pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) -> Result<()> {
+    use nix::sys::socket::{self, sockopt};
+    use nix::sys::time::TimeVal;
     socket.set_nonblocking(false)?;
     let sock = socket2::SockRef::from(socket);
     let _ = sock.set_send_buffer_size(sndbuf_target);
-    let _ = set_snd_timeout(socket, 1000);
+    let tv = TimeVal::new(
+        (UDP_SEND_TIMEOUT_MS / 1000) as libc::time_t,
+        ((UDP_SEND_TIMEOUT_MS % 1000) * 1000) as libc::suseconds_t,
+    );
+    let _ = socket::setsockopt(socket, sockopt::SendTimeout, &tv);
     Ok(())
 }
 
@@ -1010,6 +1024,24 @@ mod tests {
         assert!(
             !is_nonblocking(socket.as_raw_fd()),
             "sender socket must be switched to blocking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_sets_real_send_timeout() {
+        // Regression: a blocking sender needs a real SO_SNDTIMEO so a wedged
+        // link can't park the thread forever. TCP_USER_TIMEOUT (set_snd_timeout)
+        // is a no-op on UDP and would leave the timeout unset (#6 review).
+        use nix::sys::socket::{getsockopt, sockopt};
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        let tv = getsockopt(&socket, sockopt::SendTimeout).unwrap();
+        assert!(
+            tv.tv_sec() > 0 || tv.tv_usec() > 0,
+            "SO_SNDTIMEO must be non-zero, got {}.{:06}",
+            tv.tv_sec(),
+            tv.tv_usec()
         );
     }
 

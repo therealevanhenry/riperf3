@@ -44,9 +44,9 @@ the datagram-size sweep below.
 | 4  | 70.3 | 66.8 | 70.0 | 63.9 |
 | 8  | 62.5 | 59.4 | 62.0 | 58.5 |
 
-**Takeaway:** TCP is unchanged by the 0.4.0 UDP work and remains at parity with
-iperf3 — within run-to-run noise single-stream, and a few percent ahead at
-`-P 4`/`-P 8` in both directions.
+**Takeaway:** TCP is unchanged by the UDP work ([#6](https://github.com/therealevanhenry/riperf3/issues/6))
+and remains at parity with iperf3 — within run-to-run noise single-stream, and a
+few percent ahead at `-P 4`/`-P 8` in both directions.
 
 ## UDP (Gbps)
 

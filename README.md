@@ -71,7 +71,7 @@ Benchmarked on QEMU/KVM VMs with virtio-net (MTU 9000), 8 vCPUs, 8GB RAM:
 | UDP P1 | 34.0 Gbps | 38.8 Gbps | +14% |
 | UDP P8 | 30.7 Gbps | 35.4 Gbps | +15% |
 
-TCP and UDP are both at or above parity with iperf3. UDP single-stream and high-`-P` throughput were rebuilt in 0.4.0 ([#6](https://github.com/therealevanhenry/riperf3/issues/6)): with no `-l`, the datagram size now tracks the control-socket MSS (matching iperf3) instead of a 1460-byte floor, and the UDP sockets are blocking so the sender backpressures in-kernel rather than busy-spinning on `EAGAIN`. Throughput now holds steady across `-P` (at `-P 8`, 0.00% loss vs iperf3's ~0.5%) instead of collapsing. The experimental `--sendmmsg` batching extends the lead at large datagrams (see below).
+TCP and UDP are both at or above parity with iperf3. UDP single-stream and high-`-P` throughput were rebuilt to close [#6](https://github.com/therealevanhenry/riperf3/issues/6): with no `-l`, the datagram size now tracks the control-socket MSS (matching iperf3) instead of a 1460-byte floor, and the UDP sockets are blocking so the sender backpressures in-kernel rather than busy-spinning on `EAGAIN`. Throughput now holds steady across `-P` (at `-P 8`, 0.00% loss vs iperf3's ~0.5%) instead of collapsing. The experimental `--sendmmsg` batching extends the lead at large datagrams (see below).
 
 See [BENCHMARKS.md](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md) for a fuller per-`-P`, per-direction sweep.
 

@@ -825,7 +825,9 @@ pub fn run_udp_sender_sendmmsg(
                 seq -= unsent as u64;
             }
             Err(nix::errno::Errno::EAGAIN) => {
-                // All packets failed — rewind entire batch
+                // On a blocking socket this means the SO_SNDTIMEO set by
+                // configure_udp_sender fired (a wedged link) — send nothing,
+                // rewind the batch, and loop to re-check `done`/`deadline`.
                 seq -= batch_size as u64;
             }
             Err(e) => {
