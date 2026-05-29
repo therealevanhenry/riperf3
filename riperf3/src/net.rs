@@ -346,9 +346,64 @@ pub fn configure_tcp_stream_full(
     Ok(())
 }
 
+/// Read the TCP maximum segment size (`TCP_MAXSEG`) of a connected stream.
+///
+/// iperf3 uses this to size UDP datagrams when `-l` is not given (issue #6): on
+/// a jumbo-frame path the control connection negotiates a large MSS, so UDP
+/// datagrams should be sized to match rather than pinned at 1460. Returns
+/// `None` when the option can't be read (non-Unix, or a getsockopt error).
+#[cfg(unix)]
+pub fn tcp_maxseg(stream: &TcpStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut mss: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a valid connected TCP socket for the lifetime of `stream`;
+    // TCP_MAXSEG yields a single c_int and `len` matches the buffer size.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &mut mss as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && mss > 0).then_some(mss as u32)
+}
+
+#[cfg(not(unix))]
+pub fn tcp_maxseg(_stream: &TcpStream) -> Option<u32> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // UDP
 // ---------------------------------------------------------------------------
+
+/// Prepare a UDP socket for the blocking batched sender (issue #6).
+///
+/// tokio sockets are non-blocking, and `into_std()` preserves that flag. A
+/// non-blocking socket makes `sendmmsg` busy-spin on `EAGAIN` once the (small)
+/// send buffer fills, redundantly re-staging the whole batch and starving the
+/// async runtime. Switching to blocking lets the kernel backpressure the
+/// sender thread instead. The `SO_SNDBUF` bump is best-effort (clamped by
+/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link to 1s so the
+/// sender's per-batch `done`/deadline checks still fire.
+#[cfg(unix)]
+pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) -> Result<()> {
+    socket.set_nonblocking(false)?;
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_send_buffer_size(sndbuf_target);
+    let _ = set_snd_timeout(socket, 1000);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
+    socket.set_nonblocking(false)?;
+    Ok(())
+}
 
 /// Bind a UDP socket. If `bind_addr` is `None`, uses `0.0.0.0` (or `[::]` for IPv6).
 pub async fn udp_bind(bind_addr: Option<&str>, port: u16, ipv6: bool) -> Result<UdpSocket> {
@@ -921,10 +976,11 @@ mod tests {
         // is what the UDP datagram-size default is derived from (iperf3 parity).
         let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let client_task =
-            tokio::spawn(
-                async move { tcp_connect("127.0.0.1", port, None, None, false, None).await.unwrap() },
-            );
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, None, false, None)
+                .await
+                .unwrap()
+        });
         let (_server, _) = listener.accept().await.unwrap();
         let client = client_task.await.unwrap();
 

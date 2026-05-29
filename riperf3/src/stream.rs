@@ -757,10 +757,19 @@ pub fn run_udp_sender_sendmmsg(
     // runtime isn't starved and `done` fires normally anyway).
     let deadline = max_duration.map(|d| Instant::now() + d);
 
-    let fd = socket.as_raw_fd();
     // Larger batch than the per-packet sender: sendmmsg amortizes syscall
     // overhead so bigger batches help more than with individual send() calls.
     let batch_size: usize = if rate_bits_per_sec > 0 { 128 } else { 1 };
+
+    // Switch to blocking I/O — tokio's into_std() leaves the socket
+    // non-blocking, which makes sendmmsg busy-spin on EAGAIN once SO_SNDBUF
+    // fills (the batch is far larger than wmem_max), redundantly re-staging the
+    // whole batch and starving the async runtime. Blocking lets the kernel
+    // backpressure this thread instead; best-effort enlarge the buffer to a
+    // batch and bound a wedged link with SO_SNDTIMEO (issue #6).
+    crate::net::configure_udp_sender(&socket, batch_size * blksize)?;
+
+    let fd = socket.as_raw_fd();
 
     // Pre-allocate everything outside the hot loop
     let mut bufs: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; blksize]).collect();
@@ -901,6 +910,10 @@ pub fn run_udp_sender_blocking(
         1
     };
 
+    // Blocking I/O so send() backpressures in-kernel instead of returning
+    // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
+    crate::net::configure_udp_sender(&socket, batch_size as usize * blksize)?;
+
     let pacing = if rate_bits_per_sec > 0 {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
         let per_packet = Duration::from_secs_f64(blksize as f64 / rate_bytes);
@@ -979,6 +992,13 @@ pub fn run_udp_receiver_blocking(
     use_64bit: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; blksize.max(65536)];
+    // tokio's into_std() leaves the socket non-blocking, which makes the
+    // SO_RCVTIMEO below a no-op: recv() returns WouldBlock immediately and the
+    // loop busy-spins at 100% CPU. Switch to blocking so the read timeout
+    // actually parks the thread between datagrams (issue #6).
+    socket
+        .set_nonblocking(false)
+        .map_err(crate::error::RiperfError::Io)?;
     socket
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(crate::error::RiperfError::Io)?;

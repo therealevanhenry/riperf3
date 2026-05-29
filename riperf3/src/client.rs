@@ -23,6 +23,11 @@ pub struct Client {
     pub duration: u32,
     pub num_streams: u32,
     pub blksize: usize,
+    /// Whether `blksize` came from an explicit `-l`. When false for UDP, the
+    /// datagram size is derived from the control-socket MSS at run time
+    /// (iperf3 parity, issue #6) rather than using the `blksize` default.
+    /// Internal: set by the builder from whether `.blksize()` was called.
+    blksize_explicit: bool,
     pub reverse: bool,
     pub bidir: bool,
     pub omit: u32,
@@ -88,6 +93,16 @@ impl Client {
         .await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
+        // Resolve the UDP datagram size now that the control connection exists:
+        // when `-l` wasn't given, derive it from the control-socket MSS so a
+        // jumbo-frame path uses large datagrams instead of the 1460 floor
+        // (iperf3 parity, issue #6). TCP keeps its own block size unchanged.
+        let blksize = if self.protocol == TransportProtocol::Udp && !self.blksize_explicit {
+            resolve_udp_blksize(None, net::tcp_maxseg(&ctrl))
+        } else {
+            self.blksize
+        };
+
         // Apply control connection options
         if let Some(ref dev) = self.bind_dev {
             net::set_bind_dev(&ctrl, dev)?;
@@ -120,12 +135,12 @@ impl Client {
 
             match state {
                 TestState::ParamExchange => {
-                    let params = self.build_params();
+                    let params = self.build_params(blksize);
                     protocol::send_params(&mut ctrl, &params).await?;
                 }
 
                 TestState::CreateStreams => {
-                    streams = self.create_streams(&cookie, &done, &start).await?;
+                    streams = self.create_streams(&cookie, &done, &start, blksize).await?;
                 }
 
                 TestState::TestStart => {
@@ -135,7 +150,7 @@ impl Client {
                 }
 
                 TestState::TestRunning => {
-                    self.run_test(&mut ctrl, &streams, &done).await?;
+                    self.run_test(&mut ctrl, &streams, &done, blksize).await?;
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
                 }
@@ -147,7 +162,12 @@ impl Client {
                 }
 
                 TestState::DisplayResults => {
-                    self.print_results(&streams, cpu_start.as_ref(), server_results.as_ref());
+                    self.print_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        server_results.as_ref(),
+                        blksize,
+                    );
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
                 }
@@ -181,7 +201,7 @@ impl Client {
         })
     }
 
-    fn build_params(&self) -> TestParams {
+    fn build_params(&self, blksize: usize) -> TestParams {
         let mut p = TestParams::default();
         match self.protocol {
             TransportProtocol::Tcp => p.tcp = Some(true),
@@ -190,7 +210,7 @@ impl Client {
         p.time = Some(self.duration as i32);
         p.omit = Some(self.omit as i32);
         p.parallel = Some(self.num_streams as i32);
-        p.len = Some(self.blksize as i32);
+        p.len = Some(blksize as i32);
         if self.reverse {
             p.reverse = Some(true);
         }
@@ -250,6 +270,7 @@ impl Client {
         cookie: &[u8; protocol::COOKIE_SIZE],
         done: &Arc<AtomicBool>,
         start: &Arc<AtomicBool>,
+        blksize: usize,
     ) -> Result<Vec<DataStream>> {
         let mut streams = Vec::new();
 
@@ -331,7 +352,7 @@ impl Client {
                     let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
                     let task = if is_sender {
-                        let buf = make_send_buffer(self.blksize, self.repeating_payload);
+                        let buf = make_send_buffer(blksize, self.repeating_payload);
                         let c = counters.clone();
                         let d = done.clone();
                         let zc = self.zerocopy;
@@ -352,7 +373,7 @@ impl Client {
                     } else {
                         let c = counters.clone();
                         let d = done.clone();
-                        let bs = self.blksize;
+                        let bs = blksize;
                         let srxc = self.skip_rx_copy;
                         tokio::spawn(async move {
                             stream::run_tcp_receiver(data_stream, c, bs, d, srxc, fp).await
@@ -383,7 +404,7 @@ impl Client {
 
                     // Apply GSO/GRO if requested (no-ops on non-Linux)
                     if self.gsro {
-                        let _ = net::set_udp_gso(&udp_sock, self.blksize as u16);
+                        let _ = net::set_udp_gso(&udp_sock, blksize as u16);
                         let _ = net::set_udp_gro(&udp_sock);
                     }
                     if self.tos != 0 {
@@ -400,7 +421,7 @@ impl Client {
                     let task = if is_sender {
                         let c = counters.clone();
                         let d = done.clone();
-                        let bs = self.blksize;
+                        let bs = blksize;
                         let rate = if self.bandwidth > 0 {
                             self.bandwidth
                         } else {
@@ -424,7 +445,7 @@ impl Client {
                     } else {
                         let c = counters.clone();
                         let d = done.clone();
-                        let bs = self.blksize;
+                        let bs = blksize;
                         let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                         let sc = stats.clone();
                         let u64bit = self.udp_counters_64bit;
@@ -462,6 +483,7 @@ impl Client {
         ctrl: &mut TcpStream,
         streams: &[DataStream],
         done: &Arc<AtomicBool>,
+        blksize: usize,
     ) -> Result<()> {
         // Spawn interval reporter (unless plain JSON output without streaming)
         let interval_secs = self.interval.unwrap_or(1.0);
@@ -544,7 +566,7 @@ impl Client {
                         .filter(|s| s.is_sender)
                         .map(|s| s.counters.bytes_sent())
                         .sum();
-                    let blocks = total_bytes / self.blksize as u64;
+                    let blocks = total_bytes / blksize as u64;
                     if blocks >= target {
                         break;
                     }
@@ -626,9 +648,10 @@ impl Client {
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
+        blksize: usize,
     ) {
         if self.json_output {
-            self.print_results_json(streams, cpu_start, remote_cpu);
+            self.print_results_json(streams, cpu_start, remote_cpu, blksize);
         } else {
             self.print_results_text(streams);
         }
@@ -680,6 +703,7 @@ impl Client {
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
+        blksize: usize,
     ) {
         let test_duration = self.duration as f64;
         let cpu_end = CpuSnapshot::now();
@@ -769,7 +793,7 @@ impl Client {
                 "test_start": {
                     "protocol": protocol_str,
                     "num_streams": self.num_streams,
-                    "blksize": self.blksize,
+                    "blksize": blksize,
                     "omit": self.omit,
                     "duration": self.duration,
                     "bytes": 0,
@@ -1308,6 +1332,7 @@ impl ClientBuilder {
             duration: self.duration,
             num_streams: self.num_streams,
             blksize: self.blksize.unwrap_or(default_blksize),
+            blksize_explicit: self.blksize.is_some(),
             reverse: self.reverse,
             bidir: self.bidir,
             omit: self.omit,

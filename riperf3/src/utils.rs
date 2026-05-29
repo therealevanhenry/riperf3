@@ -110,6 +110,24 @@ pub fn iperf3_stream_id(index: u32) -> i32 {
 /// Maximum UDP payload: 65535 - 8 (UDP header) - 20 (IP header)
 pub const MAX_UDP_BLKSIZE: usize = 65507;
 
+/// Resolve the effective UDP datagram size.
+///
+/// Mirrors iperf3 (`iperf_client_api.c`): an explicit `-l` always wins;
+/// otherwise the size tracks the control-connection MSS, so a jumbo-frame path
+/// uses large datagrams instead of the conservative 1460 floor. The MSS is
+/// clamped to the valid UDP payload range, and falls back to
+/// [`DEFAULT_UDP_BLKSIZE`] when no usable MSS is available (e.g. non-Unix, or a
+/// nonsensically small value).
+pub fn resolve_udp_blksize(explicit: Option<usize>, ctrl_mss: Option<u32>) -> usize {
+    if let Some(size) = explicit {
+        return size;
+    }
+    match ctrl_mss {
+        Some(mss) if (mss as usize) >= MIN_UDP_BLKSIZE => (mss as usize).min(MAX_UDP_BLKSIZE),
+        _ => DEFAULT_UDP_BLKSIZE,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KMG suffix parser
 // ---------------------------------------------------------------------------
