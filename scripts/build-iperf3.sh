@@ -26,7 +26,10 @@ if [ ! -x "$bin" ]; then
 fi
 
 # Verify the checkout BEFORE the (expensive) build, so a moved tag fails fast.
-sha="$(git -C "$src" rev-parse HEAD)"
+if ! sha="$(git -C "$src" rev-parse HEAD 2>/dev/null)"; then
+    echo "ERROR: $src is not a usable git checkout — remove it and re-run" >&2
+    exit 1
+fi
 echo "iperf3 $version checked out at $sha" >&2
 if [ -n "$expected_sha" ] && [ "$sha" != "$expected_sha" ]; then
     echo "ERROR: iperf3 $version resolved to $sha, expected $expected_sha (tag moved?)" >&2
