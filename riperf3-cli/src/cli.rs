@@ -203,7 +203,7 @@ pub struct Cli {
     pub pacing_timer: Option<u32>,
 
     /// Only use IPv4
-    #[arg(short = '4', long)]
+    #[arg(short = '4', long, conflicts_with = "version6")]
     pub version4: bool,
 
     /// Only use IPv6
@@ -862,6 +862,13 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-6"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c.ip_version, Some(6));
+        }
+
+        #[test]
+        fn version4_and_version6_conflict() {
+            // -4 and -6 are mutually exclusive (matches iperf3).
+            let err = Cli::try_parse_from(["riperf3", "-c", "h", "-4", "-6"]);
+            assert!(err.is_err(), "-4 -6 together should be rejected");
         }
 
         #[test]

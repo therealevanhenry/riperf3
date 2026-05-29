@@ -681,10 +681,11 @@ impl ServerBuilder {
         self
     }
 
-    /// Restrict the listener to a specific IP version. `Some(4)` → IPv4 only,
-    /// `Some(6)` → IPv6 only, `None` → dual-stack (default).
-    pub fn ip_version(mut self, version: Option<u8>) -> Self {
-        self.ip_version = version;
+    /// Restrict the listener to a specific IP version: `4` → IPv4 only, `6` →
+    /// IPv6 only. Leave unset for dual-stack (the default). Signature matches
+    /// `ClientBuilder::ip_version` for consistency.
+    pub fn ip_version(mut self, version: u8) -> Self {
+        self.ip_version = Some(version);
         self
     }
 

@@ -102,6 +102,68 @@ async fn server_accepts_ipv6_client_by_default() {
     let _ = server_task.await;
 }
 
+/// Default server accepts an IPv6 UDP client too (dual-stack covers UDP).
+#[tokio::test]
+async fn server_accepts_ipv6_udp_client_by_default() {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("::1")
+        .port(Some(port))
+        .protocol(TransportProtocol::Udp)
+        .duration(1)
+        .bandwidth(10_000_000)
+        .build()
+        .unwrap();
+    let result = client.run().await;
+    assert!(
+        result.is_ok(),
+        "IPv6 UDP client to default server: {result:?}"
+    );
+    let _ = server_task.await;
+}
+
+/// `ServerBuilder::ip_version(6)` must restrict the listener to IPv6, so an
+/// IPv4 client is refused — exercises the builder→net pass-through end-to-end.
+#[tokio::test]
+async fn server_ipv6_only_refuses_ipv4_client() {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .ip_version(6)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .connect_timeout(Duration::from_millis(500))
+        .build()
+        .unwrap();
+    let result = client.run().await;
+    assert!(
+        result.is_err(),
+        "IPv4 client must be refused by an IPv6-only server"
+    );
+    // The one-off server is still waiting; drain it with a matching IPv6 client.
+    let v6 = ClientBuilder::new("::1")
+        .port(Some(port))
+        .duration(1)
+        .build()
+        .unwrap();
+    let _ = v6.run().await;
+    let _ = server_task.await;
+}
+
 // ---------------------------------------------------------------------------
 // TCP loopback tests
 // ---------------------------------------------------------------------------
