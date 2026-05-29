@@ -1467,5 +1467,49 @@ mod tests {
             assert_eq!(c.bandwidth, 100_000_000);
             assert_eq!(c.tos, 0x10);
         }
+
+        // -- UDP -b 0 = unlimited (issue #17) --
+
+        #[test]
+        fn udp_unset_bandwidth_defaults_to_1m() {
+            // No -b on UDP resolves to the 1 Mbit/s default (iperf3 parity),
+            // now resolved at build time rather than in the sender.
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, DEFAULT_UDP_RATE);
+        }
+
+        #[test]
+        fn udp_explicit_zero_bandwidth_is_unlimited() {
+            // -b 0 means unlimited (0), NOT the 1 Mbit/s default (#17).
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .bandwidth(0)
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, 0);
+        }
+
+        #[test]
+        fn tcp_unset_bandwidth_is_unlimited() {
+            // TCP default stays unlimited (0).
+            let c = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(c.protocol, TransportProtocol::Tcp);
+            assert_eq!(c.bandwidth, 0);
+        }
+
+        #[test]
+        fn udp_build_params_carries_bandwidth_including_zero() {
+            // The negotiated rate must reach the server (in `len`/`bandwidth`)
+            // so reverse-mode -b 0 is unlimited server-side, not throttled.
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .bandwidth(0)
+                .build()
+                .unwrap();
+            assert_eq!(c.build_params(1460).bandwidth, Some(0));
+        }
     }
 }
