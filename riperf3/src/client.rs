@@ -83,6 +83,7 @@ impl Client {
             self.connect_timeout,
             None,
             self.mptcp,
+            self.ip_version,
         )
         .await?;
         net::configure_tcp_stream(&ctrl, true)?;
@@ -281,6 +282,7 @@ impl Client {
                         self.connect_timeout,
                         self.cport,
                         self.mptcp,
+                        self.ip_version,
                     )
                     .await?;
                     protocol::send_cookie(&mut data_stream, cookie).await?;
@@ -368,15 +370,15 @@ impl Client {
                 }
             }
             TransportProtocol::Udp => {
+                // Resolve once, honoring -4/-6, so the bind family matches the
+                // peer and the connection respects the version preference (#10).
+                let remote = net::resolve_host(&self.host, self.port, self.ip_version).await?;
                 for i in 0..total {
-                    let is_ipv6 = self.host.contains(':');
-                    let udp_sock = net::udp_bind(None, 0, is_ipv6).await?;
+                    let udp_sock = net::udp_bind(None, 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
                         net::set_bind_dev(&udp_sock, dev)?;
                     }
-                    udp_sock
-                        .connect(net::format_addr(&self.host, self.port))
-                        .await?;
+                    udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
                     // Apply GSO/GRO if requested (no-ops on non-Linux)
@@ -1132,6 +1134,10 @@ impl ClientBuilder {
     }
 
     pub fn ip_version(mut self, version: u8) -> Self {
+        debug_assert!(
+            matches!(version, 4 | 6),
+            "ip_version must be 4 or 6, got {version}"
+        );
         self.ip_version = Some(version);
         self
     }

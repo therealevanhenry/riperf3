@@ -129,19 +129,63 @@ pub fn format_addr(host: &str, port: u16) -> String {
 /// MPTCP protocol number (not in libc/socket2 yet).
 const IPPROTO_MPTCP: i32 = 262;
 
+/// Resolve `host:port` to a single `SocketAddr`, honoring an IP-version
+/// preference. For an IP literal it validates the family matches `ip_version`
+/// (rejecting e.g. `-6` against an IPv4 literal). For a hostname it resolves
+/// and returns the first address of the requested family — this is how `-4`/
+/// `-6` constrain the connection (issue #10).
+pub async fn resolve_host(host: &str, port: u16, ip_version: Option<u8>) -> Result<SocketAddr> {
+    let family_ok = |a: &SocketAddr| match ip_version {
+        Some(4) => a.is_ipv4(),
+        Some(6) => a.is_ipv6(),
+        _ => true,
+    };
+    let want = || match ip_version {
+        Some(4) => "IPv4",
+        Some(6) => "IPv6",
+        _ => "any",
+    };
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let addr = SocketAddr::new(ip, port);
+        match ip_version {
+            Some(4) if !addr.is_ipv4() => {
+                return Err(RiperfError::Protocol(format!(
+                    "address {host} is not IPv4 (conflicts with -4)"
+                )))
+            }
+            Some(6) if !addr.is_ipv6() => {
+                return Err(RiperfError::Protocol(format!(
+                    "address {host} is not IPv6 (conflicts with -6)"
+                )))
+            }
+            _ => {}
+        }
+        return Ok(addr);
+    }
+
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(RiperfError::Io)?;
+    addrs
+        .find(family_ok)
+        .ok_or_else(|| RiperfError::Protocol(format!("no {} address found for {host}", want())))
+}
+
 /// Connect to a TCP (or MPTCP) endpoint.
-/// Uses socket2 when local_port or mptcp is set; tokio's built-in connect otherwise.
+/// Uses socket2 when local_port or mptcp is set; tokio's built-in connect
+/// otherwise. `ip_version` constrains address-family selection for hostnames
+/// (`-4`/`-6`); when `None`, the OS resolver's full address list is tried.
 pub async fn tcp_connect(
     host: &str,
     port: u16,
     timeout: Option<Duration>,
     local_port: Option<u16>,
     mptcp: bool,
+    ip_version: Option<u8>,
 ) -> Result<TcpStream> {
     if local_port.is_some() || mptcp {
-        let remote: SocketAddr = format_addr(host, port)
-            .parse()
-            .map_err(|e| RiperfError::Protocol(format!("bad address: {e}")))?;
+        let remote = resolve_host(host, port, ip_version).await?;
         let domain = if remote.is_ipv6() {
             Domain::IPV6
         } else {
@@ -175,7 +219,19 @@ pub async fn tcp_connect(
             return Err(RiperfError::Io(e));
         }
         Ok(stream)
+    } else if ip_version.is_some() {
+        // Honor -4/-6: connect to a single resolved address of the chosen
+        // family rather than letting the resolver try every family.
+        let remote = resolve_host(host, port, ip_version).await?;
+        match timeout {
+            Some(dur) => Ok(tokio::time::timeout(dur, TcpStream::connect(remote))
+                .await
+                .map_err(|_| RiperfError::ConnectionTimeout)?
+                .map_err(RiperfError::Io)?),
+            None => Ok(TcpStream::connect(remote).await?),
+        }
     } else {
+        // No version preference: let the OS resolver try all addresses.
         let addr = format_addr(host, port);
         match timeout {
             Some(dur) => {
@@ -622,7 +678,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {
-            tcp_connect("127.0.0.1", port, None, None, false)
+            tcp_connect("127.0.0.1", port, None, None, false, None)
                 .await
                 .unwrap()
         });
@@ -643,6 +699,7 @@ mod tests {
             Some(Duration::from_millis(50)),
             None,
             false,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -652,6 +709,47 @@ mod tests {
     async fn udp_bind_ephemeral() {
         let socket = udp_bind(Some("127.0.0.1"), 0, false).await.unwrap();
         assert!(socket.local_addr().is_ok());
+    }
+
+    // ---- resolve_host: honoring -4/-6 (issue #10) -------------------------
+
+    #[tokio::test]
+    async fn resolve_host_literal_no_preference() {
+        let a = resolve_host("127.0.0.1", 5201, None).await.unwrap();
+        assert!(a.is_ipv4() && a.port() == 5201);
+        let a = resolve_host("::1", 5201, None).await.unwrap();
+        assert!(a.is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn resolve_host_literal_matching_family_ok() {
+        assert!(resolve_host("127.0.0.1", 0, Some(4))
+            .await
+            .unwrap()
+            .is_ipv4());
+        assert!(resolve_host("::1", 0, Some(6)).await.unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn resolve_host_literal_family_mismatch_errors() {
+        // -6 against an IPv4 literal (and vice versa) must be rejected, not
+        // silently connected to the wrong family.
+        assert!(resolve_host("127.0.0.1", 0, Some(6)).await.is_err());
+        assert!(resolve_host("::1", 0, Some(4)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_host_hostname_filters_by_family() {
+        // localhost typically resolves to 127.0.0.1 and/or ::1; assert the
+        // requested family is honored when available, soft-skip if not.
+        match resolve_host("localhost", 5201, Some(4)).await {
+            Ok(a) => assert!(a.is_ipv4(), "Some(4) must yield IPv4, got {a}"),
+            Err(_) => eprintln!("SKIP: localhost has no IPv4 address on this host"),
+        }
+        match resolve_host("localhost", 5201, Some(6)).await {
+            Ok(a) => assert!(a.is_ipv6(), "Some(6) must yield IPv6, got {a}"),
+            Err(_) => eprintln!("SKIP: localhost has no IPv6 address on this host"),
+        }
     }
 
     #[test]
@@ -713,12 +811,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         // IPv4 connect must succeed.
-        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false, None).await;
         assert!(v4.is_ok(), "IPv4 connect failed: {v4:?}");
         let _ = listener.accept().await.unwrap();
 
         // IPv6 connect must also succeed against the same listener.
-        let v6 = tcp_connect("::1", port, None, None, false).await;
+        let v6 = tcp_connect("::1", port, None, None, false, None).await;
         match v6 {
             Ok(_) => {
                 let _ = listener.accept().await.unwrap();
@@ -744,7 +842,7 @@ mod tests {
         let port = local.port();
 
         // IPv6 connect must be refused.
-        let v6 = tcp_connect("::1", port, None, None, false).await;
+        let v6 = tcp_connect("::1", port, None, None, false, None).await;
         match v6 {
             Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
             Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
@@ -771,7 +869,7 @@ mod tests {
         let port = local.port();
 
         // IPv4 connect must be refused.
-        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false, None).await;
         match v4 {
             Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
             Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
@@ -792,7 +890,7 @@ mod tests {
         // `-B :: -6`  → IPv6-only: an IPv4 client must be refused.
         let v6only = tcp_listen(Some("::"), 0, Some(6)).await.unwrap();
         let port = v6only.local_addr().unwrap().port();
-        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false, None).await;
         assert!(
             matches!(&v4, Err(RiperfError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused),
             "`-B :: -6` must refuse IPv4, got {v4:?}"
@@ -802,7 +900,7 @@ mod tests {
         // `-B ::` alone → dual-stack: an IPv4 client connects via v4-mapped.
         let dual = tcp_listen(Some("::"), 0, None).await.unwrap();
         let port = dual.local_addr().unwrap().port();
-        let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
+        let v4 = tcp_connect("127.0.0.1", port, None, None, false, None).await;
         match v4 {
             Ok(_) => {
                 let _ = dual.accept().await.unwrap();

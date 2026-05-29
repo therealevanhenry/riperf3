@@ -715,6 +715,10 @@ impl ServerBuilder {
     /// IPv6 only. Leave unset for dual-stack (the default). Signature matches
     /// `ClientBuilder::ip_version` for consistency.
     pub fn ip_version(mut self, version: u8) -> Self {
+        debug_assert!(
+            matches!(version, 4 | 6),
+            "ip_version must be 4 or 6, got {version}"
+        );
         self.ip_version = Some(version);
         self
     }
@@ -760,6 +764,20 @@ impl ServerBuilder {
             return Err(ConfigError::Unsupported(
                 "daemon mode is not supported on this platform".into(),
             ));
+        }
+
+        // Reject -4/-6 contradicting an explicit -B of the opposite family,
+        // instead of silently letting the bind address win (issue #12).
+        if let (Some(v), Some(addr)) = (self.ip_version, self.bind_address.as_deref()) {
+            if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+                let mismatch = (v == 4 && ip.is_ipv6()) || (v == 6 && ip.is_ipv4());
+                if mismatch {
+                    return Err(ConfigError::InvalidValue(
+                        "bind_address",
+                        format!("-{v} conflicts with bind address {addr}"),
+                    ));
+                }
+            }
         }
 
         Ok(Server {
