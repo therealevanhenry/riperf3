@@ -13,10 +13,14 @@ host's virtio bridge.
 | Date | 2026-05-28 |
 | Host | Intel i9-13900K, Linux 7.0.10-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.74-cloud, 8 vCPU, 8 GB RAM each |
-| NIC | virtio-net (vhost=on), bridged; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
+| NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
 | riperf3 | 0.2.0 |
 | iperf3 | 3.20+ (cJSON 1.7.15), built from source |
 | Per-run | `-t 10` (10 s), client→server unless noted |
+
+> This is a fuller per-`-P`/per-direction sweep than the summary table in the
+> README's Performance section; it's a different run, so absolute numbers
+> differ slightly from those round figures.
 
 Methodology: each cell is a single 10 s run, server started fresh (`-s -1`) per
 run on a unique port, every invocation wrapped in a hard `timeout` guard, with
@@ -42,9 +46,10 @@ forward numbers are the client's *send* rate. UDP runs target `-b 100G` (i.e.
 | 4  | 67.3 | 65.8 | 67.1 | 64.9 |
 | 8  | 62.1 | 59.6 | 62.2 | 59.3 |
 
-**TCP read:** riperf3 is at parity with iperf3 single-stream and pulls ahead
-~10–25% at `-P 8` (e.g. 61.6 vs 50.8 Gbps forward). No measurable IPv4/IPv6
-difference for either tool.
+**Takeaway:** riperf3 is at parity with iperf3 single-stream. At `-P 8`
+*forward* it pulls ahead ~21–25% (61.6 vs 50.8 Gbps IPv4; 63.5 vs 51.0 IPv6);
+at `-P 8` *reverse* the two are roughly at parity (~4–5% ahead). No measurable
+IPv4/IPv6 difference for either tool.
 
 ## UDP (Gbps)
 
@@ -64,11 +69,13 @@ difference for either tool.
 | 4  | 13.9 | 29.3 | 14.3 | 32.4 |
 | 8  |  6.0 | 29.3 |  6.3 | 29.2 |
 
-**UDP read:** riperf3's UDP send path delivers roughly half of iperf3
-single-stream and *degrades* with parallelism — total throughput drops from
-~17 Gbps at `-P 1` to ~8 Gbps at `-P 8` (per-stream rate craters to ~1 Gbps),
-while iperf3 holds ~30 Gbps across all `-P`. Tracked in
-[#6](https://github.com/therealevanhenry/riperf3/issues/6).
+**Takeaway:** riperf3's UDP send path delivers roughly half of iperf3
+single-stream, and total throughput falls as `-P` rises rather than scaling —
+from ~17 Gbps at `-P 1` to ~8 Gbps at `-P 8` (per-stream rate craters to
+~1 Gbps), while iperf3 holds ~30 Gbps across all `-P`. (`-P 4` is flat-to-noise
+vs `-P 1`; the drop is pronounced by `-P 8`.) This is a real efficiency bug in
+the busy-spin pacing path, not the memory-safety trade-off described in the
+README — tracked in [#6](https://github.com/therealevanhenry/riperf3/issues/6).
 
 ## Not measured
 
