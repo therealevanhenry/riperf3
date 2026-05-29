@@ -782,6 +782,43 @@ mod test_config_tests {
         assert_eq!(cfg.congestion, Some("bbr".to_string()));
         assert!(cfg.udp_counters_64bit);
     }
+
+    // -- server mirrors the client's rate resolution (#17) --
+
+    #[test]
+    fn udp_absent_bandwidth_defaults_to_1m() {
+        // A peer that omits the rate (older riperf3 / some iperf3 paths) → the
+        // 1 Mbit/s UDP default, not unlimited.
+        let p = TestParams {
+            udp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 1024 * 1024); // DEFAULT_UDP_RATE
+    }
+
+    #[test]
+    fn udp_explicit_zero_bandwidth_is_unlimited() {
+        // -b 0 carried in params → unlimited server-side, so reverse/bidir
+        // runs flat-out instead of being throttled to 1 Mbit/s.
+        let p = TestParams {
+            udp: Some(true),
+            bandwidth: Some(0),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 0);
+    }
+
+    #[test]
+    fn tcp_absent_bandwidth_is_unlimited() {
+        let p = TestParams {
+            tcp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -760,7 +760,9 @@ pub fn run_udp_sender_sendmmsg(
 
     // Larger batch than the per-packet sender: sendmmsg amortizes syscall
     // overhead so bigger batches help more than with individual send() calls.
-    let batch_size: usize = if rate_bits_per_sec > 0 { 128 } else { 1 };
+    // Always batch — pacing (below) is what's gated on the rate; an unlimited
+    // run (rate 0, -b 0) still needs the full batch, not one packet (#17).
+    let batch_size: usize = 128;
 
     // Switch to blocking I/O — tokio's into_std() leaves the socket
     // non-blocking, which makes sendmmsg busy-spin on EAGAIN once SO_SNDBUF
@@ -832,8 +834,13 @@ pub fn run_udp_sender_sendmmsg(
                 seq -= batch_size as u64;
             }
             Err(e) => {
+                // A non-EAGAIN error (e.g. ECONNREFUSED from an ICMP
+                // port-unreachable on the connected socket) can persist; back
+                // off briefly so we don't spin a core re-trying until the
+                // deadline, while still recovering if it clears (#18).
                 log::debug!("sendmmsg error: {e}");
                 seq -= batch_size as u64;
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
@@ -904,14 +911,11 @@ pub fn run_udp_sender_blocking(
     let mut buf = vec![0u8; blksize];
     let mut seq: u64 = 0;
 
-    // Batch size: send 32 packets between clock checks.
-    // Small enough to maintain pacing accuracy, large enough to
-    // amortize Instant::now() and atomic counter overhead.
-    let batch_size: u32 = if rate_bits_per_sec > 0 {
-        32_u64.clamp(1, 64) as u32
-    } else {
-        1
-    };
+    // Send 32 packets between clock checks: small enough to maintain pacing
+    // accuracy, large enough to amortize Instant::now() and atomic-counter
+    // overhead. Unconditional — pacing (below) is gated on the rate, so an
+    // unlimited run (rate 0, -b 0) still batches rather than dropping to 1 (#17).
+    let batch_size: u32 = 32;
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
@@ -956,8 +960,13 @@ pub fn run_udp_sender_blocking(
                     break;
                 }
                 Err(e) => {
+                    // Persistent fatal error (e.g. ECONNREFUSED): stop the
+                    // batch and back off briefly rather than retrying every
+                    // packet in a tight loop until the deadline (#18).
                     log::debug!("UDP send error: {e}");
                     seq -= 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                    break;
                 }
             }
         }

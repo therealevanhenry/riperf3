@@ -52,7 +52,12 @@ impl TestConfig {
             no_delay: params.nodelay.unwrap_or(false),
             mss: params.mss,
             window: params.window,
-            bandwidth: params.bandwidth.unwrap_or(0),
+            // Mirror the client's resolution (#17): a present rate (incl. 0 =
+            // unlimited) is used verbatim; when absent (older peer, or TCP),
+            // default to 1 Mbit/s for UDP and unlimited for TCP. 0 = unlimited.
+            bandwidth: params
+                .bandwidth
+                .unwrap_or(if is_udp { DEFAULT_UDP_RATE } else { 0 }),
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
@@ -345,11 +350,8 @@ impl Server {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = cfg.blksize;
-                        let rate = if cfg.bandwidth > 0 {
-                            cfg.bandwidth
-                        } else {
-                            DEFAULT_UDP_RATE
-                        };
+                        // Already resolved in TestConfig (#17); 0 = unlimited.
+                        let rate = cfg.bandwidth;
                         let u64bit = cfg.udp_counters_64bit;
                         let st = start.clone();
                         let md = max_duration;

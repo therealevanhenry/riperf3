@@ -223,9 +223,11 @@ impl Client {
         }
         p.mss = self.mss;
         p.window = self.window;
-        if self.bandwidth > 0 {
-            p.bandwidth = Some(self.bandwidth);
-        }
+        // Always carry the resolved rate (incl. 0 = unlimited) so the server
+        // paces correctly in reverse/bidir; matches iperf3, which always sends
+        // it. `bandwidth` is the effective rate after the build-time default
+        // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
+        p.bandwidth = Some(self.bandwidth);
         if self.tos != 0 {
             p.tos = Some(self.tos);
         }
@@ -435,11 +437,9 @@ impl Client {
                         let c = counters.clone();
                         let d = done.clone();
                         let bs = blksize;
-                        let rate = if self.bandwidth > 0 {
-                            self.bandwidth
-                        } else {
-                            DEFAULT_UDP_RATE
-                        };
+                        // Effective rate is resolved at build time (UDP unset →
+                        // 1 Mbit/s); 0 means unlimited — no pacing (#17).
+                        let rate = self.bandwidth;
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -875,7 +875,7 @@ pub struct ClientBuilder {
     no_delay: bool,
     mss: Option<i32>,
     window: Option<i32>,
-    bandwidth: u64,
+    bandwidth: Option<u64>,
     tos: i32,
     congestion: Option<String>,
     udp_counters_64bit: bool,
@@ -934,7 +934,7 @@ impl Default for ClientBuilder {
             no_delay: false,
             mss: None,
             window: None,
-            bandwidth: 0,
+            bandwidth: None,
             tos: 0,
             congestion: None,
             udp_counters_64bit: false,
@@ -1046,7 +1046,9 @@ impl ClientBuilder {
     }
 
     pub fn bandwidth(mut self, bps: u64) -> Self {
-        self.bandwidth = bps;
+        // `Some` even for 0: an explicit `-b 0` means unlimited and must be
+        // distinguishable from "unset" (which resolves to the UDP default) (#17).
+        self.bandwidth = Some(bps);
         self
     }
 
@@ -1334,11 +1336,16 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
-            if self.sendmmsg {
-                return Err(ConfigError::Unsupported(
-                    "sendmmsg is not supported on this platform".into(),
-                ));
-            }
+        }
+
+        // sendmmsg's real implementation is Linux/FreeBSD/NetBSD only; elsewhere
+        // (incl. macOS, which is `unix` but unsupported) it would silently fall
+        // back to the per-packet sender, so reject it at build time instead (#18).
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
+        if self.sendmmsg {
+            return Err(ConfigError::Unsupported(
+                "sendmmsg is only supported on Linux, FreeBSD, and NetBSD".into(),
+            ));
         }
 
         let default_blksize = match self.protocol {
@@ -1367,7 +1374,13 @@ impl ClientBuilder {
             no_delay: self.no_delay,
             mss: self.mss,
             window: self.window,
-            bandwidth: self.bandwidth,
+            // Resolve the rate default now (UDP unset → 1 Mbit/s, like iperf3);
+            // an explicit -b (incl. 0 = unlimited) is honored. TCP default is
+            // unlimited (0). After this, bandwidth==0 unambiguously = unlimited.
+            bandwidth: self.bandwidth.unwrap_or(match self.protocol {
+                TransportProtocol::Udp => DEFAULT_UDP_RATE,
+                TransportProtocol::Tcp => 0,
+            }),
             tos,
             congestion: self.congestion,
             udp_counters_64bit: self.udp_counters_64bit,
@@ -1495,6 +1508,52 @@ mod tests {
             assert_eq!(c.bandwidth, 100_000_000);
             assert_eq!(c.tos, 0x10);
         }
+
+        // -- UDP -b 0 = unlimited (issue #17) --
+
+        #[test]
+        fn udp_unset_bandwidth_defaults_to_1m() {
+            // No -b on UDP resolves to the 1 Mbit/s default (iperf3 parity),
+            // now resolved at build time rather than in the sender.
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, DEFAULT_UDP_RATE);
+        }
+
+        #[test]
+        fn udp_explicit_zero_bandwidth_is_unlimited() {
+            // -b 0 means unlimited (0), NOT the 1 Mbit/s default (#17).
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .bandwidth(0)
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, 0);
+        }
+
+        #[test]
+        fn tcp_unset_bandwidth_is_unlimited() {
+            // TCP default stays unlimited (0).
+            let c = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(c.protocol, TransportProtocol::Tcp);
+            assert_eq!(c.bandwidth, 0);
+        }
+
+        #[test]
+        fn udp_build_params_carries_bandwidth_including_zero() {
+            // The negotiated rate must reach the server (in `len`/`bandwidth`)
+            // so reverse-mode -b 0 is unlimited server-side, not throttled.
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .bandwidth(0)
+                .build()
+                .unwrap();
+            assert_eq!(c.build_params(1460).bandwidth, Some(0));
+        }
+
+        // -- client -B vs -4/-6 build-time validation (issue #15) --
 
         #[test]
         fn bind_address_family_conflict_rejected_at_build() {
