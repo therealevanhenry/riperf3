@@ -27,11 +27,10 @@ if [ "$RIPERF3" = "$IPERF3" ]; then
 fi
 DUR="${INTEROP_DURATION:-2}"
 # Space-separated list of "name|col" keys (e.g. "udp_rev|[r->i]") for cells with a
-# tracked, KNOWN-broken interop bug. Their outcome (pass OR fail) never reds the
-# gate: the #48 teardown reset is a timing race, so a pass doesn't mean "fixed" —
-# just that the race went the other way this run. When the underlying issue is
-# fixed these pass deterministically; remove them here then so the cell becomes
-# required again. Set per iperf3 version by the CI workflow.
+# tracked, KNOWN-broken interop bug, tolerated either way (pass OR fail never reds
+# the gate). Empty by default — no cell is currently xfailed (#48 is fixed). Reserved
+# for a future racy/known-broken interop bug: set it per iperf3 version in the CI
+# workflow, then remove the entry once fixed so the cell is required again.
 XFAIL="${XFAIL:-}"
 XFAIL_REASON="${XFAIL_REASON:-tracked}"
 HOST=127.0.0.1

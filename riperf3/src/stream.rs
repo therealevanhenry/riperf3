@@ -720,8 +720,10 @@ pub async fn run_udp_receiver(
     // Buffer large enough for the negotiated block size or a jumbo datagram
     let mut buf = vec![0u8; blksize.max(65536)];
 
+    let mut drain = false;
     loop {
         if done.load(Ordering::Relaxed) {
+            drain = true;
             break;
         }
 
@@ -746,6 +748,23 @@ pub async fn run_udp_receiver(
             }
             Ok(Err(e)) => log::debug!("UDP recv error: {e}"),
             Err(_) => { /* timeout — re-check done flag */ }
+        }
+    }
+    // Hold the socket open and drain late datagrams until the peer goes quiet, so
+    // a still-sending iperf3 <=3.12 peer isn't reset at teardown (issue #48). The
+    // async sibling of the blocking receiver's drain; a recv that times out with
+    // no datagram means the peer has stopped. (This async variant is currently
+    // unwired — the client/server use run_udp_receiver_blocking — but kept in
+    // parity so the two don't diverge.)
+    if drain {
+        let deadline = tokio::time::Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf)).await {
+                // any datagram (incl. 0-byte — UDP has no EOF): discard, keep open
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break, // silence: the peer has stopped
+            }
         }
     }
     Ok(())
@@ -1054,6 +1073,44 @@ pub fn run_udp_sender_blocking(
     Ok(())
 }
 
+/// Hard cap on the post-test UDP drain (issue #48). The normal exit is a single
+/// read-timeout of silence (the peer has stopped); this only bounds a peer that
+/// floods forever without ever stopping, so the receiver thread can't block
+/// teardown. Deliberately generous — closing early is what reopens the reset.
+const UDP_RECEIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After the test ends, keep the UDP socket OPEN and discard late datagrams until
+/// the peer goes quiet (issue #48 — the UDP analog of the TCP teardown race #23).
+/// In UDP reverse/bidir the peer is the sender and keeps transmitting for a brief
+/// window after our duration ends, until our control-plane TestEnd reaches it.
+/// Closing the socket while it's still sending draws an ICMP port-unreachable, and
+/// an iperf3 <=3.12 sender takes the resulting ECONNRESET as fatal and aborts the
+/// whole control connection (which we'd see as `PeerDisconnected`). There is no
+/// UDP EOF to wait on, so drain until one read-timeout passes with no datagram —
+/// the peer has stopped — bounded by [`UDP_RECEIVER_DRAIN_TIMEOUT`]. Late datagrams
+/// are discarded, not counted: they're outside the test window. The caller must
+/// have set a read timeout on the socket (so a silent recv returns rather than
+/// blocking forever); the blocking receiver sets `SO_RCVTIMEO` for exactly this.
+fn drain_udp_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
+    let deadline = Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
+    while Instant::now() < deadline {
+        match socket.recv(buf) {
+            // Any datagram — including a 0-byte one (UDP has no EOF) — is late
+            // traffic: discard it and keep the socket open.
+            Ok(_) => continue,
+            // A read-timeout with no datagram means the peer has stopped sending:
+            // safe to return now and let the socket close.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// High-performance UDP receiver using blocking I/O on a dedicated OS thread.
 /// No `unsafe` code — uses `std::net::UdpSocket` with a read timeout.
 pub fn run_udp_receiver_blocking(
@@ -1076,8 +1133,10 @@ pub fn run_udp_receiver_blocking(
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(crate::error::RiperfError::Io)?;
 
+    let mut drain = false;
     loop {
         if done.load(Ordering::Relaxed) {
+            drain = true;
             break;
         }
         match socket.recv(&mut buf) {
@@ -1102,6 +1161,12 @@ pub fn run_udp_receiver_blocking(
             }
             Err(_) => break,
         }
+    }
+    // Stopping because the test ended (not because the peer already closed/
+    // errored): hold the socket open and drain late datagrams so a still-sending
+    // iperf3 <=3.12 peer isn't reset (issue #48). See drain_udp_after_done.
+    if drain {
+        drain_udp_after_done(&socket, &mut buf);
     }
     Ok(())
 }
@@ -1791,5 +1856,95 @@ mod tests {
         );
         assert!(done.load(Ordering::Relaxed));
         assert_eq!(counters.bytes_sent(), 0);
+    }
+
+    // ---- issue #48: UDP receiver drains after `done` instead of closing -------
+
+    /// UDP teardown race (issue #48, the UDP analog of #23): when the local
+    /// receiver's duration ends (`done`), it must NOT immediately close its data
+    /// socket while the peer sender is still transmitting. In reverse/bidir the
+    /// peer keeps sending until our control-plane TestEnd reaches it; a datagram
+    /// landing on our closed port draws an ICMP port-unreachable, and an iperf3
+    /// <=3.12 sender treats the resulting ECONNRESET as fatal and aborts the whole
+    /// control connection (surfacing to us as `PeerDisconnected`). The receiver
+    /// must hold the socket open and drain until the peer goes quiet.
+    #[test]
+    fn udp_receiver_drains_after_done_instead_of_closing() {
+        let (send, recv) = udp_pair();
+        let counters = Arc::new(StreamCounters::new());
+        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let c = counters.clone();
+        let s = stats.clone();
+        let d = done.clone();
+        let h = std::thread::spawn(move || run_udp_receiver_blocking(recv, c, s, 1400, d, false));
+
+        let buf = vec![0u8; 1400];
+        // Active phase: datagrams flow and are counted.
+        for _ in 0..10 {
+            let _ = send.send(&buf);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            counters.bytes_received() > 0,
+            "should count during the test"
+        );
+
+        // Duration ends.
+        done.store(true, Ordering::Relaxed);
+
+        // The peer keeps sending in-flight datagrams after `done` (it hasn't seen
+        // our control TestEnd yet). With the fix the receiver holds its socket open
+        // and drains them, so every send keeps succeeding; without it the socket
+        // closes and a later send draws ECONNREFUSED (the ICMP port-unreachable
+        // that resets a <=3.12 peer).
+        let loop_start = Instant::now();
+        let mut send_err = None;
+        for i in 0..30 {
+            if let Err(e) = send.send(&buf) {
+                send_err = Some((i, e));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = loop_start.elapsed();
+
+        // These assertions are only valid if the send loop ran on schedule. If the
+        // process was descheduled long enough that a gap between sends could exceed
+        // the receiver's 500ms silence window (e.g. CI build contention), the drain
+        // may legitimately have seen "silence" and exited — an environmental stall,
+        // not a regression. The loop staying under that window guarantees no single
+        // gap reached the timeout, so a stall can't false-fail this test.
+        if elapsed < Duration::from_millis(400) {
+            assert!(
+                send_err.is_none(),
+                "post-done send #{:?} failed — receiver closed its socket and would reset the peer (#48): {:?}",
+                send_err.as_ref().map(|(i, _)| *i),
+                send_err.as_ref().map(|(_, e)| e),
+            );
+            assert!(
+                !h.is_finished(),
+                "receiver exited while the peer was still sending — would ECONNRESET an iperf3 <=3.12 peer (#48)"
+            );
+        } else {
+            eprintln!(
+                "SKIP timing assertion: post-done send loop took {elapsed:?} (process stalled past the 500ms drain window); reset path not exercised this run"
+            );
+        }
+
+        // Peer stops; the receiver drains to silence and exits cleanly within the cap.
+        let start = Instant::now();
+        let res = loop {
+            if h.is_finished() {
+                break h.join().expect("receiver thread panicked");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(12),
+                "receiver did not exit after the peer went quiet (drain cap exceeded)"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(res.is_ok(), "receiver returned error: {res:?}");
     }
 }
