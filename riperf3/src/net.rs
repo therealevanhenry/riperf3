@@ -699,8 +699,11 @@ mod tests {
 
     // ---- Regression tests for issue #1: server binds IPv4 only ------------
     //
-    // These tests are written before the implementation. They MUST fail on
-    // `main`'s default-IPv4 behavior and pass after the dual-stack fix lands.
+    // `tcp_listen_dual_stack_default` and `tcp_listen_ipv6_only` are genuine
+    // regressions: they fail on `main`'s default-IPv4 behavior and pass after
+    // the dual-stack fix. `tcp_listen_ipv4_only` is a guard for behavior that
+    // was already correct on `main` (`Some(4)` always meant `0.0.0.0`); it's
+    // kept to lock that in.
 
     /// Default listener (`ip_version=None`) must accept both IPv4 and IPv6
     /// clients on the same port — matches iperf3's dual-stack default.
@@ -771,6 +774,10 @@ mod tests {
         let v4 = tcp_connect("127.0.0.1", port, None, None, false).await;
         match v4 {
             Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(RiperfError::Io(ref e)) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                // No IPv4 loopback on this host — can't exercise the refusal.
+                eprintln!("SKIP tcp_listen_ipv6_only: 127.0.0.1 unavailable");
+            }
             Ok(_) => panic!("IPv4 connect should fail against IPv6-only listener"),
             Err(e) => panic!("unexpected error from IPv4 connect: {e:?}"),
         }
