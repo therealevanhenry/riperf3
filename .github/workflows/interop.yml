@@ -1,0 +1,52 @@
+name: Interop
+
+# Wire-compatibility gate against a real iperf3, built from source at pinned
+# versions. The in-repo tests are riperf3<->riperf3 loopback only and cannot
+# catch a wire/JSON value that is wrong against actual iperf3 (issue #38); this
+# job can. Loopback, so it asserts protocol interop + data transfer, not speed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: iperf3 ${{ matrix.iperf3 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Legacy target (exercises riperf3's iperf3<=3.12 compat shims:
+        # issues #23, #24, the legacy UDP connect reply) + latest release.
+        iperf3: ["3.12", "3.21"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install iperf3 build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends automake autoconf libtool
+
+      - name: Build iperf3 ${{ matrix.iperf3 }} from source
+        run: echo "IPERF3_BIN=$(bash scripts/build-iperf3.sh '${{ matrix.iperf3 }}' "$RUNNER_TEMP/iperf3")" >> "$GITHUB_ENV"
+
+      - name: Build riperf3 (release)
+        run: cargo build --release --bin riperf3
+
+      - name: Run interop matrix
+        env:
+          INTEROP_DURATION: "1"
+        run: |
+          # iperf3 <=3.12 aborts the control connection on the late UDP send
+          # error at reverse/bidir teardown (issue #48, UDP analog of #23).
+          # Tracked as xfail until fixed; the gate flips red if it starts passing.
+          if [ "${{ matrix.iperf3 }}" = "3.12" ]; then
+            export XFAIL="udp_rev|[r->i] udp_bidir|[r->i]"
+            export XFAIL_REASON="#48 UDP reverse/bidir teardown resets iperf3<=3.12"
+          fi
+          bash scripts/interop.sh target/release/riperf3 "$IPERF3_BIN"
