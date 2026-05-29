@@ -311,11 +311,12 @@ impl Server {
                 for i in 0..total {
                     // Accept: recv magic, connect() to client, send reply.
                     // Bounded so a client that never connects fails the test
-                    // instead of hanging setup forever (#11); generous enough
-                    // to cover the client's handshake retransmits.
+                    // instead of hanging setup forever (#11); uses the same
+                    // budget as the client's handshake so neither side aborts
+                    // while the other is still retrying.
                     let _client_addr = protocol::udp_connect_server(
                         &udp_listener,
-                        std::time::Duration::from_secs(10),
+                        protocol::UDP_CONNECT_TOTAL_TIMEOUT,
                     )
                     .await?;
                     // The listener is now locked to this client — use it as the data socket

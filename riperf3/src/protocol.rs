@@ -343,7 +343,13 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
 // UDP "connect" handshake
 // ---------------------------------------------------------------------------
 
-const UDP_CONNECT_RETRIES: usize = 5;
+/// Total time the client keeps (re)sending its connect magic while waiting for
+/// the server's reply. Matches iperf3's ~30s connect read timeout so a slow or
+/// lossy (high-RTT) path isn't given up on earlier than iperf3 would. Also used
+/// by the server as its per-stream connect wait, so neither side aborts while
+/// the other is still trying.
+pub const UDP_CONNECT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often the client resends the magic while waiting (recovers a lost magic).
 const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Client-side UDP connect handshake.
@@ -351,19 +357,25 @@ const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
 ///
 /// The handshake is over UDP, so a lost magic word or reply would otherwise
-/// stall setup forever (issue #11). The client resends its magic and waits a
-/// bounded interval per attempt, giving up after a few retries. A non-reply
-/// datagram (a stray/early packet) is ignored rather than treated as a fatal
-/// error — like iperf3, which drains a couple of packets while waiting for the
-/// reply. This is a riperf3 addition (iperf3's own client sends the magic once
-/// and relies on a long socket read timeout); resending a magic the server
-/// already received just yields a duplicate reply, which is harmless, so it
-/// stays interoperable with an iperf3 server either way.
+/// stall setup forever (issue #11). The client resends its magic every
+/// `UDP_CONNECT_RETRY_INTERVAL` until it gets the reply or the overall
+/// `UDP_CONNECT_TOTAL_TIMEOUT` (~iperf3's read-timeout budget) elapses, then
+/// errors instead of hanging. A non-reply datagram (a stray/early packet) is
+/// ignored rather than treated fatally — like iperf3, which drains packets
+/// while waiting for the reply. The retransmit is a riperf3 addition (iperf3's
+/// own client sends the magic once and relies on a long read timeout);
+/// resending a magic the server already received just yields a duplicate reply,
+/// which is harmless, so it stays interoperable with an iperf3 server.
 pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     let mut buf = [0u8; 4];
-    for _ in 0..UDP_CONNECT_RETRIES {
+    let deadline = tokio::time::Instant::now() + UDP_CONNECT_TOTAL_TIMEOUT;
+    let mut saw_traffic = false;
+    while tokio::time::Instant::now() < deadline {
         socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
-        match tokio::time::timeout(UDP_CONNECT_RETRY_INTERVAL, socket.recv(&mut buf)).await {
+        let wait = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(UDP_CONNECT_RETRY_INTERVAL);
+        match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
             Ok(Ok(n))
                 if n >= 4 && {
                     let reply = u32::from_ne_bytes(buf);
@@ -374,14 +386,19 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
             }
             // A stray/short datagram that isn't the reply: ignore and resend
             // (the real reply may be a stream-setup or late packet behind it).
-            Ok(Ok(_)) => continue,
+            Ok(Ok(_)) => {
+                saw_traffic = true;
+                continue;
+            }
             Ok(Err(e)) => return Err(RiperfError::Io(e)),
             Err(_) => continue, // timed out waiting for reply — resend the magic
         }
     }
-    Err(RiperfError::Protocol(
-        "UDP connect handshake timed out (no server reply)".into(),
-    ))
+    Err(RiperfError::Protocol(if saw_traffic {
+        "UDP connect handshake failed: no valid reply (only unexpected datagrams received)".into()
+    } else {
+        "UDP connect handshake timed out (no server reply)".into()
+    }))
 }
 
 /// Server-side UDP connect handshake.
@@ -667,8 +684,10 @@ mod tests {
     }
 
     /// Issue #11: the client gives up (not hangs) if the server never replies,
-    /// after retransmitting its magic a bounded number of times.
-    #[tokio::test]
+    /// after exhausting its retransmit budget. Uses a paused clock so the full
+    /// ~30s budget elapses in virtual time (instant in real time), and asserts
+    /// the *lower* bound too — it must actually wait the budget, not bail early.
+    #[tokio::test(start_paused = true)]
     async fn udp_connect_client_times_out_when_no_reply() {
         // A bound socket that never replies (nothing recv_from's it).
         let dead_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -676,14 +695,18 @@ mod tests {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_sock.connect(dead_addr).await.unwrap();
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let res = udp_connect_client(&client_sock).await;
+        let elapsed = start.elapsed();
         assert!(res.is_err(), "expected handshake to fail, got {res:?}");
-        // 5 retries × 500ms ≈ 2.5s; bound generously but finite.
+        // Must have waited essentially the whole budget (retried), not bailed.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(6),
-            "client should give up after bounded retries, took {:?}",
-            start.elapsed()
+            elapsed >= UDP_CONNECT_TOTAL_TIMEOUT - UDP_CONNECT_RETRY_INTERVAL,
+            "client gave up too early ({elapsed:?}); should retry for the full budget"
+        );
+        assert!(
+            elapsed <= UDP_CONNECT_TOTAL_TIMEOUT + UDP_CONNECT_RETRY_INTERVAL,
+            "client overran its budget ({elapsed:?})"
         );
     }
 

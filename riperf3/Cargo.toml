@@ -31,3 +31,8 @@ nix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[dev-dependencies]
+# test-util enables tokio's paused virtual clock (`start_paused`) so
+# timeout-budget tests run instantly instead of waiting real seconds. Test-only.
+tokio = { workspace = true, features = ["test-util"] }
