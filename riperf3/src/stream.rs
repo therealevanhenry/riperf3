@@ -526,6 +526,25 @@ fn tempfile_in(dir: std::path::PathBuf) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+/// Hard cap on how long the receiver drains the data socket after its test
+/// duration ends, waiting for the peer to close it (issue #23). A well-behaved
+/// peer (iperf3/riperf3) closes its data socket at teardown, so EOF normally
+/// arrives long before this — even on a high-RTT link where result exchange runs
+/// for seconds, or one lossy enough to stall the stream past a retransmit
+/// timeout. The cap is *only* a hang guard: it bounds a peer that stops sending
+/// but never closes, so the receiver task — and the client's join on it — can't
+/// block forever. Deliberately generous, since closing early is what reopens the
+/// EPIPE this fix exists to prevent.
+const RECEIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a receive loop returned: the test duration ended (`done`), or the peer
+/// closed/reset the socket first. Only `Done` needs a post-loop drain — a peer
+/// that already closed has nothing left to send and cannot be EPIPE'd.
+enum RecvStop {
+    Done,
+    PeerClosed,
+}
+
 /// TCP receiver: reads until the peer closes the connection or `done` is set.
 /// If `skip_rx_copy` is true, uses MSG_TRUNC to avoid copying data (Linux only).
 /// If `file_path` is set, writes received data to the file.
@@ -549,39 +568,80 @@ pub async fn run_tcp_receiver(
         })
         .transpose()?;
 
-    if skip_rx_copy {
+    let stop = if skip_rx_copy {
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = stream.as_raw_fd();
-            loop {
-                if done.load(Ordering::Relaxed) {
-                    break;
-                }
-                stream.readable().await?;
-                let n = stream.try_io(tokio::io::Interest::READABLE, || {
-                    nix::sys::socket::recv(fd, &mut buf, nix::sys::socket::MsgFlags::MSG_TRUNC)
-                        .map_err(std::io::Error::from)
-                });
-                match n {
-                    Ok(0) => break,
-                    Ok(n) => counters.record_received(n as u64),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            run_tcp_receiver_msgtrunc(&mut stream, &counters, &mut buf, &done).await?
         }
         #[cfg(not(target_os = "linux"))]
         {
-            // Fallback: normal read path
-            return run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file)
-                .await;
+            run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await?
         }
     } else {
-        run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await?;
+        run_tcp_receiver_normal(&mut stream, &counters, &mut buf, &done, &mut file).await?
+    };
+
+    // Reverse/bidir teardown (issue #23): once our duration ends we must not slam
+    // the data socket shut while the peer sender is still writing — a remote
+    // iperf3 (<= 3.12) treats the resulting EPIPE as fatal and aborts the whole
+    // control connection, which we'd see as `PeerDisconnected`. iperf3 keeps data
+    // sockets open through result exchange and lets the peer initiate the close.
+    // Mirror that: drain (read and discard, without counting) and let the peer
+    // close first, so the teardown is always clean from its side.
+    if matches!(stop, RecvStop::Done) {
+        drain_until_peer_closes(&mut stream, &mut buf).await;
     }
     Ok(())
+}
+
+/// After the test ends, hold the data socket open and drain (read and discard)
+/// until the peer closes it (EOF) — never closing first, so we can't EPIPE a peer
+/// still finishing its send (issue #23). Waiting on the peer's close, rather than
+/// on a silence window, is what makes this robust on slow or lossy links: a
+/// mid-stream stall longer than any fixed grace would otherwise look like "peer
+/// done" and trip an early close. `RECEIVER_DRAIN_TIMEOUT` is only a hang guard
+/// for a peer that goes silent but never closes.
+async fn drain_until_peer_closes(stream: &mut TcpStream, buf: &mut [u8]) {
+    let _ = tokio::time::timeout(RECEIVER_DRAIN_TIMEOUT, async {
+        loop {
+            match stream.read(buf).await {
+                Ok(0) => break,    // peer closed — fully drained
+                Ok(_) => continue, // in-flight data — discard, keep the socket open
+                Err(_) => break,   // socket error — nothing left to drain
+            }
+        }
+    })
+    .await;
+}
+
+#[cfg(target_os = "linux")]
+async fn run_tcp_receiver_msgtrunc(
+    stream: &mut TcpStream,
+    counters: &StreamCounters,
+    buf: &mut [u8],
+    done: &AtomicBool,
+) -> Result<RecvStop> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    loop {
+        if done.load(Ordering::Relaxed) {
+            return Ok(RecvStop::Done);
+        }
+        stream.readable().await?;
+        let n = stream.try_io(tokio::io::Interest::READABLE, || {
+            nix::sys::socket::recv(fd, buf, nix::sys::socket::MsgFlags::MSG_TRUNC)
+                .map_err(std::io::Error::from)
+        });
+        match n {
+            Ok(0) => return Ok(RecvStop::PeerClosed),
+            Ok(n) => counters.record_received(n as u64),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(RecvStop::PeerClosed)
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 async fn run_tcp_receiver_normal(
@@ -590,13 +650,13 @@ async fn run_tcp_receiver_normal(
     buf: &mut [u8],
     done: &AtomicBool,
     file: &mut Option<std::fs::File>,
-) -> Result<()> {
+) -> Result<RecvStop> {
     loop {
         if done.load(Ordering::Relaxed) {
-            break;
+            return Ok(RecvStop::Done);
         }
         match stream.read(buf).await {
-            Ok(0) => break,
+            Ok(0) => return Ok(RecvStop::PeerClosed),
             Ok(n) => {
                 counters.record_received(n as u64);
                 if let Some(ref mut f) = file {
@@ -604,11 +664,12 @@ async fn run_tcp_receiver_normal(
                     let _ = f.write_all(&buf[..n]);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(RecvStop::PeerClosed)
+            }
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,6 +1487,71 @@ mod tests {
 
         assert!(send_counters.bytes_sent() > 0);
         assert!(recv_counters.bytes_received() > 0);
+    }
+
+    // ---- issue #23: receiver drains after `done` instead of resetting peer --
+
+    /// Reverse-mode teardown race (issue #23): when the local receiver's test
+    /// duration ends (`done` is set), it must NOT immediately close its data
+    /// socket while the peer sender is still writing. A remote iperf3 (<= 3.12)
+    /// treats the resulting EPIPE as fatal and aborts the whole control
+    /// connection, which surfaces to riperf3 as `PeerDisconnected`. The receiver
+    /// must keep draining until the peer stops/closes, so in-flight writes after
+    /// `done` still land rather than resetting the peer.
+    async fn receiver_drains_after_done(skip_rx_copy: bool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut sender = TcpStream::connect(addr).await.unwrap();
+        let (recv_sock, _) = listener.accept().await.unwrap();
+
+        let recv_counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let rc = recv_counters.clone();
+        let receiver = tokio::spawn(async move {
+            run_tcp_receiver(recv_sock, rc, 64 * 1024, d, skip_rx_copy, None).await
+        });
+
+        let block = vec![0u8; 64 * 1024];
+
+        // Data phase: peer is actively sending.
+        sender.write_all(&block).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Duration ends — the receiver observes `done`.
+        done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The peer keeps writing in-flight blocks after `done`. Every write must
+        // succeed: the receiver holds the socket open and drains rather than
+        // closing, so none of these surface as BrokenPipe/ConnectionReset.
+        for i in 0..20 {
+            sender
+                .write_all(&block)
+                .await
+                .unwrap_or_else(|e| panic!("post-done write #{i} must not fail (peer reset): {e}"));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Peer finishes and closes; the receiver drains to EOF and exits cleanly.
+        drop(sender);
+        let res = tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("receiver must finish after peer closes")
+            .expect("receiver task panicked");
+        assert!(res.is_ok(), "receiver returned error: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn tcp_receiver_drains_after_done_normal_path() {
+        receiver_drains_after_done(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_receiver_drains_after_done_msgtrunc_path() {
+        receiver_drains_after_done(true).await;
     }
 
     // ---- issue #5: UDP senders self-enforce the wall-clock deadline ---------
