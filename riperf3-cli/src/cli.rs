@@ -154,7 +154,7 @@ pub struct Cli {
     #[arg(short = 'N', long = "no-delay")]
     pub no_delay: bool,
 
-    /// Target bitrate in bits/sec (0 = unlimited for TCP, 1M default for UDP)
+    /// Target bitrate in bits/sec (0 = unlimited; default: unlimited TCP, 1M UDP)
     #[arg(short = 'b', long, value_name = "rate[/burst]")]
     pub bitrate: Option<String>,
 
