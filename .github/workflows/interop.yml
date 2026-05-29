@@ -54,16 +54,10 @@ jobs:
       - name: Build riperf3 (release)
         run: cargo build --release --bin riperf3
 
+      # No XFAILs: #48 (UDP rev/bidir teardown reset vs iperf3 <=3.12) is fixed, so
+      # every cell is required on both versions. The harness still supports XFAIL
+      # (interop.sh) for any future tracked known-issue.
       - name: Run interop matrix
         env:
           INTEROP_DURATION: "1"
-        run: |
-          # iperf3 <=3.12 aborts the control connection on the late UDP send error
-          # at reverse/bidir teardown (#48, the UDP analog of #23) — a timing race,
-          # so these cells pass/fail nondeterministically. Tracked as a soft xfail
-          # (tolerated either way, never reds the gate); remove once #48 is fixed.
-          if [ "${{ matrix.iperf3 }}" = "3.12" ]; then
-            export XFAIL="udp_rev|[r->i] udp_bidir|[r->i]"
-            export XFAIL_REASON="#48 UDP reverse/bidir teardown resets iperf3<=3.12"
-          fi
-          bash scripts/interop.sh target/release/riperf3 "$IPERF3_BIN"
+        run: bash scripts/interop.sh target/release/riperf3 "$IPERF3_BIN"
