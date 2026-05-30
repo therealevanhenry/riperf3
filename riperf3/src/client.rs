@@ -1442,7 +1442,8 @@ impl ClientBuilder {
     }
 
     pub fn fq_rate_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
-        Ok(self.fq_rate(parse_kmg(s)?))
+        // --fq-rate is a rate: decimal (1000-based) suffixes, like iperf3 (#56).
+        Ok(self.fq_rate(crate::utils::parse_rate(s)?))
     }
 
     pub fn build(self) -> std::result::Result<Client, ConfigError> {

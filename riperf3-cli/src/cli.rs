@@ -683,7 +683,7 @@ mod cli_tests {
         fn bitrate_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-b", "100M"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.bandwidth, 100 * 1024 * 1024);
+            assert_eq!(c.bandwidth, 100 * 1_000_000); // -b is decimal, like iperf3 (#56)
         }
 
         #[test]
@@ -776,7 +776,7 @@ mod cli_tests {
             assert!(c.bidir);
             assert!(c.no_delay);
             assert_eq!(c.blksize, 1460);
-            assert_eq!(c.bandwidth, 100 * 1024 * 1024);
+            assert_eq!(c.bandwidth, 100 * 1_000_000); // -b is decimal, like iperf3 (#56)
             assert!(c.json_output);
             assert_eq!(c.window, Some(512 * 1024));
             assert_eq!(c.mss, Some(1400));
@@ -889,7 +889,7 @@ mod cli_tests {
         fn fq_rate_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--fq-rate", "1G"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.fq_rate, Some(1024 * 1024 * 1024));
+            assert_eq!(c.fq_rate, Some(1_000_000_000)); // --fq-rate is decimal (#56)
         }
 
         #[test]

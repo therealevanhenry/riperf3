@@ -155,45 +155,80 @@ pub fn resolve_udp_blksize(explicit: Option<usize>, ctrl_mss: Option<u32>) -> us
 // KMG suffix parser
 // ---------------------------------------------------------------------------
 
-/// Parse a numeric string with an optional K/M/G/T suffix (case-insensitive).
-/// K = 1024, M = 1024^2, G = 1024^3, T = 1024^4.
-///
-/// Examples: "128K" -> 131072, "1M" -> 1048576, "10G" -> 10737418240, "42" -> 42
-pub fn parse_kmg(s: &str) -> std::result::Result<u64, ConfigError> {
+/// Parse a numeric string with an optional K/M/G/T suffix (case-insensitive),
+/// where each suffix level multiplies by `base` (K=base, M=base^2, G=base^3,
+/// T=base^4). iperf3 splits this: *sizes* use 1024 (`unit_atof`), *rates* use
+/// 1000 (`unit_atof_rate`).
+fn parse_suffixed(s: &str, base: u64) -> std::result::Result<u64, ConfigError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(ConfigError::InvalidValue("number", s.to_string()));
     }
 
     let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024_u64),
-        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024_u64 * 1024),
-        Some(b'g' | b'G') => (&s[..s.len() - 1], 1024_u64 * 1024 * 1024),
-        Some(b't' | b'T') => (&s[..s.len() - 1], 1024_u64 * 1024 * 1024 * 1024),
+        Some(b'k' | b'K') => (&s[..s.len() - 1], base),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], base * base),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], base * base * base),
+        Some(b't' | b'T') => (&s[..s.len() - 1], base * base * base * base),
         _ => (s, 1),
     };
 
-    let base: u64 = num_str
+    // Parse the numeric part as f64 so fractional values work (e.g. "1.5M" ->
+    // 1.5 * multiplier), matching iperf3's `sscanf("%lf", ...)` for normal
+    // decimal input (incl. scientific / leading-sign / leading-dot). Scale then
+    // truncate to u64 like iperf3's double->int. The non-finite/negative/overflow
+    // guards are a deliberate improvement, NOT iperf3 parity: iperf3 doesn't guard
+    // these and silently emits garbage (inf->0, nan->i64::MAX, overflow->junk) —
+    // we error cleanly instead. (One niche input iperf3 accepts that we don't: hex
+    // like "0x10"; immaterial for a bitrate/size.)
+    let n: f64 = num_str
         .parse()
         .map_err(|_| ConfigError::InvalidValue("number", s.to_string()))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(ConfigError::InvalidValue("number", s.to_string()));
+    }
+    let scaled = n * multiplier as f64;
+    if scaled >= u64::MAX as f64 {
+        return Err(ConfigError::InvalidValue(
+            "number",
+            format!("{s} overflows u64"),
+        ));
+    }
+    Ok(scaled as u64)
+}
 
-    base.checked_mul(multiplier)
-        .ok_or_else(|| ConfigError::InvalidValue("number", format!("{s} overflows u64")))
+/// Parse a SIZE with an optional K/M/G/T suffix — **binary** (1024-based),
+/// matching iperf3's `unit_atof` for `-w`/`-l`/`-n`/`-k`.
+///
+/// Examples: "128K" -> 131072, "1M" -> 1048576, "10G" -> 10737418240, "42" -> 42
+pub fn parse_kmg(s: &str) -> std::result::Result<u64, ConfigError> {
+    parse_suffixed(s, 1024)
+}
+
+/// Parse a RATE (bits/sec) with an optional K/M/G/T suffix — **decimal**
+/// (1000-based), matching iperf3's `unit_atof_rate` for `-b`/`--fq-rate`.
+/// iperf3 parses sizes with 1024 but rates with 1000, so "1M" as a rate is
+/// 1_000_000, not 1_048_576 (#56).
+///
+/// Examples: "1M" -> 1_000_000, "10G" -> 10_000_000_000, "42" -> 42
+pub fn parse_rate(s: &str) -> std::result::Result<u64, ConfigError> {
+    parse_suffixed(s, 1000)
 }
 
 /// Parse a bitrate string with optional KMG suffix and optional burst count.
 /// Format: `<rate>[KMG][/<burst>]`
-/// Returns (rate_bits_per_sec, burst_packets).
+/// Returns (rate_bits_per_sec, burst_packets). The rate uses decimal (1000-based)
+/// suffixes like iperf3 (`-b`), e.g. "100M" -> 100_000_000 (#56).
 pub fn parse_bitrate(s: &str) -> std::result::Result<(u64, u32), ConfigError> {
     let s = s.trim();
     if let Some((rate_str, burst_str)) = s.split_once('/') {
-        let rate = parse_kmg(rate_str)?;
+        let rate = parse_rate(rate_str)?;
         let burst: u32 = burst_str
             .parse()
             .map_err(|_| ConfigError::InvalidValue("burst count", burst_str.to_string()))?;
         Ok((rate, burst))
     } else {
-        let rate = parse_kmg(s)?;
+        let rate = parse_rate(s)?;
         Ok((rate, 0))
     }
 }
@@ -249,12 +284,53 @@ mod tests {
 
     #[test]
     fn parse_bitrate_plain() {
-        assert_eq!(parse_bitrate("100M").unwrap(), (100 * 1024 * 1024, 0));
+        // Rates are decimal (1000-based), like iperf3: 100M = 100_000_000.
+        assert_eq!(parse_bitrate("100M").unwrap(), (100 * 1_000_000, 0));
     }
 
     #[test]
     fn parse_bitrate_with_burst() {
-        assert_eq!(parse_bitrate("100M/10").unwrap(), (100 * 1024 * 1024, 10));
+        assert_eq!(parse_bitrate("100M/10").unwrap(), (100 * 1_000_000, 10));
+    }
+
+    #[test]
+    fn parse_rate_is_decimal() {
+        // Rates use 1000-based suffixes (iperf3's unit_atof_rate).
+        assert_eq!(parse_rate("1K").unwrap(), 1_000);
+        assert_eq!(parse_rate("1M").unwrap(), 1_000_000);
+        assert_eq!(parse_rate("10G").unwrap(), 10_000_000_000);
+        assert_eq!(parse_rate("42").unwrap(), 42);
+        assert_eq!(parse_rate("1m").unwrap(), 1_000_000); // case-insensitive
+    }
+
+    #[test]
+    fn rate_and_size_suffix_bases_differ() {
+        // The crux of #56: the same "1M" is 1000^2 as a rate, 1024^2 as a size.
+        assert_eq!(parse_rate("1M").unwrap(), 1_000_000);
+        assert_eq!(parse_kmg("1M").unwrap(), 1_048_576);
+        assert_ne!(parse_rate("1M").unwrap(), parse_kmg("1M").unwrap());
+    }
+
+    #[test]
+    fn fractional_suffixes_accepted() {
+        // #73: iperf3 parses the numeric part with %lf, so fractional values work.
+        assert_eq!(parse_rate("1.5M").unwrap(), 1_500_000); // 1.5 * 1000^2
+        assert_eq!(parse_kmg("1.5K").unwrap(), 1_536); // 1.5 * 1024
+        assert_eq!(parse_kmg("0.5M").unwrap(), 524_288); // 0.5 * 1024^2
+        assert_eq!(parse_bitrate("2.5M").unwrap(), (2_500_000, 0));
+        // Plain integers and the exact-value tests above still hold (f64 is exact
+        // for these magnitudes).
+        assert_eq!(parse_rate("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn rejects_non_finite_negative_and_garbage() {
+        assert!(parse_rate("-5M").is_err()); // negative
+        assert!(parse_rate("inf").is_err()); // non-finite
+        assert!(parse_kmg("nanK").is_err());
+        assert!(parse_kmg("1.5.5M").is_err()); // not a number
+        assert!(parse_kmg("abc").is_err());
+        assert!(parse_kmg("K").is_err()); // suffix only, no number
     }
 
     // -- parse_keepalive --
