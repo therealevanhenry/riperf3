@@ -969,10 +969,15 @@ impl Client {
             congestion_used: None,
             cookie: start_meta.cookie.clone(),
             tcp_mss_default: start_meta.tcp_mss_default,
+            // -M/--set-mss request: emitted as start.tcp_mss (TCP only), which
+            // suppresses tcp_mss_default. build() does the TCP/UDP gating.
+            mss: self.mss.filter(|&m| m > 0).map(|m| m as u32),
             fq_rate: self.fq_rate.unwrap_or(0),
             // iperf3's start.sock_bufsize is the requested -w value (0 if unset);
             // sndbuf/rcvbuf_actual are the kernel's actual sizes on a data socket.
-            sock_bufsize: self.window.map(|w| w as u64).unwrap_or(0),
+            // .max(0): the public builder accepts an i32 window; clamp so a
+            // negative can't wrap to a huge u64 (the CLI path is already >= 0).
+            sock_bufsize: self.window.map(|w| w.max(0) as u64).unwrap_or(0),
             sndbuf_actual: streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0),
             rcvbuf_actual: streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0),
             interval: self.interval.unwrap_or(1.0),

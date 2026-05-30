@@ -50,7 +50,13 @@ pub struct Start {
     pub timestamp: Timestamp,
     pub connecting_to: ConnectingTo,
     pub cookie: String,
-    pub tcp_mss_default: u32,
+    // iperf3 emits exactly one of these, and only for TCP (iperf_api.c:1021):
+    // `tcp_mss` when `-M`/`--set-mss` was given, else `tcp_mss_default` (the
+    // control-socket MSS). UDP emits neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_mss: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_mss_default: Option<u32>,
     pub target_bitrate: u64,
     pub fq_rate: u64,
     pub sock_bufsize: u64,
@@ -349,7 +355,12 @@ pub struct ReportInput {
     pub congestion_used: Option<String>,
     // start{} metadata (PR3).
     pub cookie: String,
+    /// The control-socket MSS, emitted as `start.tcp_mss_default` for a TCP test
+    /// that did not pass `-M`.
     pub tcp_mss_default: u32,
+    /// The requested `-M`/`--set-mss` value, if any. When set on a TCP test it is
+    /// emitted as `start.tcp_mss` and suppresses `tcp_mss_default` (iperf3 parity).
+    pub mss: Option<u32>,
     pub fq_rate: u64,
     pub sock_bufsize: u64,
     pub sndbuf_actual: u64,
@@ -569,6 +580,17 @@ impl ReportInput {
         };
 
         let secs = self.start_time_millis / 1000;
+        // iperf3 (iperf_api.c:1021) emits the MSS key only for TCP, and picks
+        // exactly one: `tcp_mss` when `-M` was given, else `tcp_mss_default`.
+        // UDP emits neither. `self.mss.filter(|&m| m > 0)` mirrors iperf3's
+        // `if (settings->mss)` truthiness check.
+        let (tcp_mss, tcp_mss_default) = if is_udp {
+            (None, None)
+        } else if let Some(m) = self.mss.filter(|&m| m > 0) {
+            (Some(m), None)
+        } else {
+            (None, Some(self.tcp_mss_default))
+        };
         Report {
             start: Start {
                 connected,
@@ -584,7 +606,8 @@ impl ReportInput {
                     port: self.connecting_port,
                 },
                 cookie: self.cookie.clone(),
-                tcp_mss_default: self.tcp_mss_default,
+                tcp_mss,
+                tcp_mss_default,
                 target_bitrate: self.target_bitrate,
                 fq_rate: self.fq_rate,
                 sock_bufsize: self.sock_bufsize,
@@ -800,6 +823,7 @@ mod tests {
             congestion_used: Some("cubic".into()),
             cookie: "testcookie000000000000000000000000000".into(),
             tcp_mss_default: 1448,
+            mss: None,
             fq_rate: 0,
             sock_bufsize: 0,
             sndbuf_actual: 16384,
@@ -982,9 +1006,14 @@ mod tests {
         assert_eq!(ts["timemillisecs"], 1_780_107_649_449u64);
         assert_eq!(ts["timesecs"], 1_780_107_649u64);
         assert_eq!(ts["time"], "Sat, 30 May 2026 02:20:49 GMT");
-        // pass-through metadata.
+        // pass-through metadata. TCP without -M: tcp_mss_default present, tcp_mss
+        // absent (iperf3 emits exactly one).
         assert_eq!(start["cookie"], "testcookie000000000000000000000000000");
         assert_eq!(start["tcp_mss_default"], 1448);
+        assert!(
+            start.get("tcp_mss").is_none(),
+            "tcp_mss must be absent: {start}"
+        );
         assert_eq!(start["sndbuf_actual"], 16384);
         assert_eq!(start["rcvbuf_actual"], 87380);
         // test_start additions.
@@ -993,6 +1022,36 @@ mod tests {
         assert_eq!(test_start["interval"], 1.0);
         assert_eq!(test_start["gso"], 0);
         assert_eq!(test_start["gro"], 0);
+    }
+
+    #[test]
+    fn udp_start_omits_tcp_mss_keys() {
+        // iperf3 (iperf_api.c:1021) gates the MSS key on SOCK_STREAM; a UDP test
+        // emits neither tcp_mss nor tcp_mss_default.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.mss = Some(1400); // even with -M, UDP must not emit either key
+        input.streams = vec![tcp_stream(1, false, 1000, 1000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert!(start.get("tcp_mss").is_none(), "{start}");
+        assert!(start.get("tcp_mss_default").is_none(), "{start}");
+    }
+
+    #[test]
+    fn set_mss_emits_tcp_mss_and_suppresses_default() {
+        // TCP with -M/--set-mss: iperf3 emits tcp_mss = <value> and omits
+        // tcp_mss_default (the two are mutually exclusive).
+        let mut input = base_input();
+        input.mss = Some(1400);
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert_eq!(start["tcp_mss"], 1400);
+        assert!(
+            start.get("tcp_mss_default").is_none(),
+            "tcp_mss_default must be suppressed under -M: {start}"
+        );
     }
 
     #[test]
