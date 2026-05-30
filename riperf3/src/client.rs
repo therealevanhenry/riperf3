@@ -154,6 +154,9 @@ impl Client {
         // Released at TestStart so UDP senders don't transmit during stream
         // setup (issue #5): the create-streams handshake is lost under a flood.
         let start = Arc::new(AtomicBool::new(false));
+        // Interval samples + TCP_INFO extremes the reporter collects during the
+        // run, read back at DisplayResults for the `-J` blob (#36 PR2).
+        let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
         let mut streams: Vec<DataStream> = Vec::new();
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
@@ -179,7 +182,8 @@ impl Client {
                 }
 
                 TestState::TestRunning => {
-                    self.run_test(&mut ctrl, &streams, &done, blksize).await?;
+                    self.run_test(&mut ctrl, &streams, &done, blksize, interval_data.clone())
+                        .await?;
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
                 }
@@ -196,6 +200,7 @@ impl Client {
                         cpu_start.as_ref(),
                         server_results.as_ref(),
                         blksize,
+                        &interval_data,
                     );
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
@@ -541,11 +546,15 @@ impl Client {
         streams: &[DataStream],
         done: &Arc<AtomicBool>,
         blksize: usize,
+        collector: Arc<Mutex<crate::reporter::CollectedIntervals>>,
     ) -> Result<()> {
-        // Spawn interval reporter (unless plain JSON output without streaming)
+        // Run the interval reporter whenever intervals are enabled. It prints
+        // live for text / json-stream; for plain -J it runs silently to collect
+        // intervals for the final blob (#36 PR2).
         let interval_secs = self.interval.unwrap_or(1.0);
-        let use_intervals = interval_secs > 0.0 && (!self.json_output || self.json_stream);
-        let interval_handle = if use_intervals {
+        let print_intervals = !self.json_output || self.json_stream;
+        let collect_intervals = self.json_output && !self.json_stream;
+        let interval_handle = if interval_secs > 0.0 {
             let stream_refs: Vec<_> = streams
                 .iter()
                 .map(|s| crate::reporter::IntervalStreamRef {
@@ -566,9 +575,12 @@ impl Client {
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
+                    print: print_intervals,
+                    blksize,
                 },
                 stream_refs,
                 done.clone(),
+                collect_intervals.then(|| collector.clone()),
             )
         } else {
             None
@@ -706,9 +718,10 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
     ) {
         if self.json_output {
-            self.print_results_json(streams, cpu_start, remote_cpu, blksize);
+            self.print_results_json(streams, cpu_start, remote_cpu, blksize, interval_data);
         } else {
             self.print_results_text(streams, remote_cpu);
         }
@@ -773,8 +786,21 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
     ) {
-        use crate::json_report::{CpuUtilization, ReportInput, StreamReport, UdpStreamStats};
+        use crate::json_report::{
+            CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
+        };
+
+        // Take the interval samples + per-stream extremes the reporter collected.
+        // Its task has been joined by now (run_test awaits it), so this is final.
+        let (collected_intervals, extremes) = match interval_data.lock() {
+            Ok(mut g) => (
+                std::mem::take(&mut g.intervals),
+                std::mem::take(&mut g.extremes),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
 
         let test_duration = self.duration as f64;
         let cpu_end = CpuSnapshot::now();
@@ -831,6 +857,34 @@ impl Client {
                     .map(|a| (a.ip().to_string(), a.port()))
                     .unwrap_or_else(|| (self.host.clone(), self.port));
 
+                // Sender-side TCP_INFO extremes + real retransmit total collected
+                // across intervals (#36 PR2); only present for streams we sent.
+                let ext = extremes
+                    .iter()
+                    .find(|e| e.stream_id == s.id && e.has_samples());
+                let tcp_end = ext.map(|e| TcpEndExtras {
+                    max_snd_cwnd: e.max_snd_cwnd,
+                    max_rtt: e.max_rtt,
+                    min_rtt: e.min_rtt,
+                    mean_rtt: e.mean_rtt(),
+                    reorder: e.reorder,
+                });
+                let retransmits = if is_udp {
+                    None
+                } else {
+                    // Real cumulative total when TCP_INFO gave us one (forward
+                    // sender). Otherwise (reverse, or a stream we didn't send) use
+                    // iperf3's defaults: 0 on a platform that supports retransmit
+                    // info, -1 where it doesn't.
+                    ext.and_then(|e| e.total_retransmits)
+                        .map(|r| r as i64)
+                        .or(Some(if crate::tcp_info::has_retransmit_info() {
+                            0
+                        } else {
+                            -1
+                        }))
+                };
+
                 StreamReport {
                     id: s.id,
                     local_host,
@@ -840,10 +894,8 @@ impl Client {
                     is_sender: s.is_sender,
                     local_bytes,
                     remote_bytes: server_stream.map(|x| x.bytes),
-                    // End-of-test per-stream retransmits aren't accumulated yet
-                    // (-1 = unavailable, iperf3's sentinel); real values arrive
-                    // with the interval TCP_INFO work in PR2. UDP carries none.
-                    retransmits: if is_udp { None } else { Some(-1) },
+                    retransmits,
+                    tcp_end,
                     udp,
                 }
             })
@@ -878,6 +930,7 @@ impl Client {
             // the field until that read-back lands rather than emit the requested
             // value (which may differ from what the kernel used).
             congestion_used: None,
+            intervals: collected_intervals,
             streams: stream_reports,
         };
 

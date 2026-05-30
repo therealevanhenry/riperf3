@@ -1277,8 +1277,10 @@ mod interval_reporter_tests {
             forceflush: false,
             timestamp_format: None,
             json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
         };
-        assert!(spawn_interval_reporter(config, vec![], done).is_none());
+        assert!(spawn_interval_reporter(config, vec![], done, None).is_none());
     }
 
     #[tokio::test]
@@ -1293,8 +1295,10 @@ mod interval_reporter_tests {
             forceflush: false,
             timestamp_format: None,
             json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
         };
-        assert!(spawn_interval_reporter(config, vec![], done).is_none());
+        assert!(spawn_interval_reporter(config, vec![], done, None).is_none());
     }
 
     #[tokio::test]
@@ -1309,8 +1313,10 @@ mod interval_reporter_tests {
             forceflush: false,
             timestamp_format: None,
             json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
         };
-        let handle = spawn_interval_reporter(config, vec![], done.clone());
+        let handle = spawn_interval_reporter(config, vec![], done.clone(), None);
         assert!(handle.is_some());
         // Let it tick once then stop
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
