@@ -149,6 +149,10 @@ pub fn has_retransmit_info() -> bool {
 mod tests {
     use super::*;
 
+    // Unix-only: queries TCP_INFO via a raw fd (`as_raw_fd`), which doesn't exist
+    // on Windows (`TcpStream` there is `as_raw_socket`). get_tcp_info returns None
+    // on Windows anyway, so there's nothing to exercise (#71).
+    #[cfg(unix)]
     #[tokio::test]
     async fn tcp_info_on_connected_socket() {
         use std::os::unix::io::AsRawFd;
