@@ -36,6 +36,11 @@ pub struct Report {
     pub start: Start,
     pub intervals: Vec<Interval>,
     pub end: End,
+    /// `--extra-data` string, emitted at the top level (after `end`) only when
+    /// given — matching iperf3's placement (#35). Present on both client and
+    /// server (the server receives it via the parameter exchange).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_data: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +392,8 @@ pub struct ReportInput {
     pub gro: i32,
     /// Wall-clock at test start, ms since the Unix epoch — for `start.timestamp`.
     pub start_time_millis: u64,
+    /// `--extra-data` string, emitted at the top level when present (#35).
+    pub extra_data: Option<String>,
     /// Per-interval samples collected during the run (PR2). Empty if interval
     /// reporting was disabled (`-i 0`).
     pub intervals: Vec<Interval>,
@@ -730,6 +737,7 @@ impl ReportInput {
             },
             intervals: self.intervals.clone(),
             end,
+            extra_data: self.extra_data.clone(),
         }
     }
 
@@ -957,6 +965,7 @@ mod tests {
             gso: 0,
             gro: 0,
             start_time_millis: 1_780_107_649_449,
+            extra_data: None,
             intervals: vec![],
             streams: vec![],
         }
@@ -1401,6 +1410,30 @@ mod tests {
         assert_eq!(udp["bytes"], 20_000);
         assert_eq!(udp["packets"], 20, "sent packets = bytes / blksize: {udp}");
         assert_eq!(udp["sender"], true);
+    }
+
+    #[test]
+    fn extra_data_emitted_at_top_level_when_set() {
+        // iperf3 emits --extra-data as a top-level key (after `end`), only when
+        // given — on both client and server (#35).
+        let mut input = base_input();
+        input.extra_data = Some("payload-tag-42".into());
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["extra_data"], "payload-tag-42");
+        // Not nested in start.
+        assert!(v["start"].get("extra_data").is_none());
+    }
+
+    #[test]
+    fn extra_data_absent_when_unset() {
+        let mut input = base_input(); // extra_data: None
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert!(
+            v.get("extra_data").is_none(),
+            "extra_data must be absent when unset: {v}"
+        );
     }
 
     #[test]

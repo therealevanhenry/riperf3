@@ -850,6 +850,9 @@ impl Server {
             gso: 0,
             gro: 0,
             start_time_millis,
+            // The client sends --extra-data via the parameter exchange; echo it
+            // into the server's -J output too, like iperf3 (#35).
+            extra_data: params.extra_data.clone(),
             intervals: collected_intervals,
             streams: stream_reports,
         };
