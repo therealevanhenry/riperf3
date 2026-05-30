@@ -240,9 +240,17 @@ pub async fn tcp_connect(
             })?;
         }
         socket.set_nonblocking(true)?;
+        // A non-blocking connect signals "in progress" differently per platform:
+        // Unix returns EINPROGRESS; Windows returns WSAEWOULDBLOCK (surfaced as
+        // ErrorKind::WouldBlock). Both mean the connect started and will complete
+        // asynchronously — we await writability below and then surface SO_ERROR
+        // via take_error(). Treating the Windows WSAEWOULDBLOCK as a hard error
+        // is what broke --cport (and any -B/mptcp connect) on Windows (#79).
         match socket.connect(&remote.into()) {
             Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINPROGRESS)
+                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(RiperfError::Io(e)),
         }
         let std_stream: std::net::TcpStream = socket.into();
@@ -944,6 +952,28 @@ mod tests {
             client.local_addr().unwrap().ip(),
             "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_local_port_path_succeeds() {
+        // Setting a local source port (`--cport`) routes through the socket2
+        // bind-then-connect path. That path does a non-blocking connect, which
+        // returns EINPROGRESS on Unix but WSAEWOULDBLOCK on Windows; the latter
+        // was treated as fatal, so the connect failed on Windows (#79). Use an
+        // OS-assigned source port (Some(0)) so this is portable and collision-
+        // free while still exercising the explicit-local-port path on every OS.
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, Some(0), None, false, None).await
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+        assert!(
+            client.is_ok(),
+            "local-port (--cport) connect must succeed on every platform: {client:?}"
+        );
+        assert!(client.unwrap().peer_addr().is_ok());
     }
 
     #[tokio::test]
