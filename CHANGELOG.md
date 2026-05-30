@@ -11,6 +11,50 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.6.1] - 2026-05-30
+
+A cross-platform compatibility and CI release. There are **no data-path or
+wire-protocol changes** — the Linux fast path is byte-for-byte unchanged, so
+throughput is identical to 0.6.0 (the iperf3 compatibility matrix was re-verified;
+the performance campaign carries forward).
+
+### Added
+- **Native FreeBSD CI** (#39): a `vmactions/freebsd-vm` job builds and runs the
+  full test suite on real FreeBSD, so FreeBSD-specific code (the `sendfile` arity,
+  the FreeBSD `tcp_info` fields, the `sendmmsg` sender, `TCP_CONGESTION`) is
+  observed rather than assumed. Promoted to a required check.
+- **macOS `--bind-dev` verified** (#72): `--bind-dev` was already implemented on
+  macOS via `IP_BOUND_IF`; its tests now select the loopback name per-OS and run
+  on macOS, so the path is exercised in native CI.
+
+### Fixed
+- **Windows: `--cport`/`-B`/`--mptcp` connect failed with `WSAEWOULDBLOCK`** (#79).
+  The non-blocking socket2 connect path treated Windows' in-progress
+  `WSAEWOULDBLOCK` as fatal — it only accepted Unix's `EINPROGRESS`. It now also
+  accepts `WouldBlock`, awaits writability, and surfaces a genuine failure via
+  `take_error()`, matching the Unix path.
+- **Compilation on other-Unix** (#78): the library failed to compile on Unix
+  targets that aren't Linux/macOS/FreeBSD (NetBSD/OpenBSD/illumos). Two `cfg`
+  gates — the zerocopy sender dispatch and `set_dont_fragment`'s no-op fallback —
+  promised more than their implementations covered. `-Z` falls back to the normal
+  sender and `--dont-fragment` becomes a no-op on those targets.
+
+### Known issues
+
+Tracked for a follow-up; the notable user-facing ones:
+
+- **Windows UDP `-P`/`--bidir` multi-stream hangs** during stream setup
+  ([#80](https://github.com/therealevanhenry/riperf3/issues/80)). A native-winsock
+  limitation: a connected UDP data socket and the recycled wildcard listener share
+  one port (`SO_REUSEADDR`), and winsock doesn't route a new stream's handshake to
+  the listener the way Linux/BSD do (iperf3 sidesteps this by running under
+  Cygwin). Single-stream UDP is unaffected. The Windows native CI check stays
+  informational until this is fixed.
+- **TCP `--bind-dev` is applied after `connect()`**
+  ([#88](https://github.com/therealevanhenry/riperf3/issues/88)), so it may not
+  constrain routing for TCP (the UDP path binds before connect). macOS
+  `--bind-dev` over IPv6 (`IPV6_BOUND_IF`) is also not yet implemented.
+
 ## [0.6.0] - 2026-05-30
 
 End-to-end iperf3 `-J` JSON faithfulness (client **and** server), a locked-down
@@ -101,4 +145,5 @@ complete list; the notable user-facing ones:
   ([#78](https://github.com/therealevanhenry/riperf3/issues/78)), and FreeBSD has
   no CI coverage ([#39](https://github.com/therealevanhenry/riperf3/issues/39)).
 
+[0.6.1]: https://github.com/therealevanhenry/riperf3/releases/tag/v0.6.1
 [0.6.0]: https://github.com/therealevanhenry/riperf3/releases/tag/v0.6.0
