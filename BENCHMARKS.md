@@ -10,6 +10,11 @@ Reproducible from the committed harness in [`scripts/`](scripts): `compat.sh`
 (interop grid), `bench.sh` + `analyze.py` (statistical campaign), and
 `interop.sh` (the loopback CI gate). See [Reproducing](#reproducing).
 
+> **0.6.1 status.** The compatibility matrix below was re-verified on 0.6.1 (all
+> cells PASS). The throughput campaign is carried forward from 0.6.0 unchanged:
+> 0.6.1 is a cross-platform/CI release with no data-path change, so Linux
+> throughput is identical.
+
 ## Test environment
 
 | | |
@@ -18,7 +23,7 @@ Reproducible from the committed harness in [`scripts/`](scripts): `compat.sh`
 | Host | Intel i9-13900K, Linux 7.0.10-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.90-cloud, 8 vCPU, 8 GB RAM each |
 | NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
-| riperf3 | 0.6.0 |
+| riperf3 | 0.6.1 |
 | iperf3 | 3.20+ (cJSON 1.7.15), built from source |
 
 ## Compatibility matrix (iperf3 interop)
