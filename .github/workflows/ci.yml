@@ -121,11 +121,17 @@ jobs:
   freebsd-test:
     name: Native test (FreeBSD)
     runs-on: ubuntu-latest
+    # The emulated VM (no build cache, plus a test suite that spins up real
+    # loopback servers) is the most likely place for a hang; fail fast rather
+    # than burn the 6h default. Generous — a cold build + test runs ~5-6 min.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Build + test in a FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
+          # Pinned for reproducibility; bump when this 14.x minor goes EOL (the
+          # vmactions image for it is eventually dropped).
           release: "14.2"
           usesh: true
           # Runs as root before the workspace sync: install the toolchain.
