@@ -240,12 +240,21 @@ pub async fn tcp_connect(
             })?;
         }
         socket.set_nonblocking(true)?;
-        // A non-blocking connect signals "in progress" differently per platform:
-        // Unix returns EINPROGRESS; Windows returns WSAEWOULDBLOCK (surfaced as
-        // ErrorKind::WouldBlock). Both mean the connect started and will complete
-        // asynchronously — we await writability below and then surface SO_ERROR
-        // via take_error(). Treating the Windows WSAEWOULDBLOCK as a hard error
-        // is what broke --cport (and any -B/mptcp connect) on Windows (#79).
+        // A non-blocking connect signals "in progress" differently per platform,
+        // and the two arms below catch disjoint errno sets — neither subsumes the
+        // other:
+        //   - Unix: EINPROGRESS, matched by raw_os_error (it decodes to
+        //     ErrorKind::InProgress, *not* WouldBlock).
+        //   - Windows: WSAEWOULDBLOCK, which decodes to ErrorKind::WouldBlock
+        //     (libc::EINPROGRESS exists on Windows but is a different value that
+        //     a connect never returns, so that arm is dead there).
+        // Both mean "connect started, completes asynchronously": we await
+        // writability below and surface a genuine failure via take_error()
+        // (SO_ERROR). Treating WSAEWOULDBLOCK as fatal is what broke --cport (and
+        // any -B/mptcp connect) on Windows (#79). The WouldBlock arm can in
+        // principle also swallow a rare Unix EAGAIN (e.g. ephemeral-port
+        // exhaustion), but take_error() still reports a real failure, so this
+        // doesn't mask a broken connection.
         match socket.connect(&remote.into()) {
             Ok(()) => {}
             Err(e)
@@ -973,7 +982,15 @@ mod tests {
             client.is_ok(),
             "local-port (--cport) connect must succeed on every platform: {client:?}"
         );
-        assert!(client.unwrap().peer_addr().is_ok());
+        let client = client.unwrap();
+        assert!(client.peer_addr().is_ok());
+        // A source port was actually bound (the socket2 bind+connect path ran),
+        // so this also guards against --cport silently not binding.
+        assert_ne!(
+            client.local_addr().unwrap().port(),
+            0,
+            "an explicit local port should have been bound"
+        );
     }
 
     #[tokio::test]
