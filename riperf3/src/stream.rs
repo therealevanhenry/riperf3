@@ -1043,7 +1043,15 @@ pub fn run_udp_sender_blocking(
 
             match socket.send(&buf) {
                 Ok(n) => batch_bytes += n as u64,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // WouldBlock: a full send buffer on a (briefly) non-blocking
+                // socket. TimedOut: the write-timeout/SO_SNDTIMEO fired on a
+                // wedged blocking send (the Windows hang guard, #80). Either is a
+                // zero-progress batch — rewind the sequence and break so the
+                // outer loop re-checks `done`/deadline.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     seq -= 1;
                     break;
                 }

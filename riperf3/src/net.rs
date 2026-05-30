@@ -424,9 +424,10 @@ pub fn tcp_maxseg(_stream: &TcpStream) -> Option<u32> {
 
 /// Wall-clock bound a blocking UDP `sendmmsg`/`send` so a wedged link can't park
 /// the sender thread forever (the per-batch `done`/deadline checks only run
-/// between blocking calls). On expiry the syscall returns `EAGAIN`, which the
-/// sender treats as a zero-progress batch and loops to re-check those flags.
-#[cfg(unix)]
+/// between blocking calls). On expiry the send returns a would-block/timeout
+/// error, which the sender treats as a zero-progress batch and loops to re-check
+/// those flags. Applies on every platform (Unix via `SO_SNDTIMEO`, Windows via
+/// `set_write_timeout`).
 const UDP_SEND_TIMEOUT_MS: u64 = 1000;
 
 /// Prepare a UDP socket for the blocking batched sender (issue #6).
@@ -454,12 +455,20 @@ pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) 
     Ok(())
 }
 
-// Non-Unix: switch to blocking only. There's no portable SO_SNDTIMEO here, so a
-// wedged send can block until the link recovers; the per-batch deadline can't
-// fire mid-block. Acceptable given the sendmmsg fast path is Unix-only anyway.
+// Non-Unix (Windows): switch to blocking, and bound a wedged send with a write
+// timeout. `std::net::UdpSocket::set_write_timeout` is portable and maps to
+// SO_SNDTIMEO, so a blocking `send()` whose buffer stays full (UDP bidir + `-P`
+// at a high rate backs up at teardown, when the peer stops draining) can no
+// longer park the sender thread forever — which hung the client's join on it
+// (#80). On expiry the send returns WouldBlock/TimedOut; the sender re-checks
+// `done`/deadline and exits. SO_SNDBUF tuning stays Unix-only (the sendmmsg
+// batch path is Unix-only; the per-send fallback doesn't need it).
 #[cfg(not(unix))]
 pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
     socket.set_nonblocking(false)?;
+    socket
+        .set_write_timeout(Some(Duration::from_millis(UDP_SEND_TIMEOUT_MS)))
+        .map_err(RiperfError::Io)?;
     Ok(())
 }
 
@@ -1214,6 +1223,22 @@ mod tests {
             "SO_SNDTIMEO must be non-zero, got {}.{:06}",
             tv.tv_sec(),
             tv.tv_usec()
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn configure_udp_sender_sets_write_timeout() {
+        // Windows analog of the SO_SNDTIMEO test above: the non-Unix blocking
+        // sender needs a write timeout so a wedged send (UDP bidir + -P at high
+        // rate, backed up at teardown) can't park the sender thread forever and
+        // hang the client's join on it (#80).
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        let wt = socket.write_timeout().unwrap();
+        assert!(
+            wt.is_some_and(|d| !d.is_zero()),
+            "write timeout (SO_SNDTIMEO) must be set and non-zero, got {wt:?}"
         );
     }
 
