@@ -511,6 +511,9 @@ async fn tcp_combined_socket_opts() {
 
 /// Verify -C congestion algorithm is applied to data stream sockets.
 /// Bug: congestion was sent in TestParams JSON but not applied via setsockopt.
+// -C congestion control is Linux/FreeBSD-only (net.rs gates the setsockopt on
+// those; iperf3's HAVE_TCP_CONGESTION). No-op elsewhere, so don't run it there (#76).
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[tokio::test]
 async fn tcp_congestion_applied() {
     let port = next_port();
@@ -654,6 +657,8 @@ mod builder_tests {
         assert_eq!(c.tos, 0x10);
     }
 
+    // Congestion is a Linux/FreeBSD feature (net.rs); gate to match (#76).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn client_builder_congestion() {
         let c = ClientBuilder::new("h").congestion("bbr").build().unwrap();
@@ -1604,6 +1609,8 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
+    // -C is Linux/FreeBSD-only (net.rs); gate to match (#76).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[tokio::test]
     async fn congestion_cubic_runs() {
         let port = next_port();
@@ -2623,6 +2630,9 @@ mod unimplemented_flags {
 
     // -- Deferred --
 
+    // -Z zerocopy uses sendfile, implemented for Linux/macOS/FreeBSD but not
+    // Windows (no sendfile). Gate to Unix (#76).
+    #[cfg(unix)]
     #[tokio::test]
     async fn zerocopy_send() {
         // -Z zerocopy: uses sendfile() to avoid userspace-to-kernel copy.
