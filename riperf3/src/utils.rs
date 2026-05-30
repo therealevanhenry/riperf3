@@ -174,9 +174,13 @@ fn parse_suffixed(s: &str, base: u64) -> std::result::Result<u64, ConfigError> {
     };
 
     // Parse the numeric part as f64 so fractional values work (e.g. "1.5M" ->
-    // 1.5 * multiplier), matching iperf3's `sscanf("%lf", ...)`. Scale then
-    // truncate to u64, like iperf3's implicit double->int. Reject non-finite,
-    // negative, and overflow (a plain `as u64` cast would silently saturate).
+    // 1.5 * multiplier), matching iperf3's `sscanf("%lf", ...)` for normal
+    // decimal input (incl. scientific / leading-sign / leading-dot). Scale then
+    // truncate to u64 like iperf3's double->int. The non-finite/negative/overflow
+    // guards are a deliberate improvement, NOT iperf3 parity: iperf3 doesn't guard
+    // these and silently emits garbage (inf->0, nan->i64::MAX, overflow->junk) —
+    // we error cleanly instead. (One niche input iperf3 accepts that we don't: hex
+    // like "0x10"; immaterial for a bitrate/size.)
     let n: f64 = num_str
         .parse()
         .map_err(|_| ConfigError::InvalidValue("number", s.to_string()))?;
