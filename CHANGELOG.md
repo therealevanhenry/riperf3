@@ -41,6 +41,8 @@ the performance campaign carries forward).
 
 ### Known issues
 
+Tracked for a follow-up; the notable user-facing ones:
+
 - **Windows UDP `-P`/`--bidir` multi-stream hangs** during stream setup
   ([#80](https://github.com/therealevanhenry/riperf3/issues/80)). A native-winsock
   limitation: a connected UDP data socket and the recycled wildcard listener share
