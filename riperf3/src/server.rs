@@ -292,6 +292,8 @@ impl Server {
                         // Populated for the server's own `-J` output in #50.
                         local_addr: None,
                         peer_addr: None,
+                        sndbuf_actual: None,
+                        rcvbuf_actual: None,
                     });
                 }
             }
@@ -373,6 +375,8 @@ impl Server {
                             raw_fd: None,
                             local_addr: None,
                             peer_addr: None,
+                            sndbuf_actual: None,
+                            rcvbuf_actual: None,
                         });
                     } else {
                         let c = counters.clone();
@@ -400,6 +404,8 @@ impl Server {
                             raw_fd: None,
                             local_addr: None,
                             peer_addr: None,
+                            sndbuf_actual: None,
+                            rcvbuf_actual: None,
                         });
                     }
                 }

@@ -6,22 +6,22 @@
 //! blob, which diverged from iperf3's schema (flat `end.streams`, empty
 //! `intervals`, fabricated addresses).
 //!
-//! Built incrementally (see #36):
-//! - **This PR**: the `end` block — per-stream objects nested as
-//!   `{sender, receiver}` (TCP) or `{udp}` (UDP), the `sum_sent`/`sum_received`
-//!   aggregates plus the UDP `sum` and bidir `sum_*_bidir_reverse`, CPU
-//!   utilization, and `sender`/`receiver_tcp_congestion`; plus real connection
-//!   addresses in `start.connected`.
-//! - **PR2**: populate `intervals` (and the per-stream TCP_INFO extremes
-//!   `max_snd_cwnd` / `min`/`max`/`mean_rtt`, which derive from per-interval
-//!   `TCP_INFO` accumulation).
-//! - **PR3**: full `start` metadata (`cookie`, `timestamp`, `system_info`,
-//!   `tcp_mss_default`, socket buffer sizes, …).
+//! The model covers all three top-level blocks (built incrementally across #36
+//! PR1–PR3):
+//! - `start`: connection metadata and addresses (`connected`, `connecting_to`),
+//!   `timestamp`, `cookie`, `system_info` (uname), `tcp_mss_default`, the socket
+//!   buffer sizes (`sock_bufsize`, `sndbuf_actual`, `rcvbuf_actual`), and the
+//!   `test_start` parameters.
+//! - `intervals`: per-interval stream samples and sums, with the per-stream
+//!   `TCP_INFO` extremes (`max_snd_cwnd` / `min`/`max`/`mean_rtt`) accumulated
+//!   from per-interval `TCP_INFO` reads and surfaced on the `end` streams.
+//! - `end`: per-stream objects nested as `{sender, receiver}` (TCP) or `{udp}`
+//!   (UDP), the `sum_sent`/`sum_received` aggregates plus the UDP `sum` and bidir
+//!   `sum_*_bidir_reverse`, CPU utilization, and `sender`/`receiver_tcp_congestion`.
 //!
 //! Fields iperf3 emits but riperf3 cannot yet produce are omitted
 //! (`skip_serializing_if`) rather than emitted with placeholder values, so the
-//! shape only ever contains real data. The one exception is `system_info`, which
-//! iperf3 always emits: it ships as an empty string until PR3 fills in the uname.
+//! shape only ever contains real data.
 
 use serde::Serialize;
 
@@ -47,8 +47,30 @@ pub struct Start {
     pub connected: Vec<Connection>,
     pub version: String,
     pub system_info: String,
+    pub timestamp: Timestamp,
     pub connecting_to: ConnectingTo,
+    pub cookie: String,
+    // iperf3 emits exactly one of these, and only for TCP (iperf_api.c:1021):
+    // `tcp_mss` when `-M`/`--set-mss` was given, else `tcp_mss_default` (the
+    // control-socket MSS). UDP emits neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_mss: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_mss_default: Option<u32>,
+    pub target_bitrate: u64,
+    pub fq_rate: u64,
+    pub sock_bufsize: u64,
+    pub sndbuf_actual: u64,
+    pub rcvbuf_actual: u64,
     pub test_start: TestStart,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Timestamp {
+    /// RFC 1123 / HTTP-date GMT string, e.g. "Sat, 30 May 2026 02:20:49 GMT".
+    pub time: String,
+    pub timesecs: u64,
+    pub timemillisecs: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,6 +101,10 @@ pub struct TestStart {
     pub tos: i32,
     pub target_bitrate: u64,
     pub bidir: i32,
+    pub fqrate: u64,
+    pub interval: f64,
+    pub gso: i32,
+    pub gro: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +353,23 @@ pub struct ReportInput {
     pub system_info: String,
     pub cpu: CpuUtilization,
     pub congestion_used: Option<String>,
+    // start{} metadata (PR3).
+    pub cookie: String,
+    /// The control-socket MSS, emitted as `start.tcp_mss_default` for a TCP test
+    /// that did not pass `-M`.
+    pub tcp_mss_default: u32,
+    /// The requested `-M`/`--set-mss` value, if any. When set on a TCP test it is
+    /// emitted as `start.tcp_mss` and suppresses `tcp_mss_default` (iperf3 parity).
+    pub mss: Option<u32>,
+    pub fq_rate: u64,
+    pub sock_bufsize: u64,
+    pub sndbuf_actual: u64,
+    pub rcvbuf_actual: u64,
+    pub interval: f64,
+    pub gso: i32,
+    pub gro: i32,
+    /// Wall-clock at test start, ms since the Unix epoch — for `start.timestamp`.
+    pub start_time_millis: u64,
     /// Per-interval samples collected during the run (PR2). Empty if interval
     /// reporting was disabled (`-i 0`).
     pub intervals: Vec<Interval>,
@@ -349,9 +392,45 @@ fn pct_lost(lost: i64, total: i64) -> f64 {
     crate::reporter::lost_percent(lost, total)
 }
 
+/// Format a Unix timestamp (seconds) as an RFC 1123 GMT string, e.g.
+/// "Sat, 30 May 2026 02:20:49 GMT" — matching iperf3's `start.timestamp.time`.
+/// Pure safe Rust (no chrono): epoch → civil date via Howard Hinnant's algorithm.
+fn http_date(epoch_secs: u64) -> String {
+    const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (epoch_secs / 86_400) as i64;
+    let tod = epoch_secs % 86_400;
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // 1970-01-01 was a Thursday (index 4 with Sunday = 0).
+    let dow = (((days % 7) + 4) % 7) as usize;
+    // civil_from_days (Hinnant): days since the epoch -> (year, month, day).
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        DOW[dow],
+        day,
+        MON[(month - 1) as usize],
+        year,
+        hh,
+        mm,
+        ss
+    )
+}
+
 impl ReportInput {
-    /// Assemble the iperf3-schema report: `start`, the collected `intervals`, and
-    /// the `end` block. `start` metadata stays minimal (PR3).
+    /// Assemble the iperf3-schema report: the `start` block (timestamp, cookie,
+    /// `system_info`, `tcp_mss_default`, socket buffers, and `test_start`
+    /// parameters), the collected `intervals`, and the `end` block.
     pub fn build(&self) -> Report {
         let dur = self.duration;
         let is_udp = matches!(self.protocol, TransportProtocol::Udp);
@@ -500,15 +579,40 @@ impl ReportInput {
             receiver_tcp_congestion: cong_receiver,
         };
 
+        let secs = self.start_time_millis / 1000;
+        // iperf3 (iperf_api.c:1021) emits the MSS key only for TCP, and picks
+        // exactly one: `tcp_mss` when `-M` was given, else `tcp_mss_default`.
+        // UDP emits neither. `self.mss.filter(|&m| m > 0)` mirrors iperf3's
+        // `if (settings->mss)` truthiness check.
+        let (tcp_mss, tcp_mss_default) = if is_udp {
+            (None, None)
+        } else if let Some(m) = self.mss.filter(|&m| m > 0) {
+            (Some(m), None)
+        } else {
+            (None, Some(self.tcp_mss_default))
+        };
         Report {
             start: Start {
                 connected,
                 version: self.version.clone(),
                 system_info: self.system_info.clone(),
+                timestamp: Timestamp {
+                    time: http_date(secs),
+                    timesecs: secs,
+                    timemillisecs: self.start_time_millis,
+                },
                 connecting_to: ConnectingTo {
                     host: self.connecting_host.clone(),
                     port: self.connecting_port,
                 },
+                cookie: self.cookie.clone(),
+                tcp_mss,
+                tcp_mss_default,
+                target_bitrate: self.target_bitrate,
+                fq_rate: self.fq_rate,
+                sock_bufsize: self.sock_bufsize,
+                sndbuf_actual: self.sndbuf_actual,
+                rcvbuf_actual: self.rcvbuf_actual,
                 test_start: TestStart {
                     protocol: if is_udp { "UDP" } else { "TCP" }.to_string(),
                     num_streams: self.num_streams,
@@ -521,6 +625,10 @@ impl ReportInput {
                     tos: self.tos,
                     target_bitrate: self.target_bitrate,
                     bidir: self.bidir as i32,
+                    fqrate: self.fq_rate,
+                    interval: self.interval,
+                    gso: self.gso,
+                    gro: self.gro,
                 },
             },
             intervals: self.intervals.clone(),
@@ -713,6 +821,17 @@ mod tests {
                 remote_system: 1.0,
             },
             congestion_used: Some("cubic".into()),
+            cookie: "testcookie000000000000000000000000000".into(),
+            tcp_mss_default: 1448,
+            mss: None,
+            fq_rate: 0,
+            sock_bufsize: 0,
+            sndbuf_actual: 16384,
+            rcvbuf_actual: 87380,
+            interval: 1.0,
+            gso: 0,
+            gro: 0,
+            start_time_millis: 1_780_107_649_449,
             intervals: vec![],
             streams: vec![],
         }
@@ -830,10 +949,40 @@ mod tests {
             "connected",
             "version",
             "system_info",
+            "timestamp",
             "connecting_to",
+            "cookie",
+            "tcp_mss_default",
+            "target_bitrate",
+            "fq_rate",
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
             "test_start",
         ] {
             assert!(v["start"].get(k).is_some(), "start.{k} missing");
+        }
+        for k in [
+            "protocol",
+            "num_streams",
+            "blksize",
+            "omit",
+            "duration",
+            "bytes",
+            "blocks",
+            "reverse",
+            "tos",
+            "target_bitrate",
+            "bidir",
+            "fqrate",
+            "interval",
+            "gso",
+            "gro",
+        ] {
+            assert!(
+                v["start"]["test_start"].get(k).is_some(),
+                "start.test_start.{k} missing"
+            );
         }
         for k in [
             "streams",
@@ -843,6 +992,75 @@ mod tests {
         ] {
             assert!(v["end"].get(k).is_some(), "end.{k} missing");
         }
+    }
+
+    #[test]
+    fn start_metadata_values_match_input() {
+        let mut input = base_input();
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        // timestamp: timesecs = millis / 1000, timemillisecs verbatim, and the
+        // RFC 1123 GMT string derived from timesecs.
+        let ts = &start["timestamp"];
+        assert_eq!(ts["timemillisecs"], 1_780_107_649_449u64);
+        assert_eq!(ts["timesecs"], 1_780_107_649u64);
+        assert_eq!(ts["time"], "Sat, 30 May 2026 02:20:49 GMT");
+        // pass-through metadata. TCP without -M: tcp_mss_default present, tcp_mss
+        // absent (iperf3 emits exactly one).
+        assert_eq!(start["cookie"], "testcookie000000000000000000000000000");
+        assert_eq!(start["tcp_mss_default"], 1448);
+        assert!(
+            start.get("tcp_mss").is_none(),
+            "tcp_mss must be absent: {start}"
+        );
+        assert_eq!(start["sndbuf_actual"], 16384);
+        assert_eq!(start["rcvbuf_actual"], 87380);
+        // test_start additions.
+        let test_start = &start["test_start"];
+        assert_eq!(test_start["fqrate"], 0);
+        assert_eq!(test_start["interval"], 1.0);
+        assert_eq!(test_start["gso"], 0);
+        assert_eq!(test_start["gro"], 0);
+    }
+
+    #[test]
+    fn udp_start_omits_tcp_mss_keys() {
+        // iperf3 (iperf_api.c:1021) gates the MSS key on SOCK_STREAM; a UDP test
+        // emits neither tcp_mss nor tcp_mss_default.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.mss = Some(1400); // even with -M, UDP must not emit either key
+        input.streams = vec![tcp_stream(1, false, 1000, 1000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert!(start.get("tcp_mss").is_none(), "{start}");
+        assert!(start.get("tcp_mss_default").is_none(), "{start}");
+    }
+
+    #[test]
+    fn set_mss_emits_tcp_mss_and_suppresses_default() {
+        // TCP with -M/--set-mss: iperf3 emits tcp_mss = <value> and omits
+        // tcp_mss_default (the two are mutually exclusive).
+        let mut input = base_input();
+        input.mss = Some(1400);
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert_eq!(start["tcp_mss"], 1400);
+        assert!(
+            start.get("tcp_mss_default").is_none(),
+            "tcp_mss_default must be suppressed under -M: {start}"
+        );
+    }
+
+    #[test]
+    fn http_date_matches_rfc1123_gmt() {
+        // Reference values cross-checked against `date -u -d @<epoch>`.
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(http_date(1_780_107_649), "Sat, 30 May 2026 02:20:49 GMT");
+        // Leap-year boundary: 2000-02-29 (a leap day) must format as Feb 29.
+        assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
     }
 
     // ---- cold-review round 1 regressions ------------------------------------
