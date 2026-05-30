@@ -48,7 +48,15 @@ pub struct Start {
     pub version: String,
     pub system_info: String,
     pub timestamp: Timestamp,
-    pub connecting_to: ConnectingTo,
+    // The client emits `connecting_to` (the server it dialed); the server emits
+    // `accepted_connection` (the client's control-socket address). Exactly one is
+    // present, and they share the `{host, port}` shape. They sit in the same slot
+    // (right after `timestamp`), so a single struct serializes both roles in
+    // iperf3's order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connecting_to: Option<ConnectingTo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_connection: Option<ConnectingTo>,
     pub cookie: String,
     // iperf3 emits exactly one of these, and only for TCP (iperf_api.c:1021):
     // `tcp_mss` when `-M`/`--set-mss` was given, else `tcp_mss_default` (the
@@ -349,6 +357,15 @@ pub struct ReportInput {
     pub blocks: u64,
     pub connecting_host: String,
     pub connecting_port: u16,
+    /// True when this report is the server's (`-s -J`). It flips the role-specific
+    /// behavior: emit `accepted_connection` instead of `connecting_to`, report
+    /// only this host's measured bytes (no peer graft — the un-measured side is 0),
+    /// and gate the single `*_tcp_congestion` side on the server's direction.
+    pub is_server: bool,
+    /// The client's control-socket address, for the server's `accepted_connection`.
+    /// Unused on the client.
+    pub accepted_host: String,
+    pub accepted_port: u16,
     pub version: String,
     pub system_info: String,
     pub cpu: CpuUtilization,
@@ -509,7 +526,57 @@ impl ReportInput {
         let mut sum_sent_bidir_reverse = None;
         let mut sum_received_bidir_reverse = None;
 
-        let (sum_sent, sum_received) = if self.bidir {
+        let (sum_sent, sum_received) = if self.is_server {
+            // Server: report only this host's OWN measured bytes — iperf3 sums
+            // local per-stream counters filtered by `sp->sender` and never grafts
+            // the peer's reported bytes, so the side the server didn't measure is
+            // genuinely 0 (forward → sent 0, reverse → received 0). The aggregate
+            // `sender` flag is the server's role: it is the sender only in reverse.
+            let server_is_sender = self.reverse;
+            if self.bidir {
+                // Two flows: forward (client→server, server receives → sender=false)
+                // in sum_sent/sum_received; reverse (server→client, server sends →
+                // sender=true) in the *_bidir_reverse pair. Retransmits, measured on
+                // the server's send path, attach to the reverse (sent) side.
+                sum_sent_bidir_reverse = Some(self.tcp_sum(local_sent, true, retransmits));
+                sum_received_bidir_reverse = Some(self.tcp_sum(0, true, None));
+                (
+                    self.tcp_sum(0, false, None),
+                    self.tcp_sum(local_recv, false, None),
+                )
+            } else if is_udp {
+                // sum_sent is always the sender perspective (bytes the server sent,
+                // no loss); sum_received the receiver perspective (bytes received,
+                // with measured loss/jitter). `sum` carries the server's sent bytes
+                // tagged with its role, and the packet/loss/jitter of whichever side
+                // the server actually measured (received in forward, sent in reverse).
+                let sent_packets = (local_sent / blk) as i64;
+                let (sum_packets, sum_lost, sum_jitter) = if server_is_sender {
+                    (sent_packets, 0, 0.0)
+                } else {
+                    (udp_packets, udp_lost, udp_jitter)
+                };
+                sum = Some(self.udp_sum(
+                    local_sent,
+                    server_is_sender,
+                    sum_packets,
+                    sum_lost,
+                    sum_jitter,
+                ));
+                (
+                    self.udp_sum(local_sent, true, sent_packets, 0, 0.0),
+                    self.udp_sum(local_recv, false, udp_packets, udp_lost, udp_jitter),
+                )
+            } else {
+                // Single-direction TCP. sum_sent = bytes the server sent (0 forward),
+                // sum_received = bytes received (0 reverse); both carry the server's
+                // role flag. Retransmits live on the sent side.
+                (
+                    self.tcp_sum(local_sent, server_is_sender, retransmits),
+                    self.tcp_sum(local_recv, server_is_sender, None),
+                )
+            }
+        } else if self.bidir {
             // Forward (this host → peer) goes in sum_sent/sum_received; reverse
             // (peer → this host) in the *_bidir_reverse pair, matching iperf3 —
             // rather than folding the reverse flow into sum_received (which would
@@ -563,6 +630,19 @@ impl ReportInput {
 
         let (cong_sender, cong_receiver) = if is_udp {
             (None, None)
+        } else if self.is_server {
+            // The peer's (client's) congestion algorithm is never exchanged to the
+            // server, so only one side is emitted — the server's local algorithm,
+            // on the side matching its role: receiver in forward, sender in reverse
+            // and bidir (iperf_api.c:4544 swaps by stream_must_be_sender). Until
+            // #37 reads the applied algorithm back, `congestion_used` is None on
+            // both client and server, so both currently omit the field.
+            let local = self.congestion_used.clone();
+            if self.reverse || self.bidir {
+                (local, None)
+            } else {
+                (None, local)
+            }
         } else {
             (self.congestion_used.clone(), self.congestion_used.clone())
         };
@@ -580,6 +660,25 @@ impl ReportInput {
         };
 
         let secs = self.start_time_millis / 1000;
+        // Role-specific connection target: the client dialed a server
+        // (`connecting_to`), the server accepted a client (`accepted_connection`).
+        let (connecting_to, accepted_connection) = if self.is_server {
+            (
+                None,
+                Some(ConnectingTo {
+                    host: self.accepted_host.clone(),
+                    port: self.accepted_port,
+                }),
+            )
+        } else {
+            (
+                Some(ConnectingTo {
+                    host: self.connecting_host.clone(),
+                    port: self.connecting_port,
+                }),
+                None,
+            )
+        };
         // iperf3 (iperf_api.c:1021) emits the MSS key only for TCP, and picks
         // exactly one: `tcp_mss` when `-M` was given, else `tcp_mss_default`.
         // UDP emits neither. `self.mss.filter(|&m| m > 0)` mirrors iperf3's
@@ -601,10 +700,8 @@ impl ReportInput {
                     timesecs: secs,
                     timemillisecs: self.start_time_millis,
                 },
-                connecting_to: ConnectingTo {
-                    host: self.connecting_host.clone(),
-                    port: self.connecting_port,
-                },
+                connecting_to,
+                accepted_connection,
                 cookie: self.cookie.clone(),
                 tcp_mss,
                 tcp_mss_default,
@@ -648,6 +745,22 @@ impl ReportInput {
                 packets: 0,
                 out_of_order: 0,
             });
+            // `bytes` is a sender-side count. The client reports its own local
+            // bytes (it grafts the peer's count elsewhere); the server only knows
+            // the bytes it *sent*, so a stream it received reports 0 bytes (iperf3
+            // parity) while still carrying the packet/loss/jitter it measured. A
+            // stream the server sent has no receiver stats, so its sent packet
+            // count is derived from the bytes it pushed.
+            let (bytes, packets) = if self.is_server {
+                if s.is_sender {
+                    let blk = self.blksize.max(1) as u64;
+                    (s.local_bytes, (s.local_bytes / blk) as i64)
+                } else {
+                    (0, u.packets)
+                }
+            } else {
+                (s.local_bytes, u.packets)
+            };
             return EndStream {
                 sender: None,
                 receiver: None,
@@ -656,11 +769,11 @@ impl ReportInput {
                     start: 0.0,
                     end: dur,
                     seconds: dur,
-                    bytes: s.local_bytes,
-                    bits_per_second: bps(s.local_bytes, dur),
+                    bytes,
+                    bits_per_second: bps(bytes, dur),
                     jitter_ms: u.jitter_secs * 1000.0,
                     lost_packets: u.lost_packets,
-                    packets: u.packets,
+                    packets,
                     lost_percent: pct_lost(u.lost_packets, u.packets),
                     out_of_order: u.out_of_order,
                     sender: s.is_sender,
@@ -677,12 +790,21 @@ impl ReportInput {
         // Sender-side TCP_INFO extremes go on whichever sub-object is the local
         // sender (forward). The peer's extremes aren't exchanged, so the sender
         // sub-object of a reverse stream omits them.
-        let remote_bytes = s.remote_bytes.unwrap_or(s.local_bytes);
-        // iperf3 always emits the sender sub-object's TCP_INFO keys (0 when
-        // unmeasured). The local sender's extremes (forward) are real; the peer's
-        // (reverse) aren't exchanged, so they default to 0 — exactly what iperf3
-        // emits for a reverse stream's sender block. The receiver sub-object omits
-        // them, like iperf3.
+        // The server never learns the peer's per-stream byte count, so its
+        // un-measured side is 0 (iperf3 reports only local counters) — never
+        // grafted from `local_bytes` the way the client fills the peer side.
+        let remote_bytes = if self.is_server {
+            0
+        } else {
+            s.remote_bytes.unwrap_or(s.local_bytes)
+        };
+        // The client always emits the sender sub-object's TCP_INFO keys (real on
+        // the forward side, 0 on the reverse side it didn't measure). iperf3's
+        // *server*, by contrast, omits them entirely on a stream it didn't send
+        // (a forward receiver) and emits them only on a stream it sent
+        // (reverse/bidir). Match that asymmetry: emit the extras unless this is a
+        // server stream the server received.
+        let emit_extras = !self.is_server || s.is_sender;
         let e = s.tcp_end.unwrap_or_default();
         let sender_side = |bytes: u64, retransmits: Option<i64>| TcpStreamSide {
             socket: s.id,
@@ -691,13 +813,13 @@ impl ReportInput {
             seconds: dur,
             bytes,
             bits_per_second: bps(bytes, dur),
-            retransmits,
-            max_snd_cwnd: Some(e.max_snd_cwnd),
-            max_snd_wnd: Some(0), // tcpi_snd_wnd unavailable via libc; 0 like iperf3
-            max_rtt: Some(e.max_rtt),
-            min_rtt: Some(e.min_rtt),
-            mean_rtt: Some(e.mean_rtt),
-            reorder: Some(e.reorder),
+            retransmits: if emit_extras { retransmits } else { None },
+            max_snd_cwnd: emit_extras.then_some(e.max_snd_cwnd),
+            max_snd_wnd: emit_extras.then_some(0), // tcpi_snd_wnd unavailable via libc; 0 like iperf3
+            max_rtt: emit_extras.then_some(e.max_rtt),
+            min_rtt: emit_extras.then_some(e.min_rtt),
+            mean_rtt: emit_extras.then_some(e.mean_rtt),
+            reorder: emit_extras.then_some(e.reorder),
             sender: dir,
         };
         let receiver_side = |bytes: u64| TcpStreamSide {
@@ -810,6 +932,9 @@ mod tests {
             blocks: 0,
             connecting_host: "host".into(),
             connecting_port: 5201,
+            is_server: false,
+            accepted_host: String::new(),
+            accepted_port: 0,
             version: "riperf3 0.5.4".into(),
             system_info: String::new(),
             cpu: CpuUtilization {
@@ -1052,6 +1177,230 @@ mod tests {
             start.get("tcp_mss_default").is_none(),
             "tcp_mss_default must be suppressed under -M: {start}"
         );
+    }
+
+    // ---- server-perspective JSON (#50) --------------------------------------
+
+    #[test]
+    fn server_emits_accepted_connection_not_connecting_to() {
+        let mut input = base_input();
+        input.is_server = true;
+        input.accepted_host = "10.0.0.5".into();
+        input.accepted_port = 41810;
+        input.streams = vec![tcp_stream(1, false, 1000, 0)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert!(
+            start.get("connecting_to").is_none(),
+            "server must not emit connecting_to: {start}"
+        );
+        assert_eq!(start["accepted_connection"]["host"], "10.0.0.5");
+        assert_eq!(start["accepted_connection"]["port"], 41810);
+    }
+
+    #[test]
+    fn client_emits_connecting_to_not_accepted_connection() {
+        let mut input = base_input(); // is_server = false
+        input.streams = vec![tcp_stream(1, true, 1000, 1000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let start = &v["start"];
+        assert!(start["connecting_to"].is_object());
+        assert!(
+            start.get("accepted_connection").is_none(),
+            "client must not emit accepted_connection: {start}"
+        );
+    }
+
+    #[test]
+    fn server_forward_tcp_zeroes_sent_side() {
+        // Forward: the server is the receiver. It measured the received bytes; it
+        // sent nothing, and never grafts the client's count. Both aggregates carry
+        // sender=false (the server is not the sender in forward).
+        let mut input = base_input();
+        input.is_server = true;
+        input.streams = vec![tcp_stream(1, false, 1_000_000, 7_777)]; // remote ignored
+        let v = serde_json::to_value(input.build()).unwrap();
+        let e = &v["end"];
+        assert_eq!(e["sum_sent"]["bytes"], 0);
+        assert_eq!(e["sum_received"]["bytes"], 1_000_000);
+        assert_eq!(e["sum_sent"]["sender"], false);
+        assert_eq!(e["sum_received"]["sender"], false);
+        assert_eq!(e["streams"][0]["sender"]["bytes"], 0);
+        assert_eq!(e["streams"][0]["receiver"]["bytes"], 1_000_000);
+    }
+
+    #[test]
+    fn server_reverse_tcp_zeroes_received_side() {
+        // Reverse: the server is the sender. sum_received is 0; both aggregates
+        // carry sender=true; retransmits live on the sent side.
+        let mut input = base_input();
+        input.is_server = true;
+        input.reverse = true;
+        let mut s = tcp_stream(1, true, 2_000_000, 9_999);
+        s.retransmits = Some(5);
+        input.streams = vec![s];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let e = &v["end"];
+        assert_eq!(e["sum_sent"]["bytes"], 2_000_000);
+        assert_eq!(e["sum_received"]["bytes"], 0);
+        assert_eq!(e["sum_sent"]["sender"], true);
+        assert_eq!(e["sum_received"]["sender"], true);
+        assert_eq!(e["sum_sent"]["retransmits"], 5);
+        assert_eq!(e["streams"][0]["sender"]["bytes"], 2_000_000);
+        assert_eq!(e["streams"][0]["receiver"]["bytes"], 0);
+    }
+
+    #[test]
+    fn server_forward_congestion_receiver_only() {
+        // base_input has congestion_used = Some("cubic"). Forward server → the
+        // local algorithm appears on the receiver side only; sender side absent.
+        let mut input = base_input();
+        input.is_server = true;
+        input.streams = vec![tcp_stream(1, false, 1000, 0)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let e = &v["end"];
+        assert_eq!(e["receiver_tcp_congestion"], "cubic");
+        assert!(
+            e.get("sender_tcp_congestion").is_none(),
+            "forward server: sender congestion must be absent: {e}"
+        );
+    }
+
+    #[test]
+    fn server_reverse_congestion_sender_only() {
+        let mut input = base_input();
+        input.is_server = true;
+        input.reverse = true;
+        input.streams = vec![tcp_stream(1, true, 1000, 0)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let e = &v["end"];
+        assert_eq!(e["sender_tcp_congestion"], "cubic");
+        assert!(e.get("receiver_tcp_congestion").is_none(), "{e}");
+    }
+
+    #[test]
+    fn server_bidir_congestion_sender_only_and_directions_split() {
+        // Bidir server: congestion on the sender side only (verified vs iperf3
+        // 3.21). Forward flow (received) → sum_sent/sum_received with sender=false;
+        // reverse flow (sent) → *_bidir_reverse with sender=true.
+        let mut input = base_input();
+        input.is_server = true;
+        input.bidir = true;
+        input.streams = vec![
+            tcp_stream(1, false, 1_000_000, 0), // forward: server receives
+            tcp_stream(3, true, 2_000_000, 0),  // reverse: server sends
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let e = &v["end"];
+        assert_eq!(e["sender_tcp_congestion"], "cubic");
+        assert!(e.get("receiver_tcp_congestion").is_none(), "{e}");
+        assert_eq!(e["sum_sent"]["bytes"], 0);
+        assert_eq!(e["sum_received"]["bytes"], 1_000_000);
+        assert_eq!(e["sum_sent"]["sender"], false);
+        assert_eq!(e["sum_sent_bidir_reverse"]["bytes"], 2_000_000);
+        assert_eq!(e["sum_received_bidir_reverse"]["bytes"], 0);
+        assert_eq!(e["sum_sent_bidir_reverse"]["sender"], true);
+    }
+
+    #[test]
+    fn server_forward_sender_omits_tcp_info_keys() {
+        // iperf3's server emits the sender sub-object's TCP_INFO keys only for a
+        // stream it sent. On a forward test (server receives) the sender block is
+        // bytes-only — no retransmits / max_snd_cwnd / *_rtt / reorder.
+        let mut input = base_input();
+        input.is_server = true;
+        input.streams = vec![tcp_stream(1, false, 1_000_000, 0)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let sender = &v["end"]["streams"][0]["sender"];
+        for k in [
+            "retransmits",
+            "max_snd_cwnd",
+            "max_snd_wnd",
+            "max_rtt",
+            "min_rtt",
+            "mean_rtt",
+            "reorder",
+        ] {
+            assert!(
+                sender.get(k).is_none(),
+                "forward server sender must omit {k}: {sender}"
+            );
+        }
+        // The bytes-only fields remain.
+        assert!(sender["bytes"].is_number());
+        assert!(sender["bits_per_second"].is_number());
+    }
+
+    #[test]
+    fn server_reverse_sender_emits_tcp_info_keys() {
+        // On a reverse test the server sends, so its sender block carries the
+        // TCP_INFO extras (real cwnd/rtt, snd_wnd 0 like iperf3).
+        let mut input = base_input();
+        input.is_server = true;
+        input.reverse = true;
+        input.streams = vec![StreamReport {
+            tcp_end: Some(TcpEndExtras {
+                max_snd_cwnd: 65535,
+                max_rtt: 200,
+                min_rtt: 90,
+                mean_rtt: 120,
+                reorder: 0,
+            }),
+            ..tcp_stream(1, true, 2_000_000, 0)
+        }];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let sender = &v["end"]["streams"][0]["sender"];
+        assert_eq!(sender["max_snd_cwnd"], 65535);
+        assert_eq!(sender["max_rtt"], 200);
+        assert_eq!(sender["max_snd_wnd"], 0); // libc has no tcpi_snd_wnd
+        assert!(sender["retransmits"].is_number());
+    }
+
+    #[test]
+    fn server_udp_forward_stream_reports_zero_bytes_measured_packets() {
+        // Forward UDP: the server received the datagrams. iperf3's per-stream udp
+        // `bytes` is a sender-side count the server doesn't know → 0, while the
+        // measured packet/loss/jitter it observed are reported.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.blksize = 1460;
+        input.is_server = true;
+        input.streams = vec![StreamReport {
+            udp: Some(UdpStreamStats {
+                jitter_secs: 0.00002,
+                lost_packets: 3,
+                packets: 700,
+                out_of_order: 0,
+            }),
+            ..tcp_stream(1, false, 1_022_000, 0)
+        }];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let udp = &v["end"]["streams"][0]["udp"];
+        assert_eq!(
+            udp["bytes"], 0,
+            "server received → sender-side bytes 0: {udp}"
+        );
+        assert_eq!(udp["packets"], 700, "measured received packets reported");
+        assert_eq!(udp["lost_packets"], 3);
+        assert_eq!(udp["sender"], false);
+    }
+
+    #[test]
+    fn server_udp_reverse_stream_derives_sent_packets() {
+        // Reverse UDP: the server sent the datagrams; it has no receiver stats, so
+        // the sent packet count is derived from the bytes pushed (bytes / blksize).
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.blksize = 1000;
+        input.reverse = true;
+        input.is_server = true;
+        // 20_000 bytes / 1000 blksize = 20 packets, no udp_recv_stats (sender).
+        input.streams = vec![tcp_stream(1, true, 20_000, 0)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let udp = &v["end"]["streams"][0]["udp"];
+        assert_eq!(udp["bytes"], 20_000);
+        assert_eq!(udp["packets"], 20, "sent packets = bytes / blksize: {udp}");
+        assert_eq!(udp["sender"], true);
     }
 
     #[test]

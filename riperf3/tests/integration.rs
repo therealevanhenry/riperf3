@@ -71,6 +71,46 @@ async fn regression_udp_default_path() {
     let _ = server_task.await;
 }
 
+/// #50: the server's `-J` JSON output path must complete the test cleanly in
+/// both directions (the JSON assembly runs after the run; a panic or protocol
+/// break there would surface as a client/server error). The JSON document goes
+/// to the server's stdout; field-for-field fidelity is validated separately
+/// against real iperf3.
+#[tokio::test]
+async fn server_json_output_completes_forward_and_reverse() {
+    for reverse in [false, true] {
+        let port = next_port();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            .one_off(true)
+            .json_output(true)
+            .build()
+            .unwrap();
+        let server_task = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Duration-limited (not byte-limited): reverse + `-n` has a pre-existing
+        // non-termination bug unrelated to JSON output, so use the duration path
+        // the JSON output was validated against.
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .reverse(reverse)
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(
+            result.is_ok(),
+            "server -J path failed (reverse={reverse}): {result:?}"
+        );
+        let server_result = server_task.await.unwrap();
+        assert!(
+            server_result.is_ok(),
+            "server -J run errored (reverse={reverse}): {server_result:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #1: dual-stack server bind regression
 // ---------------------------------------------------------------------------
