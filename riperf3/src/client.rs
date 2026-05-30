@@ -420,11 +420,26 @@ impl Client {
                         let zc = self.zerocopy;
                         tokio::spawn(async move {
                             if zc {
-                                #[cfg(unix)]
+                                // Zerocopy senders exist only for these targets
+                                // (stream.rs). The gate must match the impls, not
+                                // `unix`: other-Unix (NetBSD/OpenBSD/illumos) is
+                                // `unix` with no zerocopy impl, so `#[cfg(unix)]`
+                                // referenced a nonexistent fn and failed to
+                                // compile there (#78). Elsewhere `-Z` cleanly
+                                // falls back to the normal sender.
+                                #[cfg(any(
+                                    target_os = "linux",
+                                    target_os = "macos",
+                                    target_os = "freebsd"
+                                ))]
                                 {
                                     stream::run_tcp_sender_zerocopy(data_stream, c, buf, d).await
                                 }
-                                #[cfg(not(unix))]
+                                #[cfg(not(any(
+                                    target_os = "linux",
+                                    target_os = "macos",
+                                    target_os = "freebsd"
+                                )))]
                                 {
                                     stream::run_tcp_sender(data_stream, c, buf, d, fp).await
                                 }
