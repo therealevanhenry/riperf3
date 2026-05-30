@@ -41,9 +41,9 @@ trap 'rm -rf "$workdir"' EXIT
 # Per-attempt I/O sinks (fixed paths, reused per case). -J JSON (stdout) and
 # diagnostics (stderr) stay SEPARATE: a stray stderr line merged into the JSON
 # sink would make the parser choke and score a good transfer as a false FAIL.
-# The server's output (sj/serr) is kept for failure diagnostics only; it is NOT
-# validated as JSON — the riperf3 server emits text, not JSON yet (#50). Once it
-# gains a -J path, validate sj for the interop pairings too (#49 review).
+# Both sides emit JSON now (the riperf3 server gained a -J path in #50), so the
+# server's output (sj) is validated too — catching server-side-only regressions
+# (e.g. the #23/#48 teardown class) that leave the client JSON looking fine.
 cj="$workdir/c.json"; cerr="$workdir/c.err"
 sj="$workdir/s.json"; serr="$workdir/s.err"
 
@@ -118,6 +118,37 @@ sys.exit(2)
 PY
 }
 
+# Succeeds iff the server's -J output is valid JSON, reports no error, and shows
+# the server moved data on the side it measured. Unlike the client check, the
+# server only ever populates ONE direction's aggregate (forward → sum_received,
+# reverse → sum_sent; bidir populates both — see #50), so require sum_sent>0 OR
+# sum_received>0, not both. This catches a server that crashed, emitted broken
+# JSON, or tore the connection down with no data (the #23/#48 class) — failures
+# invisible in the client JSON alone.
+valid_server_result() {
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("  server json parse failed:", e, file=sys.stderr)
+    sys.exit(1)
+if isinstance(d, dict) and d.get("error"):
+    print("  server reported error:", d["error"], file=sys.stderr)
+    sys.exit(1)
+end = d.get("end", {}) if isinstance(d, dict) else {}
+def aggregate_bytes(key):
+    v = end.get(key)
+    return v["bytes"] if isinstance(v, dict) and isinstance(v.get("bytes"), (int, float)) else 0
+sent = aggregate_bytes("sum_sent")
+recv = aggregate_bytes("sum_received")
+if sent > 0 or recv > 0:
+    sys.exit(0)
+print(f"  server moved no data: sum_sent={sent} sum_received={recv}", file=sys.stderr)
+sys.exit(2)
+PY
+}
+
 # attempt <client-bin> <server-bin> <client-opts...>
 # One server/client round on a fresh port. Returns 0 iff the test completed with
 # bidirectional transfer. Writes cj/cerr (client) and sj/serr (server).
@@ -137,9 +168,18 @@ attempt() {
     # with the test duration so a hang costs seconds rather than a fixed ceiling.
     timeout -k 5 "$((DUR + 15))" "$client" -c "$HOST" -p "$p" -J "$@" >"$cj" 2>"$cerr"
     local rc=$?
+    # The one-off server prints its JSON and exits on its own once the test ends.
+    # Let it finish so $sj is complete before we validate it (a premature kill
+    # would truncate the JSON and score a false FAIL); only force-kill if it
+    # overruns, i.e. hung.
+    local w
+    for w in $(seq 1 50); do
+        kill -0 "$spid" 2>/dev/null || break
+        sleep 0.1
+    done
     kill "$spid" 2>/dev/null
     wait "$spid" 2>/dev/null
-    [ "$rc" -eq 0 ] && valid_result "$cj"
+    [ "$rc" -eq 0 ] && valid_result "$cj" && valid_server_result "$sj"
 }
 
 # run_case <name> <client-bin> <server-bin> <client-opts...>
