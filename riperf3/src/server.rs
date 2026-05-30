@@ -173,7 +173,11 @@ impl Server {
         // The control-socket peer address feeds the server's `start.accepted_connection`
         // (iperf_api.c uses getpeername(ctrl_sck) — distinct from the data-stream
         // addresses in `connected[]`). Captured for the `-J` blob (#50).
-        let (accepted_host, accepted_port) = (peer_addr.ip().to_string(), peer_addr.port());
+        // `to_canonical()` unwraps an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`)
+        // from the dual-stack listener back to plain `127.0.0.1`, as iperf3 does
+        // (mapped_v4_to_regular_v4).
+        let (accepted_host, accepted_port) =
+            (peer_addr.ip().to_canonical().to_string(), peer_addr.port());
 
         // ---- Cookie ----
         let cookie = protocol::recv_cookie(&mut ctrl).await?;
@@ -741,13 +745,15 @@ impl Server {
                     })
                 });
 
+                // to_canonical(): unwrap IPv4-mapped IPv6 from the dual-stack
+                // listener to plain IPv4 in connected[], matching iperf3.
                 let (local_host, local_port) = s
                     .local_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_default();
                 let (remote_host, remote_port) = s
                     .peer_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_default();
 
                 // Sender-side TCP_INFO extremes + retransmit total, present only

@@ -886,13 +886,16 @@ impl Client {
                     None
                 };
 
+                // to_canonical(): unwrap an IPv4-mapped IPv6 address to plain IPv4
+                // (matches iperf3); a no-op for the client's usual canonical
+                // addresses, correct if the client is bound to a dual-stack socket.
                 let (local_host, local_port) = s
                     .local_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_else(|| (self.host.clone(), 0));
                 let (remote_host, remote_port) = s
                     .peer_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_else(|| (self.host.clone(), self.port));
 
                 // Sender-side TCP_INFO extremes + real retransmit total collected
