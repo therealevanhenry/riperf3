@@ -173,12 +173,24 @@ fn parse_suffixed(s: &str, base: u64) -> std::result::Result<u64, ConfigError> {
         _ => (s, 1),
     };
 
-    let n: u64 = num_str
+    // Parse the numeric part as f64 so fractional values work (e.g. "1.5M" ->
+    // 1.5 * multiplier), matching iperf3's `sscanf("%lf", ...)`. Scale then
+    // truncate to u64, like iperf3's implicit double->int. Reject non-finite,
+    // negative, and overflow (a plain `as u64` cast would silently saturate).
+    let n: f64 = num_str
         .parse()
         .map_err(|_| ConfigError::InvalidValue("number", s.to_string()))?;
-
-    n.checked_mul(multiplier)
-        .ok_or_else(|| ConfigError::InvalidValue("number", format!("{s} overflows u64")))
+    if !n.is_finite() || n < 0.0 {
+        return Err(ConfigError::InvalidValue("number", s.to_string()));
+    }
+    let scaled = n * multiplier as f64;
+    if scaled >= u64::MAX as f64 {
+        return Err(ConfigError::InvalidValue(
+            "number",
+            format!("{s} overflows u64"),
+        ));
+    }
+    Ok(scaled as u64)
 }
 
 /// Parse a SIZE with an optional K/M/G/T suffix — **binary** (1024-based),
@@ -293,6 +305,28 @@ mod tests {
         assert_eq!(parse_rate("1M").unwrap(), 1_000_000);
         assert_eq!(parse_kmg("1M").unwrap(), 1_048_576);
         assert_ne!(parse_rate("1M").unwrap(), parse_kmg("1M").unwrap());
+    }
+
+    #[test]
+    fn fractional_suffixes_accepted() {
+        // #73: iperf3 parses the numeric part with %lf, so fractional values work.
+        assert_eq!(parse_rate("1.5M").unwrap(), 1_500_000); // 1.5 * 1000^2
+        assert_eq!(parse_kmg("1.5K").unwrap(), 1_536); // 1.5 * 1024
+        assert_eq!(parse_kmg("0.5M").unwrap(), 524_288); // 0.5 * 1024^2
+        assert_eq!(parse_bitrate("2.5M").unwrap(), (2_500_000, 0));
+        // Plain integers and the exact-value tests above still hold (f64 is exact
+        // for these magnitudes).
+        assert_eq!(parse_rate("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn rejects_non_finite_negative_and_garbage() {
+        assert!(parse_rate("-5M").is_err()); // negative
+        assert!(parse_rate("inf").is_err()); // non-finite
+        assert!(parse_kmg("nanK").is_err());
+        assert!(parse_kmg("1.5.5M").is_err()); // not a number
+        assert!(parse_kmg("abc").is_err());
+        assert!(parse_kmg("K").is_err()); // suffix only, no number
     }
 
     // -- parse_keepalive --

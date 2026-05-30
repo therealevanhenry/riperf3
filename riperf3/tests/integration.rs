@@ -1045,8 +1045,12 @@ mod error_tests {
     }
 
     #[test]
-    fn parse_kmg_float() {
-        assert!(parse_kmg("1.5M").is_err());
+    fn parse_kmg_fractional() {
+        // #73: fractional suffixes are now accepted (iperf3 parses with %lf).
+        // 1.5 * 1024^2 = 1_572_864.
+        assert_eq!(parse_kmg("1.5M").unwrap(), 1_572_864);
+        // Still rejects genuinely-malformed numbers.
+        assert!(parse_kmg("1.5.5M").is_err());
     }
 
     #[test]
