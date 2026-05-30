@@ -62,7 +62,7 @@ Verified across TCP (normal, reverse, bidir, parallel, zerocopy, BBR, file mode)
 On a two-VM QEMU/KVM sandbox (virtio-net, MTU 9000, 8 vCPU), a 30-run-per-cell
 campaign puts riperf3 **at or above iperf3** throughput across the board:
 
-- **TCP** — statistical parity single-stream (~75 Gbps); a few percent ahead at `-P 8`.
+- **TCP** — near-parity single-stream (~75 Gbps; one marginal cell aside); a few percent ahead at `-P 8`.
 - **UDP** — significantly faster in every cell (~+10–17%), and holds steady across `-P` instead of collapsing.
 - **Wire-compatible** with iperf3 (current and 3.12) in both directions.
 
@@ -85,7 +85,7 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--dont-fragment` | yes | yes | yes | yes |
 | `-Z` zerocopy (sendfile) | yes | yes | yes | |
 | `-C` congestion control | yes | | yes | |
-| `-D` daemon | yes | | yes | |
+| `-D` daemon | yes\* | | yes\* | |
 | `--bind-dev` | yes | yes | | |
 | `--rcv-timeout` | yes | yes | yes | |
 | `--cntl-ka` keepalive | yes | yes | yes | |
@@ -97,6 +97,8 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--sendmmsg` batched UDP | yes | | yes | |
 
 All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
+
+\* `-s -D` daemon mode is currently broken — the daemonized server listens but never serves, so clients hang ([#81](https://github.com/therealevanhenry/riperf3/issues/81)). Tracked for a post-0.6.0 fix; use a foreground `-s` server meanwhile.
 
 ## CLI Reference
 
@@ -234,7 +236,7 @@ Not yet implemented:
 - `libiperf`-compatible FFI library
 
 Experimental:
-- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux and FreeBSD. Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
+- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux and FreeBSD (the send path is also written for NetBSD, but the crate doesn't yet build there — [#78](https://github.com/therealevanhenry/riperf3/issues/78)). Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
 
 ## License
 

@@ -29,8 +29,9 @@ sides of the connection.
   socket buffer sizes).
 - **`--extra-data` surfaced in `-J` output** (#35), matching iperf3's top-level
   `extra_data` field.
-- **Native macOS and Windows CI runners plus a musl build check** (#39), so
-  cross-platform behavior is observed rather than assumed.
+- **Native macOS and Windows CI runners plus a musl build check**, so
+  cross-platform behavior is observed rather than assumed. (FreeBSD CI is still
+  outstanding — see Known issues, #39.)
 - **`cargo-semver-checks` gate** in CI (a required check) to catch unintended
   public-API breaks before release.
 
@@ -55,7 +56,8 @@ sides of the connection.
 - Real-iperf3 wire-interop CI gate against current and 3.12 iperf3 (#38), now
   also validating the server's `-J` output (#50).
 - Linux/Unix-only feature tests are gated by target so the native macOS/Windows
-  CI runners pass cleanly (#71, #72, #76).
+  CI runners pass cleanly (#71, #76). (The macOS `--bind-dev` test is gated
+  pending its underlying fix — see Known issues, #72.)
 
 ### Known issues
 
