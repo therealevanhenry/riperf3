@@ -1,6 +1,8 @@
 # riperf3
 
-A ground-up Rust implementation of [iperf3](https://github.com/esnet/iperf), the standard network performance measurement tool. Wire-compatible with ESNet's iperf3 — a riperf3 client talks to an iperf3 server and vice versa.
+A ground-up, idiomatic Rust implementation of [iperf3](https://github.com/esnet/iperf), the standard network performance measurement tool — not a C port or a binding, but a faithful reimplementation in safe, async Rust.
+
+riperf3 speaks iperf3's exact wire protocol: a riperf3 client interoperates with an iperf3 server, and vice versa, across every mode. Fidelity is the guiding principle — riperf3 matches iperf3 flag for flag and quirk for quirk rather than reinventing the interface. Where iperf3 accepts an option, riperf3 implements it to behave the same way; it does not reject, rename, or work around iperf3's semantics. The goal is a drop-in you can swap in without your scripts, dashboards, or muscle memory noticing.
 
 ## Highlights
 
@@ -9,7 +11,7 @@ A ground-up Rust implementation of [iperf3](https://github.com/esnet/iperf), the
 - **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](https://github.com/therealevanhenry/riperf3/blob/main/riperf3/src/lib.rs) for the full inventory.
 - **Single static binary** with no runtime dependencies.
 - **Idiomatic Rust** — not a C port. Uses tokio for async I/O, serde for JSON, clap for CLI parsing, nix for safe Unix syscalls.
-- **269 tests** — unit, integration, and full client-server loopback with interchange verification.
+- **369 tests** — unit, integration, and full client-server loopback with interchange verification.
 
 ## Quick Start
 
@@ -60,8 +62,8 @@ Verified across TCP (normal, reverse, bidir, parallel, zerocopy, BBR, file mode)
 On a two-VM QEMU/KVM sandbox (virtio-net, MTU 9000, 8 vCPU), a 30-run-per-cell
 campaign puts riperf3 **at or above iperf3** throughput across the board:
 
-- **TCP** — statistical parity single-stream (~75 Gbps); a few percent ahead at `-P 8`.
-- **UDP** — significantly faster in every cell (~+10–18%), and holds steady across `-P` instead of collapsing.
+- **TCP** — near-parity single-stream (~75 Gbps; one marginal cell aside); a few percent ahead at `-P 8`.
+- **UDP** — significantly faster in every cell (~+10–17%), and holds steady across `-P` instead of collapsing.
 - **Wire-compatible** with iperf3 (current and 3.12) in both directions.
 
 [**BENCHMARKS.md**](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md)
@@ -70,7 +72,7 @@ tests, the compatibility matrix, and full methodology.
 
 ## Platform Support
 
-riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specific features use safe Rust wrappers where available, with graceful degradation or clear error messages on unsupported platforms.
+riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference platform (full feature set, primary CI); macOS is verified in native CI; Windows compiles and is cross-checked in CI, with a few runtime gaps still under triage in the [issue tracker](https://github.com/therealevanhenry/riperf3/issues); FreeBSD is supported via conditional compilation but is not yet exercised in CI. Platform-specific features use safe Rust wrappers where available, with graceful degradation or a clear error message where a flag is unavailable.
 
 | Feature | Linux | macOS | FreeBSD | Windows |
 |---|:---:|:---:|:---:|:---:|
@@ -83,7 +85,7 @@ riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specif
 | `--dont-fragment` | yes | yes | yes | yes |
 | `-Z` zerocopy (sendfile) | yes | yes | yes | |
 | `-C` congestion control | yes | | yes | |
-| `-D` daemon | yes | | yes | |
+| `-D` daemon | yes\* | | yes\* | |
 | `--bind-dev` | yes | yes | | |
 | `--rcv-timeout` | yes | yes | yes | |
 | `--cntl-ka` keepalive | yes | yes | yes | |
@@ -95,6 +97,8 @@ riperf3 compiles and runs on Linux, macOS, FreeBSD, and Windows. Platform-specif
 | `--sendmmsg` batched UDP | yes | | yes | |
 
 All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
+
+\* `-s -D` daemon mode is currently broken — the daemonized server listens but never serves, so clients hang ([#81](https://github.com/therealevanhenry/riperf3/issues/81)). Tracked for a post-0.6.0 fix; use a foreground `-s` server meanwhile.
 
 ## CLI Reference
 
@@ -223,14 +227,16 @@ cargo clippy --all-targets -- -D warnings      # lint
 
 ## Status
 
-Feature-complete for the core iperf3 flag set. Full interchange compatibility verified across all modes. Full platform parity across Linux, macOS, FreeBSD, and Windows.
+Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux and macOS are fully supported and exercised in native CI; Windows compiles and cross-checks but has a few runtime gaps under active triage; FreeBSD is supported via conditional compilation. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
+
+See [CHANGELOG.md](CHANGELOG.md) for the 0.6.0 release notes and current known issues — including a daemon-mode (`-s -D`) bug ([#81](https://github.com/therealevanhenry/riperf3/issues/81)) and a handful of options that are accepted but not yet fully effective.
 
 Not yet implemented:
 - SCTP transport
 - `libiperf`-compatible FFI library
 
 Experimental:
-- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux, FreeBSD, NetBSD. Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
+- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux and FreeBSD (the send path is also written for NetBSD, but the crate doesn't yet build there — [#78](https://github.com/therealevanhenry/riperf3/issues/78)). Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
 
 ## License
 

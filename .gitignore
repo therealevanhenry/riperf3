@@ -9,6 +9,10 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+# Python bytecode cache (benchmark analysis script)
+__pycache__/
+*.pyc
+
 # Claude Code local config
 .claude/
 CLAUDE.md
