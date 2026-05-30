@@ -171,6 +171,7 @@ impl Client {
         // ---- State machine: react to server-driven transitions ----
         loop {
             let state = protocol::recv_state(&mut ctrl).await?;
+            eprintln!("[riperf3 #80 trace] client state -> {state:?}"); // TEMP DEBUG
 
             match state {
                 TestState::ParamExchange => {
@@ -241,10 +242,22 @@ impl Client {
         }
 
         // ---- Clean up ----
+        eprintln!(
+            "[riperf3 #80 trace] client cleanup: setting done, awaiting {} tasks",
+            streams.len()
+        ); // TEMP DEBUG
         done.store(true, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(100)).await;
         for s in streams {
+            eprintln!(
+                "[riperf3 #80 trace] awaiting task id={} sender={}",
+                s.id, s.is_sender
+            ); // TEMP DEBUG
             let _ = s.task.await;
+            eprintln!(
+                "[riperf3 #80 trace] joined  task id={} sender={}",
+                s.id, s.is_sender
+            ); // TEMP DEBUG
         }
 
         server_results.ok_or_else(|| {
@@ -477,7 +490,9 @@ impl Client {
                         net::set_bind_dev(&udp_sock, dev)?;
                     }
                     udp_sock.connect(remote).await?;
+                    eprintln!("[riperf3 #80 trace] udp stream {i}/{total}: handshake start"); // TEMP DEBUG
                     protocol::udp_connect_client(&udp_sock).await?;
+                    eprintln!("[riperf3 #80 trace] udp stream {i}/{total}: handshake ok"); // TEMP DEBUG
 
                     // Apply GSO/GRO if requested (no-ops on non-Linux)
                     if self.gsro {
