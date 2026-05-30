@@ -70,6 +70,10 @@ impl TestConfig {
 // Server
 // ---------------------------------------------------------------------------
 
+// Constructed only via ServerBuilder; #[non_exhaustive] keeps future field
+// additions (like json_output/json_stream in #50) from being breaking changes
+// for downstream crates (#43 semver-proofing, the cheap half).
+#[non_exhaustive]
 pub struct Server {
     pub port: u16,
     pub one_off: bool,

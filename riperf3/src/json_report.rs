@@ -32,6 +32,7 @@ use crate::protocol::TransportProtocol;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Report {
     pub start: Start,
     pub intervals: Vec<Interval>,
@@ -48,6 +49,7 @@ pub struct Report {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Start {
     pub connected: Vec<Connection>,
     pub version: String,
@@ -79,6 +81,7 @@ pub struct Start {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Timestamp {
     /// RFC 1123 / HTTP-date GMT string, e.g. "Sat, 30 May 2026 02:20:49 GMT".
     pub time: String,
@@ -87,6 +90,7 @@ pub struct Timestamp {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Connection {
     pub socket: i32,
     pub local_host: String,
@@ -96,12 +100,14 @@ pub struct Connection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ConnectingTo {
     pub host: String,
     pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TestStart {
     pub protocol: String,
     pub num_streams: i32,
@@ -125,12 +131,14 @@ pub struct TestStart {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct Interval {
     pub streams: Vec<IntervalStream>,
     pub sum: IntervalSum,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct IntervalStream {
     pub socket: i32,
     pub start: f64,
@@ -168,6 +176,7 @@ pub struct IntervalStream {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct IntervalSum {
     pub start: f64,
     pub end: f64,
@@ -193,6 +202,7 @@ pub struct IntervalSum {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct End {
     pub streams: Vec<EndStream>,
     pub sum_sent: SumSide,
@@ -215,6 +225,7 @@ pub struct End {
 /// One `end.streams[]` entry. iperf3 nests the per-direction stats: TCP carries
 /// `{sender, receiver}`, UDP carries `{udp}`. Exactly one shape is populated.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct EndStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<TcpStreamSide>,
@@ -225,6 +236,7 @@ pub struct EndStream {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TcpStreamSide {
     pub socket: i32,
     pub start: f64,
@@ -257,6 +269,7 @@ pub struct TcpStreamSide {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct UdpStreamEnd {
     pub socket: i32,
     pub start: f64,
@@ -273,6 +286,7 @@ pub struct UdpStreamEnd {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SumSide {
     pub start: f64,
     pub end: f64,
@@ -293,6 +307,7 @@ pub struct SumSide {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CpuUtilization {
     pub host_total: f64,
     pub host_user: f64,
@@ -310,6 +325,7 @@ pub struct CpuUtilization {
 /// Per-stream end data, already resolved to the local (this host) and remote
 /// (peer, from the exchanged results) byte counts and roles.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamReport {
     pub id: i32,
     pub local_host: String,
@@ -332,6 +348,7 @@ pub struct StreamReport {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct TcpEndExtras {
     pub max_snd_cwnd: u64,
     pub max_rtt: u32,
@@ -341,6 +358,7 @@ pub struct TcpEndExtras {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct UdpStreamStats {
     pub jitter_secs: f64,
     pub lost_packets: i64,
@@ -348,6 +366,7 @@ pub struct UdpStreamStats {
     pub out_of_order: i64,
 }
 
+#[non_exhaustive]
 pub struct ReportInput {
     pub protocol: TransportProtocol,
     pub reverse: bool,
