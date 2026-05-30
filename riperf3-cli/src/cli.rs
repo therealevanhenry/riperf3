@@ -969,6 +969,9 @@ mod cli_tests {
             assert_eq!(c.logfile, Some("/tmp/log".to_string()));
         }
 
+        // sendmmsg(2) is Linux/FreeBSD/NetBSD-only (stream.rs); build() rejects
+        // --sendmmsg on other platforms, so gate the wiring test to match (#76).
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         #[test]
         fn sendmmsg_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-u", "--sendmmsg"]);
