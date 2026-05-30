@@ -240,9 +240,26 @@ pub async fn tcp_connect(
             })?;
         }
         socket.set_nonblocking(true)?;
+        // A non-blocking connect signals "in progress" differently per platform,
+        // and the two arms below catch disjoint errno sets — neither subsumes the
+        // other:
+        //   - Unix: EINPROGRESS, matched by raw_os_error (it decodes to
+        //     ErrorKind::InProgress, *not* WouldBlock).
+        //   - Windows: WSAEWOULDBLOCK, which decodes to ErrorKind::WouldBlock
+        //     (libc::EINPROGRESS exists on Windows but is a different value that
+        //     a connect never returns, so that arm is dead there).
+        // Both mean "connect started, completes asynchronously": we await
+        // writability below and surface a genuine failure via take_error()
+        // (SO_ERROR). Treating WSAEWOULDBLOCK as fatal is what broke --cport (and
+        // any -B/mptcp connect) on Windows (#79). The WouldBlock arm can in
+        // principle also swallow a rare Unix EAGAIN (e.g. ephemeral-port
+        // exhaustion), but take_error() still reports a real failure, so this
+        // doesn't mask a broken connection.
         match socket.connect(&remote.into()) {
             Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e)
+                if e.raw_os_error() == Some(libc::EINPROGRESS)
+                    || e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(RiperfError::Io(e)),
         }
         let std_stream: std::net::TcpStream = socket.into();
@@ -943,6 +960,36 @@ mod tests {
         assert_eq!(
             client.local_addr().unwrap().ip(),
             "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_local_port_path_succeeds() {
+        // Setting a local source port (`--cport`) routes through the socket2
+        // bind-then-connect path. That path does a non-blocking connect, which
+        // returns EINPROGRESS on Unix but WSAEWOULDBLOCK on Windows; the latter
+        // was treated as fatal, so the connect failed on Windows (#79). Use an
+        // OS-assigned source port (Some(0)) so this is portable and collision-
+        // free while still exercising the explicit-local-port path on every OS.
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, Some(0), None, false, None).await
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+        assert!(
+            client.is_ok(),
+            "local-port (--cport) connect must succeed on every platform: {client:?}"
+        );
+        let client = client.unwrap();
+        assert!(client.peer_addr().is_ok());
+        // A source port was actually bound (the socket2 bind+connect path ran),
+        // so this also guards against --cport silently not binding.
+        assert_ne!(
+            client.local_addr().unwrap().port(),
+            0,
+            "an explicit local port should have been bound"
         );
     }
 
