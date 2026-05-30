@@ -378,6 +378,11 @@ impl Client {
                     #[cfg(not(unix))]
                     let raw_fd: Option<i32> = None;
 
+                    // Capture the real socket addresses before the stream moves
+                    // into its task, for the `-J` start.connected block (#36).
+                    let local_addr = data_stream.local_addr().ok();
+                    let peer_addr = data_stream.peer_addr().ok();
+
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
@@ -419,6 +424,8 @@ impl Client {
                         udp_recv_stats: None,
                         task,
                         raw_fd,
+                        local_addr,
+                        peer_addr,
                     });
                 }
             }
@@ -457,6 +464,11 @@ impl Client {
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
+
+                    // Capture real addresses for the `-J` start.connected block
+                    // (#36) before the socket moves into its task.
+                    let local_addr = udp_sock.local_addr().ok();
+                    let peer_addr = udp_sock.peer_addr().ok();
 
                     // Convert tokio UdpSocket to std for blocking I/O
                     let std_sock = udp_sock.into_std().map_err(RiperfError::Io)?;
@@ -500,6 +512,8 @@ impl Client {
                             udp_recv_stats: Some(stats),
                             task,
                             raw_fd: None,
+                            local_addr,
+                            peer_addr,
                         });
                         continue;
                     };
@@ -511,6 +525,8 @@ impl Client {
                         udp_recv_stats: None,
                         task,
                         raw_fd: None,
+                        local_addr,
+                        peer_addr,
                     });
                 }
             }
@@ -758,171 +774,114 @@ impl Client {
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
     ) {
+        use crate::json_report::{CpuUtilization, ReportInput, StreamReport, UdpStreamStats};
+
         let test_duration = self.duration as f64;
         let cpu_end = CpuSnapshot::now();
         let cpu_util = cpu_start
             .map(|start| cpu_end.utilization_since(start))
             .unwrap_or_default();
-
-        let protocol_str = match self.protocol {
-            TransportProtocol::Tcp => "TCP",
-            TransportProtocol::Udp => "UDP",
-        };
-
-        // Forward UDP: the server is the receiver, so its loss lives only in the
-        // results it returned. Surface it in `-J` too, mirroring the text path (#25).
-        let is_forward_udp =
-            matches!(self.protocol, TransportProtocol::Udp) && !self.reverse && !self.bidir;
-
-        // Build per-stream end results
-        let mut j_streams = Vec::new();
-        let mut sum_sent_bytes: u64 = 0;
-        let mut sum_recv_bytes: u64 = 0;
-        let sum_retransmits: i64 = 0;
-
-        for s in streams {
-            let sent = s.counters.bytes_sent();
-            let recv = s.counters.bytes_received();
-            let bytes = if s.is_sender { sent } else { recv };
-            let bits_per_sec = bytes as f64 * 8.0 / test_duration;
-
-            if s.is_sender {
-                sum_sent_bytes += sent;
-            } else {
-                sum_recv_bytes += recv;
-            }
-
-            let mut stream_obj = serde_json::json!({
-                "socket": s.id,
-                "start": 0.0,
-                "end": test_duration,
-                "seconds": test_duration,
-                "bytes": bytes,
-                "bits_per_second": bits_per_sec,
-                "sender": s.is_sender
-            });
-
-            if let (Some(ref udp_stats_lock), false) = (&s.udp_recv_stats, s.is_sender) {
-                if let Ok(stats) = udp_stats_lock.lock() {
-                    stream_obj["jitter_ms"] = serde_json::json!(stats.jitter * 1000.0);
-                    stream_obj["lost_packets"] = serde_json::json!(stats.cnt_error);
-                    stream_obj["packets"] = serde_json::json!(stats.packet_count);
-                    stream_obj["lost_percent"] = serde_json::json!(crate::reporter::lost_percent(
-                        stats.cnt_error,
-                        stats.packet_count
-                    ));
-                }
-            } else if is_forward_udp && s.is_sender {
-                // Forward UDP: the loss was measured by the server (receiver), so
-                // attach it from its results — otherwise `-J` forward looks
-                // loss-free too, the machine-readable twin of the text gap (#25).
-                if let Some(rs) = remote_cpu.and_then(|r| r.streams.iter().find(|x| x.id == s.id)) {
-                    stream_obj["jitter_ms"] = serde_json::json!(rs.jitter * 1000.0);
-                    stream_obj["lost_packets"] = serde_json::json!(rs.errors);
-                    stream_obj["packets"] = serde_json::json!(rs.packets);
-                    stream_obj["lost_percent"] =
-                        serde_json::json!(crate::reporter::lost_percent(rs.errors, rs.packets));
-                }
-            }
-
-            j_streams.push(stream_obj);
-        }
-
-        // If we only have senders, use sent bytes for both
-        if sum_recv_bytes == 0 {
-            sum_recv_bytes = sum_sent_bytes;
-        }
-        if sum_sent_bytes == 0 {
-            sum_sent_bytes = sum_recv_bytes;
-        }
-
         let (remote_total, remote_user, remote_system) = remote_cpu
             .map(|r| (r.cpu_util_total, r.cpu_util_user, r.cpu_util_system))
             .unwrap_or((0.0, 0.0, 0.0));
 
-        let mut output = serde_json::json!({
-            "start": {
-                "connected": streams.iter().map(|s| {
-                    serde_json::json!({
-                        "socket": s.id,
-                        "local_host": self.host,
-                        "local_port": self.port,
-                        "remote_host": self.host,
-                        "remote_port": self.port
+        let is_udp = matches!(self.protocol, TransportProtocol::Udp);
+        // Forward UDP: the server is the receiver, so its loss lives only in the
+        // results it returned — attach it to the (sender) streams (#25).
+        let is_forward_udp = is_udp && !self.reverse && !self.bidir;
+
+        let stream_reports: Vec<StreamReport> = streams
+            .iter()
+            .map(|s| {
+                let local_bytes = if s.is_sender {
+                    s.counters.bytes_sent()
+                } else {
+                    s.counters.bytes_received()
+                };
+                // The peer's per-stream result is the opposite side of this stream.
+                let server_stream =
+                    remote_cpu.and_then(|r| r.streams.iter().find(|x| x.id == s.id));
+
+                // UDP datagram stats: from our local receiver if we measured them,
+                // else (forward UDP) from the server's results for this stream (#25).
+                let udp = if let Some(ref lock) = s.udp_recv_stats {
+                    lock.lock().ok().map(|st| UdpStreamStats {
+                        jitter_secs: st.jitter,
+                        lost_packets: st.cnt_error,
+                        packets: st.packet_count,
+                        out_of_order: st.outoforder_packets,
                     })
-                }).collect::<Vec<_>>(),
-                "version": format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
-                "system_info": "",
-                "connecting_to": {
-                    "host": self.host,
-                    "port": self.port
-                },
-                "test_start": {
-                    "protocol": protocol_str,
-                    "num_streams": self.num_streams,
-                    "blksize": blksize,
-                    "omit": self.omit,
-                    "duration": self.duration,
-                    "bytes": 0,
-                    "blocks": 0,
-                    "reverse": if self.reverse { 1 } else { 0 },
-                    "tos": self.tos,
-                    "target_bitrate": self.bandwidth,
-                    "bidir": if self.bidir { 1 } else { 0 }
+                } else if is_forward_udp && s.is_sender {
+                    server_stream.map(|x| UdpStreamStats {
+                        jitter_secs: x.jitter,
+                        lost_packets: x.errors,
+                        packets: x.packets,
+                        out_of_order: 0,
+                    })
+                } else {
+                    None
+                };
+
+                let (local_host, local_port) = s
+                    .local_addr
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|| (self.host.clone(), 0));
+                let (remote_host, remote_port) = s
+                    .peer_addr
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|| (self.host.clone(), self.port));
+
+                StreamReport {
+                    id: s.id,
+                    local_host,
+                    local_port,
+                    remote_host,
+                    remote_port,
+                    is_sender: s.is_sender,
+                    local_bytes,
+                    remote_bytes: server_stream.map(|x| x.bytes),
+                    // End-of-test per-stream retransmits aren't accumulated yet
+                    // (-1 = unavailable, iperf3's sentinel); real values arrive
+                    // with the interval TCP_INFO work in PR2. UDP carries none.
+                    retransmits: if is_udp { None } else { Some(-1) },
+                    udp,
                 }
+            })
+            .collect();
+
+        let input = ReportInput {
+            protocol: self.protocol,
+            reverse: self.reverse,
+            bidir: self.bidir,
+            duration: test_duration,
+            num_streams: self.num_streams as i32,
+            blksize: blksize as i64,
+            omit: self.omit as i32,
+            tos: self.tos,
+            target_bitrate: self.bandwidth,
+            bytes: self.bytes_to_send.unwrap_or(0),
+            blocks: self.blocks_to_send.unwrap_or(0),
+            connecting_host: self.host.clone(),
+            connecting_port: self.port,
+            version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+            // Full system_info (uname) lands with the rest of start{} metadata in PR3.
+            system_info: String::new(),
+            cpu: CpuUtilization {
+                host_total: cpu_util.host_total,
+                host_user: cpu_util.host_user,
+                host_system: cpu_util.host_system,
+                remote_total,
+                remote_user,
+                remote_system,
             },
-            "intervals": [],
-            "end": {
-                "streams": j_streams,
-                "sum_sent": {
-                    "start": 0.0,
-                    "end": test_duration,
-                    "seconds": test_duration,
-                    "bytes": sum_sent_bytes,
-                    "bits_per_second": sum_sent_bytes as f64 * 8.0 / test_duration,
-                    "retransmits": sum_retransmits,
-                    "sender": true
-                },
-                "sum_received": {
-                    "start": 0.0,
-                    "end": test_duration,
-                    "seconds": test_duration,
-                    "bytes": sum_recv_bytes,
-                    "bits_per_second": sum_recv_bytes as f64 * 8.0 / test_duration,
-                    "sender": true
-                },
-                "cpu_utilization_percent": {
-                    "host_total": cpu_util.host_total,
-                    "host_user": cpu_util.host_user,
-                    "host_system": cpu_util.host_system,
-                    "remote_total": remote_total,
-                    "remote_user": remote_user,
-                    "remote_system": remote_system
-                }
-            }
-        });
+            // Reporting the *actually-applied* congestion algorithm is #37; omit
+            // the field until that read-back lands rather than emit the requested
+            // value (which may differ from what the kernel used).
+            congestion_used: None,
+            streams: stream_reports,
+        };
 
-        // Forward UDP: fold the server-measured loss into the aggregate
-        // `sum_received` so `-J` reports it alongside the per-stream lines (#25).
-        if is_forward_udp {
-            if let Some(server) = remote_cpu {
-                let lost: i64 = server.streams.iter().map(|s| s.errors).sum();
-                let packets: i64 = server.streams.iter().map(|s| s.packets).sum();
-                let jitter = server
-                    .streams
-                    .iter()
-                    .map(|s| s.jitter)
-                    .fold(0.0_f64, f64::max);
-                let sr = &mut output["end"]["sum_received"];
-                sr["jitter_ms"] = serde_json::json!(jitter * 1000.0);
-                sr["lost_packets"] = serde_json::json!(lost);
-                sr["packets"] = serde_json::json!(packets);
-                sr["lost_percent"] =
-                    serde_json::json!(crate::reporter::lost_percent(lost, packets));
-            }
-        }
-
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        println!("{}", serde_json::to_string_pretty(&input.build()).unwrap());
     }
 }
 

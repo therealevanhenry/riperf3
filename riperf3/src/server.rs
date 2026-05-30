@@ -289,6 +289,9 @@ impl Server {
                         udp_recv_stats: None,
                         task,
                         raw_fd,
+                        // Populated for the server's own `-J` output in #50.
+                        local_addr: None,
+                        peer_addr: None,
                     });
                 }
             }
@@ -368,6 +371,8 @@ impl Server {
                             udp_recv_stats: None,
                             task,
                             raw_fd: None,
+                            local_addr: None,
+                            peer_addr: None,
                         });
                     } else {
                         let c = counters.clone();
@@ -393,6 +398,8 @@ impl Server {
                             udp_recv_stats: Some(stats),
                             task,
                             raw_fd: None,
+                            local_addr: None,
+                            peer_addr: None,
                         });
                     }
                 }
