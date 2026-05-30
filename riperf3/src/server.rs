@@ -359,12 +359,14 @@ impl Server {
                     // instead of hanging setup forever (#11); uses the same
                     // budget as the client's handshake so neither side aborts
                     // while the other is still retrying.
+                    eprintln!("[riperf3 #80 trace] server udp accept stream {i}/{total}: listener local={:?} waiting for magic", udp_listener.local_addr()); // TEMP DEBUG
                     let _client_addr = protocol::udp_connect_server(
                         &udp_listener,
                         protocol::UDP_CONNECT_TOTAL_TIMEOUT,
                     )
                     .await?;
-                    // The listener is now locked to this client — use it as the data socket
+                    eprintln!("[riperf3 #80 trace] server udp accept stream {i}/{total}: got client {_client_addr:?}"); // TEMP DEBUG
+                                                                                                                        // The listener is now locked to this client — use it as the data socket
                     let data_sock = udp_listener;
 
                     // Create a fresh listener for the next stream (if any)
