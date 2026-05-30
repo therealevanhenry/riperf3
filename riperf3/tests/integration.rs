@@ -2153,15 +2153,22 @@ mod unimplemented_flags {
         let _ = server_task.await;
     }
 
-    // Linux-only: --bind-dev uses SO_BINDTODEVICE and the "lo" interface name,
-    // both Linux-specific (macOS/BSD use IP_BOUND_IF + "lo0"). Matches the gate
-    // already on bind_device_invalid_rejects below (#72). macOS/Windows support
-    // for --bind-dev is tracked separately.
-    #[cfg(target_os = "linux")]
+    // --bind-dev is implemented on Linux (SO_BINDTODEVICE) and macOS (IP_BOUND_IF),
+    // each with its own loopback interface name (`lo` vs `lo0`). The test runs on
+    // both; other platforms (Windows/BSD) don't implement it (set_bind_dev is a
+    // no-op there) so there's nothing to exercise (#72).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const LOOPBACK_DEV: &str = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn bind_device_loopback() {
-        // --bind-dev lo: bind all sockets to the loopback interface.
-        // Works unprivileged on Linux 5.7+.
+        // --bind-dev <loopback>: bind all sockets to the loopback interface.
+        // Unprivileged on Linux 5.7+ (SO_BINDTODEVICE) and on macOS (IP_BOUND_IF).
         let port = next_port();
         let server = ServerBuilder::new()
             .port(Some(port))
@@ -2173,7 +2180,7 @@ mod unimplemented_flags {
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
             .duration(1)
-            .bind_dev("lo")
+            .bind_dev(LOOPBACK_DEV)
             .build()
             .unwrap();
         let result = client.run().await;
@@ -2183,11 +2190,14 @@ mod unimplemented_flags {
                 return; // old kernel, skip gracefully
             }
         }
-        assert!(result.is_ok(), "--bind-dev lo failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "--bind-dev {LOOPBACK_DEV} failed: {result:?}"
+        );
         let _ = server_task.await;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn bind_device_invalid_rejects() {
         // An invalid device name should cause an error, proving set_bind_dev is called.
