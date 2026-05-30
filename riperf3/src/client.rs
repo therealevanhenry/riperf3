@@ -991,6 +991,7 @@ impl Client {
             gso: i32::from(self.gsro),
             gro: i32::from(self.gsro),
             start_time_millis: start_meta.start_time_millis,
+            extra_data: self.extra_data.clone(),
             intervals: collected_intervals,
             streams: stream_reports,
         };
