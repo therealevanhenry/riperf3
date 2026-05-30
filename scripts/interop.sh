@@ -120,11 +120,12 @@ PY
 
 # Succeeds iff the server's -J output is valid JSON, reports no error, and shows
 # the server moved data on the side it measured. Unlike the client check, the
-# server only ever populates ONE direction's aggregate (forward → sum_received,
-# reverse → sum_sent; bidir populates both — see #50), so require sum_sent>0 OR
-# sum_received>0, not both. This catches a server that crashed, emitted broken
-# JSON, or tore the connection down with no data (the #23/#48 class) — failures
-# invisible in the client JSON alone.
+# server populates at most one top-level aggregate per direction (forward →
+# sum_received, reverse → sum_sent; bidir → sum_received, with the reverse half in
+# sum_*_bidir_reverse — see #50), so require sum_sent>0 OR sum_received>0, not
+# both. This catches a server that crashed, emitted broken JSON, or tore the
+# connection down with no data (the #23/#48 class) — failures invisible in the
+# client JSON alone.
 valid_server_result() {
     python3 - "$1" <<'PY'
 import json, sys
