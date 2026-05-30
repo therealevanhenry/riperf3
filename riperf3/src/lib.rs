@@ -49,6 +49,8 @@ pub mod auth;
 #[doc(hidden)]
 pub mod cpu;
 #[doc(hidden)]
+pub mod json_report;
+#[doc(hidden)]
 pub mod net;
 #[doc(hidden)]
 pub mod protocol;

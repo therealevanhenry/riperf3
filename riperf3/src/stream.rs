@@ -294,6 +294,10 @@ pub struct DataStream {
     pub task: JoinHandle<Result<()>>,
     /// Raw TCP socket fd for TCP_INFO queries. `None` for UDP streams.
     pub raw_fd: Option<i32>,
+    /// This stream's actual local/peer socket addresses, captured at creation
+    /// for the `-J` `start.connected` block (issue #36). `None` if unavailable.
+    pub local_addr: Option<std::net::SocketAddr>,
+    pub peer_addr: Option<std::net::SocketAddr>,
 }
 
 // ---------------------------------------------------------------------------
