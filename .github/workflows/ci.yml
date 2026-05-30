@@ -106,3 +106,39 @@ jobs:
         with:
           key: musl
       - run: cargo check --workspace --target x86_64-unknown-linux-musl
+
+  # Native build + test on FreeBSD in a VM (#39). FreeBSD carries real
+  # platform-specific code that no other job compiles: the sendfile arity
+  # (stream.rs), the FreeBSD tcp_info field names (tcp_info.rs), the sendmmsg
+  # sender, and TCP_CONGESTION. cargo check from Linux can't cover it (some of
+  # this is behind `#[cfg(target_os = "freebsd")]`), and GitHub has no native
+  # FreeBSD runner — hence a VM via vmactions/freebsd-vm (QEMU; Rust from the
+  # FreeBSD `rust` package). `release` is pinned for reproducibility.
+  #
+  # INFORMATIONAL to start, like native-test: a first run may surface
+  # pre-existing FreeBSD bugs. Those get filed + fixed, then this check is
+  # promoted into branch protection's required set.
+  freebsd-test:
+    name: Native test (FreeBSD)
+    runs-on: ubuntu-latest
+    # The emulated VM (no build cache, plus a test suite that spins up real
+    # loopback servers) is the most likely place for a hang; fail fast rather
+    # than burn the 6h default. Generous — a cold build + test runs ~5-6 min.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          # Pinned for reproducibility; bump when this 14.x minor goes EOL (the
+          # vmactions image for it is eventually dropped).
+          release: "14.2"
+          usesh: true
+          # Runs as root before the workspace sync: install the toolchain.
+          prepare: |
+            pkg install -y rust
+          # cargo build proves codegen + link (cargo check does neither);
+          # cargo test then exercises the suite on real FreeBSD.
+          run: |
+            cargo build --workspace
+            cargo test --workspace
