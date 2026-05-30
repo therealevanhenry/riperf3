@@ -2146,6 +2146,11 @@ mod unimplemented_flags {
         let _ = server_task.await;
     }
 
+    // Linux-only: --bind-dev uses SO_BINDTODEVICE and the "lo" interface name,
+    // both Linux-specific (macOS/BSD use IP_BOUND_IF + "lo0"). Matches the gate
+    // already on bind_device_invalid_rejects below (#72). macOS/Windows support
+    // for --bind-dev is tracked separately.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bind_device_loopback() {
         // --bind-dev lo: bind all sockets to the loopback interface.
