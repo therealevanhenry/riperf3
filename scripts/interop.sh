@@ -221,9 +221,13 @@ run_case() {
         pass=$((pass + 1))
     else
         printf 'FAIL  %-26s %s\n' "$name" "$col"
-        sed 's/^/    client    | /' "$cj" | tail -4
+        # The validators already print the reason (parse error / no transfer) to
+        # stderr above. These show the raw output for context. The -J files are
+        # pretty JSON whose end-of-test aggregates sit near the bottom, so show
+        # enough of the tail to include the `end` block, not just closing braces.
+        sed 's/^/    client    | /' "$cj" | tail -25
         sed 's/^/    client-err| /' "$cerr" | tail -4
-        sed 's/^/    server    | /' "$sj" | tail -4
+        sed 's/^/    server    | /' "$sj" | tail -25
         sed 's/^/    server-err| /' "$serr" | tail -4
         fail=$((fail + 1))
         failed_cases+=("$name $col")
