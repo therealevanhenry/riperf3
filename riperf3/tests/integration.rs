@@ -1278,6 +1278,7 @@ mod interval_reporter_tests {
             timestamp_format: None,
             json_stream: false,
             print: true,
+            blksize: 128 * 1024,
         };
         assert!(spawn_interval_reporter(config, vec![], done, None).is_none());
     }
@@ -1295,6 +1296,7 @@ mod interval_reporter_tests {
             timestamp_format: None,
             json_stream: false,
             print: true,
+            blksize: 128 * 1024,
         };
         assert!(spawn_interval_reporter(config, vec![], done, None).is_none());
     }
@@ -1312,6 +1314,7 @@ mod interval_reporter_tests {
             timestamp_format: None,
             json_stream: false,
             print: true,
+            blksize: 128 * 1024,
         };
         let handle = spawn_interval_reporter(config, vec![], done.clone(), None);
         assert!(handle.is_some());

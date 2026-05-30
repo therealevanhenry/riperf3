@@ -53,7 +53,11 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_snd_mss,
         pmtu: info.tcpi_pmtu,
-        reorder: info.tcpi_reordering,
+        // iperf3's `reorder` is `tcpi_reord_seen` (count of reordering events),
+        // NOT `tcpi_reordering` (the kernel's reordering-degree estimate). libc's
+        // `tcp_info` truncates before `tcpi_reord_seen`, so it's unreachable here;
+        // report 0, as iperf3 does when the field is unavailable.
+        reorder: 0,
     })
 }
 

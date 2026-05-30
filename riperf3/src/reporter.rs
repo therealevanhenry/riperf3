@@ -290,6 +290,9 @@ pub struct IntervalReporterConfig {
     /// Print interval lines live (text or json-stream). When false the reporter
     /// runs purely to collect intervals for the final `-J` blob (issue #36 PR2).
     pub print: bool,
+    /// Datagram size, used to derive the UDP *sender's* per-interval packet count
+    /// (the sender doesn't measure loss/jitter, so iperf3 reports only `packets`).
+    pub blksize: usize,
 }
 
 /// Per-stream sender-side TCP_INFO extremes accumulated across the run (#36 PR2),
@@ -365,6 +368,9 @@ pub fn spawn_interval_reporter(
         let mut prev_retransmits: Vec<u32> = vec![0; streams.len()];
         let mut prev_cnt_error: Vec<i64> = vec![0; streams.len()];
         let mut prev_packet_count: Vec<i64> = vec![0; streams.len()];
+
+        // Datagram size for the UDP sender's per-interval packet count.
+        let blk = config.blksize.max(1) as u64;
 
         // Accumulated state for the final `-J` report (#36 PR2). Written to the
         // collector once the loop ends; the client reads it after joining us.
@@ -533,9 +539,23 @@ pub fn spawn_interval_reporter(
                 }
 
                 if collecting {
-                    let lost_pct = match (lost, total) {
-                        (Some(l), Some(t)) => Some(lost_percent(l, t)),
-                        _ => None,
+                    // UDP datagram detail: a receiver stream reports measured
+                    // loss/jitter; a sender stream reports only the sent packet
+                    // count (bytes / datagram size), like iperf3.
+                    let (j_ms, lost_p, pkts, lost_pct) = if stream.udp_recv_stats.is_some() {
+                        (
+                            jitter.map(|j| j * 1000.0),
+                            lost,
+                            total,
+                            match (lost, total) {
+                                (Some(l), Some(t)) => Some(lost_percent(l, t)),
+                                _ => None,
+                            },
+                        )
+                    } else if is_udp {
+                        (None, None, Some((bytes / blk) as i64), None)
+                    } else {
+                        (None, None, None, None)
                     };
                     collected_streams.push(crate::json_report::IntervalStream {
                         socket: stream.id,
@@ -546,13 +566,16 @@ pub fn spawn_interval_reporter(
                         bits_per_second: bps_val,
                         retransmits,
                         snd_cwnd,
+                        // snd_wnd is unavailable via libc (see TcpStreamSide); emit
+                        // 0 alongside the other TCP detail, like iperf3.
+                        snd_wnd: snd_cwnd.map(|_| 0u64),
                         rtt,
                         rttvar,
                         pmtu,
                         reorder: reorder_iv,
-                        jitter_ms: jitter.map(|j| j * 1000.0),
-                        lost_packets: lost,
-                        packets: total,
+                        jitter_ms: j_ms,
+                        lost_packets: lost_p,
+                        packets: pkts,
                         lost_percent: lost_pct,
                         omitted,
                         sender: stream.is_sender,
@@ -600,6 +623,21 @@ pub fn spawn_interval_reporter(
                 } else {
                     0.0
                 };
+                // UDP sum: a receiving side reports measured loss/jitter; a pure
+                // sending side reports only the sent packet count, like iperf3.
+                let any_udp_recv = streams.iter().any(|s| s.udp_recv_stats.is_some());
+                let (sum_j, sum_lostp, sum_pkts, sum_lostpct) = if is_udp && any_udp_recv {
+                    (
+                        Some(last_jitter * 1000.0),
+                        Some(sum_lost),
+                        Some(sum_packets),
+                        Some(lost_percent(sum_lost, sum_packets)),
+                    )
+                } else if is_udp {
+                    (None, None, Some((sum_bytes / blk) as i64), None)
+                } else {
+                    (None, None, None, None)
+                };
                 collected.push(crate::json_report::Interval {
                     streams: collected_streams,
                     sum: crate::json_report::IntervalSum {
@@ -613,18 +651,10 @@ pub fn spawn_interval_reporter(
                         } else {
                             None
                         },
-                        jitter_ms: if is_udp {
-                            Some(last_jitter * 1000.0)
-                        } else {
-                            None
-                        },
-                        lost_packets: if is_udp { Some(sum_lost) } else { None },
-                        packets: if is_udp { Some(sum_packets) } else { None },
-                        lost_percent: if is_udp {
-                            Some(lost_percent(sum_lost, sum_packets))
-                        } else {
-                            None
-                        },
+                        jitter_ms: sum_j,
+                        lost_packets: sum_lostp,
+                        packets: sum_pkts,
+                        lost_percent: sum_lostpct,
                         omitted,
                         sender: streams.first().is_none_or(|s| s.is_sender),
                     },

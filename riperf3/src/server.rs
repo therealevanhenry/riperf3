@@ -436,6 +436,7 @@ impl Server {
                     timestamp_format: self.timestamps.clone(),
                     json_stream: false, // server doesn't stream JSON
                     print: true,        // server prints its interval lines live
+                    blksize: cfg.blksize,
                 },
                 stream_refs,
                 done.clone(),

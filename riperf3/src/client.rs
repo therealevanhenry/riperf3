@@ -576,6 +576,7 @@ impl Client {
                     timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
+                    blksize,
                 },
                 stream_refs,
                 done.clone(),
@@ -871,11 +872,17 @@ impl Client {
                 let retransmits = if is_udp {
                     None
                 } else {
-                    // Real cumulative total when TCP_INFO gave us one; otherwise
-                    // -1 (iperf3's "unavailable" sentinel).
+                    // Real cumulative total when TCP_INFO gave us one (forward
+                    // sender). Otherwise (reverse, or a stream we didn't send) use
+                    // iperf3's defaults: 0 on a platform that supports retransmit
+                    // info, -1 where it doesn't.
                     ext.and_then(|e| e.total_retransmits)
                         .map(|r| r as i64)
-                        .or(Some(-1))
+                        .or(Some(if crate::tcp_info::has_retransmit_info() {
+                            0
+                        } else {
+                            -1
+                        }))
                 };
 
                 StreamReport {
