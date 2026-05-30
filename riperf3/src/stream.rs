@@ -298,6 +298,10 @@ pub struct DataStream {
     /// for the `-J` `start.connected` block (issue #36). `None` if unavailable.
     pub local_addr: Option<std::net::SocketAddr>,
     pub peer_addr: Option<std::net::SocketAddr>,
+    /// Actual SO_SNDBUF/SO_RCVBUF on this stream's socket, captured at creation
+    /// for the `-J` `start.sndbuf_actual`/`rcvbuf_actual` fields (#36 PR3).
+    pub sndbuf_actual: Option<u64>,
+    pub rcvbuf_actual: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

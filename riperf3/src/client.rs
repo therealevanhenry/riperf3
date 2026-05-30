@@ -122,12 +122,17 @@ impl Client {
         .await?;
         net::configure_tcp_stream(&ctrl, true)?;
 
+        // The control connection's MSS sizes UDP datagrams (issue #6) and feeds
+        // the `-J` start.tcp_mss_default field (#36 PR3).
+        let control_mss_opt = net::tcp_maxseg(&ctrl);
+        let control_mss = control_mss_opt.unwrap_or(0);
+
         // Resolve the UDP datagram size now that the control connection exists:
         // when `-l` wasn't given, derive it from the control-socket MSS so a
         // jumbo-frame path uses large datagrams instead of the 1460 floor
         // (iperf3 parity, issue #6). TCP keeps its own block size unchanged.
         let blksize = if self.protocol == TransportProtocol::Udp && !self.blksize_explicit {
-            resolve_udp_blksize(None, net::tcp_maxseg(&ctrl))
+            resolve_udp_blksize(None, control_mss_opt)
         } else {
             self.blksize
         };
@@ -160,6 +165,8 @@ impl Client {
         let mut streams: Vec<DataStream> = Vec::new();
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
+        // Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
+        let mut test_start_millis = 0u64;
 
         // ---- State machine: react to server-driven transitions ----
         loop {
@@ -179,6 +186,10 @@ impl Client {
                     // All streams are set up — release the UDP senders.
                     start.store(true, Ordering::Relaxed);
                     cpu_start = Some(CpuSnapshot::now());
+                    test_start_millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                 }
 
                 TestState::TestRunning => {
@@ -201,6 +212,12 @@ impl Client {
                         server_results.as_ref(),
                         blksize,
                         &interval_data,
+                        &StartMeta {
+                            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                                .into_owned(),
+                            tcp_mss_default: control_mss,
+                            start_time_millis: test_start_millis,
+                        },
                     );
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
@@ -387,6 +404,9 @@ impl Client {
                     // into its task, for the `-J` start.connected block (#36).
                     let local_addr = data_stream.local_addr().ok();
                     let peer_addr = data_stream.peer_addr().ok();
+                    let sock = socket2::SockRef::from(&data_stream);
+                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
+                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
@@ -431,6 +451,8 @@ impl Client {
                         raw_fd,
                         local_addr,
                         peer_addr,
+                        sndbuf_actual,
+                        rcvbuf_actual,
                     });
                 }
             }
@@ -474,6 +496,9 @@ impl Client {
                     // (#36) before the socket moves into its task.
                     let local_addr = udp_sock.local_addr().ok();
                     let peer_addr = udp_sock.peer_addr().ok();
+                    let sock = socket2::SockRef::from(&udp_sock);
+                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
+                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
 
                     // Convert tokio UdpSocket to std for blocking I/O
                     let std_sock = udp_sock.into_std().map_err(RiperfError::Io)?;
@@ -519,6 +544,8 @@ impl Client {
                             raw_fd: None,
                             local_addr,
                             peer_addr,
+                            sndbuf_actual,
+                            rcvbuf_actual,
                         });
                         continue;
                     };
@@ -532,6 +559,8 @@ impl Client {
                         raw_fd: None,
                         local_addr,
                         peer_addr,
+                        sndbuf_actual,
+                        rcvbuf_actual,
                     });
                 }
             }
@@ -719,9 +748,17 @@ impl Client {
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        start_meta: &StartMeta,
     ) {
         if self.json_output {
-            self.print_results_json(streams, cpu_start, remote_cpu, blksize, interval_data);
+            self.print_results_json(
+                streams,
+                cpu_start,
+                remote_cpu,
+                blksize,
+                interval_data,
+                start_meta,
+            );
         } else {
             self.print_results_text(streams, remote_cpu);
         }
@@ -787,6 +824,7 @@ impl Client {
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        start_meta: &StartMeta,
     ) {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
@@ -916,8 +954,7 @@ impl Client {
             connecting_host: self.host.clone(),
             connecting_port: self.port,
             version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
-            // Full system_info (uname) lands with the rest of start{} metadata in PR3.
-            system_info: String::new(),
+            system_info: system_info(),
             cpu: CpuUtilization {
                 host_total: cpu_util.host_total,
                 host_user: cpu_util.host_user,
@@ -930,6 +967,19 @@ impl Client {
             // the field until that read-back lands rather than emit the requested
             // value (which may differ from what the kernel used).
             congestion_used: None,
+            cookie: start_meta.cookie.clone(),
+            tcp_mss_default: start_meta.tcp_mss_default,
+            fq_rate: self.fq_rate.unwrap_or(0),
+            // iperf3's start.sock_bufsize is the requested -w value (0 if unset);
+            // sndbuf/rcvbuf_actual are the kernel's actual sizes on a data socket.
+            sock_bufsize: self.window.map(|w| w as u64).unwrap_or(0),
+            sndbuf_actual: streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0),
+            rcvbuf_actual: streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0),
+            interval: self.interval.unwrap_or(1.0),
+            // riperf3's single --gsro flag drives both GSO and GRO.
+            gso: i32::from(self.gsro),
+            gro: i32::from(self.gsro),
+            start_time_millis: start_meta.start_time_millis,
             intervals: collected_intervals,
             streams: stream_reports,
         };
@@ -942,6 +992,36 @@ enum EndCondition {
     Duration(Duration),
     Bytes(u64),
     Blocks(u64),
+}
+
+/// Start-of-test metadata for the `-J` `start` block (#36 PR3), captured in
+/// `run()` where the cookie / control-MSS / start wall-clock are known.
+struct StartMeta {
+    cookie: String,
+    tcp_mss_default: u32,
+    start_time_millis: u64,
+}
+
+/// iperf3-style `system_info`: the uname fields joined, e.g.
+/// "Linux host 6.x #1 SMP ... x86_64". Empty on platforms without `uname`.
+#[cfg(unix)]
+fn system_info() -> String {
+    match nix::sys::utsname::uname() {
+        Ok(u) => format!(
+            "{} {} {} {} {}",
+            u.sysname().to_string_lossy(),
+            u.nodename().to_string_lossy(),
+            u.release().to_string_lossy(),
+            u.version().to_string_lossy(),
+            u.machine().to_string_lossy(),
+        ),
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn system_info() -> String {
+    String::new()
 }
 
 // ---------------------------------------------------------------------------
