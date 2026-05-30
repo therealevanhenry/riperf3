@@ -234,7 +234,7 @@ Not yet implemented:
 - `libiperf`-compatible FFI library
 
 Experimental:
-- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux, FreeBSD, NetBSD. Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
+- `--sendmmsg` — batched UDP sends via `sendmmsg(2)`. Uses safe Rust only (nix wrapper). Available on Linux and FreeBSD. Not part of iperf3 — a riperf3-exclusive optimization exploring safe Rust performance at the kernel boundary.
 
 ## License
 

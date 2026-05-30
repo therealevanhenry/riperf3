@@ -55,7 +55,7 @@ sides of the connection.
 - Real-iperf3 wire-interop CI gate against current and 3.12 iperf3 (#38), now
   also validating the server's `-J` output (#50).
 - Linux/Unix-only feature tests are gated by target so the native macOS/Windows
-  CI runners pass cleanly (#71, #72, #76, #77).
+  CI runners pass cleanly (#71, #72, #76).
 
 ### Known issues
 

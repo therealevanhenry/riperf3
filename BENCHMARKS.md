@@ -129,7 +129,9 @@ characteristic rather than a regression.
 | riperf3 UDP | 27.0 | 21.9 |
 | iperf3 UDP | 29.3 | 26.2 |
 
-TCP bidir is at parity (~80 Gbps aggregate); UDP bidir aggregate is comparable.
+TCP bidir aggregate is close (~78–83 Gbps; iperf3 edges it a few percent in this
+single run); UDP bidir aggregate is likewise comparable. These are single
+non-campaign runs — directional, not statistical.
 
 ### UDP datagram-size sweep (IPv6 forward, P1)
 

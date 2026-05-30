@@ -106,7 +106,8 @@ def main():
         icell = f"{is_['mean']:.1f} [{is_['mean']-is_['ci']:.1f}–{is_['mean']+is_['ci']:.1f}]"
         print(f"| {label} | {rcell} | {icell} | {delta:+.1f}% | {fmt_p(p)} | {verdict} |")
 
-    print(f"\n_Per-cell CV range: {cv_lo:.1f}–{cv_hi:.1f}%._")
+    if cv_lo <= cv_hi:  # at least one cell contributed (else the seed values invert)
+        print(f"\n_Per-cell CV range: {cv_lo:.1f}–{cv_hi:.1f}%._")
 
     # UDP loss at -b 0, P8, by direction (aggregate over families).
     udp_p8 = defaultdict(lambda: defaultdict(list))
