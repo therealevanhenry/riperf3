@@ -89,6 +89,10 @@ pub struct Server {
     pub authorized_users_path: Option<String>,
     pub time_skew_threshold: u32,
     pub use_pkcs1_padding: bool,
+    /// Emit the test results as iperf3-schema JSON on stdout instead of text (#50).
+    pub json_output: bool,
+    /// Stream line-delimited interval JSON during the test (`--json-stream`).
+    pub json_stream: bool,
 }
 
 impl Server {
@@ -107,10 +111,16 @@ impl Server {
 
         let listener =
             net::tcp_listen(self.bind_address.as_deref(), self.port, self.ip_version).await?;
+        // Under -J / --json-stream iperf3's server stdout is pure JSON (the
+        // "Server listening" banners are suppressed) so the document parses
+        // cleanly; match that.
+        let json = self.json_output || self.json_stream;
         let sep = "-----------------------------------------------------------";
-        println!("{sep}");
-        println!("Server listening on {}", self.port);
-        println!("{sep}");
+        if !json {
+            println!("{sep}");
+            println!("Server listening on {}", self.port);
+            println!("{sep}");
+        }
 
         loop {
             match self.handle_one_test(&listener).await {
@@ -128,9 +138,11 @@ impl Server {
             if self.one_off {
                 break;
             }
-            println!("{sep}");
-            println!("Server listening on {}", self.port);
-            println!("{sep}");
+            if !json {
+                println!("{sep}");
+                println!("Server listening on {}", self.port);
+                println!("{sep}");
+            }
         }
         Ok(())
     }
@@ -156,6 +168,16 @@ impl Server {
             vprintln!("Accepted connection from {peer_addr}");
         }
         net::configure_tcp_stream(&ctrl, true)?;
+
+        let json = self.json_output || self.json_stream;
+        // The control-socket peer address feeds the server's `start.accepted_connection`
+        // (iperf_api.c uses getpeername(ctrl_sck) — distinct from the data-stream
+        // addresses in `connected[]`). Captured for the `-J` blob (#50).
+        // `to_canonical()` unwraps an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`)
+        // from the dual-stack listener back to plain `127.0.0.1`, as iperf3 does
+        // (mapped_v4_to_regular_v4).
+        let (accepted_host, accepted_port) =
+            (peer_addr.ip().to_canonical().to_string(), peer_addr.port());
 
         // ---- Cookie ----
         let cookie = protocol::recv_cookie(&mut ctrl).await?;
@@ -266,6 +288,15 @@ impl Server {
                     let raw_fd: Option<i32> = None;
                     let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
+                    // Real socket addresses + kernel buffer sizes for the server's
+                    // `-J` `connected[]` / `sndbuf_actual` / `rcvbuf_actual` (#50),
+                    // captured before the stream moves into its task.
+                    let local_addr = data_stream.local_addr().ok();
+                    let peer_addr_s = data_stream.peer_addr().ok();
+                    let sock = socket2::SockRef::from(&data_stream);
+                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
+                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
+
                     let task = if is_sender {
                         let buf = make_send_buffer(cfg.blksize, false);
                         let c = counters.clone();
@@ -289,11 +320,10 @@ impl Server {
                         udp_recv_stats: None,
                         task,
                         raw_fd,
-                        // Populated for the server's own `-J` output in #50.
-                        local_addr: None,
-                        peer_addr: None,
-                        sndbuf_actual: None,
-                        rcvbuf_actual: None,
+                        local_addr,
+                        peer_addr: peer_addr_s,
+                        sndbuf_actual,
+                        rcvbuf_actual,
                     });
                 }
             }
@@ -350,6 +380,18 @@ impl Server {
                     let is_sender = i >= recv_count;
                     let counters = Arc::new(StreamCounters::new());
 
+                    // Socket addresses + buffer sizes for the `-J` blob (#50),
+                    // captured before the socket is converted to std + moved.
+                    let local_addr = data_sock.local_addr().ok();
+                    let peer_addr_s = data_sock.peer_addr().ok();
+                    let (sndbuf_actual, rcvbuf_actual) = {
+                        let sock = socket2::SockRef::from(&data_sock);
+                        (
+                            sock.send_buffer_size().ok().map(|v| v as u64),
+                            sock.recv_buffer_size().ok().map(|v| v as u64),
+                        )
+                    };
+
                     let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
 
                     if is_sender {
@@ -373,10 +415,10 @@ impl Server {
                             udp_recv_stats: None,
                             task,
                             raw_fd: None,
-                            local_addr: None,
-                            peer_addr: None,
-                            sndbuf_actual: None,
-                            rcvbuf_actual: None,
+                            local_addr,
+                            peer_addr: peer_addr_s,
+                            sndbuf_actual,
+                            rcvbuf_actual,
                         });
                     } else {
                         let c = counters.clone();
@@ -402,10 +444,10 @@ impl Server {
                             udp_recv_stats: Some(stats),
                             task,
                             raw_fd: None,
-                            local_addr: None,
-                            peer_addr: None,
-                            sndbuf_actual: None,
-                            rcvbuf_actual: None,
+                            local_addr,
+                            peer_addr: peer_addr_s,
+                            sndbuf_actual,
+                            rcvbuf_actual,
                         });
                     }
                 }
@@ -417,7 +459,19 @@ impl Server {
         start.store(true, Ordering::Relaxed);
         protocol::send_state(&mut ctrl, TestState::TestStart).await?;
         let cpu_start = CpuSnapshot::now();
+        // Wall-clock at TestStart, for the `-J` start.timestamp (#50).
+        let test_start_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         protocol::send_state(&mut ctrl, TestState::TestRunning).await?;
+
+        // For plain -J the reporter runs silently to collect intervals for the
+        // final blob; for text or --json-stream it prints/streams live, matching
+        // the client's gating (#50).
+        let print_intervals = !json || self.json_stream;
+        let collect_intervals = json && !self.json_stream;
+        let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
 
         // Spawn interval reporter (server uses 1.0s default)
         let interval_handle = {
@@ -440,13 +494,13 @@ impl Server {
                     num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
-                    json_stream: false, // server doesn't stream JSON
-                    print: true,        // server prints its interval lines live
+                    json_stream: self.json_stream,
+                    print: print_intervals,
                     blksize: cfg.blksize,
                 },
                 stream_refs,
                 done.clone(),
-                None, // server has no -J blob to collect for yet (#50)
+                collect_intervals.then(|| interval_data.clone()),
             )
         };
 
@@ -559,7 +613,9 @@ impl Server {
         };
 
         protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
-        // iperf3 protocol: server reads client results first, then sends its own
+        // iperf3 protocol: server reads client results first, then sends its own.
+        // The client's results are not used in the server's own report — iperf3's
+        // server reports only its own measured bytes and a 0 remote CPU (#50).
         let _client_results = protocol::recv_results(&mut ctrl).await?;
         protocol::send_results(&mut ctrl, &server_results).await?;
 
@@ -576,40 +632,56 @@ impl Server {
             }
         }
 
-        // Print summary: per-stream lines plus aggregate [SUM] row(s) for
-        // parallel streams (issue #4), via the shared path the client uses.
-        let summaries: Vec<crate::reporter::StreamSummary> = streams
-            .iter()
-            .map(|s| {
-                let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
-                } else {
-                    s.counters.bytes_received()
-                };
+        if json {
+            // Emit the iperf3-schema JSON report on stdout (#50).
+            self.print_results_json(
+                &streams,
+                &cfg,
+                &params,
+                &cpu_util,
+                test_duration,
+                &cookie,
+                &accepted_host,
+                accepted_port,
+                test_start_millis,
+                &interval_data,
+            );
+        } else {
+            // Print summary: per-stream lines plus aggregate [SUM] row(s) for
+            // parallel streams (issue #4), via the shared path the client uses.
+            let summaries: Vec<crate::reporter::StreamSummary> = streams
+                .iter()
+                .map(|s| {
+                    let bytes = if s.is_sender {
+                        s.counters.bytes_sent()
+                    } else {
+                        s.counters.bytes_received()
+                    };
 
-                let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                    udp_stats
-                        .lock()
-                        .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
-                        .unwrap_or((None, None, None))
-                } else {
-                    (None, None, None)
-                };
+                    let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                        udp_stats
+                            .lock()
+                            .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                            .unwrap_or((None, None, None))
+                    } else {
+                        (None, None, None)
+                    };
 
-                crate::reporter::StreamSummary {
-                    stream_id: s.id,
-                    start: 0.0,
-                    end: test_duration,
-                    bytes,
-                    is_sender: s.is_sender,
-                    retransmits: None,
-                    jitter,
-                    lost,
-                    total_packets: total,
-                }
-            })
-            .collect();
-        crate::reporter::print_final_summaries(&summaries, 'a');
+                    crate::reporter::StreamSummary {
+                        stream_id: s.id,
+                        start: 0.0,
+                        end: test_duration,
+                        bytes,
+                        is_sender: s.is_sender,
+                        retransmits: None,
+                        jitter,
+                        lost,
+                        total_packets: total,
+                    }
+                })
+                .collect();
+            crate::reporter::print_final_summaries(&summaries, 'a');
+        }
 
         // Join stream tasks (best-effort, they should be done)
         for s in streams {
@@ -617,6 +689,185 @@ impl Server {
         }
 
         Ok(())
+    }
+
+    /// Assemble and print the server's iperf3-schema `-J` report (#50). Mirrors
+    /// the client's `print_results_json`, with the server's perspective baked in
+    /// via `is_server: true`: `accepted_connection` instead of `connecting_to`,
+    /// no peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
+    /// (iperf3's server never reads its control-socket MSS).
+    #[allow(clippy::too_many_arguments)]
+    fn print_results_json(
+        &self,
+        streams: &[DataStream],
+        cfg: &TestConfig,
+        params: &TestParams,
+        cpu_util: &crate::cpu::CpuUtilization,
+        test_duration: f64,
+        cookie: &[u8; protocol::COOKIE_SIZE],
+        accepted_host: &str,
+        accepted_port: u16,
+        start_time_millis: u64,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+    ) {
+        use crate::json_report::{
+            CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
+        };
+
+        // Take the interval samples + per-stream TCP_INFO extremes the reporter
+        // collected (its task is joined by now, so this is final).
+        let (collected_intervals, extremes) = match interval_data.lock() {
+            Ok(mut g) => (
+                std::mem::take(&mut g.intervals),
+                std::mem::take(&mut g.extremes),
+            ),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+
+        let is_udp = matches!(cfg.protocol, TransportProtocol::Udp);
+
+        let stream_reports: Vec<StreamReport> = streams
+            .iter()
+            .map(|s| {
+                let local_bytes = if s.is_sender {
+                    s.counters.bytes_sent()
+                } else {
+                    s.counters.bytes_received()
+                };
+
+                // The server measures UDP loss/jitter on the streams it receives.
+                let udp = s.udp_recv_stats.as_ref().and_then(|lock| {
+                    lock.lock().ok().map(|st| UdpStreamStats {
+                        jitter_secs: st.jitter,
+                        lost_packets: st.cnt_error,
+                        packets: st.packet_count,
+                        out_of_order: st.outoforder_packets,
+                    })
+                });
+
+                // to_canonical(): unwrap IPv4-mapped IPv6 from the dual-stack
+                // listener to plain IPv4 in connected[], matching iperf3.
+                let (local_host, local_port) = s
+                    .local_addr
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
+                    .unwrap_or_default();
+                let (remote_host, remote_port) = s
+                    .peer_addr
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
+                    .unwrap_or_default();
+
+                // Sender-side TCP_INFO extremes + retransmit total, present only
+                // for streams the server sent (reverse / bidir).
+                let ext = extremes
+                    .iter()
+                    .find(|e| e.stream_id == s.id && e.has_samples());
+                let tcp_end = ext.map(|e| TcpEndExtras {
+                    max_snd_cwnd: e.max_snd_cwnd,
+                    max_rtt: e.max_rtt,
+                    min_rtt: e.min_rtt,
+                    mean_rtt: e.mean_rtt(),
+                    reorder: e.reorder,
+                });
+                // Retransmits are a sender-side metric. The server only sends on
+                // reverse/bidir streams; a stream it received has no retransmit
+                // count (None → omitted), so it can't leak a 0 into sum_sent on a
+                // forward test (where iperf3's server emits no retransmits).
+                let retransmits = if is_udp || !s.is_sender {
+                    None
+                } else {
+                    ext.and_then(|e| e.total_retransmits)
+                        .map(|r| r as i64)
+                        .or(Some(if crate::tcp_info::has_retransmit_info() {
+                            0
+                        } else {
+                            -1
+                        }))
+                };
+
+                StreamReport {
+                    id: s.id,
+                    local_host,
+                    local_port,
+                    remote_host,
+                    remote_port,
+                    is_sender: s.is_sender,
+                    local_bytes,
+                    // The server never learns the peer's per-stream bytes; build()
+                    // zeroes the un-measured side for is_server reports.
+                    remote_bytes: None,
+                    retransmits,
+                    tcp_end,
+                    udp,
+                }
+            })
+            .collect();
+
+        let input = ReportInput {
+            protocol: cfg.protocol,
+            reverse: cfg.reverse,
+            bidir: cfg.bidir,
+            duration: test_duration,
+            num_streams: cfg.num_streams as i32,
+            blksize: cfg.blksize as i64,
+            omit: cfg.omit as i32,
+            tos: cfg.tos,
+            target_bitrate: cfg.bandwidth,
+            bytes: params.num.unwrap_or(0),
+            blocks: params.blockcount.unwrap_or(0),
+            connecting_host: String::new(),
+            connecting_port: 0,
+            is_server: true,
+            accepted_host: accepted_host.to_string(),
+            accepted_port,
+            version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+            system_info: crate::utils::system_info(),
+            cpu: CpuUtilization {
+                // Only the server's own CPU. iperf3's server reports the remote
+                // (client) CPU as 0 — it doesn't surface the client's figure even
+                // though the client sends it — so match that rather than graft it.
+                host_total: cpu_util.host_total,
+                host_user: cpu_util.host_user,
+                host_system: cpu_util.host_system,
+                remote_total: 0.0,
+                remote_user: 0.0,
+                remote_system: 0.0,
+            },
+            // Reporting the server's actually-applied congestion is #37; until then
+            // it stays None (omitted), consistent with the client.
+            congestion_used: None,
+            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1]).to_string(),
+            // iperf3's server emits tcp_mss_default = 0 (it never reads the control
+            // socket MSS); the requested -M (via params) still surfaces as tcp_mss.
+            tcp_mss_default: 0,
+            mss: cfg.mss.filter(|&m| m > 0).map(|m| m as u32),
+            fq_rate: params.fqrate.unwrap_or(0),
+            sock_bufsize: cfg.window.map(|w| w.max(0) as u64).unwrap_or(0),
+            sndbuf_actual: streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0),
+            rcvbuf_actual: streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0),
+            // The server reports at its 1s default; it has no -i.
+            interval: 1.0,
+            // GSO/GRO are client-side knobs, not exchanged; iperf3's server emits 0.
+            gso: 0,
+            gro: 0,
+            start_time_millis,
+            intervals: collected_intervals,
+            streams: stream_reports,
+        };
+
+        let report = input.build();
+        if self.json_stream {
+            // --json-stream: the interval lines were already streamed; emit the
+            // final document the same way the client does.
+            match serde_json::to_string(&report) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
+            }
+        } else {
+            match serde_json::to_string_pretty(&report) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
+            }
+        }
     }
 }
 
@@ -643,6 +894,8 @@ pub struct ServerBuilder {
     authorized_users_path: Option<String>,
     time_skew_threshold: u32,
     use_pkcs1_padding: bool,
+    json_output: bool,
+    json_stream: bool,
 }
 
 impl Default for ServerBuilder {
@@ -666,6 +919,8 @@ impl Default for ServerBuilder {
             authorized_users_path: None,
             time_skew_threshold: 10,
             use_pkcs1_padding: false,
+            json_output: false,
+            json_stream: false,
         }
     }
 }
@@ -687,6 +942,18 @@ impl ServerBuilder {
 
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// Emit the results as iperf3-schema JSON on stdout instead of text (`-J`).
+    pub fn json_output(mut self, enabled: bool) -> Self {
+        self.json_output = enabled;
+        self
+    }
+
+    /// Stream line-delimited interval JSON during the test (`--json-stream`).
+    pub fn json_stream(mut self, enabled: bool) -> Self {
+        self.json_stream = enabled;
         self
     }
 
@@ -821,6 +1088,8 @@ impl ServerBuilder {
             authorized_users_path: self.authorized_users_path,
             time_skew_threshold: self.time_skew_threshold,
             use_pkcs1_padding: self.use_pkcs1_padding,
+            json_output: self.json_output,
+            json_stream: self.json_stream,
         })
     }
 }

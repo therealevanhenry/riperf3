@@ -107,6 +107,29 @@ pub fn iperf3_stream_id(index: u32) -> i32 {
     }
 }
 
+/// iperf3-style `system_info`: the uname fields joined, e.g.
+/// "Linux host 6.x #1 SMP ... x86_64". Empty on platforms without `uname`.
+/// Shared by the client and server `-J` `start.system_info` (#36, #50).
+#[cfg(unix)]
+pub fn system_info() -> String {
+    match nix::sys::utsname::uname() {
+        Ok(u) => format!(
+            "{} {} {} {} {}",
+            u.sysname().to_string_lossy(),
+            u.nodename().to_string_lossy(),
+            u.release().to_string_lossy(),
+            u.version().to_string_lossy(),
+            u.machine().to_string_lossy(),
+        ),
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn system_info() -> String {
+    String::new()
+}
+
 /// Maximum UDP payload: 65535 - 8 (UDP header) - 20 (IP header)
 pub const MAX_UDP_BLKSIZE: usize = 65507;
 

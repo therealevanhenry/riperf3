@@ -638,6 +638,12 @@ pub fn spawn_interval_reporter(
                 } else {
                     (None, None, None, None)
                 };
+                // iperf3 emits the sum's retransmits only on a sender-direction
+                // sum (sender_has_retransmits && stream_must_be_sender). On the
+                // server's bidir `sum` (which describes the received flow, so
+                // sender=false) it must be omitted, not just gated on "any stream
+                // sends" — otherwise the received-flow sum carries a spurious count.
+                let sum_is_sender = streams.first().is_none_or(|s| s.is_sender);
                 collected.push(crate::json_report::Interval {
                     streams: collected_streams,
                     sum: crate::json_report::IntervalSum {
@@ -646,7 +652,7 @@ pub fn spawn_interval_reporter(
                         seconds,
                         bytes: sum_bytes,
                         bits_per_second: sum_bps,
-                        retransmits: if has_retransmits {
+                        retransmits: if has_retransmits && sum_is_sender {
                             Some(sum_retransmits)
                         } else {
                             None
@@ -656,7 +662,7 @@ pub fn spawn_interval_reporter(
                         packets: sum_pkts,
                         lost_percent: sum_lostpct,
                         omitted,
-                        sender: streams.first().is_none_or(|s| s.is_sender),
+                        sender: sum_is_sender,
                     },
                 });
             }

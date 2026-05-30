@@ -886,13 +886,16 @@ impl Client {
                     None
                 };
 
+                // to_canonical(): unwrap an IPv4-mapped IPv6 address to plain IPv4
+                // (matches iperf3); a no-op for the client's usual canonical
+                // addresses, correct if the client is bound to a dual-stack socket.
                 let (local_host, local_port) = s
                     .local_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_else(|| (self.host.clone(), 0));
                 let (remote_host, remote_port) = s
                     .peer_addr
-                    .map(|a| (a.ip().to_string(), a.port()))
+                    .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_else(|| (self.host.clone(), self.port));
 
                 // Sender-side TCP_INFO extremes + real retransmit total collected
@@ -953,6 +956,9 @@ impl Client {
             blocks: self.blocks_to_send.unwrap_or(0),
             connecting_host: self.host.clone(),
             connecting_port: self.port,
+            is_server: false,
+            accepted_host: String::new(),
+            accepted_port: 0,
             version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
             system_info: system_info(),
             cpu: CpuUtilization {
@@ -1005,28 +1011,6 @@ struct StartMeta {
     cookie: String,
     tcp_mss_default: u32,
     start_time_millis: u64,
-}
-
-/// iperf3-style `system_info`: the uname fields joined, e.g.
-/// "Linux host 6.x #1 SMP ... x86_64". Empty on platforms without `uname`.
-#[cfg(unix)]
-fn system_info() -> String {
-    match nix::sys::utsname::uname() {
-        Ok(u) => format!(
-            "{} {} {} {} {}",
-            u.sysname().to_string_lossy(),
-            u.nodename().to_string_lossy(),
-            u.release().to_string_lossy(),
-            u.version().to_string_lossy(),
-            u.machine().to_string_lossy(),
-        ),
-        Err(_) => String::new(),
-    }
-}
-
-#[cfg(not(unix))]
-fn system_info() -> String {
-    String::new()
 }
 
 // ---------------------------------------------------------------------------

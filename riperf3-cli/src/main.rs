@@ -242,6 +242,12 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if cli.verbose {
             builder = builder.verbose(true);
         }
+        if cli.json {
+            builder = builder.json_output(true);
+        }
+        if cli.json_stream {
+            builder = builder.json_stream(true);
+        }
         if cli.daemon {
             builder = builder.daemon(true);
         }
