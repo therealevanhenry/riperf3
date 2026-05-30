@@ -511,8 +511,10 @@ pub async fn run_tcp_sender_zerocopy(
     Ok(())
 }
 
-/// Create a temporary file for zerocopy sends.
-#[cfg(unix)]
+/// Create a temporary file for zerocopy sends. Gated to the targets whose
+/// `run_tcp_sender_zerocopy` impls call it; a broader `#[cfg(unix)]` would be
+/// dead code (and warn) on other-Unix, which has no zerocopy sender (#78).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn tempfile() -> std::io::Result<std::fs::File> {
     use std::io::Seek;
     let mut f = tempfile_in(std::env::temp_dir())?;
@@ -520,7 +522,7 @@ fn tempfile() -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn tempfile_in(dir: std::path::PathBuf) -> std::io::Result<std::fs::File> {
     let path = dir.join(format!(".riperf3-zc-{}", std::process::id()));
     let f = std::fs::OpenOptions::new()

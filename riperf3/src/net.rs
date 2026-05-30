@@ -569,7 +569,17 @@ pub fn set_dont_fragment(fd: &impl std::os::windows::io::AsSocket) -> Result<()>
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+// No-op fallback for every target without a real impl above. This must exclude
+// the handled targets explicitly rather than say `not(any(unix, windows))`:
+// other-Unix (NetBSD/OpenBSD/illumos) is `unix` but has no `set_dont_fragment`
+// arm, so the old gate left the call site referencing a nonexistent fn there
+// (#78). `--dont-fragment` is a silent no-op on those platforms.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+)))]
 pub fn set_dont_fragment<F>(_fd: &F) -> Result<()> {
     Ok(())
 }
