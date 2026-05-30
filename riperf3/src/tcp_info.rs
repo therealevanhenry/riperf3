@@ -15,6 +15,8 @@ pub struct TcpInfoSnapshot {
     pub snd_mss: u32,
     /// Path MTU.
     pub pmtu: u32,
+    /// Reordering metric (segments).
+    pub reorder: u32,
 }
 
 /// Query TCP_INFO for a connected TCP socket.
@@ -46,11 +48,12 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     Some(TcpInfoSnapshot {
         total_retransmits: info.tcpi_total_retrans,
         snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,
-        snd_wnd: 0, // tcpi_snd_wnd not available in all libc versions
+        snd_wnd: 0, // tcpi_snd_wnd is not exposed by libc's tcp_info on Linux
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_snd_mss,
         pmtu: info.tcpi_pmtu,
+        reorder: info.tcpi_reordering,
     })
 }
 
@@ -84,7 +87,8 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         rtt: info.tcpi_srtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_maxseg,
-        pmtu: 0, // not available in tcp_connection_info
+        pmtu: 0,    // not available in tcp_connection_info
+        reorder: 0, // not exposed by tcp_connection_info
     })
 }
 
@@ -119,6 +123,7 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_snd_mss,
         pmtu: info.__tcpi_pmtu,
+        reorder: 0, // tcpi_reordering not in FreeBSD's tcp_info
     })
 }
 

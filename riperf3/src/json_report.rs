@@ -99,6 +99,29 @@ pub struct IntervalStream {
     pub seconds: f64,
     pub bytes: u64,
     pub bits_per_second: f64,
+    // TCP per-interval detail (sender side); omitted where TCP_INFO is
+    // unavailable. `snd_wnd` is absent — see TcpStreamSide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retransmits: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snd_cwnd: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rttvar: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pmtu: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reorder: Option<u32>,
+    // UDP per-interval detail (receiver side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost_packets: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
 }
@@ -110,6 +133,16 @@ pub struct IntervalSum {
     pub seconds: f64,
     pub bytes: u64,
     pub bits_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retransmits: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost_packets: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
 }
@@ -161,6 +194,20 @@ pub struct TcpStreamSide {
     /// Sender side only; iperf3 reports -1 when the OS doesn't expose retransmits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
+    // Sender-side TCP_INFO extremes, accumulated across the test's intervals
+    // (PR2). Omitted on the receiver side and where TCP_INFO is unavailable.
+    // `max_snd_wnd` is intentionally absent: libc's `tcp_info` doesn't expose
+    // `tcpi_snd_wnd` on Linux, so riperf3 can't produce it (omit, don't fake).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_snd_cwnd: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rtt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_rtt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_rtt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reorder: Option<u32>,
     pub sender: bool,
 }
 
@@ -231,9 +278,21 @@ pub struct StreamReport {
     /// Bytes the peer reports for the opposite side of this stream, if known.
     pub remote_bytes: Option<u64>,
     pub retransmits: Option<i64>,
+    /// Sender-side TCP_INFO extremes for the `end.streams[].sender` object (PR2).
+    /// Only set for streams this host sent (local TCP_INFO); `None` otherwise.
+    pub tcp_end: Option<TcpEndExtras>,
     /// UDP receiver stats (jitter seconds, lost, total packets, out-of-order),
     /// from whichever side measured them. `None` for TCP.
     pub udp: Option<UdpStreamStats>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpEndExtras {
+    pub max_snd_cwnd: u64,
+    pub max_rtt: u32,
+    pub min_rtt: u32,
+    pub mean_rtt: u32,
+    pub reorder: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -262,6 +321,9 @@ pub struct ReportInput {
     pub system_info: String,
     pub cpu: CpuUtilization,
     pub congestion_used: Option<String>,
+    /// Per-interval samples collected during the run (PR2). Empty if interval
+    /// reporting was disabled (`-i 0`).
+    pub intervals: Vec<Interval>,
     pub streams: Vec<StreamReport>,
 }
 
@@ -282,8 +344,8 @@ fn pct_lost(lost: i64, total: i64) -> f64 {
 }
 
 impl ReportInput {
-    /// Assemble the iperf3-schema `end` block and connection list. `intervals`
-    /// is left empty (PR2) and `start` metadata minimal (PR3).
+    /// Assemble the iperf3-schema report: `start`, the collected `intervals`, and
+    /// the `end` block. `start` metadata stays minimal (PR3).
     pub fn build(&self) -> Report {
         let dur = self.duration;
         let is_udp = matches!(self.protocol, TransportProtocol::Udp);
@@ -455,7 +517,7 @@ impl ReportInput {
                     bidir: self.bidir as i32,
                 },
             },
-            intervals: Vec::new(),
+            intervals: self.intervals.clone(),
             end,
         }
     }
@@ -498,6 +560,19 @@ impl ReportInput {
         // covers our side; the peer's reported bytes the other (falling back to
         // the local count when the peer reported no per-stream figure).
         let dir = s.is_sender;
+        // Sender-side TCP_INFO extremes go on whichever sub-object is the local
+        // sender (forward). The peer's extremes aren't exchanged, so the sender
+        // sub-object of a reverse stream omits them.
+        let (cwnd, maxr, minr, meanr, reord) = match s.tcp_end {
+            Some(e) => (
+                Some(e.max_snd_cwnd),
+                Some(e.max_rtt),
+                Some(e.min_rtt),
+                Some(e.mean_rtt),
+                Some(e.reorder),
+            ),
+            None => (None, None, None, None, None),
+        };
         let local = TcpStreamSide {
             socket: s.id,
             start: 0.0,
@@ -506,6 +581,11 @@ impl ReportInput {
             bytes: s.local_bytes,
             bits_per_second: bps(s.local_bytes, dur),
             retransmits: if s.is_sender { s.retransmits } else { None },
+            max_snd_cwnd: cwnd,
+            max_rtt: maxr,
+            min_rtt: minr,
+            mean_rtt: meanr,
+            reorder: reord,
             sender: dir,
         };
         let remote_bytes = s.remote_bytes.unwrap_or(s.local_bytes);
@@ -517,6 +597,11 @@ impl ReportInput {
             bytes: remote_bytes,
             bits_per_second: bps(remote_bytes, dur),
             retransmits: if s.is_sender { None } else { s.retransmits },
+            max_snd_cwnd: None,
+            max_rtt: None,
+            min_rtt: None,
+            mean_rtt: None,
+            reorder: None,
             sender: dir,
         };
         if s.is_sender {
@@ -624,6 +709,7 @@ mod tests {
                 remote_system: 1.0,
             },
             congestion_used: Some("cubic".into()),
+            intervals: vec![],
             streams: vec![],
         }
     }
@@ -639,6 +725,7 @@ mod tests {
             local_bytes: local,
             remote_bytes: Some(remote),
             retransmits: Some(3),
+            tcp_end: None,
             udp: None,
         }
     }
@@ -861,5 +948,79 @@ mod tests {
             .map(|s| s["sender"]["sender"].as_bool().unwrap())
             .collect();
         assert_eq!(flags, vec![true, false], "{:?}", v["end"]["streams"]);
+    }
+
+    // ---- PR2: intervals + sender extremes -----------------------------------
+
+    #[test]
+    fn intervals_and_sender_extremes_are_emitted() {
+        let mut input = base_input();
+        input.intervals = vec![Interval {
+            streams: vec![IntervalStream {
+                socket: 1,
+                start: 0.0,
+                end: 1.0,
+                seconds: 1.0,
+                bytes: 1000,
+                bits_per_second: 8000.0,
+                retransmits: Some(2),
+                snd_cwnd: Some(64000),
+                rtt: Some(15),
+                rttvar: Some(3),
+                pmtu: Some(1500),
+                reorder: Some(0),
+                jitter_ms: None,
+                lost_packets: None,
+                packets: None,
+                lost_percent: None,
+                omitted: false,
+                sender: true,
+            }],
+            sum: IntervalSum {
+                start: 0.0,
+                end: 1.0,
+                seconds: 1.0,
+                bytes: 1000,
+                bits_per_second: 8000.0,
+                retransmits: Some(2),
+                jitter_ms: None,
+                lost_packets: None,
+                packets: None,
+                lost_percent: None,
+                omitted: false,
+                sender: true,
+            },
+        }];
+        let mut s = tcp_stream(1, true, 1000, 1000);
+        s.retransmits = Some(2);
+        s.tcp_end = Some(TcpEndExtras {
+            max_snd_cwnd: 64000,
+            max_rtt: 17,
+            min_rtt: 14,
+            mean_rtt: 15,
+            reorder: 0,
+        });
+        input.streams = vec![s];
+        let v = serde_json::to_value(input.build()).unwrap();
+
+        // intervals populated with TCP per-interval detail.
+        assert_eq!(v["intervals"].as_array().unwrap().len(), 1);
+        let i0 = &v["intervals"][0]["streams"][0];
+        assert_eq!(i0["snd_cwnd"], 64000);
+        assert_eq!(i0["rtt"], 15);
+        assert_eq!(i0["retransmits"], 2);
+        assert_eq!(v["intervals"][0]["sum"]["retransmits"], 2);
+
+        // end.sender carries the accumulated extremes.
+        let snd = &v["end"]["streams"][0]["sender"];
+        assert_eq!(snd["max_snd_cwnd"], 64000);
+        assert_eq!(snd["min_rtt"], 14);
+        assert_eq!(snd["max_rtt"], 17);
+        assert_eq!(snd["mean_rtt"], 15);
+        assert_eq!(snd["reorder"], 0);
+
+        // snd_wnd / max_snd_wnd are intentionally absent (Linux libc gap).
+        assert!(i0.get("snd_wnd").is_none(), "{i0}");
+        assert!(snd.get("max_snd_wnd").is_none(), "{snd}");
     }
 }

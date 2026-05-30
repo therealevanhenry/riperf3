@@ -287,6 +287,44 @@ pub struct IntervalReporterConfig {
     pub forceflush: bool,
     pub timestamp_format: Option<String>,
     pub json_stream: bool,
+    /// Print interval lines live (text or json-stream). When false the reporter
+    /// runs purely to collect intervals for the final `-J` blob (issue #36 PR2).
+    pub print: bool,
+}
+
+/// Per-stream sender-side TCP_INFO extremes accumulated across the run (#36 PR2),
+/// for the `end.streams[].sender` object. Only meaningful for TCP sender streams.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StreamExtremes {
+    pub stream_id: i32,
+    pub max_snd_cwnd: u64,
+    pub max_rtt: u32,
+    pub min_rtt: u32,
+    pub reorder: u32,
+    rtt_sum: u64,
+    rtt_samples: u64,
+    /// Final cumulative retransmit total; `None` until a TCP_INFO read succeeds.
+    pub total_retransmits: Option<u32>,
+}
+
+impl StreamExtremes {
+    pub fn mean_rtt(&self) -> u32 {
+        self.rtt_sum.checked_div(self.rtt_samples).unwrap_or(0) as u32
+    }
+
+    /// True once at least one TCP_INFO sample was recorded.
+    pub fn has_samples(&self) -> bool {
+        self.rtt_samples > 0
+    }
+}
+
+/// Interval samples plus per-stream extremes collected during a run, for the
+/// final `-J` report (#36 PR2). Written once when the reporter task finishes;
+/// the client reads it after joining that task.
+#[derive(Debug, Default)]
+pub struct CollectedIntervals {
+    pub intervals: Vec<crate::json_report::Interval>,
+    pub extremes: Vec<StreamExtremes>,
 }
 
 /// Spawn an async task that prints interval reports periodically.
@@ -297,6 +335,7 @@ pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
     done: Arc<AtomicBool>,
+    collector: Option<Arc<Mutex<CollectedIntervals>>>,
 ) -> Option<JoinHandle<()>> {
     if config.interval_secs <= 0.0 {
         return None;
@@ -306,6 +345,8 @@ pub fn spawn_interval_reporter(
     let has_retransmits = tcp_info::has_retransmit_info()
         && config.protocol == TransportProtocol::Tcp
         && streams.iter().any(|s| s.is_sender);
+    let collecting = collector.is_some();
+    let is_udp = config.protocol == TransportProtocol::Udp;
 
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval_dur);
@@ -325,6 +366,18 @@ pub fn spawn_interval_reporter(
         let mut prev_cnt_error: Vec<i64> = vec![0; streams.len()];
         let mut prev_packet_count: Vec<i64> = vec![0; streams.len()];
 
+        // Accumulated state for the final `-J` report (#36 PR2). Written to the
+        // collector once the loop ends; the client reads it after joining us.
+        let mut collected: Vec<crate::json_report::Interval> = Vec::new();
+        let mut acc_extremes: Vec<StreamExtremes> = streams
+            .iter()
+            .map(|s| StreamExtremes {
+                stream_id: s.id,
+                min_rtt: u32::MAX,
+                ..Default::default()
+            })
+            .collect();
+
         loop {
             ticker.tick().await;
 
@@ -336,9 +389,10 @@ pub fn spawn_interval_reporter(
             let omitted = interval_num <= omit_intervals;
             let start = (interval_num - 1) as f64 * config.interval_secs;
             let end = interval_num as f64 * config.interval_secs;
+            let seconds = end - start;
 
             // Timestamp prefix for this tick
-            if config.timestamp_format.is_some() {
+            if config.print && config.timestamp_format.is_some() {
                 // Use libc strftime for iperf3-compatible timestamp formatting
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -351,7 +405,7 @@ pub fn spawn_interval_reporter(
                 print!("{hours:02}:{mins:02}:{s:02} ");
             }
 
-            if !header_printed {
+            if config.print && !header_printed {
                 print_header(config.protocol, has_retransmits);
                 header_printed = true;
             }
@@ -362,6 +416,7 @@ pub fn spawn_interval_reporter(
             let mut sum_lost: i64 = 0;
             let mut sum_packets: i64 = 0;
             let mut last_jitter: f64 = 0.0;
+            let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
 
             for (i, stream) in streams.iter().enumerate() {
                 let bytes = if stream.is_sender {
@@ -370,21 +425,41 @@ pub fn spawn_interval_reporter(
                     stream.counters.take_received_interval()
                 };
 
-                // TCP_INFO for retransmits and cwnd
-                let (retransmits, snd_cwnd, rtt) = if has_retransmits && stream.is_sender {
+                // TCP_INFO for the interval detail and the end extremes.
+                let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) = if has_retransmits
+                    && stream.is_sender
+                {
                     if let Some(fd) = stream.raw_fd {
                         if let Some(info) = tcp_info::get_tcp_info(fd) {
                             let delta = info.total_retransmits.saturating_sub(prev_retransmits[i]);
                             prev_retransmits[i] = info.total_retransmits;
-                            (Some(delta as i64), Some(info.snd_cwnd), Some(info.rtt))
+                            // Accumulate sender-side extremes for the end report.
+                            let e = &mut acc_extremes[i];
+                            e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
+                            e.reorder = e.reorder.max(info.reorder);
+                            if info.rtt > 0 {
+                                e.max_rtt = e.max_rtt.max(info.rtt);
+                                e.min_rtt = e.min_rtt.min(info.rtt);
+                                e.rtt_sum += info.rtt as u64;
+                                e.rtt_samples += 1;
+                            }
+                            e.total_retransmits = Some(info.total_retransmits);
+                            (
+                                Some(delta as i64),
+                                Some(info.snd_cwnd),
+                                Some(info.rtt),
+                                Some(info.rttvar),
+                                Some(info.pmtu),
+                                Some(info.reorder),
+                            )
                         } else {
-                            (None, None, None)
+                            (None, None, None, None, None, None)
                         }
                     } else {
-                        (None, None, None)
+                        (None, None, None, None, None, None)
                     }
                 } else {
-                    (None, None, None)
+                    (None, None, None, None, None, None)
                 };
 
                 // UDP stats (compute deltas for loss/packets)
@@ -403,56 +478,85 @@ pub fn spawn_interval_reporter(
                     (None, None, None)
                 };
 
-                let interval = StreamInterval {
-                    stream_id: stream.id,
-                    start,
-                    end,
-                    bytes,
-                    is_sender: stream.is_sender,
-                    retransmits,
-                    snd_cwnd,
-                    rtt,
-                    jitter,
-                    lost,
-                    total_packets: total,
-                    omitted,
+                let bps_val = if seconds > 0.0 {
+                    bytes as f64 * 8.0 / seconds
+                } else {
+                    0.0
                 };
 
-                if config.json_stream {
-                    let seconds = end - start;
-                    let bps = if seconds > 0.0 {
-                        bytes as f64 * 8.0 / seconds
-                    } else {
-                        0.0
+                if config.print {
+                    let interval = StreamInterval {
+                        stream_id: stream.id,
+                        start,
+                        end,
+                        bytes,
+                        is_sender: stream.is_sender,
+                        retransmits,
+                        snd_cwnd,
+                        rtt,
+                        jitter,
+                        lost,
+                        total_packets: total,
+                        omitted,
                     };
-                    let mut j = serde_json::json!({
-                        "socket": stream.id,
-                        "start": start,
-                        "end": end,
-                        "seconds": seconds,
-                        "bytes": bytes,
-                        "bits_per_second": bps,
-                        "omitted": omitted,
-                        "sender": stream.is_sender,
+
+                    if config.json_stream {
+                        let mut j = serde_json::json!({
+                            "socket": stream.id,
+                            "start": start,
+                            "end": end,
+                            "seconds": seconds,
+                            "bytes": bytes,
+                            "bits_per_second": bps_val,
+                            "omitted": omitted,
+                            "sender": stream.is_sender,
+                        });
+                        if let Some(r) = retransmits {
+                            j["retransmits"] = serde_json::json!(r);
+                        }
+                        if let Some(c) = snd_cwnd {
+                            j["snd_cwnd"] = serde_json::json!(c);
+                        }
+                        if let Some(ji) = jitter {
+                            j["jitter_ms"] = serde_json::json!(ji * 1000.0);
+                        }
+                        if let Some(l) = lost {
+                            j["lost_packets"] = serde_json::json!(l);
+                        }
+                        if let Some(p) = total {
+                            j["packets"] = serde_json::json!(p);
+                        }
+                        println!("{}", serde_json::to_string(&j).unwrap());
+                    } else {
+                        print_interval(&interval, config.format_char);
+                    }
+                }
+
+                if collecting {
+                    let lost_pct = match (lost, total) {
+                        (Some(l), Some(t)) => Some(lost_percent(l, t)),
+                        _ => None,
+                    };
+                    collected_streams.push(crate::json_report::IntervalStream {
+                        socket: stream.id,
+                        start,
+                        end,
+                        seconds,
+                        bytes,
+                        bits_per_second: bps_val,
+                        retransmits,
+                        snd_cwnd,
+                        rtt,
+                        rttvar,
+                        pmtu,
+                        reorder: reorder_iv,
+                        jitter_ms: jitter.map(|j| j * 1000.0),
+                        lost_packets: lost,
+                        packets: total,
+                        lost_percent: lost_pct,
+                        omitted,
+                        sender: stream.is_sender,
                     });
-                    if let Some(r) = retransmits {
-                        j["retransmits"] = serde_json::json!(r);
-                    }
-                    if let Some(c) = snd_cwnd {
-                        j["snd_cwnd"] = serde_json::json!(c);
-                    }
-                    if let Some(ji) = jitter {
-                        j["jitter_ms"] = serde_json::json!(ji * 1000.0);
-                    }
-                    if let Some(l) = lost {
-                        j["lost_packets"] = serde_json::json!(l);
-                    }
-                    if let Some(p) = total {
-                        j["packets"] = serde_json::json!(p);
-                    }
-                    println!("{}", serde_json::to_string(&j).unwrap());
-                } else {
-                    print_interval(&interval, config.format_char);
                 }
 
                 sum_bytes += bytes;
@@ -468,8 +572,7 @@ pub fn spawn_interval_reporter(
             }
 
             // Print [SUM] line for parallel streams
-            if config.num_streams > 1 {
-                let is_udp = config.protocol == TransportProtocol::Udp;
+            if config.print && config.num_streams > 1 {
                 let sum_interval = StreamInterval {
                     stream_id: -1, // renders as "SUM"
                     start,
@@ -491,10 +594,60 @@ pub fn spawn_interval_reporter(
                 print_interval(&sum_interval, config.format_char);
             }
 
+            if collecting {
+                let sum_bps = if seconds > 0.0 {
+                    sum_bytes as f64 * 8.0 / seconds
+                } else {
+                    0.0
+                };
+                collected.push(crate::json_report::Interval {
+                    streams: collected_streams,
+                    sum: crate::json_report::IntervalSum {
+                        start,
+                        end,
+                        seconds,
+                        bytes: sum_bytes,
+                        bits_per_second: sum_bps,
+                        retransmits: if has_retransmits {
+                            Some(sum_retransmits)
+                        } else {
+                            None
+                        },
+                        jitter_ms: if is_udp {
+                            Some(last_jitter * 1000.0)
+                        } else {
+                            None
+                        },
+                        lost_packets: if is_udp { Some(sum_lost) } else { None },
+                        packets: if is_udp { Some(sum_packets) } else { None },
+                        lost_percent: if is_udp {
+                            Some(lost_percent(sum_lost, sum_packets))
+                        } else {
+                            None
+                        },
+                        omitted,
+                        sender: streams.first().is_none_or(|s| s.is_sender),
+                    },
+                });
+            }
+
             // Flush after each interval if requested
-            if config.forceflush {
+            if config.print && config.forceflush {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
+            }
+        }
+
+        // Hand the collected samples + extremes to the client (#36 PR2).
+        if let Some(c) = collector {
+            if let Ok(mut g) = c.lock() {
+                for e in acc_extremes.iter_mut() {
+                    if e.min_rtt == u32::MAX {
+                        e.min_rtt = 0;
+                    }
+                }
+                g.intervals = collected;
+                g.extremes = acc_extremes;
             }
         }
     }))
