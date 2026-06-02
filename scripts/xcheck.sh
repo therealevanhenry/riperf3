@@ -68,6 +68,9 @@ cd "$ROOT"
 declare -A RESULT
 overall=0
 log_dir="$(mktemp -d)"
+# On interrupt, drop the temp logs. (Normal exit handles them below: removed on
+# full success, kept and their path printed on failure.)
+trap 'rm -rf "$log_dir"' INT TERM
 
 for t in "${TARGETS[@]}"; do
     # Process substitution (not a pipe): `grep -q` exits on first match, and
