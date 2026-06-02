@@ -169,7 +169,7 @@ riperf3↔iperf3 wire-interop on a single host; it's the same check CI runs:
 numbers were measured on our two-VM sandbox (two hosts over a real virtio-net
 bridge, riperf3 + iperf3 built on each VM) via internal tooling — the
 `riperf3-matrix` skill, which drives provisioning, the cross-tool grid, and a
-seeded, randomized N≈30 campaign (per-cell 95% CIs + Welch's-t) under VM-fleet
+randomized N=30 campaign (per-cell 95% CIs + Welch's-t) under VM-fleet
 isolation. That orchestration assumes our sandbox, so it isn't shipped as a
 turnkey script. The method is, so the results stay auditable and the campaign is
 replicable on any two hosts: N=30 randomized iterations/cell, 2 warm-ups
