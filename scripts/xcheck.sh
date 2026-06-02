@@ -14,6 +14,13 @@
 #   EINPROGRESS, #80 winsock UDP demux) — those compile fine and only fail on a
 #   real host. For that class, deploy to a native VM (sandbox-* / mithrandir).
 #
+#   Worth running because CI's blocking checks cross-check only windows-msvc and
+#   apple-darwin — freebsd is a native VM job, netbsd is unchecked — so the
+#   netbsd canary here catches the "other-Unix" cfg break (#78) that no blocking
+#   CI check would. (Cross-checking windows/apple from Linux works only because
+#   `check` doesn't link; if a non-cfg'd C-compiling dep is ever added, those
+#   would then need a cross C toolchain and would false-FAIL here.)
+#
 # Usage:
 #   scripts/xcheck.sh                  # check every target, lib+bins+tests
 #   scripts/xcheck.sh --no-tests       # lib+bins only (skip --all-targets)
@@ -39,8 +46,11 @@ DEFAULT_TARGETS=(
 # shellcheck disable=SC2206
 TARGETS=(${XCHECK_TARGETS:-${DEFAULT_TARGETS[*]}})
 
-# --all-targets also checks tests/ (where macOS/Windows cfg gating lives, e.g.
-# #72 LOOPBACK_DEV). Drop it with --no-tests for a faster lib+bins-only pass.
+# --all-targets also checks the integration tests (riperf3/tests/), where some
+# per-OS cfg gating lives (e.g. #72 LOOPBACK_DEV). Drop it with --no-tests for a
+# faster lib+bins-only pass. Note this is stricter than CI's Cross-platform job
+# (a bare `cargo check`, no --all-targets), so xcheck can FAIL on a test-only cfg
+# break that CI's cross check would miss.
 CHECK_SCOPE=(--all-targets)
 PASSTHRU=()
 while [ $# -gt 0 ]; do
@@ -60,7 +70,10 @@ overall=0
 log_dir="$(mktemp -d)"
 
 for t in "${TARGETS[@]}"; do
-    if ! rustup target list --installed 2>/dev/null | grep -qx "$t"; then
+    # Process substitution (not a pipe): `grep -q` exits on first match, and
+    # under `pipefail` the resulting SIGPIPE on `rustup` could poison the status
+    # into a false "not installed" and trigger a needless re-add.
+    if ! grep -qx "$t" < <(rustup target list --installed 2>/dev/null); then
         printf '  + rustup target add %s\n' "$t"
         if ! rustup target add "$t" >/dev/null 2>&1; then
             RESULT[$t]="NO-STD (rustup target add failed)"
@@ -91,8 +104,12 @@ if [ "$overall" -ne 0 ]; then
     echo "=== failure logs (last 30 lines each) ==="
     for t in "${TARGETS[@]}"; do
         if [ "${RESULT[$t]:-}" != "ok" ]; then
-            echo "--- $t ---"
-            tail -n 30 "$log_dir/$t.log" 2>/dev/null
+            echo "--- $t (${RESULT[$t]:-?}) ---"
+            if [ -f "$log_dir/$t.log" ]; then
+                tail -n 30 "$log_dir/$t.log"
+            else
+                echo "(no check log — target unavailable)"
+            fi
             echo
         fi
     done
