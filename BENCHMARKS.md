@@ -6,9 +6,13 @@ bridge. Throughput numbers measure protocol and CPU efficiency of the
 implementations, **not** physical link speed — there is no physical NIC in the
 path, so the ceiling is set by the guests' CPU and the host's virtio bridge.
 
-Reproducible from the committed harness in [`scripts/`](scripts): `compat.sh`
-(interop grid), `bench.sh` + `analyze.py` (statistical campaign), and
-`interop.sh` (the loopback CI gate). See [Reproducing](#reproducing).
+Wire-compatibility is independently reproducible from the committed
+[`scripts/interop.sh`](scripts/interop.sh) — a loopback gate (no second host)
+that also runs in CI. The throughput campaign and the cross-bridge compatibility
+matrix below were measured on our two-VM sandbox with internal tooling (the
+`riperf3-matrix` skill), not a turnkey script; the method is documented under
+[Reproducing](#reproducing) so the numbers stay auditable, but they are
+environment-specific.
 
 > **0.6.1 status.** The compatibility matrix below was re-verified on 0.6.1 (all
 > cells PASS). The throughput campaign is carried forward from 0.6.0 unchanged:
@@ -154,25 +158,21 @@ datagrams are large.
 
 ## Reproducing
 
-The harness lives in [`scripts/`](scripts) and drives the two-VM sandbox over
-SSH (server on `sandbox-server-1`, client on `sandbox-client-1`, data crossing
-the bridge). With both binaries built on the VMs at
-`~/riperf3/target/release/riperf3` and `~/iperf/src/iperf3`:
+**Wire-compatibility — turnkey, no sandbox.** The committed loopback gate proves
+riperf3↔iperf3 wire-interop on a single host; it's the same check CI runs:
 
 ```bash
-# Compatibility grid + feature spot-checks (cross-tool, over the bridge):
-./scripts/compat.sh "$RIPERF3" "$IPERF3"
-
-# Statistical campaign (~2h: 64 warmup + 960 measured, randomized, seeded):
-N=30 WARMUP=2 DURATION=5 PROTOS="TCP UDP" SEED=20260530 \
-  ./scripts/bench.sh "$RIPERF3" "$IPERF3" campaign.csv
-./scripts/analyze.py campaign.csv      # per-cell CIs, UDP loss, Welch's-t verdicts
+./scripts/interop.sh <riperf3-bin> <iperf3-bin>
 ```
 
-`bench.sh` samples N randomized iterations/cell to a CSV; `analyze.py` computes
-the per-cell CIs and Welch's-t verdicts above. UDP uses `-b 0`. Direction-aware
-parse: forward → client `sum_sent`, reverse → client `sum_received`, UDP →
-`sum`; `-P>1` aggregates are already summed in `-J`. For pure wire-interop
-without a sandbox, `./scripts/interop.sh <riperf3-bin> <iperf3-bin>` is the
-loopback CI gate. The `riperf3-matrix` skill wraps these scripts with the
-provisioning steps and VM-fleet isolation rules.
+**Throughput + cross-bridge compatibility matrix — environment-specific.** These
+numbers were measured on our two-VM sandbox (two hosts over a real virtio-net
+bridge, riperf3 + iperf3 built on each VM) via internal tooling — the
+`riperf3-matrix` skill, which drives provisioning, the cross-tool grid, and a
+seeded, randomized N≈30 campaign (per-cell 95% CIs + Welch's-t) under VM-fleet
+isolation. That orchestration assumes our sandbox, so it isn't shipped as a
+turnkey script. The method is, so the results stay auditable and the campaign is
+replicable on any two hosts: N=30 randomized iterations/cell, 2 warm-ups
+discarded, a fresh `-s -1` server per run on a unique port, UDP at `-b 0`, and a
+direction-aware parse (forward → client `sum_sent`, reverse → `sum_received`,
+UDP → `sum`; `-P>1` aggregates already summed in `-J`).
