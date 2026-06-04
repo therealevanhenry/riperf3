@@ -14,6 +14,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     configure_log4rs(cli.debug.unwrap_or(0));
 
+    // Reject client-only options on the server (#65) before any side effects
+    // (pidfile/logfile writes, CPU affinity, runtime build), mirroring iperf3,
+    // which raises IECLIENTONLY at parse time — before it applies affinity or
+    // does any work. The message embeds iperf3's canonical IECLIENTONLY text as
+    // a substring (so anything matching iperf3's string still matches) and adds
+    // the offending flag name, which iperf3 omits.
+    if cli.server {
+        if let Some(flag) = cli.first_client_only_violation() {
+            return Err(format!(
+                "some option you are trying to set is client only: \
+                 {flag} cannot be used with -s/--server"
+            )
+            .into());
+        }
+    }
+
     // Write PID file if requested
     if let Some(ref path) = cli.pidfile {
         std::fs::write(path, format!("{}\n", std::process::id()))?;
@@ -231,6 +247,8 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         client.run().await?;
     } else if cli.server {
         // ---- Server mode ----
+        // (Client-only options are rejected up front in `main`, before any side
+        // effects, matching iperf3's parse-time IECLIENTONLY — see #65.)
         let mut builder = riperf3::ServerBuilder::new();
 
         if let Some(port) = cli.port {
