@@ -108,6 +108,14 @@ fn server_receiver_summaries(
 
 impl Client {
     pub async fn run(&self) -> Result<TestResultsJson> {
+        // -T/--title: prefix every client text line with "<title>:  " (#34),
+        // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
+        // mode — `-J` and `--json-stream` emit machine JSON, which iperf3 never
+        // titles. Held for the whole run so the reporter task and the preamble
+        // both see it.
+        let _title_guard = (!self.json_output && !self.json_stream)
+            .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
+
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(
