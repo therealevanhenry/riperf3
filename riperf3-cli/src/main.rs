@@ -231,6 +231,15 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         client.run().await?;
     } else if cli.server {
         // ---- Server mode ----
+        // Reject client-only options on the server, like iperf3 (#65), instead of
+        // silently ignoring them.
+        if let Some(flag) = cli.first_client_only_violation() {
+            return Err(format!(
+                "the option {flag} is client only and cannot be used with -s/--server"
+            )
+            .into());
+        }
+
         let mut builder = riperf3::ServerBuilder::new();
 
         if let Some(port) = cli.port {
