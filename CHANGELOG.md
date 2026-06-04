@@ -11,6 +11,21 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.6.2] - 2026-06-04
+
+A packaging fix release. There are **no data-path, wire-protocol, or public API
+changes** — behavior and throughput are identical to 0.6.1.
+
+### Fixed
+- **`riperf3` failed to compile as a dependency of downstream crates** (#92): the
+  library calls `socket2`'s `set_mss`, which socket2 gates behind its `all`
+  feature, but the crate never enabled that feature itself. It built only because
+  `tokio` transitively enabled `all` on socket2 0.5. Once a downstream resolved a
+  newer `tokio` that moved to socket2 0.6, riperf3's own socket2 0.5 dependency
+  lost `all` and the build failed with `error[E0599]: no method named set_mss`.
+  riperf3 now enables socket2's `all` feature explicitly, so it compiles
+  regardless of sibling feature unification (#93).
+
 ## [0.6.1] - 2026-05-30
 
 A cross-platform compatibility and CI release. There are **no data-path or
