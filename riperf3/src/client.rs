@@ -512,6 +512,10 @@ impl Client {
                     let local_addr = udp_sock.local_addr().ok();
                     let peer_addr = udp_sock.peer_addr().ok();
                     let sock = socket2::SockRef::from(&udp_sock);
+                    // Honor -w/--window on the UDP socket too (#59); iperf3 applies
+                    // it to UDP via iperf_udp_buffercheck. Set before the read-back
+                    // so sndbuf_actual/rcvbuf_actual report the realized size.
+                    net::apply_socket_window(&sock, self.window);
                     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
                     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
 

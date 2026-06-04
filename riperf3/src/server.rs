@@ -390,6 +390,10 @@ impl Server {
                     let peer_addr_s = data_sock.peer_addr().ok();
                     let (sndbuf_actual, rcvbuf_actual) = {
                         let sock = socket2::SockRef::from(&data_sock);
+                        // Honor -w/--window on the server's UDP data socket too
+                        // (#59) so reverse/bidir UDP matches iperf3; set before the
+                        // read-back below.
+                        net::apply_socket_window(&sock, cfg.window);
                         (
                             sock.send_buffer_size().ok().map(|v| v as u64),
                             sock.recv_buffer_size().ok().map(|v| v as u64),

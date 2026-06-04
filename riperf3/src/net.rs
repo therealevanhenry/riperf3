@@ -348,6 +348,21 @@ pub fn configure_tcp_stream(stream: &TcpStream, no_delay: bool) -> Result<()> {
     Ok(())
 }
 
+/// Apply the requested socket buffer size (`-w/--window`) to a socket's send and
+/// receive buffers (`SO_SNDBUF` / `SO_RCVBUF`).
+///
+/// Best-effort: a kernel that clamps or rejects the size is not fatal — iperf3
+/// likewise proceeds, and the realized size is read back separately for the
+/// `sndbuf_actual` / `rcvbuf_actual` report. Used for both TCP and UDP data
+/// sockets so `-w` is honored on UDP too (#59), matching iperf3's
+/// `iperf_udp_buffercheck`. `None` is a no-op (kernel default).
+pub(crate) fn apply_socket_window(sock: &socket2::SockRef<'_>, window: Option<i32>) {
+    if let Some(size) = window {
+        let _ = sock.set_recv_buffer_size(size as usize);
+        let _ = sock.set_send_buffer_size(size as usize);
+    }
+}
+
 /// Configure a connected TCP stream with all negotiated socket options.
 pub fn configure_tcp_stream_full(
     stream: &TcpStream,
@@ -384,10 +399,7 @@ pub fn configure_tcp_stream_full(
         #[cfg(not(any(unix, windows)))]
         let _ = mss;
 
-        if let Some(size) = window {
-            let _ = sock.set_recv_buffer_size(size as usize);
-            let _ = sock.set_send_buffer_size(size as usize);
-        }
+        apply_socket_window(&sock, window);
     }
 
     // Congestion control: Linux + FreeBSD (iperf3 uses HAVE_TCP_CONGESTION)
@@ -811,6 +823,38 @@ pub async fn udp_bind_reusable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #59: -w/--window must be applied to UDP sockets, not just TCP. Requesting a
+    // size *below* the default and asserting the read-back drops is robust across
+    // platforms — the kernel honors reductions down to its floor, whereas a
+    // larger request can be silently clamped by wmem_max/SO_*BUF maximums.
+    #[test]
+    fn apply_socket_window_sets_udp_buffers() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s = socket2::SockRef::from(&sock);
+        let default_snd = s.send_buffer_size().unwrap();
+        let default_rcv = s.recv_buffer_size().unwrap();
+
+        let window = default_snd.min(default_rcv) as i32 / 4;
+        apply_socket_window(&s, Some(window));
+        assert!(
+            s.send_buffer_size().unwrap() < default_snd,
+            "SO_SNDBUF not applied: {} !< {default_snd}",
+            s.send_buffer_size().unwrap()
+        );
+        assert!(
+            s.recv_buffer_size().unwrap() < default_rcv,
+            "SO_RCVBUF not applied: {} !< {default_rcv}",
+            s.recv_buffer_size().unwrap()
+        );
+
+        // None must be a no-op (kernel default left untouched).
+        let sock2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s2 = socket2::SockRef::from(&sock2);
+        let before = s2.send_buffer_size().unwrap();
+        apply_socket_window(&s2, None);
+        assert_eq!(s2.send_buffer_size().unwrap(), before);
+    }
 
     #[tokio::test]
     async fn tcp_listen_and_connect() {
