@@ -1255,6 +1255,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Prefix every client text-output line with `<title>:  ` (`-T/--title`),
+    /// matching iperf3. Applies only to plain-text output, not `-J`/`--json-stream`.
+    ///
+    /// Note: the prefix is tracked in a process-global for the duration of the
+    /// run, so two `Client::run` calls executing concurrently in the same process
+    /// are not isolated for `-T` (their titled lines can interleave). This does
+    /// not affect the CLI (one run per process) or sequential library use.
     pub fn title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self

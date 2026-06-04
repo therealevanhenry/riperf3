@@ -139,13 +139,18 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
 /// Whether this platform provides a usable TCP **retransmit packet count** for
 /// the sender (the `Retr` column / JSON `sender_has_retransmits`).
 ///
-/// macOS is deliberately excluded (#40): its `tcp_connection_info` exposes only
-/// `tcpi_txretransmitbytes` (retransmitted *bytes*), not a sender packet count,
-/// so `get_tcp_info` can only hard-code `total_retransmits: 0`. Advertising
-/// retransmit info there printed a perpetual `Retr 0`, implying a loss-free
-/// transfer regardless of reality. We now report no retransmit info on macOS
-/// rather than a misleading zero; the coupled `Cwnd` column is suppressed with
-/// it (iperf3 shows both together, gated on the same flag).
+/// macOS is deliberately excluded (#40). iperf3 *does* report retransmits on
+/// macOS — it reads `tcp_connection_info.tcpi_txretransmitpackets` (a sender
+/// retransmit packet count) and shows the Retr+Cwnd columns. But the Rust `libc`
+/// binding's `tcp_connection_info` does not expose that field — its sender-side
+/// retransmit member is `tcpi_txretransmitbytes` (retransmitted *bytes*) — so
+/// riperf3's `get_tcp_info` can only hard-code `total_retransmits: 0`. Rather
+/// than print a perpetual, misleading `Retr 0` (implying a loss-free transfer),
+/// we report no retransmit info on macOS. The Retr and Cwnd columns are gated
+/// together (iperf3 couples them on the same flag), so Cwnd is suppressed with
+/// it. This is a deliberate divergence from iperf3 for now; the faithful fix —
+/// reading `tcpi_txretransmitpackets` via a custom struct binding to show the
+/// real macOS Retr/Cwnd — is a deferred follow-up, not patch scope.
 pub fn has_retransmit_info() -> bool {
     cfg!(any(target_os = "linux", target_os = "freebsd"))
 }
