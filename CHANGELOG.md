@@ -11,6 +11,41 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.6.3] - 2026-06-04
+
+An iperf3-fidelity and correctness release. There are **no public Rust API
+changes** (SemVer-clean) and **no data-path/throughput changes** — the Linux
+fast path is unchanged. The `-J`/text output changes below move *toward* iperf3
+parity and remain parseable; parity was verified against iperf3 3.12 and 3.21 in
+the interop CI.
+
+### Added
+- **`-T`/`--title` now prefixes output** (#34): client text lines are prefixed
+  with `<title>:  ` (colon + two spaces), matching iperf3's `iperf_printf`.
+  Text mode only — `-J` and `--json-stream` are never titled.
+
+### Fixed
+- **`-J` integral floats drop the trailing `.0`** (#57): the JSON report now
+  renders floats the way iperf3's bundled cJSON does — integral doubles as
+  integer tokens (`0`, `1`, `10485760`), fractionals via `%.15g`/`%.17g` — so the
+  blob is byte-compatible with iperf3 for consumers that diff raw text. Still
+  parses identically.
+- **`-w`/`--window` is now applied to UDP sockets** (#59): `SO_SNDBUF`/`SO_RCVBUF`
+  are set on UDP data sockets (client and server), matching iperf3's
+  `iperf_udp_buffercheck`. Previously `-u -w <N>` left the kernel defaults in
+  place while still reporting the requested size.
+- **macOS no longer reports a misleading `Retr 0`** (#40): macOS exposes no
+  sender retransmit *packet* count via the Rust `libc` binding, so riperf3 now
+  reports no retransmit info there instead of a perpetual zero. The coupled
+  `Cwnd` column is suppressed with it; the faithful fix is tracked in #96.
+- **`-Z` zerocopy temp files get unique names** (#42): each zerocopy sender now
+  uses a `<pid>-<seq>` temp file, removing a create/truncate race under
+  `-Z -P>1`.
+
+### Documentation
+- **Unsafe-audit table completed** (#44): added the `getsockopt(TCP_MAXSEG)` row;
+  the table now maps 1:1 to every production `unsafe` block.
+
 ## [0.6.2] - 2026-06-04
 
 A packaging fix release. There are **no data-path, wire-protocol, or public API
