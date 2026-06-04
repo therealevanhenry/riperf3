@@ -21,7 +21,12 @@ rsa.workspace = true
 serde.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-serde_json.workspace = true
+# raw_value enabled at the crate level (not just the workspace) so it flattens
+# into the PUBLISHED manifest: #57 emits cJSON-formatted number tokens via
+# serde_json::value::RawValue. A workspace-only feature does NOT flatten on
+# publish, which would leave the published crate free-riding on a consumer to
+# enable raw_value — the same socket2 #92 trap as `all` below.
+serde_json = { workspace = true, features = ["raw_value"] }
 socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
