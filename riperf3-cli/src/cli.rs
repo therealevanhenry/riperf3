@@ -304,14 +304,35 @@ impl Cli {
     /// iperf3 (#65). iperf3 sets an internal `client_flag` for each of these in
     /// `iperf_parse_arguments` and errors with IECLIENTONLY ("some option you are
     /// trying to set is client only") when `role == 's'`. riperf3 silently
-    /// accepted and ignored them, which is a drop-in divergence. The set mirrors
-    /// iperf3's `client_flag` options, plus riperf3-only client transmit options
-    /// (`--mptcp`, `--gsro`, `--sendmmsg`, `--cport`) that have no server meaning.
+    /// accepted and ignored them, which is a drop-in divergence.
+    ///
+    /// The set is adjudicated against iperf3's `iperf_api.c` (3.20) so riperf3
+    /// rejects exactly what iperf3 rejects, no more:
+    /// - Every option iperf3 marks `client_flag = 1`.
+    /// - `--gsro`: iperf3 tracks this with a separate `gsro_flag` but applies the
+    ///   same `role == 's'` -> IECLIENTONLY rejection, so it belongs here.
+    /// - `--sendmmsg`: riperf3-only client transmit option with no iperf3
+    ///   equivalent and no server meaning; rejecting it carries no drop-in risk.
+    ///
+    /// Deliberately NOT rejected, because iperf3 accepts them on a server:
+    /// - `-m/--mptcp` and `--cport`: iperf3's `'m'` and `OPT_CLIENT_PORT` cases do
+    ///   not set `client_flag`.
+    /// - A bare `-A n`: iperf3 only sets `client_flag` for the two-arg `-A n,m`
+    ///   form (where the first value is the *client* affinity); `-A n` alone is
+    ///   the server's own CPU affinity. riperf3's server does not yet honor it,
+    ///   but faithfulness means matching iperf3's accept/reject decision, not
+    ///   erroring on a legal invocation.
     ///
     /// Returns the name of the first offending flag if one was given.
     pub fn first_client_only_violation(&self) -> Option<&'static str> {
+        // iperf3 rejects `-A n,m` (the comma form carries a client affinity) but
+        // accepts a bare `-A n` (server affinity). Mirror that distinction.
+        let affinity_client_only = self
+            .affinity
+            .as_deref()
+            .is_some_and(|spec| spec.contains(','));
         // (was-it-set, canonical flag name) — order is the report priority.
-        let checks: [(bool, &'static str); 35] = [
+        let checks: [(bool, &'static str); 33] = [
             (self.udp, "-u/--udp"),
             (self.time.is_some(), "-t/--time"),
             (self.bytes.is_some(), "-n/--bytes"),
@@ -340,13 +361,11 @@ impl Cli {
             (self.fq_rate.is_some(), "--fq-rate"),
             (self.flowlabel.is_some(), "-L/--flowlabel"),
             (self.dscp.is_some(), "--dscp"),
-            (self.affinity.is_some(), "-A/--affinity"),
+            (affinity_client_only, "-A/--affinity"),
             (self.username.is_some(), "--username"),
             (self.rsa_public_key_path.is_some(), "--rsa-public-key-path"),
-            (self.mptcp, "-m/--mptcp"),
             (self.gsro, "--gsro"),
             (self.sendmmsg, "--sendmmsg"),
-            (self.cport.is_some(), "--cport"),
         ];
         checks.iter().find(|(set, _)| *set).map(|(_, name)| *name)
     }
@@ -509,7 +528,29 @@ mod cli_tests {
             ]);
             assert_eq!(clean.first_client_only_violation(), None);
 
-            // Each client-only option is flagged on the server.
+            // Options iperf3 ACCEPTS on a server must not be flagged: a bare
+            // `-A n` (server's own affinity), `--cport`, and `-m/--mptcp` all map
+            // to iperf3 cases that do not set `client_flag`.
+            for args in [
+                vec!["-A", "3"],
+                vec!["--affinity", "3"],
+                vec!["--cport", "12345"],
+                vec!["-m"],
+                vec!["--mptcp"],
+            ] {
+                let mut argv = vec!["riperf3", "-s"];
+                argv.extend(args.iter().copied());
+                let cli = Cli::parse_from(&argv);
+                assert_eq!(
+                    cli.first_client_only_violation(),
+                    None,
+                    "expected {args:?} accepted on the server (iperf3 parity)"
+                );
+            }
+
+            // Each client-only option is flagged on the server. `-A n,m` is
+            // client-only (the comma form carries a client affinity); `--gsro`
+            // maps to iperf3's `gsro_flag` reject; `--sendmmsg` is riperf3-only.
             for (args, want) in [
                 (vec!["-t", "5"], "-t/--time"),
                 (vec!["-u"], "-u/--udp"),
@@ -521,6 +562,9 @@ mod cli_tests {
                 (vec!["-w", "1M"], "-w/--window"),
                 (vec!["--get-server-output"], "--get-server-output"),
                 (vec!["-Z"], "-Z/--zerocopy"),
+                (vec!["-A", "3,4"], "-A/--affinity"),
+                (vec!["--gsro"], "--gsro"),
+                (vec!["--sendmmsg"], "--sendmmsg"),
             ] {
                 let mut argv = vec!["riperf3", "-s"];
                 argv.extend(args.iter().copied());
