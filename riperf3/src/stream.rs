@@ -522,9 +522,22 @@ fn tempfile() -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+/// A unique temp-file name for one zerocopy sender. The `<pid>-<seq>` form keeps
+/// every sender's backing file distinct: with `-Z -P >1` each sender opened its
+/// own temp file under the same fixed `.riperf3-zc-<pid>` name and raced
+/// create+truncate on that shared path (#42). A monotonic per-process sequence
+/// removes the shared name entirely, so the senders can never collide.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+fn zc_tempfile_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(".riperf3-zc-{}-{}", std::process::id(), seq)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn tempfile_in(dir: std::path::PathBuf) -> std::io::Result<std::fs::File> {
-    let path = dir.join(format!(".riperf3-zc-{}", std::process::id()));
+    let path = dir.join(zc_tempfile_name());
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1188,6 +1201,20 @@ pub fn run_udp_receiver_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #42: zerocopy senders must get distinct temp-file names so `-Z -P >1`
+    // can't race create+truncate on a shared path. The race needs concurrency a
+    // sequential test can't reproduce, so we assert the mechanism directly: the
+    // name generator never repeats and carries the pid.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn zc_tempfile_names_are_unique() {
+        let names: Vec<String> = (0..16).map(|_| zc_tempfile_name()).collect();
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "names collided: {names:?}");
+        let pid = std::process::id().to_string();
+        assert!(names.iter().all(|n| n.contains(&pid)));
+    }
 
     // -- StreamCounters --
 
