@@ -70,6 +70,19 @@ impl StreamCounters {
         self.bytes_received_interval.swap(0, Ordering::Relaxed)
     }
 
+    /// Read the sent interval counter without clearing it. Used to decide
+    /// whether a final partial interval has any residual bytes to report (#55)
+    /// without disturbing the next `take_sent_interval`.
+    pub fn peek_sent_interval(&self) -> u64 {
+        self.bytes_sent_interval.load(Ordering::Relaxed)
+    }
+
+    /// Read the received interval counter without clearing it (see
+    /// [`Self::peek_sent_interval`]).
+    pub fn peek_received_interval(&self) -> u64 {
+        self.bytes_received_interval.load(Ordering::Relaxed)
+    }
+
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
     }

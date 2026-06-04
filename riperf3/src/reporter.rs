@@ -372,6 +372,15 @@ pub fn spawn_interval_reporter(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate first tick
 
+        // Clock origin for this reporter. Idealized interval boundaries are
+        // `k * interval_secs` from here; the final partial interval (#55) ends
+        // at the real elapsed time measured from this point.
+        let loop_start = tokio::time::Instant::now();
+        // How often to check `done` while waiting for the next tick, so the run
+        // end is noticed promptly (see the wait loop below). Small relative to
+        // the interval; capped so sub-second intervals still stay responsive.
+        let poll_dur = interval_dur.min(std::time::Duration::from_millis(10));
+
         let mut interval_num: u64 = 0;
         let mut header_printed = false;
         let omit_intervals = if config.interval_secs > 0.0 {
@@ -400,17 +409,12 @@ pub fn spawn_interval_reporter(
             })
             .collect();
 
-        loop {
-            ticker.tick().await;
-
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-
-            interval_num += 1;
-            let omitted = interval_num <= omit_intervals;
-            let start = (interval_num - 1) as f64 * config.interval_secs;
-            let end = interval_num as f64 * config.interval_secs;
+        // Emit one interval [start, end] (`omitted` marks warm-up under -O).
+        // Shared by the periodic ticks and the final partial flush (#55) so both
+        // render and collect identically. Each call drains the per-stream
+        // interval counters, reporting exactly the bytes/stats accrued since the
+        // previous call.
+        let mut emit_interval = |start: f64, end: f64, omitted: bool| {
             let seconds = end - start;
 
             // Timestamp prefix for this tick
@@ -688,6 +692,60 @@ pub fn spawn_interval_reporter(
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
+        };
+
+        loop {
+            // Wait for the next interval boundary, but notice `done` promptly
+            // (within `poll_dur`) rather than only at the next tick. Otherwise
+            // the final partial (#55) would be measured up to a whole interval
+            // late, skewing its duration and bitrate. `biased` checks the tick
+            // first, so a `done` that lands exactly on a boundary still emits
+            // that boundary's full interval before the loop exits.
+            let tick = ticker.tick();
+            tokio::pin!(tick);
+            let became_done = loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut tick => break false,
+                    _ = tokio::time::sleep(poll_dur) => {
+                        if done.load(Ordering::Relaxed) {
+                            break true;
+                        }
+                    }
+                }
+            };
+            if became_done {
+                break;
+            }
+
+            interval_num += 1;
+            let omitted = interval_num <= omit_intervals;
+            let start = (interval_num - 1) as f64 * config.interval_secs;
+            let end = interval_num as f64 * config.interval_secs;
+            emit_interval(start, end, omitted);
+        }
+
+        // #55: flush a final partial interval for the sub-interval remainder.
+        // The periodic ticks covered `[0, interval_num * interval_secs]`; if the
+        // run ran past that boundary AND residual bytes accrued since the last
+        // tick, emit one more interval `[last_end, elapsed]`. The residual-bytes
+        // guard drops the empty interval produced when a run ends on a boundary
+        // (prompt detection still leaves ~`poll_dur` of measured slack there).
+        let last_end = interval_num as f64 * config.interval_secs;
+        let elapsed = loop_start.elapsed().as_secs_f64();
+        let residual_bytes: u64 = streams
+            .iter()
+            .map(|s| {
+                if s.is_sender {
+                    s.counters.peek_sent_interval()
+                } else {
+                    s.counters.peek_received_interval()
+                }
+            })
+            .sum();
+        if elapsed > last_end + 1e-6 && residual_bytes > 0 {
+            let omitted = (interval_num + 1) <= omit_intervals;
+            emit_interval(last_end, elapsed, omitted);
         }
 
         // Hand the collected samples + extremes to the client (#36 PR2).
