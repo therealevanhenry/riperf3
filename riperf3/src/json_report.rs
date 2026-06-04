@@ -23,9 +23,103 @@
 //! (`skip_serializing_if`) rather than emitted with placeholder values, so the
 //! shape only ever contains real data.
 
+use serde::ser::Serializer;
 use serde::Serialize;
 
 use crate::protocol::TransportProtocol;
+
+// ---------------------------------------------------------------------------
+// cJSON-compatible float rendering (#57)
+// ---------------------------------------------------------------------------
+//
+// serde_json prints every f64 with a fractional part (`0.0`, `1.0`,
+// `10485760.0`). iperf3 uses cJSON, which prints an *integral* double as an
+// integer token (`0`, `1`, `10485760`) and a fractional one via C's
+// `%.15g`/`%.17g`. These helpers reproduce cJSON's `print_number` so the `-J`
+// blob is byte-compatible with iperf3 for consumers that diff raw text, not just
+// parsed values. Applied to the report's f64 fields via `serialize_with`.
+
+/// Render an `f64` exactly the way cJSON's `print_number` does.
+fn cjson_number(d: f64) -> String {
+    if !d.is_finite() {
+        return "null".to_string(); // cJSON emits the bareword null for NaN/Inf
+    }
+    // Integral and representable as i64 → integer token (drops the `.0`).
+    if d.abs() < 9_223_372_036_854_775_000.0 && d == (d as i64) as f64 {
+        return (d as i64).to_string();
+    }
+    // Fractional: 15 significant digits, falling back to 17 if 15 doesn't
+    // round-trip — exactly cJSON's strategy.
+    let s = format_g(d, 15);
+    let round_trips = s
+        .parse::<f64>()
+        .map(|t| compare_double(t, d))
+        .unwrap_or(false);
+    if round_trips {
+        s
+    } else {
+        format_g(d, 17)
+    }
+}
+
+/// cJSON's `compare_double`: equal within a one-ULP-ish epsilon.
+fn compare_double(a: f64, b: f64) -> bool {
+    let maxval = a.abs().max(b.abs());
+    (a - b).abs() <= maxval * f64::EPSILON
+}
+
+/// C `printf("%.*g", precision, d)` for a finite `d`. `precision` is the number
+/// of significant digits (15 or 17 here).
+fn format_g(d: f64, precision: usize) -> String {
+    let p = precision.max(1);
+    if d == 0.0 {
+        return "0".to_string();
+    }
+    // `{:.*e}` rounds correctly and carries the exponent (9.99e9 → 1.00e10), so
+    // read the decimal exponent from it rather than from log10 (which mis-rounds
+    // at powers of ten).
+    let sci = format!("{:.*e}", p - 1, d);
+    let (mantissa, exp_str) = sci.split_once('e').unwrap();
+    let exp: i32 = exp_str.parse().unwrap();
+
+    if exp < -4 || exp >= p as i32 {
+        // Scientific: trim trailing zeros in the mantissa; C-style signed,
+        // ≥2-digit exponent.
+        let mant = trim_trailing_zeros(mantissa);
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mant}e{sign}{:02}", exp.unsigned_abs())
+    } else {
+        // Fixed: `p-1-exp` fraction digits, trailing zeros trimmed.
+        let frac = (p as i32 - 1 - exp).max(0) as usize;
+        trim_trailing_zeros(&format!("{:.*}", frac, d))
+    }
+}
+
+/// Trim trailing fractional zeros (and a now-bare decimal point).
+fn trim_trailing_zeros(s: &str) -> String {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// `serialize_with` for an `f64` field: emit the cJSON-formatted token as a raw
+/// JSON number (serde_json), so integral values lose the `.0`.
+fn ser_f64<S: Serializer>(v: &f64, ser: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error;
+    let raw = serde_json::value::RawValue::from_string(cjson_number(*v)).map_err(Error::custom)?;
+    raw.serialize(ser)
+}
+
+/// `serialize_with` for an `Option<f64>` field. Paired with
+/// `skip_serializing_if = "Option::is_none"`, so `None` is normally skipped.
+fn ser_opt_f64<S: Serializer>(v: &Option<f64>, ser: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(x) => ser_f64(x, ser),
+        None => ser.serialize_none(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Top-level report
@@ -121,6 +215,7 @@ pub struct TestStart {
     pub target_bitrate: u64,
     pub bidir: i32,
     pub fqrate: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub interval: f64,
     pub gso: i32,
     pub gro: i32,
@@ -141,10 +236,14 @@ pub struct Interval {
 #[non_exhaustive]
 pub struct IntervalStream {
     pub socket: i32,
+    #[serde(serialize_with = "ser_f64")]
     pub start: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub end: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     // TCP per-interval detail (sender side); omitted where TCP_INFO is
     // unavailable. `snd_wnd` is absent — see TcpStreamSide.
@@ -163,13 +262,19 @@ pub struct IntervalStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reorder: Option<u32>,
     // UDP per-interval detail (receiver side).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
@@ -178,20 +283,30 @@ pub struct IntervalStream {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct IntervalSum {
+    #[serde(serialize_with = "ser_f64")]
     pub start: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub end: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
@@ -239,10 +354,14 @@ pub struct EndStream {
 #[non_exhaustive]
 pub struct TcpStreamSide {
     pub socket: i32,
+    #[serde(serialize_with = "ser_f64")]
     pub start: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub end: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     /// Sender side only; iperf3 reports -1 when the OS doesn't expose retransmits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,14 +391,20 @@ pub struct TcpStreamSide {
 #[non_exhaustive]
 pub struct UdpStreamEnd {
     pub socket: i32,
+    #[serde(serialize_with = "ser_f64")]
     pub start: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub end: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub jitter_ms: f64,
     pub lost_packets: i64,
     pub packets: i64,
+    #[serde(serialize_with = "ser_f64")]
     pub lost_percent: f64,
     pub out_of_order: i64,
     pub sender: bool,
@@ -288,20 +413,30 @@ pub struct UdpStreamEnd {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct SumSide {
+    #[serde(serialize_with = "ser_f64")]
     pub start: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub end: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub sender: bool,
 }
@@ -309,11 +444,17 @@ pub struct SumSide {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct CpuUtilization {
+    #[serde(serialize_with = "ser_f64")]
     pub host_total: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub host_user: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub host_system: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub remote_total: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub remote_user: f64,
+    #[serde(serialize_with = "ser_f64")]
     pub remote_system: f64,
 }
 
@@ -943,6 +1084,58 @@ impl ReportInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #57: cjson_number must match C cJSON's print_number byte-for-byte. Expected
+    // values were cross-checked against Python's %.15g/%.17g (same libc path as
+    // cJSON), including the two high-precision bits_per_second cases where 15g
+    // fails the round-trip and 17g kicks in.
+    #[test]
+    fn cjson_number_matches_cjson() {
+        let cases = [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (-5.0, "-5"),
+            (10485760.0, "10485760"),
+            (4194304.0, "4194304"),
+            (0.5, "0.5"),
+            (1.002098, "1.002098"),
+            (99.99, "99.99"),
+            (0.045, "0.045"),
+            (1.0000349, "1.0000349"),
+            // 15g round-trips → kept:
+            (943161195.674271, "943161195.674271"),
+            // 15g fails round-trip → 17g fallback (more digits than ryu's shortest):
+            (943718412.3076923, "943718412.30769229"),
+            (349525333.3333333, "349525333.33333331"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(cjson_number(v), want, "cjson_number({v})");
+        }
+        // Non-finite degrades to JSON null, like cJSON.
+        assert_eq!(cjson_number(f64::NAN), "null");
+        assert_eq!(cjson_number(f64::INFINITY), "null");
+    }
+
+    // The whole point of #57: a serialized report carries no integral `N.0`
+    // token. Build a report whose floats are all integral and assert the raw
+    // text has no `<digit>.0` anywhere.
+    #[test]
+    fn report_json_has_no_integral_dot_zero() {
+        let json = serde_json::to_string_pretty(&base_input().build()).unwrap();
+        let bytes = json.as_bytes();
+        for (i, w) in bytes.windows(3).enumerate() {
+            if w[0].is_ascii_digit() && w[1] == b'.' && w[2] == b'0' {
+                // allow `.0` only if followed by another digit (e.g. 1.02)
+                let next = bytes.get(i + 3).copied().unwrap_or(b' ');
+                assert!(
+                    next.is_ascii_digit(),
+                    "integral N.0 token at byte {i}: ...{}...",
+                    &json[i.saturating_sub(8)..(i + 6).min(json.len())]
+                );
+            }
+        }
+    }
 
     fn base_input() -> ReportInput {
         ReportInput {

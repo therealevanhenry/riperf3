@@ -55,20 +55,31 @@ fn fmt_id(id: i32) -> String {
     }
 }
 
+/// Emit one human-readable report line, prefixed with the `-T/--title` string
+/// when a title is active (#34). Every report line routes through this so the
+/// prefix matches iperf3 without changing the public printer signatures.
+fn titled(line: std::fmt::Arguments) {
+    println!("{}{}", crate::macros::output_title_prefix(), line);
+}
+
 /// Print the header line for interval reports.
 pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
     match protocol {
         TransportProtocol::Tcp => {
             if has_retransmits {
-                println!("[ ID] Interval           Transfer     Bitrate         Retr  Cwnd");
+                titled(format_args!(
+                    "[ ID] Interval           Transfer     Bitrate         Retr  Cwnd"
+                ));
             } else {
-                println!("[ ID] Interval           Transfer     Bitrate");
+                titled(format_args!(
+                    "[ ID] Interval           Transfer     Bitrate"
+                ));
             }
         }
         TransportProtocol::Udp => {
-            println!(
+            titled(format_args!(
                 "[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
-            );
+            ));
         }
     }
 }
@@ -91,7 +102,7 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
         (interval.jitter, interval.lost, interval.total_packets)
     {
         let pct = lost_percent(lost, total);
-        println!(
+        titled(format_args!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
             interval.start,
             interval.end,
@@ -102,24 +113,26 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
             total,
             pct,
             omit_tag,
-        );
+        ));
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
-        println!(
+        titled(format_args!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}   {:>10}  {}",
             interval.start, interval.end, transfer, rate, retr, cwnd_str, omit_tag,
-        );
+        ));
     } else {
-        println!(
+        titled(format_args!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {}",
             interval.start, interval.end, transfer, rate, omit_tag,
-        );
+        ));
     }
 }
 
 /// Print the separator line.
 pub fn print_separator() {
-    println!("- - - - - - - - - - - - - - - - - - - - - - - - -");
+    titled(format_args!(
+        "- - - - - - - - - - - - - - - - - - - - - - - - -"
+    ));
 }
 
 /// UDP loss as a percentage of total datagrams, guarding the zero-total case
@@ -182,7 +195,10 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
 
 /// Print a single final summary line.
 pub fn print_summary(summary: &StreamSummary, format_char: char) {
-    println!("{}", format_summary_line(summary, format_char));
+    titled(format_args!(
+        "{}",
+        format_summary_line(summary, format_char)
+    ));
 }
 
 /// Build the full set of final-report lines for a set of per-stream summaries:
@@ -205,7 +221,7 @@ pub fn final_report_lines(per_stream: &[StreamSummary], format_char: char) -> Ve
 /// Print the final report (per-stream summaries + aggregate `[SUM]` rows).
 pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
     for line in final_report_lines(per_stream, format_char) {
-        println!("{line}");
+        titled(format_args!("{line}"));
     }
 }
 

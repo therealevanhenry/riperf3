@@ -136,13 +136,23 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
     None
 }
 
-/// Whether this platform provides TCP retransmit information.
+/// Whether this platform provides a usable TCP **retransmit packet count** for
+/// the sender (the `Retr` column / JSON `sender_has_retransmits`).
+///
+/// macOS is deliberately excluded (#40). iperf3 *does* report retransmits on
+/// macOS — it reads `tcp_connection_info.tcpi_txretransmitpackets` (a sender
+/// retransmit packet count) and shows the Retr+Cwnd columns. But the Rust `libc`
+/// binding's `tcp_connection_info` does not expose that field — its sender-side
+/// retransmit member is `tcpi_txretransmitbytes` (retransmitted *bytes*) — so
+/// riperf3's `get_tcp_info` can only hard-code `total_retransmits: 0`. Rather
+/// than print a perpetual, misleading `Retr 0` (implying a loss-free transfer),
+/// we report no retransmit info on macOS. The Retr and Cwnd columns are gated
+/// together (iperf3 couples them on the same flag), so Cwnd is suppressed with
+/// it. This is a deliberate divergence from iperf3 for now; the faithful fix —
+/// reading `tcpi_txretransmitpackets` via a custom struct binding to show the
+/// real macOS Retr/Cwnd — is a deferred follow-up, not patch scope.
 pub fn has_retransmit_info() -> bool {
-    cfg!(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd"
-    ))
+    cfg!(any(target_os = "linux", target_os = "freebsd"))
 }
 
 #[cfg(test)]
@@ -176,5 +186,17 @@ mod tests {
             let info = get_tcp_info(client_stream.as_raw_fd()).unwrap();
             assert!(info.snd_mss > 0);
         }
+    }
+
+    // #40: only platforms with a real sender retransmit *packet* count advertise
+    // retransmit info. macOS (bytes only) and other targets must report false so
+    // the Retr column isn't a misleading 0. Runs on every platform; the macOS
+    // assertion is validated by the macOS native CI job.
+    #[test]
+    fn retransmit_info_only_where_packet_count_exists() {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert!(has_retransmit_info());
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        assert!(!has_retransmit_info());
     }
 }

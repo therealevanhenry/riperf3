@@ -108,6 +108,14 @@ fn server_receiver_summaries(
 
 impl Client {
     pub async fn run(&self) -> Result<TestResultsJson> {
+        // -T/--title: prefix every client text line with "<title>:  " (#34),
+        // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
+        // mode — `-J` and `--json-stream` emit machine JSON, which iperf3 never
+        // titles. Held for the whole run so the reporter task and the preamble
+        // both see it.
+        let _title_guard = (!self.json_output && !self.json_stream)
+            .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
+
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(
@@ -512,6 +520,10 @@ impl Client {
                     let local_addr = udp_sock.local_addr().ok();
                     let peer_addr = udp_sock.peer_addr().ok();
                     let sock = socket2::SockRef::from(&udp_sock);
+                    // Honor -w/--window on the UDP socket too (#59); iperf3 applies
+                    // it to UDP via iperf_udp_buffercheck. Set before the read-back
+                    // so sndbuf_actual/rcvbuf_actual report the realized size.
+                    net::apply_socket_window(&sock, self.window);
                     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
                     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
 
@@ -1243,6 +1255,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Prefix every client text-output line with `<title>:  ` (`-T/--title`),
+    /// matching iperf3. Applies only to plain-text output, not `-J`/`--json-stream`.
+    ///
+    /// Note: the prefix is tracked in a process-global for the duration of the
+    /// run, so two `Client::run` calls executing concurrently in the same process
+    /// are not isolated for `-T` (their titled lines can interleave). This does
+    /// not affect the CLI (one run per process) or sequential library use.
     pub fn title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self
