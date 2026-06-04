@@ -262,13 +262,19 @@ pub struct IntervalStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reorder: Option<u32>,
     // UDP per-interval detail (receiver side).
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
@@ -288,13 +294,19 @@ pub struct IntervalSum {
     pub bits_per_second: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub omitted: bool,
     pub sender: bool,
@@ -412,13 +424,19 @@ pub struct SumSide {
     pub bits_per_second: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub jitter_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_packets: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f64")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f64"
+    )]
     pub lost_percent: Option<f64>,
     pub sender: bool,
 }

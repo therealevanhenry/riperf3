@@ -46,6 +46,21 @@ impl Drop for OutputTitleGuard {
     }
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! vprintln {
+    ($($arg:tt)*) => {
+        {
+            log::info!($($arg)*);
+            println!(
+                "{}{}",
+                $crate::macros::output_title_prefix(),
+                format_args!($($arg)*)
+            );
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,19 +76,4 @@ mod tests {
         // Guard dropped → prefix cleared.
         assert_eq!(output_title_prefix(), "");
     }
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! vprintln {
-    ($($arg:tt)*) => {
-        {
-            log::info!($($arg)*);
-            println!(
-                "{}{}",
-                $crate::macros::output_title_prefix(),
-                format_args!($($arg)*)
-            );
-        }
-    };
 }

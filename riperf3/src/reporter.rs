@@ -71,7 +71,9 @@ pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
                     "[ ID] Interval           Transfer     Bitrate         Retr  Cwnd"
                 ));
             } else {
-                titled(format_args!("[ ID] Interval           Transfer     Bitrate"));
+                titled(format_args!(
+                    "[ ID] Interval           Transfer     Bitrate"
+                ));
             }
         }
         TransportProtocol::Udp => {
@@ -193,7 +195,10 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
 
 /// Print a single final summary line.
 pub fn print_summary(summary: &StreamSummary, format_char: char) {
-    titled(format_args!("{}", format_summary_line(summary, format_char)));
+    titled(format_args!(
+        "{}",
+        format_summary_line(summary, format_char)
+    ));
 }
 
 /// Build the full set of final-report lines for a set of per-stream summaries:
