@@ -17,6 +17,7 @@
 //! | `--bind-dev` | `setsockopt(IP_BOUND_IF)` | macOS | net.rs |
 //! | `-A` (affinity) | `SetThreadAffinityMask` | Windows | net.rs |
 //! | *(internal)* | `getsockopt(IP_MTU_DISCOVER)` | Linux | net.rs |
+//! | *(internal)* | `getsockopt(TCP_MAXSEG)` | Unix | net.rs |
 //! | *(internal)* | `getsockopt(TCP_INFO)` | Linux | tcp_info.rs |
 //! | *(internal)* | `getsockopt(TCP_CONNECTION_INFO)` | macOS | tcp_info.rs |
 //! | *(internal)* | `getsockopt(TCP_INFO)` | FreeBSD | tcp_info.rs |
