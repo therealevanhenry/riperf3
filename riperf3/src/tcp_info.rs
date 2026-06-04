@@ -136,13 +136,18 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
     None
 }
 
-/// Whether this platform provides TCP retransmit information.
+/// Whether this platform provides a usable TCP **retransmit packet count** for
+/// the sender (the `Retr` column / JSON `sender_has_retransmits`).
+///
+/// macOS is deliberately excluded (#40): its `tcp_connection_info` exposes only
+/// `tcpi_txretransmitbytes` (retransmitted *bytes*), not a sender packet count,
+/// so `get_tcp_info` can only hard-code `total_retransmits: 0`. Advertising
+/// retransmit info there printed a perpetual `Retr 0`, implying a loss-free
+/// transfer regardless of reality. We now report no retransmit info on macOS
+/// rather than a misleading zero; the coupled `Cwnd` column is suppressed with
+/// it (iperf3 shows both together, gated on the same flag).
 pub fn has_retransmit_info() -> bool {
-    cfg!(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd"
-    ))
+    cfg!(any(target_os = "linux", target_os = "freebsd"))
 }
 
 #[cfg(test)]
@@ -176,5 +181,17 @@ mod tests {
             let info = get_tcp_info(client_stream.as_raw_fd()).unwrap();
             assert!(info.snd_mss > 0);
         }
+    }
+
+    // #40: only platforms with a real sender retransmit *packet* count advertise
+    // retransmit info. macOS (bytes only) and other targets must report false so
+    // the Retr column isn't a misleading 0. Runs on every platform; the macOS
+    // assertion is validated by the macOS native CI job.
+    #[test]
+    fn retransmit_info_only_where_packet_count_exists() {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert!(has_retransmit_info());
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        assert!(!has_retransmit_info());
     }
 }
