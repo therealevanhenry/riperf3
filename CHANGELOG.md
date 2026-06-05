@@ -40,6 +40,17 @@ data-path/throughput changes.
   working directory so relative `-I`/`--logfile` paths resolve as given;
   redirects std{in,out,err} to `/dev/null`) and writes the pidfile after the
   fork so it records the daemon's pid.
+- **`--json-stream` now emits valid line-delimited JSON** (#62): it printed text
+  banners (the `[ ID] Interval` header, the `- - -` separator, the final summary
+  lines) interleaved with *bare* per-stream interval objects that had no
+  `event`/`data` wrapping and no `start`/`end` events — so the output was neither
+  parseable NDJSON nor iperf3's event schema. Both the client and the server now
+  emit pure NDJSON: a `{"event":"start","data":{…}}` line, one
+  `{"event":"interval","data":{"streams":[…],"sum":{…}}}` per interval (streamed
+  live and flushed as it happens), then `{"event":"end","data":{…}}`, with no
+  banners. The `start`/`interval`/`end` payloads reuse the typed `-J` model, so
+  each is byte-for-byte the corresponding section of the batched `-J` report
+  (including the cJSON float formatting, #57).
 - **The final (partial) interval is no longer dropped** (#55): the interval
   reporter looped `tick -> if done break`, so a run that ended part-way through an
   interval lost its last interval (a 2s `-i 1` run intermittently printed 1

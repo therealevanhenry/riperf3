@@ -198,6 +198,25 @@ impl Client {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+
+                    // --json-stream: emit the `start` event now, before the reporter
+                    // streams any `interval` events (faithful event order, #62).
+                    if self.json_stream {
+                        self.emit_json_stream_start(
+                            &streams,
+                            cpu_start.as_ref(),
+                            blksize,
+                            &interval_data,
+                            &StartMeta {
+                                cookie: String::from_utf8_lossy(
+                                    &cookie[..protocol::COOKIE_SIZE - 1],
+                                )
+                                .into_owned(),
+                                tcp_mss_default: control_mss,
+                                start_time_millis: test_start_millis,
+                            },
+                        );
+                    }
                 }
 
                 TestState::TestRunning => {
@@ -610,6 +629,11 @@ impl Client {
         let interval_secs = self.interval.unwrap_or(1.0);
         let print_intervals = !self.json_output || self.json_stream;
         let collect_intervals = self.json_output && !self.json_stream;
+        // The reporter needs the collector whenever we emit JSON: `-J` collects the
+        // typed intervals for the final blob; `--json-stream` streams them live but
+        // still needs the per-stream TCP_INFO extremes (max cwnd/rtt) handed back
+        // for the `end` event (#62).
+        let want_collector = collect_intervals || self.json_stream;
         // Clock origin shared with the reporter: `report_start` is captured right
         // before spawning it, so `report_start.elapsed()` at end-of-test is the
         // authoritative final-interval boundary (#55).
@@ -642,7 +666,7 @@ impl Client {
                 stream_refs,
                 done.clone(),
                 reporter_end.clone(),
-                collect_intervals.then(|| collector.clone()),
+                want_collector.then(|| collector.clone()),
             )
         } else {
             None
@@ -807,6 +831,17 @@ impl Client {
                 interval_data,
                 start_meta,
             );
+        } else if self.json_stream {
+            // --json-stream: emit the `end` event. (Previously this fell through
+            // to print_results_text, printing text banners into the NDJSON — #62.)
+            self.emit_json_stream_end(
+                streams,
+                cpu_start,
+                remote_cpu,
+                blksize,
+                interval_data,
+                start_meta,
+            );
         } else {
             self.print_results_text(streams, remote_cpu);
         }
@@ -865,7 +900,11 @@ impl Client {
         crate::reporter::print_final_summaries(&summaries, self.format_char);
     }
 
-    fn print_results_json(
+    /// Assemble the typed iperf3-schema report input from the finished test.
+    /// Shared by `-J` (build + pretty-print) and `--json-stream` (build + emit the
+    /// `end` event; and at TestStart, the `start` event from a partial input where
+    /// only the start fields are meaningful — see `emit_json_stream_start`).
+    fn build_report_input(
         &self,
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
@@ -873,7 +912,7 @@ impl Client {
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
-    ) {
+    ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
         };
@@ -1044,7 +1083,73 @@ impl Client {
             streams: stream_reports,
         };
 
+        input
+    }
+
+    /// `-J`: build and pretty-print the single batched report blob.
+    fn print_results_json(
+        &self,
+        streams: &[DataStream],
+        cpu_start: Option<&CpuSnapshot>,
+        remote_cpu: Option<&TestResultsJson>,
+        blksize: usize,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        start_meta: &StartMeta,
+    ) {
+        let input = self.build_report_input(
+            streams,
+            cpu_start,
+            remote_cpu,
+            blksize,
+            interval_data,
+            start_meta,
+        );
         println!("{}", serde_json::to_string_pretty(&input.build()).unwrap());
+    }
+
+    /// `--json-stream`: emit the `start` event (#62). Called at TestStart, before
+    /// any interval event. Only the `start` block is meaningful at this point; the
+    /// rest of the report input is placeholder (no bytes/cpu/intervals collected
+    /// yet) and is discarded.
+    fn emit_json_stream_start(
+        &self,
+        streams: &[DataStream],
+        cpu_start: Option<&CpuSnapshot>,
+        blksize: usize,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        start_meta: &StartMeta,
+    ) {
+        let input =
+            self.build_report_input(streams, cpu_start, None, blksize, interval_data, start_meta);
+        crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+            "start",
+            &input.build().start,
+        ));
+    }
+
+    /// `--json-stream`: emit the `end` event (#62) at DisplayResults. The interval
+    /// events were already streamed live by the reporter.
+    fn emit_json_stream_end(
+        &self,
+        streams: &[DataStream],
+        cpu_start: Option<&CpuSnapshot>,
+        remote_cpu: Option<&TestResultsJson>,
+        blksize: usize,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        start_meta: &StartMeta,
+    ) {
+        let input = self.build_report_input(
+            streams,
+            cpu_start,
+            remote_cpu,
+            blksize,
+            interval_data,
+            start_meta,
+        );
+        crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+            "end",
+            &input.build().end,
+        ));
     }
 }
 

@@ -470,7 +470,25 @@ impl Server {
         // the client's gating (#50).
         let print_intervals = !json || self.json_stream;
         let collect_intervals = json && !self.json_stream;
+        // Like the client: `--json-stream` streams intervals live but still needs
+        // the per-stream TCP_INFO extremes handed back for the `end` event (#62).
+        let want_collector = collect_intervals || self.json_stream;
         let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
+
+        // --json-stream: emit the `start` event now — before the reporter is
+        // spawned, so it is guaranteed to precede every `interval` event (#62).
+        if self.json_stream {
+            self.emit_json_stream_start(
+                &streams,
+                &cfg,
+                &params,
+                &cookie,
+                &accepted_host,
+                accepted_port,
+                test_start_millis,
+                &interval_data,
+            );
+        }
 
         // Spawn interval reporter (server uses 1.0s default). `report_start` is
         // captured right before the spawn so its elapsed at TEST_END is the
@@ -504,7 +522,7 @@ impl Server {
                 stream_refs,
                 done.clone(),
                 reporter_end.clone(),
-                collect_intervals.then(|| interval_data.clone()),
+                want_collector.then(|| interval_data.clone()),
             )
         };
 
@@ -640,9 +658,23 @@ impl Server {
             }
         }
 
-        if json {
+        if self.json_output {
             // Emit the iperf3-schema JSON report on stdout (#50).
             self.print_results_json(
+                &streams,
+                &cfg,
+                &params,
+                &cpu_util,
+                test_duration,
+                &cookie,
+                &accepted_host,
+                accepted_port,
+                test_start_millis,
+                &interval_data,
+            );
+        } else if self.json_stream {
+            // --json-stream: emit the `end` event (intervals already streamed; #62).
+            self.emit_json_stream_end(
                 &streams,
                 &cfg,
                 &params,
@@ -704,8 +736,11 @@ impl Server {
     /// via `is_server: true`: `accepted_connection` instead of `connecting_to`,
     /// no peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
     /// (iperf3's server never reads its control-socket MSS).
+    /// Assemble the server's typed iperf3-schema report input. Shared by `-J`
+    /// (build + pretty-print) and `--json-stream` (build + emit the `start`/`end`
+    /// events). The server's perspective is baked in via `is_server: true`.
     #[allow(clippy::too_many_arguments)]
-    fn print_results_json(
+    fn build_report_input(
         &self,
         streams: &[DataStream],
         cfg: &TestConfig,
@@ -717,7 +752,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
-    ) {
+    ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
         };
@@ -865,20 +900,107 @@ impl Server {
             streams: stream_reports,
         };
 
-        let report = input.build();
-        if self.json_stream {
-            // --json-stream: the interval lines were already streamed; emit the
-            // final document the same way the client does.
-            match serde_json::to_string(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
-            }
-        } else {
-            match serde_json::to_string_pretty(&report) {
-                Ok(s) => println!("{s}"),
-                Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
-            }
+        input
+    }
+
+    /// `-J`: build and pretty-print the server's single batched report blob (#50).
+    #[allow(clippy::too_many_arguments)]
+    fn print_results_json(
+        &self,
+        streams: &[DataStream],
+        cfg: &TestConfig,
+        params: &TestParams,
+        cpu_util: &crate::cpu::CpuUtilization,
+        test_duration: f64,
+        cookie: &[u8; protocol::COOKIE_SIZE],
+        accepted_host: &str,
+        accepted_port: u16,
+        start_time_millis: u64,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+    ) {
+        let input = self.build_report_input(
+            streams,
+            cfg,
+            params,
+            cpu_util,
+            test_duration,
+            cookie,
+            accepted_host,
+            accepted_port,
+            start_time_millis,
+            interval_data,
+        );
+        match serde_json::to_string_pretty(&input.build()) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
         }
+    }
+
+    /// `--json-stream`: emit the server's `end` event (#62). The interval events
+    /// were already streamed live by the reporter.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_json_stream_end(
+        &self,
+        streams: &[DataStream],
+        cfg: &TestConfig,
+        params: &TestParams,
+        cpu_util: &crate::cpu::CpuUtilization,
+        test_duration: f64,
+        cookie: &[u8; protocol::COOKIE_SIZE],
+        accepted_host: &str,
+        accepted_port: u16,
+        start_time_millis: u64,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+    ) {
+        let input = self.build_report_input(
+            streams,
+            cfg,
+            params,
+            cpu_util,
+            test_duration,
+            cookie,
+            accepted_host,
+            accepted_port,
+            start_time_millis,
+            interval_data,
+        );
+        crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+            "end",
+            &input.build().end,
+        ));
+    }
+
+    /// `--json-stream`: emit the server's `start` event (#62), before any interval
+    /// event. Only the `start` block is meaningful at this point; cpu/bytes are
+    /// zero and intervals empty (the test hasn't run yet), and are discarded.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_json_stream_start(
+        &self,
+        streams: &[DataStream],
+        cfg: &TestConfig,
+        params: &TestParams,
+        cookie: &[u8; protocol::COOKIE_SIZE],
+        accepted_host: &str,
+        accepted_port: u16,
+        start_time_millis: u64,
+        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+    ) {
+        let input = self.build_report_input(
+            streams,
+            cfg,
+            params,
+            &crate::cpu::CpuUtilization::default(),
+            cfg.duration as f64,
+            cookie,
+            accepted_host,
+            accepted_port,
+            start_time_millis,
+            interval_data,
+        );
+        crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+            "start",
+            &input.build().start,
+        ));
     }
 }
 

@@ -138,6 +138,23 @@ pub struct Report {
     pub extra_data: Option<String>,
 }
 
+/// Serialize one `--json-stream` NDJSON line: `{"event":<event>,"data":<data>}`,
+/// compact (one object per line, no pretty-printing), matching iperf3's
+/// `--json-stream` (#62). The `data` payload keeps its own serde formatting —
+/// notably the cJSON-style float rendering (`ser_f64`, #57) — so a streamed
+/// `start` / `interval` / `end` object is byte-for-byte the same as the
+/// corresponding section of the batched `-J` report.
+pub(crate) fn json_stream_event<T: Serialize>(event: &'static str, data: &T) -> String {
+    #[derive(Serialize)]
+    struct Event<'a, T: Serialize> {
+        event: &'static str,
+        data: &'a T,
+    }
+    // Infallible for the report structs (plain owned data), like the other
+    // `to_string` sites in this crate.
+    serde_json::to_string(&Event { event, data }).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // start{}
 // ---------------------------------------------------------------------------
@@ -1115,6 +1132,26 @@ mod tests {
         // Non-finite degrades to JSON null, like cJSON.
         assert_eq!(cjson_number(f64::NAN), "null");
         assert_eq!(cjson_number(f64::INFINITY), "null");
+    }
+
+    // #62: the --json-stream envelope is `{"event":<event>,"data":<data>}`,
+    // compact (one line), `event` first, and the `data` payload is byte-identical
+    // to the standalone encoding of the typed value (so it keeps the cJSON float
+    // formatting and matches the corresponding `-J` section).
+    #[test]
+    fn json_stream_event_wraps_compactly() {
+        let report = base_input().build();
+        let line = json_stream_event("start", &report.start);
+        assert!(!line.contains('\n'), "must be one compact line: {line}");
+        assert!(
+            line.starts_with(r#"{"event":"start","data":"#),
+            "envelope/field order wrong: {line}"
+        );
+        let data = serde_json::to_string(&report.start).unwrap();
+        assert_eq!(line, format!(r#"{{"event":"start","data":{data}}}"#));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["event"], "start");
+        assert!(v["data"].is_object());
     }
 
     // The whole point of #57: a serialized report carries no integral `N.0`
