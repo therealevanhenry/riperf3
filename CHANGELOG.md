@@ -75,9 +75,10 @@ data-path/throughput changes.
   demultiplexes streams by client source address in userspace — correct on every
   platform, and wire-compatible with an iperf3 client (verified against the 3.20
   binary over IPv4 and IPv6, forward/reverse/bidir `-P 4`). It is the default on
-  Windows; the connected-socket recycling path stays the default on Unix
-  (kernel-parallel receive, faithful to iperf3) and is measurably faster with
-  lower loss there.
+  Windows; the connected-socket recycling path stays the default on Unix because
+  it mirrors iperf3 and gives one socket and thread per stream (kernel-parallel
+  receive that scales better at high `-P`). At modest parallelism the two paths
+  measure comparably on throughput and loss.
 
 ### Added
 - **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
