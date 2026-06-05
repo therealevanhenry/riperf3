@@ -78,7 +78,6 @@ pub struct Server {
     pub port: u16,
     pub one_off: bool,
     pub verbose: bool,
-    pub daemon: bool,
     pub idle_timeout: Option<u32>,
     pub server_bitrate_limit: Option<u64>,
     pub server_max_duration: Option<u32>,
@@ -101,18 +100,10 @@ pub struct Server {
 
 impl Server {
     pub async fn run(&self) -> Result<()> {
-        if self.daemon {
-            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-            nix::unistd::daemon(false, false)
-                .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd")))]
-            {
-                return Err(RiperfError::Protocol(
-                    "daemon mode is not supported on this platform".into(),
-                ));
-            }
-        }
-
+        // Daemonizing (`-s -D`) is a process-level concern handled by the binary
+        // *before* the tokio runtime is built — `daemon()` forks, and a fork from
+        // inside a multi-threaded runtime would leave the child with no worker
+        // threads (#81). The library must not fork here.
         let listener =
             net::tcp_listen(self.bind_address.as_deref(), self.port, self.ip_version).await?;
         // Under -J / --json-stream iperf3's server stdout is pure JSON (the
@@ -899,7 +890,6 @@ pub struct ServerBuilder {
     port: Option<u16>,
     one_off: bool,
     verbose: bool,
-    daemon: bool,
     idle_timeout: Option<u32>,
     server_bitrate_limit: Option<u64>,
     server_max_duration: Option<u32>,
@@ -924,7 +914,6 @@ impl Default for ServerBuilder {
             port: Some(DEFAULT_PORT),
             one_off: false,
             verbose: false,
-            daemon: false,
             idle_timeout: None,
             server_bitrate_limit: None,
             server_max_duration: None,
@@ -974,11 +963,6 @@ impl ServerBuilder {
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
-        self
-    }
-
-    pub fn daemon(mut self, daemon: bool) -> Self {
-        self.daemon = daemon;
         self
     }
 
@@ -1066,13 +1050,6 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
-        #[cfg(not(unix))]
-        if self.daemon {
-            return Err(ConfigError::Unsupported(
-                "daemon mode is not supported on this platform".into(),
-            ));
-        }
-
         // Reject -4/-6 contradicting an explicit -B of the opposite family,
         // instead of silently letting the bind address win (issue #12).
         if let (Some(v), Some(addr)) = (self.ip_version, self.bind_address.as_deref()) {
@@ -1094,7 +1071,6 @@ impl ServerBuilder {
             port: self.port.unwrap_or(DEFAULT_PORT),
             one_off: self.one_off,
             verbose: self.verbose,
-            daemon: self.daemon,
             idle_timeout: self.idle_timeout,
             server_bitrate_limit: self.server_bitrate_limit,
             server_max_duration: self.server_max_duration,
