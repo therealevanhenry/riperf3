@@ -80,8 +80,39 @@ fn assert_valid_ndjson(stdout: &str, who: &str) {
     }
 }
 
-/// Spawn `riperf3` and bound the wait so a hang fails the test instead of the
-/// whole suite. Returns captured stdout (panics on timeout/failure).
+/// Kills the wrapped child on drop, so a spawned server is reaped even if the
+/// test panics before it is waited on.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Wait for a child to exit, bounded by `timeout` (kill + panic on timeout), so a
+/// hang fails the test cleanly instead of stalling the whole suite.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    who: &str,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => return status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{who}: timed out");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// Spawn `riperf3`, bound its run, and return captured stdout.
 fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_riperf3");
     let mut child = Command::new(bin)
@@ -91,18 +122,7 @@ fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
         .spawn()
         .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{who}: timed out");
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    wait_bounded(&mut child, timeout, who);
     let mut out = String::new();
     child
         .stdout
@@ -188,30 +208,38 @@ fn server_json_stream_is_valid_ndjson() {
     let port = free_port();
     let ps = port.to_string();
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut server = Command::new(bin)
-        .args(["-s", "-1", "-p", &ps, "--json-stream"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
+    // Guard so the server is reaped even if an assertion below panics.
+    let mut server = ChildGuard(
+        Command::new(bin)
+            .args(["-s", "-1", "-p", &ps, "--json-stream"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
     std::thread::sleep(Duration::from_millis(300));
 
-    // Drive one test; the one-off server then finishes and closes its stdout.
-    let status = Command::new(bin)
+    // Drive one test, bounded so a non-serving server can't hang the suite.
+    let mut client = Command::new(bin)
         .args(["-c", "127.0.0.1", "-p", &ps, "-t", "1", "-i", "1"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .expect("run client");
+        .spawn()
+        .expect("spawn client");
+    let status = wait_bounded(&mut client, Duration::from_secs(20), "client");
     assert!(status.success(), "client failed: {status:?}");
 
+    // The one-off server now finishes and closes stdout; bound that wait too.
+    // (Output is a handful of small lines, well under the pipe buffer, so
+    // waiting for exit before reading can't deadlock on a full pipe.)
+    wait_bounded(&mut server.0, Duration::from_secs(20), "server");
     let mut out = String::new();
     server
+        .0
         .stdout
         .take()
         .unwrap()
         .read_to_string(&mut out)
         .unwrap();
-    let _ = server.wait();
     assert_valid_ndjson(&out, "server");
 }
