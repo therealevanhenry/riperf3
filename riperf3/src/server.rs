@@ -344,10 +344,18 @@ impl Server {
                 // when a connected and a wildcard socket share a port, so that
                 // design hangs `-P > 1` setup on Windows (#80). The demux path
                 // binds ONE unconnected socket and routes by source address in
-                // userspace — correct on every platform. Default on Windows;
-                // forceable elsewhere via RIPERF3_UDP_SERVER_DEMUX for testing.
-                let udp_use_demux =
-                    cfg!(windows) || std::env::var_os("RIPERF3_UDP_SERVER_DEMUX").is_some();
+                // userspace — correct on every platform.
+                //
+                // Default: demux on Windows (recycling cannot work there),
+                // recycling on Unix (faithful to iperf3, kernel-parallel
+                // receive). RIPERF3_UDP_SERVER_DEMUX overrides either way —
+                // `0`/`false`/`no`/empty force recycling, any other value forces
+                // demux — so both paths are exercisable on one build (the Windows
+                // red→green sets it to `0` to reproduce the old hang).
+                let udp_use_demux = match std::env::var("RIPERF3_UDP_SERVER_DEMUX") {
+                    Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "no"),
+                    Err(_) => cfg!(windows),
+                };
 
                 if udp_use_demux {
                     self.setup_udp_demux_streams(
