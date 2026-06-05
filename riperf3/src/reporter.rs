@@ -84,6 +84,15 @@ pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
     }
 }
 
+/// Print one `--json-stream` event line and flush immediately, so a piped
+/// consumer sees the `start`/`end` event as soon as it is produced (#62). The
+/// reporter flushes its own `interval` events via the per-tick flush.
+pub(crate) fn emit_json_stream_line(line: &str) {
+    use std::io::Write;
+    println!("{line}");
+    let _ = std::io::stdout().flush();
+}
+
 /// Print one interval line.
 pub fn print_interval(interval: &StreamInterval, format_char: char) {
     let id = fmt_id(interval.stream_id);
@@ -470,8 +479,8 @@ pub fn spawn_interval_reporter(
         let mut emit_interval = |start: f64, end: f64, omitted: bool| {
             let seconds = end - start;
 
-            // Timestamp prefix for this tick
-            if config.print && config.timestamp_format.is_some() {
+            // Timestamp prefix for this tick (text decoration; never on --json-stream)
+            if config.print && !config.json_stream && config.timestamp_format.is_some() {
                 // Use libc strftime for iperf3-compatible timestamp formatting
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -484,7 +493,8 @@ pub fn spawn_interval_reporter(
                 print!("{hours:02}:{mins:02}:{s:02} ");
             }
 
-            if config.print && !header_printed {
+            // The text header banner is suppressed under --json-stream (pure NDJSON).
+            if config.print && !config.json_stream && !header_printed {
                 print_header(config.protocol, has_retransmits);
                 header_printed = true;
             }
@@ -583,7 +593,11 @@ pub fn spawn_interval_reporter(
                     0.0
                 };
 
-                if config.print {
+                // Text mode prints a per-stream line here. `--json-stream` emits
+                // one typed `interval` event per tick (assembled after the loop
+                // from the same typed streams the `-J` collector builds), so it
+                // has nothing to print per stream.
+                if config.print && !config.json_stream {
                     let interval = StreamInterval {
                         stream_id: stream.id,
                         start,
@@ -598,37 +612,7 @@ pub fn spawn_interval_reporter(
                         total_packets: total,
                         omitted,
                     };
-
-                    if config.json_stream {
-                        let mut j = serde_json::json!({
-                            "socket": stream.id,
-                            "start": start,
-                            "end": end,
-                            "seconds": seconds,
-                            "bytes": bytes,
-                            "bits_per_second": bps_val,
-                            "omitted": omitted,
-                            "sender": stream.is_sender,
-                        });
-                        if let Some(r) = retransmits {
-                            j["retransmits"] = serde_json::json!(r);
-                        }
-                        if let Some(c) = snd_cwnd {
-                            j["snd_cwnd"] = serde_json::json!(c);
-                        }
-                        if let Some(ji) = jitter {
-                            j["jitter_ms"] = serde_json::json!(ji * 1000.0);
-                        }
-                        if let Some(l) = lost {
-                            j["lost_packets"] = serde_json::json!(l);
-                        }
-                        if let Some(p) = total {
-                            j["packets"] = serde_json::json!(p);
-                        }
-                        println!("{}", serde_json::to_string(&j).unwrap());
-                    } else {
-                        print_interval(&interval, config.format_char);
-                    }
+                    print_interval(&interval, config.format_char);
                 }
 
                 if collecting {
@@ -687,8 +671,9 @@ pub fn spawn_interval_reporter(
                 }
             }
 
-            // Print [SUM] line for parallel streams
-            if config.print && config.num_streams > 1 {
+            // Print [SUM] line for parallel streams (text only; the json-stream
+            // `interval` event below carries the typed `sum` instead).
+            if config.print && !config.json_stream && config.num_streams > 1 {
                 let sum_interval = StreamInterval {
                     stream_id: -1, // renders as "SUM"
                     start,
@@ -737,7 +722,7 @@ pub fn spawn_interval_reporter(
                 // sender=false) it must be omitted, not just gated on "any stream
                 // sends" — otherwise the received-flow sum carries a spurious count.
                 let sum_is_sender = streams.first().is_none_or(|s| s.is_sender);
-                collected.push(crate::json_report::Interval {
+                let interval = crate::json_report::Interval {
                     streams: collected_streams,
                     sum: crate::json_report::IntervalSum {
                         start,
@@ -757,11 +742,23 @@ pub fn spawn_interval_reporter(
                         omitted,
                         sender: sum_is_sender,
                     },
-                });
+                };
+                // `-J` collects intervals for the final batched blob; `--json-stream`
+                // emits each one live as `{"event":"interval","data":{...}}`.
+                if config.json_stream {
+                    println!(
+                        "{}",
+                        crate::json_report::json_stream_event("interval", &interval)
+                    );
+                } else {
+                    collected.push(interval);
+                }
             }
 
-            // Flush after each interval if requested
-            if config.print && config.forceflush {
+            // Flush after each interval if requested. --json-stream always flushes
+            // so a piped consumer sees each event as it happens (the point of the
+            // streaming format), regardless of --forceflush.
+            if config.print && (config.forceflush || config.json_stream) {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
