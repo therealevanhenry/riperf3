@@ -11,6 +11,36 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.7.0] - unreleased
+
+A minor bump (the first `0.x` minor since 0.6.0) because the interval-reporter
+fix needs a new parameter on a public function — see **Changed** below. No
+data-path/throughput changes.
+
+### Changed
+- **BREAKING (library API): `riperf3::reporter::spawn_interval_reporter` gains a
+  `ReporterEnd` argument** (#55). Callers pass an `Arc<ReporterEnd>` and signal
+  the authoritative end-of-test time via `ReporterEnd::finish(end_secs)`. The new
+  public `ReporterEnd` type is the only API addition required by the fix. The CLI
+  binary is unaffected; only direct library consumers need to update.
+
+### Fixed
+- **The final (partial) interval is no longer dropped** (#55): the interval
+  reporter looped `tick -> if done break`, so a run that ended part-way through an
+  interval lost its last interval (a 2s `-i 1` run intermittently printed 1
+  interval instead of 2; `-J`/`--json-stream` lost the tail too). The test driver
+  now hands the reporter the authoritative end time and the reporter flushes a
+  final interval `[last_boundary, end]` before stopping, matching iperf3. A
+  duration run passes its exact `-t`, so a boundary-aligned end produces no
+  spurious trailing interval; the senders stop at the deadline, so the summary is
+  unchanged. The final interval reuses the last-sampled TCP_INFO when the socket
+  has already closed, so it still carries `Cwnd`/`RTT`/`Retr`.
+
+### Added
+- **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
+  non-draining reads of the interval byte counters, used to skip an empty final
+  partial interval on the receiver side.
+
 ## [0.6.3] - 2026-06-04
 
 An iperf3-fidelity and correctness release. There are **no public Rust API
