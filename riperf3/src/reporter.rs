@@ -311,6 +311,17 @@ pub struct IntervalReporterConfig {
     pub blksize: usize,
 }
 
+/// A single TCP_INFO sample reused for the final interval (#55) when the socket
+/// has already closed by the time the reporter flushes it.
+#[derive(Clone, Copy)]
+struct TcpSample {
+    snd_cwnd: u64,
+    rtt: u32,
+    rttvar: u32,
+    pmtu: u32,
+    reorder: u32,
+}
+
 /// Per-stream sender-side TCP_INFO extremes accumulated across the run (#36 PR2),
 /// for the `end.streams[].sender` object. Only meaningful for TCP sender streams.
 #[derive(Debug, Default, Clone, Copy)]
@@ -346,14 +357,60 @@ pub struct CollectedIntervals {
     pub extremes: Vec<StreamExtremes>,
 }
 
+/// End-of-test signal from the test driver to the interval reporter (#55).
+///
+/// The reporter's periodic ticks fall on idealized boundaries, but a run can end
+/// part-way through an interval. The driver calls [`ReporterEnd::finish`] with the
+/// authoritative elapsed test time at the exact moment the run ends; the reporter
+/// then flushes one final interval `[last_boundary, end_secs]` and stops. Using the
+/// driver's measured end time (rather than the reporter's own late, polled
+/// detection) keeps the final interval's boundary and bitrate exact, and because
+/// the driver signals *before* it tears the streams down, the final flush still
+/// reads live TCP_INFO.
+#[derive(Debug)]
+pub struct ReporterEnd {
+    notify: tokio::sync::Notify,
+    end_secs_bits: std::sync::atomic::AtomicU64,
+}
+
+impl ReporterEnd {
+    pub fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            end_secs_bits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Signal that the run ended at `end_secs` elapsed (test-relative seconds).
+    /// Wakes the reporter to emit its final partial interval up to `end_secs`.
+    pub fn finish(&self, end_secs: f64) {
+        self.end_secs_bits
+            .store(end_secs.to_bits(), Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    fn end_secs(&self) -> f64 {
+        f64::from_bits(self.end_secs_bits.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for ReporterEnd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Spawn an async task that prints interval reports periodically.
 ///
-/// Returns `None` if interval reporting is disabled (interval_secs <= 0).
-/// The handle should be awaited after the test's `done` flag is set.
+/// Returns `None` if interval reporting is disabled (interval_secs <= 0). On a
+/// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
+/// interval and stop the task; `done` is the fallback stop signal for error/early
+/// teardown paths. The handle should be awaited after `finish`/`done`.
 pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
     done: Arc<AtomicBool>,
+    reporter_end: Arc<ReporterEnd>,
     collector: Option<Arc<Mutex<CollectedIntervals>>>,
 ) -> Option<JoinHandle<()>> {
     if config.interval_secs <= 0.0 {
@@ -372,15 +429,6 @@ pub fn spawn_interval_reporter(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate first tick
 
-        // Clock origin for this reporter. Idealized interval boundaries are
-        // `k * interval_secs` from here; the final partial interval (#55) ends
-        // at the real elapsed time measured from this point.
-        let loop_start = tokio::time::Instant::now();
-        // How often to check `done` while waiting for the next tick, so the run
-        // end is noticed promptly (see the wait loop below). Small relative to
-        // the interval; capped so sub-second intervals still stay responsive.
-        let poll_dur = interval_dur.min(std::time::Duration::from_millis(10));
-
         let mut interval_num: u64 = 0;
         let mut header_printed = false;
         let omit_intervals = if config.interval_secs > 0.0 {
@@ -393,6 +441,11 @@ pub fn spawn_interval_reporter(
         let mut prev_retransmits: Vec<u32> = vec![0; streams.len()];
         let mut prev_cnt_error: Vec<i64> = vec![0; streams.len()];
         let mut prev_packet_count: Vec<i64> = vec![0; streams.len()];
+        // Last successfully sampled TCP_INFO per stream. Reused for the final
+        // interval (#55) when the socket has already closed by the time it
+        // flushes, so the final line still carries Cwnd/RTT like the periodic
+        // ones rather than going blank.
+        let mut last_tcp: Vec<Option<TcpSample>> = vec![None; streams.len()];
 
         // Datagram size for the UDP sender's per-interval packet count.
         let blk = config.blksize.max(1) as u64;
@@ -470,6 +523,13 @@ pub fn spawn_interval_reporter(
                                 e.rtt_samples += 1;
                             }
                             e.total_retransmits = Some(info.total_retransmits);
+                            last_tcp[i] = Some(TcpSample {
+                                snd_cwnd: info.snd_cwnd,
+                                rtt: info.rtt,
+                                rttvar: info.rttvar,
+                                pmtu: info.pmtu,
+                                reorder: info.reorder,
+                            });
                             (
                                 Some(delta as i64),
                                 Some(info.snd_cwnd),
@@ -477,6 +537,19 @@ pub fn spawn_interval_reporter(
                                 Some(info.rttvar),
                                 Some(info.pmtu),
                                 Some(info.reorder),
+                            )
+                        } else if let Some(s) = last_tcp[i] {
+                            // Final-interval fallback (#55): the socket closed as
+                            // the run ended, so a fresh read failed. Reuse the
+                            // last sample's cwnd/rtt; no new retransmit count is
+                            // measurable for the sub-interval, so report 0.
+                            (
+                                Some(0),
+                                Some(s.snd_cwnd),
+                                Some(s.rtt),
+                                Some(s.rttvar),
+                                Some(s.pmtu),
+                                Some(s.reorder),
                             )
                         } else {
                             (None, None, None, None, None, None)
@@ -695,57 +768,57 @@ pub fn spawn_interval_reporter(
         };
 
         loop {
-            // Wait for the next interval boundary, but notice `done` promptly
-            // (within `poll_dur`) rather than only at the next tick. Otherwise
-            // the final partial (#55) would be measured up to a whole interval
-            // late, skewing its duration and bitrate. `biased` checks the tick
-            // first, so a `done` that lands exactly on a boundary still emits
-            // that boundary's full interval before the loop exits.
-            let tick = ticker.tick();
-            tokio::pin!(tick);
-            let became_done = loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut tick => break false,
-                    _ = tokio::time::sleep(poll_dur) => {
-                        if done.load(Ordering::Relaxed) {
-                            break true;
-                        }
+            // Wait for either the next interval boundary or the driver's
+            // end-of-test signal. `biased` checks the end signal FIRST: the driver
+            // sets `done` immediately after `finish` (to stop the senders at the
+            // deadline), so the notify must win that race — otherwise the tick
+            // branch would observe `done` and exit without flushing the final
+            // interval. When `finish` and a boundary tick are both ready, that
+            // boundary's data is folded into the recovered final interval below.
+            tokio::select! {
+                biased;
+                _ = reporter_end.notify.notified() => {
+                    // #55: the run ended part-way through an interval. Flush one
+                    // final interval `[last_boundary, end_secs]` using the
+                    // driver's authoritative end time, then stop.
+                    //
+                    // Skip a remainder that is zero-length (the run ended on a
+                    // boundary — the sender driver passes the exact `-t`, so this
+                    // is exact) OR carries no residual bytes (the receiver side:
+                    // the peer has stopped, so its boundary-aligned tail is empty
+                    // even though `end_secs` trails the boundary by the control
+                    // round-trip).
+                    let last_end = interval_num as f64 * config.interval_secs;
+                    let end_secs = reporter_end.end_secs();
+                    let residual_bytes: u64 = streams
+                        .iter()
+                        .map(|s| {
+                            if s.is_sender {
+                                s.counters.peek_sent_interval()
+                            } else {
+                                s.counters.peek_received_interval()
+                            }
+                        })
+                        .sum();
+                    if end_secs > last_end + 1e-3 && residual_bytes > 0 {
+                        let omitted = (interval_num + 1) <= omit_intervals;
+                        emit_interval(last_end, end_secs, omitted);
                     }
+                    break;
                 }
-            };
-            if became_done {
-                break;
+                _ = ticker.tick() => {
+                    // `done` without a `finish` is the error/early-teardown path:
+                    // stop without inventing a final interval.
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    interval_num += 1;
+                    let omitted = interval_num <= omit_intervals;
+                    let start = (interval_num - 1) as f64 * config.interval_secs;
+                    let end = interval_num as f64 * config.interval_secs;
+                    emit_interval(start, end, omitted);
+                }
             }
-
-            interval_num += 1;
-            let omitted = interval_num <= omit_intervals;
-            let start = (interval_num - 1) as f64 * config.interval_secs;
-            let end = interval_num as f64 * config.interval_secs;
-            emit_interval(start, end, omitted);
-        }
-
-        // #55: flush a final partial interval for the sub-interval remainder.
-        // The periodic ticks covered `[0, interval_num * interval_secs]`; if the
-        // run ran past that boundary AND residual bytes accrued since the last
-        // tick, emit one more interval `[last_end, elapsed]`. The residual-bytes
-        // guard drops the empty interval produced when a run ends on a boundary
-        // (prompt detection still leaves ~`poll_dur` of measured slack there).
-        let last_end = interval_num as f64 * config.interval_secs;
-        let elapsed = loop_start.elapsed().as_secs_f64();
-        let residual_bytes: u64 = streams
-            .iter()
-            .map(|s| {
-                if s.is_sender {
-                    s.counters.peek_sent_interval()
-                } else {
-                    s.counters.peek_received_interval()
-                }
-            })
-            .sum();
-        if elapsed > last_end + 1e-6 && residual_bytes > 0 {
-            let omitted = (interval_num + 1) <= omit_intervals;
-            emit_interval(last_end, elapsed, omitted);
         }
 
         // Hand the collected samples + extremes to the client (#36 PR2).

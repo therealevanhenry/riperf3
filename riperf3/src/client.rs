@@ -610,6 +610,11 @@ impl Client {
         let interval_secs = self.interval.unwrap_or(1.0);
         let print_intervals = !self.json_output || self.json_stream;
         let collect_intervals = self.json_output && !self.json_stream;
+        // Clock origin shared with the reporter: `report_start` is captured right
+        // before spawning it, so `report_start.elapsed()` at end-of-test is the
+        // authoritative final-interval boundary (#55).
+        let reporter_end = Arc::new(crate::reporter::ReporterEnd::new());
+        let report_start = std::time::Instant::now();
         let interval_handle = if interval_secs > 0.0 {
             let stream_refs: Vec<_> = streams
                 .iter()
@@ -636,6 +641,7 @@ impl Client {
                 },
                 stream_refs,
                 done.clone(),
+                reporter_end.clone(),
                 collect_intervals.then(|| collector.clone()),
             )
         } else {
@@ -651,7 +657,13 @@ impl Client {
             EndCondition::Duration(Duration::from_secs(self.duration as u64))
         };
 
-        match end_condition {
+        // The authoritative end time for the reporter's final interval (#55). A
+        // duration run ends at exactly `-t`, so pass that value (not the measured
+        // elapsed, which trails the deadline by a variable scheduling slack and
+        // would smear a boundary-aligned end into a spurious sliver). A
+        // byte/block run ends at an arbitrary instant, so use the measured
+        // elapsed.
+        let end_secs = match end_condition {
             EndCondition::Duration(dur) => {
                 // Use select to handle both timer and control socket.
                 //
@@ -670,18 +682,22 @@ impl Client {
                         }
                     }
                 }
+                dur.as_secs_f64()
             }
-            EndCondition::Bytes(target) => loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let total: u64 = streams
-                    .iter()
-                    .filter(|s| s.is_sender)
-                    .map(|s| s.counters.bytes_sent())
-                    .sum();
-                if total >= target {
-                    break;
+            EndCondition::Bytes(target) => {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let total: u64 = streams
+                        .iter()
+                        .filter(|s| s.is_sender)
+                        .map(|s| s.counters.bytes_sent())
+                        .sum();
+                    if total >= target {
+                        break;
+                    }
                 }
-            },
+                report_start.elapsed().as_secs_f64()
+            }
             EndCondition::Blocks(target) => {
                 // For block-based, approximate by dividing bytes by blksize
                 loop {
@@ -696,12 +712,17 @@ impl Client {
                         break;
                     }
                 }
+                report_start.elapsed().as_secs_f64()
             }
-        }
+        };
 
+        // End of test: hand the reporter the authoritative end time, then stop
+        // the senders immediately (`done`) so no bytes leak past the deadline into
+        // the final interval or the summary (#55). The reporter prioritises this
+        // `finish` over `done` (see its select), so the final interval still
+        // flushes; we then wait for it before tearing the streams down.
+        reporter_end.finish(end_secs);
         done.store(true, Ordering::Relaxed);
-
-        // Wait for interval reporter to finish its last tick
         if let Some(handle) = interval_handle {
             let _ = handle.await;
         }

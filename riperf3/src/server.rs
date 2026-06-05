@@ -481,7 +481,11 @@ impl Server {
         let collect_intervals = json && !self.json_stream;
         let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
 
-        // Spawn interval reporter (server uses 1.0s default)
+        // Spawn interval reporter (server uses 1.0s default). `report_start` is
+        // captured right before the spawn so its elapsed at TEST_END is the
+        // authoritative final-interval boundary handed to the reporter (#55).
+        let reporter_end = Arc::new(crate::reporter::ReporterEnd::new());
+        let report_start = std::time::Instant::now();
         let interval_handle = {
             let stream_refs: Vec<_> = streams
                 .iter()
@@ -508,13 +512,14 @@ impl Server {
                 },
                 stream_refs,
                 done.clone(),
+                reporter_end.clone(),
                 collect_intervals.then(|| interval_data.clone()),
             )
         };
 
         // ---- Wait for TEST_END (with optional max duration and bitrate limit) ----
         let bitrate_limit = self.server_bitrate_limit;
-        let test_start = std::time::Instant::now();
+        let test_start = report_start;
         let max_dur_secs = self.server_max_duration.unwrap_or(0) as u64;
 
         let mut rate_check = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -561,8 +566,12 @@ impl Server {
         let _ = server_terminated;
 
         // ---- Shut down streams ----
+        // Hand the reporter the authoritative end time, then stop the streams
+        // (`done`) so no received bytes leak past the deadline into the final
+        // interval (#55). The reporter prioritises `finish` over `done`, so the
+        // final interval still flushes; wait for it before tearing streams down.
+        reporter_end.finish(report_start.elapsed().as_secs_f64());
         done.store(true, Ordering::Relaxed);
-
         if let Some(handle) = interval_handle {
             let _ = handle.await;
         }
