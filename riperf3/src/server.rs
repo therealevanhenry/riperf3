@@ -98,6 +98,30 @@ pub struct Server {
     pub json_stream: bool,
 }
 
+/// Best-effort source IP the kernel would use to reach `client_addr`, paired
+/// with `server_port` — the per-stream `local_host`/`local_port` for the `-J`
+/// connected block on the single-socket UDP demux path (#80). The demux socket
+/// is never `connect()`'d, so its own `local_addr` is the wildcard bind; the
+/// recycling path reports the connected socket's source IP instead. Reproduce
+/// that by connecting a throwaway socket to the client and reading its local IP.
+/// Returns `None` on any error so the caller can fall back to the shared socket.
+fn demux_local_addr_for(
+    client_addr: std::net::SocketAddr,
+    server_port: u16,
+) -> Option<std::net::SocketAddr> {
+    let bind: std::net::SocketAddr = if client_addr.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let probe = std::net::UdpSocket::bind(bind).ok()?;
+    probe.connect(client_addr).ok()?;
+    Some(std::net::SocketAddr::new(
+        probe.local_addr().ok()?.ip(),
+        server_port,
+    ))
+}
+
 impl Server {
     pub async fn run(&self) -> Result<()> {
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
@@ -876,14 +900,15 @@ impl Server {
         }
 
         // Move to a blocking std socket for the data phase and share it across the
-        // demux receiver thread and every sender thread. Set blocking ONCE here so
-        // there is no nonblocking window for the threads to race on.
+        // demux receiver thread and every sender thread. Set blocking here before
+        // wrapping in `Arc` so no thread observes a nonblocking socket. (The
+        // receiver thread and the senders' `configure_udp_sender` redundantly set
+        // it again, but to the same value, so the result is deterministic.)
         let udp_std = udp_sock.into_std().map_err(RiperfError::Io)?;
         udp_std.set_nonblocking(false).map_err(RiperfError::Io)?;
 
-        // `-J` metadata is the same socket for every stream: one local address and
-        // one pair of buffer sizes. Honor -w/--window once on the shared socket.
-        let local_addr = udp_std.local_addr().ok();
+        // `-J` metadata: the shared socket is the same for every stream, so the
+        // buffer sizes are read once; honor -w/--window on it once too.
         let (sndbuf_actual, rcvbuf_actual) = {
             let sock = socket2::SockRef::from(&udp_std);
             net::apply_socket_window(&sock, cfg.window);
@@ -892,6 +917,15 @@ impl Server {
                 sock.recv_buffer_size().ok().map(|v| v as u64),
             )
         };
+        // The connected recycling path reports each stream's local_host as the
+        // kernel-selected source IP for that client. The demux socket is never
+        // connect()'d, so its own local_addr is the wildcard bind — only on a
+        // wildcard bind (no -B) do we probe the route per client to reproduce the
+        // recycling/iperf3 local_host; with an explicit -B the bound IP is already
+        // right for every stream. The port is always the shared socket's.
+        let shared_local_addr = udp_std.local_addr().ok();
+        let server_port = shared_local_addr.map_or(self.port, |a| a.port());
+        let bound_wildcard = shared_local_addr.is_none_or(|a| a.ip().is_unspecified());
         let shared = Arc::new(udp_std);
 
         // Build the per-stream entries: senders get their own send_to task;
@@ -905,6 +939,11 @@ impl Server {
             let is_sender = i >= recv_count;
             let client_addr = client_addrs[i as usize];
             let counters = Arc::new(StreamCounters::new());
+            let local_addr = if bound_wildcard {
+                demux_local_addr_for(client_addr, server_port).or(shared_local_addr)
+            } else {
+                shared_local_addr
+            };
 
             if is_sender {
                 let s = shared.clone();

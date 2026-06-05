@@ -1205,6 +1205,8 @@ pub(crate) fn run_udp_server_demux_receiver(
     done: Arc<AtomicBool>,
     use_64bit: bool,
 ) -> Result<()> {
+    // 65536 >= MAX_UDP_BLKSIZE (65507), so a full UDP datagram never truncates;
+    // this is the same floor run_udp_receiver_blocking caps to via blksize.max().
     let mut buf = vec![0u8; 65536];
     // Match run_udp_receiver_blocking: blocking + a read timeout so the thread
     // parks between datagrams instead of busy-spinning, and so `done` is observed
