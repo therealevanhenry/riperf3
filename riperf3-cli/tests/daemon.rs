@@ -38,6 +38,17 @@ impl Drop for Reaper {
     }
 }
 
+/// Grab a currently-free ephemeral port. There's an inherent TOCTOU gap between
+/// releasing it and the daemon binding it, but it avoids the real flakiness of a
+/// hardcoded port (a leaked or concurrent server sitting on it).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
+
 /// Poll for the pidfile to appear and contain a parseable pid.
 fn wait_for_pid(pidfile: &Path, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;
@@ -55,8 +66,7 @@ fn wait_for_pid(pidfile: &Path, timeout: Duration) -> Option<i32> {
 #[test]
 fn daemon_server_serves_a_client() {
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    // Fixed port: only this test uses it. Picked high to avoid collisions.
-    let port = 15397u16;
+    let port = free_port();
     let pidfile = std::env::temp_dir().join(format!("riperf3-daemon-test-{port}.pid"));
     let _ = std::fs::remove_file(&pidfile);
 
@@ -82,6 +92,14 @@ fn daemon_server_serves_a_client() {
     };
     let pid = pid.expect("daemon never wrote a pidfile (did it die at fork?)");
 
+    // The daemon child must actually be running (fork succeeded, not dead).
+    // `kill(pid, 0)` probes for existence without delivering a signal.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "daemon pid {pid} is not alive after fork"
+    );
+
     // Give the listener a moment to bind before connecting.
     std::thread::sleep(Duration::from_millis(300));
 
@@ -106,11 +124,12 @@ fn daemon_server_serves_a_client() {
         }
     };
 
-    // The daemon served the one-off test and has now exited; don't let the
-    // reaper SIGTERM an unrelated pid that may have recycled it.
-    reaper.pid = None;
-    let _ = pid; // silence unused if the asserts below are compiled out
-
     let exit = exit.expect("client hung against the daemon — server never served (#81)");
     assert!(exit.success(), "client failed against the daemon: {exit:?}");
+
+    // Disarm the reaper only here, on full success: the one-off daemon has served
+    // the test and is exiting on its own, so there's nothing to kill and we avoid
+    // SIGTERMing a possibly-recycled pid. Any earlier panic (notably the hang on
+    // line above) leaves the reaper armed so it reaps the leaked daemon.
+    reaper.pid = None;
 }
