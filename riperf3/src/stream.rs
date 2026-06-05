@@ -1228,7 +1228,10 @@ pub(crate) fn run_udp_server_demux_receiver(
             Ok((n, src)) => {
                 // Route by source address. An unknown source is a late connect
                 // retransmit or stray — drop it (do not count it against any
-                // stream). A 0-byte datagram routes too but carries no header.
+                // stream). Unlike the connected receiver, a 0-byte datagram is
+                // NOT a loop-exit here: it must not tear down an N-stream demux
+                // (iperf3 never sends empty data datagrams anyway); it just routes
+                // and records 0 bytes with no header.
                 if let Some(route) = routes.get(&src) {
                     route.counters.record_received(n as u64);
                     if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {

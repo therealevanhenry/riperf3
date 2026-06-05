@@ -864,8 +864,13 @@ impl Server {
         // hanging (#11).
         let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(total as usize);
         let mut seen: HashSet<SocketAddr> = HashSet::new();
-        let deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
         let mut magic_buf = [0u8; 65536];
+        // Each *new* stream gets a fresh budget — matching the recycling path,
+        // which calls udp_connect_server(UDP_CONNECT_TOTAL_TIMEOUT) once per
+        // stream, and the client, which retries each stream's connect for that
+        // long independently. A single aggregate deadline would abort setup while
+        // the client is still legitimately handshaking a later stream.
+        let mut deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
         while client_addrs.len() < total as usize {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -896,6 +901,8 @@ impl Server {
                 .await?;
             if seen.insert(src) {
                 client_addrs.push(src);
+                // Fresh per-stream budget for the next stream's handshake.
+                deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
             }
         }
 
@@ -912,6 +919,19 @@ impl Server {
         let (sndbuf_actual, rcvbuf_actual) = {
             let sock = socket2::SockRef::from(&udp_std);
             net::apply_socket_window(&sock, cfg.window);
+            // The recycling path gives each receiving stream its OWN socket (and
+            // its own SO_RCVBUF), drained by its own thread. This path funnels
+            // every receiving stream through ONE socket drained by a single
+            // thread, so size its receive buffer to the aggregate the recycling
+            // path spreads across `recv_count` sockets. Otherwise riperf3's
+            // batched sender (32-packet bursts per stream) overflows the lone
+            // default buffer and inflates measured UDP loss many-fold (#80 review).
+            if recv_count > 1 {
+                if let Ok(per_stream) = sock.recv_buffer_size() {
+                    let _ =
+                        sock.set_recv_buffer_size(per_stream.saturating_mul(recv_count as usize));
+                }
+            }
             (
                 sock.send_buffer_size().ok().map(|v| v as u64),
                 sock.recv_buffer_size().ok().map(|v| v as u64),
