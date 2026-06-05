@@ -1141,14 +1141,14 @@ mod cli_tests {
 
         // Server new flags
         #[test]
-        fn server_daemon_wired() {
+        fn server_daemon_flag_parses() {
+            // `-D`/`--daemon` is consumed by the binary (it daemonizes before the
+            // tokio runtime is built — see main.rs / #81), not by ServerBuilder,
+            // so there's nothing to wire through the builder; just assert parse.
             let cli = Cli::parse_from(["riperf3", "-s", "-D"]);
-            let mut b = riperf3::ServerBuilder::new();
-            if cli.daemon {
-                b = b.daemon(true);
-            }
-            let s = b.build().unwrap();
-            assert!(s.daemon);
+            assert!(cli.daemon);
+            let long = Cli::parse_from(["riperf3", "-s", "--daemon"]);
+            assert!(long.daemon);
         }
 
         #[test]

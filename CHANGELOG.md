@@ -23,8 +23,23 @@ data-path/throughput changes.
   the authoritative end-of-test time via `ReporterEnd::finish(end_secs)`. The new
   public `ReporterEnd` type is the only API addition required by the fix. The CLI
   binary is unaffected; only direct library consumers need to update.
+- **BREAKING (library API): server daemonization removed from the library**
+  (#81). `ServerBuilder::daemon()` and the `Server::daemon` field are gone, and
+  `Server::run()` no longer forks. A library consumer that wants a daemon must
+  `daemon()`/fork *before* constructing its async runtime — doing it from inside
+  `run()` cannot work (see Fixed). The CLI is unaffected; `-s -D` behaves as
+  before, only correctly.
 
 ### Fixed
+- **`-s -D` daemon mode now actually serves** (#81): the server called
+  `daemon()` *after* the multi-threaded tokio runtime was built. `daemon()`
+  forks, and a fork of a multi-threaded process keeps only the calling thread in
+  the child, so the daemon had no tokio worker threads — it accepted the control
+  connection but never ran a test, and every client hung. The CLI now daemonizes
+  *before* building the runtime, matching iperf3's `daemon(1, 0)` (keeps the
+  working directory so relative `-I`/`--logfile` paths resolve as given;
+  redirects std{in,out,err} to `/dev/null`) and writes the pidfile after the
+  fork so it records the daemon's pid.
 - **The final (partial) interval is no longer dropped** (#55): the interval
   reporter looped `tick -> if done break`, so a run that ended part-way through an
   interval lost its last interval (a 2s `-i 1` run intermittently printed 1

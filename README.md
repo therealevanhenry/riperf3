@@ -85,7 +85,7 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--dont-fragment` | yes | yes | yes | yes |
 | `-Z` zerocopy (sendfile) | yes | yes | yes | |
 | `-C` congestion control | yes | | yes | |
-| `-D` daemon | yes\* | | yes\* | |
+| `-D` daemon | yes | | yes | |
 | `--bind-dev` | yes | yes | | |
 | `--rcv-timeout` | yes | yes | yes | |
 | `--cntl-ka` keepalive | yes | yes | yes | |
@@ -97,8 +97,6 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--sendmmsg` batched UDP | yes | | yes | |
 
 All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
-
-\* `-s -D` daemon mode is currently broken — the daemonized server listens but never serves, so clients hang ([#81](https://github.com/therealevanhenry/riperf3/issues/81)). Tracked for a post-0.6.0 fix; use a foreground `-s` server meanwhile.
 
 ## CLI Reference
 
@@ -229,7 +227,7 @@ cargo clippy --all-targets -- -D warnings      # lint
 
 Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux and macOS are fully supported and exercised in native CI; Windows compiles and cross-checks but has a few runtime gaps under active triage; FreeBSD is supported via conditional compilation. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
 
-See [CHANGELOG.md](CHANGELOG.md) for the 0.6.0 release notes and current known issues — including a daemon-mode (`-s -D`) bug ([#81](https://github.com/therealevanhenry/riperf3/issues/81)) and a handful of options that are accepted but not yet fully effective.
+See [CHANGELOG.md](CHANGELOG.md) for the release notes and current known issues — including a handful of options that are accepted but not yet fully effective.
 
 Not yet implemented:
 - SCTP transport
