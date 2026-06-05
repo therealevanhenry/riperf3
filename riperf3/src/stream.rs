@@ -1153,7 +1153,7 @@ pub fn run_udp_sender_blocking(
 /// is per-datagram atomic and thread-safe), each fanning out to its own client.
 /// The socket must already be in blocking mode (the demux setup sets it once).
 #[allow(clippy::too_many_arguments)]
-pub fn run_udp_server_demux_sender(
+pub(crate) fn run_udp_server_demux_sender(
     socket: Arc<std::net::UdpSocket>,
     target: std::net::SocketAddr,
     counters: Arc<StreamCounters>,
@@ -1179,9 +1179,9 @@ pub fn run_udp_server_demux_sender(
 
 /// Where one client's datagrams are accounted in the single-socket UDP server
 /// demux: the receiving stream's byte counters and its jitter/loss stats.
-pub struct UdpDemuxRoute {
-    pub counters: Arc<StreamCounters>,
-    pub stats: Arc<Mutex<UdpRecvStats>>,
+pub(crate) struct UdpDemuxRoute {
+    pub(crate) counters: Arc<StreamCounters>,
+    pub(crate) stats: Arc<Mutex<UdpRecvStats>>,
 }
 
 /// Single-socket UDP server receiver demux (#80). On native winsock a connected
@@ -1199,7 +1199,7 @@ pub struct UdpDemuxRoute {
 /// Teardown mirrors the connected receiver: keep the socket open and drain late
 /// datagrams until the peer goes quiet (issue #48), so a still-sending iperf3
 /// <=3.12 peer isn't reset. The socket must already be in blocking mode.
-pub fn run_udp_server_demux_receiver(
+pub(crate) fn run_udp_server_demux_receiver(
     socket: Arc<std::net::UdpSocket>,
     routes: std::collections::HashMap<std::net::SocketAddr, UdpDemuxRoute>,
     done: Arc<AtomicBool>,
