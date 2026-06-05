@@ -5,9 +5,12 @@
 //! already has a multi-threaded runtime leaves the child with only the calling
 //! thread — no tokio worker threads — so the daemon accepted the control
 //! connection but never actually served, and every client hung. The fix
-//! daemonizes in the binary *before* the runtime is built. This test spawns the
-//! real daemon and runs a client against it; before the fix the client hangs
-//! (caught here by a bounded wait) and the test fails.
+//! daemonizes in the binary *before* the runtime is built (and writes the
+//! pidfile from the daemon child, not the parent that forks away). This test
+//! spawns the real daemon and runs a client against it. Before the fix it fails
+//! one of two ways: the pidfile records the dead forking parent, so the
+//! liveness probe below trips; or, failing that, the daemon never serves and
+//! the bounded client wait times out. Either way the test goes red.
 //!
 //! Gated to the platforms that support `daemon()` (same set as the binary).
 
