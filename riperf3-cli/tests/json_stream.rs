@@ -139,12 +139,14 @@ fn client_json_stream_tcp_is_valid_ndjson() {
     let port = free_port();
     let ps = port.to_string();
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut server = Command::new(bin)
-        .args(["-s", "-1", "-p", &ps])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
+    let mut server = ChildGuard(
+        Command::new(bin)
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
     std::thread::sleep(Duration::from_millis(300));
 
     let out = run_capturing(
@@ -162,7 +164,7 @@ fn client_json_stream_tcp_is_valid_ndjson() {
         Duration::from_secs(20),
         "client",
     );
-    let _ = server.wait();
+    let _ = server.0.wait();
     assert_valid_ndjson(&out, "client");
 }
 
@@ -172,12 +174,14 @@ fn client_json_stream_udp_is_valid_ndjson() {
     let port = free_port();
     let ps = port.to_string();
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut server = Command::new(bin)
-        .args(["-s", "-1", "-p", &ps])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn server");
+    let mut server = ChildGuard(
+        Command::new(bin)
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
     std::thread::sleep(Duration::from_millis(300));
 
     let out = run_capturing(
@@ -198,7 +202,7 @@ fn client_json_stream_udp_is_valid_ndjson() {
         Duration::from_secs(20),
         "client-udp",
     );
-    let _ = server.wait();
+    let _ = server.0.wait();
     assert_valid_ndjson(&out, "client-udp");
 }
 
