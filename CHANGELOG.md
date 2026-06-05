@@ -33,8 +33,9 @@ data-path/throughput changes.
   final interval `[last_boundary, end]` before stopping, matching iperf3. A
   duration run passes its exact `-t`, so a boundary-aligned end produces no
   spurious trailing interval; the senders stop at the deadline, so the summary is
-  unchanged. The final interval reuses the last-sampled TCP_INFO when the socket
-  has already closed, so it still carries `Cwnd`/`RTT`/`Retr`.
+  unchanged. The final interval reuses the last-sampled `Cwnd`/`RTT` when the
+  socket has already closed (reporting `Retr 0` for the sub-interval, as iperf3
+  does) instead of leaving those columns blank.
 
 ### Added
 - **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
