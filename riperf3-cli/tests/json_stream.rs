@@ -26,6 +26,16 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// How long to wait for a freshly spawned `-s` server to bind its control
+/// listener before connecting a client. 300 ms intermittently lost the race on a
+/// loaded Windows CI runner — these three tests each spawn a server concurrently,
+/// and a client that connected first got an empty stream ("no events", a #62 test
+/// flake). The server normally binds in well under this; 2 s is ample headroom.
+/// (A connect poll would be tighter, but a probe connection consumes the `-1`
+/// one-off server, and a bind probe is unreliable under the listener's
+/// `SO_REUSEADDR` on Windows — so a generous fixed margin is the robust choice.)
+const SERVER_BIND_WAIT: Duration = Duration::from_secs(2);
+
 /// Assert `stdout` is a valid `--json-stream` document: every non-empty line is a
 /// JSON object with `event` + `data`, and the events run `start`, one or more
 /// `interval`, `end` — in that order, with nothing else mixed in.
@@ -151,7 +161,7 @@ fn client_json_stream_tcp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SERVER_BIND_WAIT);
 
     let out = run_capturing(
         &[
@@ -186,7 +196,7 @@ fn client_json_stream_udp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SERVER_BIND_WAIT);
 
     let out = run_capturing(
         &[
@@ -225,7 +235,7 @@ fn server_json_stream_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(SERVER_BIND_WAIT);
 
     // Drive one test, bounded so a non-serving server can't hang the suite.
     let mut client = Command::new(bin)
