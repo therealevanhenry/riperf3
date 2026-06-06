@@ -61,6 +61,10 @@ fn assert_valid_ndjson(stdout: &str, who: &str) {
         "end",
         "{who}: last event must be `end` ({events:?})"
     );
+    // Callers must run long enough to cross an interval boundary mid-test (e.g.
+    // `-t 2 -i 1`, not `-t 1 -i 1`): with interval == duration the lone tick
+    // coincides with the end and its boundary-aligned final interval is dropped
+    // (#55), leaving only start+end — an intermittent 2-event flake under load.
     assert!(
         events.len() >= 3,
         "{who}: expected at least one interval between start and end ({events:?})"
@@ -156,7 +160,7 @@ fn client_json_stream_tcp_is_valid_ndjson() {
             "-p",
             &ps,
             "-t",
-            "1",
+            "2",
             "-i",
             "1",
             "--json-stream",
@@ -194,7 +198,7 @@ fn client_json_stream_udp_is_valid_ndjson() {
             "-b",
             "10M",
             "-t",
-            "1",
+            "2",
             "-i",
             "1",
             "--json-stream",
@@ -225,7 +229,7 @@ fn server_json_stream_is_valid_ndjson() {
 
     // Drive one test, bounded so a non-serving server can't hang the suite.
     let mut client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &ps, "-t", "1", "-i", "1"])
+        .args(["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
