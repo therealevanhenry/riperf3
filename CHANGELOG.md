@@ -11,7 +11,7 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.7.0] - unreleased
+## [0.7.0] - 2026-06-06
 
 A minor bump (the first `0.x` minor since 0.6.0) because the interval-reporter
 fix needs a new parameter on a public function — see **Changed** below. No
