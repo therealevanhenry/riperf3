@@ -62,11 +62,34 @@ data-path/throughput changes.
   unchanged. The final interval reuses the last-sampled `Cwnd`/`RTT` when the
   socket has already closed (reporting `Retr 0` for the sub-interval, as iperf3
   does) instead of leaving those columns blank.
+- **UDP `-P > 1` no longer hangs setup on native Windows** (#80): the server's
+  UDP design mirrors iperf3 — one connected data socket per stream, recycled on
+  the same port via `SO_REUSEADDR`, with the kernel demultiplexing incoming
+  datagrams by 4-tuple. Native winsock breaks this: once a connected and a
+  wildcard UDP socket share a port, a new source's datagram is silently dropped,
+  so streams 2..N never finish their connect handshake and any `-u -P >1` (hence
+  UDP `--bidir -P`) hung until the client's 30 s connect timeout. (iperf3 itself
+  only runs on Windows under Cygwin, whose socket layer emulates Unix demux, so
+  it never hits this; a native-MSVC build does.) The server now has a second UDP
+  path that binds **one** unconnected socket for the whole test and
+  demultiplexes streams by client source address in userspace — correct on every
+  platform, and wire-compatible with an iperf3 client (verified against the 3.20
+  binary over IPv4 and IPv6, forward/reverse/bidir `-P 4`). It is the default on
+  Windows; the connected-socket recycling path stays the default on Unix because
+  it mirrors iperf3 and gives one socket and thread per stream (kernel-parallel
+  receive that scales better at high `-P`). At modest parallelism the two paths
+  measure comparably on throughput and loss.
 
 ### Added
 - **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
   non-draining reads of the interval byte counters, used to skip an empty final
   partial interval on the receiver side.
+- **`RIPERF3_UDP_SERVER_DEMUX` environment variable** (#80): overrides which
+  server UDP path is used — `0`/`false`/`no`/empty force the connected-socket
+  recycling path, any other value forces the single-socket userspace demux;
+  unset falls back to the platform default (demux on Windows, recycling on Unix).
+  Primarily a testing/escape hatch — it lets either path be exercised on one
+  build.
 
 ## [0.6.3] - 2026-06-04
 

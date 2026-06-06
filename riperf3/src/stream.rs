@@ -1005,9 +1005,17 @@ pub fn run_udp_sender_sendmmsg(
 /// Batch pacing: sends N packets in a tight loop, then does a single clock
 /// check and sleep/spin for the aggregate interval. This amortizes the cost
 /// of `Instant::now()` (~50ns) and atomic operations across multiple packets.
+///
+/// `target` selects the destination model. `None` sends on a *connected* socket
+/// (the per-stream client/Unix-server path: one socket per stream, kernel 4-tuple
+/// demux). `Some(addr)` uses `send_to(addr)` on a *shared, unconnected* socket —
+/// the single-socket UDP server demux (#80), where one server socket fans out to
+/// each client by address. The loop body is otherwise identical, so both paths
+/// share the same pacing/batching/error handling.
 #[allow(clippy::too_many_arguments)] // hot-path sender: socket + tuning + lifecycle
-pub fn run_udp_sender_blocking(
-    socket: std::net::UdpSocket,
+fn udp_send_loop(
+    socket: &std::net::UdpSocket,
+    target: Option<std::net::SocketAddr>,
     counters: Arc<StreamCounters>,
     blksize: usize,
     done: Arc<AtomicBool>,
@@ -1034,7 +1042,7 @@ pub fn run_udp_sender_blocking(
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
-    crate::net::configure_udp_sender(&socket, batch_size as usize * blksize)?;
+    crate::net::configure_udp_sender(socket, batch_size as usize * blksize)?;
 
     let pacing = if rate_bits_per_sec > 0 {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
@@ -1068,7 +1076,11 @@ pub fn run_udp_sender_blocking(
             };
             header.write_to(&mut buf, use_64bit);
 
-            match socket.send(&buf) {
+            let sent = match target {
+                Some(addr) => socket.send_to(&buf, addr),
+                None => socket.send(&buf),
+            };
+            match sent {
                 Ok(n) => batch_bytes += n as u64,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     seq -= 1;
@@ -1106,6 +1118,166 @@ pub fn run_udp_sender_blocking(
         }
     }
     Ok(())
+}
+
+/// UDP sender on a *connected* socket — the per-stream client/Unix-server path.
+/// Thin wrapper over [`udp_send_loop`] with no `send_to` target; the public API
+/// (owned socket, `send`) is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn run_udp_sender_blocking(
+    socket: std::net::UdpSocket,
+    counters: Arc<StreamCounters>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    rate_bits_per_sec: u64,
+    use_64bit: bool,
+    start: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
+) -> Result<()> {
+    udp_send_loop(
+        &socket,
+        None,
+        counters,
+        blksize,
+        done,
+        rate_bits_per_sec,
+        use_64bit,
+        start,
+        max_duration,
+    )
+}
+
+/// UDP sender on a *shared, unconnected* server socket, addressing one client by
+/// `target` via `send_to` — the reverse/bidir half of the single-socket UDP
+/// server demux (#80). Multiple senders share one `Arc<UdpSocket>` (UDP `send_to`
+/// is per-datagram atomic and thread-safe), each fanning out to its own client.
+/// The socket must already be in blocking mode (the demux setup sets it once).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_udp_server_demux_sender(
+    socket: Arc<std::net::UdpSocket>,
+    target: std::net::SocketAddr,
+    counters: Arc<StreamCounters>,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    rate_bits_per_sec: u64,
+    use_64bit: bool,
+    start: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
+) -> Result<()> {
+    udp_send_loop(
+        &socket,
+        Some(target),
+        counters,
+        blksize,
+        done,
+        rate_bits_per_sec,
+        use_64bit,
+        start,
+        max_duration,
+    )
+}
+
+/// Where one client's datagrams are accounted in the single-socket UDP server
+/// demux: the receiving stream's byte counters and its jitter/loss stats.
+pub(crate) struct UdpDemuxRoute {
+    pub(crate) counters: Arc<StreamCounters>,
+    pub(crate) stats: Arc<Mutex<UdpRecvStats>>,
+}
+
+/// Single-socket UDP server receiver demux (#80). On native winsock a connected
+/// UDP socket sharing a port with a wildcard socket silently drops a new source's
+/// datagrams, so the per-stream connected-socket design hangs `-P > 1` setup on
+/// Windows. This path instead binds **one** unconnected server socket for the
+/// whole test and demultiplexes incoming datagrams to the right receiving stream
+/// by source address in userspace — exactly what the kernel does on Linux/BSD,
+/// done explicitly so it is correct on every platform.
+///
+/// One dedicated blocking thread owns `recv_from` (a datagram can be consumed
+/// only once, so a single consumer must route every packet — N threads each
+/// filtering by source would lose each other's data). Datagrams from an unknown
+/// source — a late retransmit of the connect magic, or a stray — are dropped.
+/// Teardown mirrors the connected receiver: keep the socket open and drain late
+/// datagrams until the peer goes quiet (issue #48), so a still-sending iperf3
+/// <=3.12 peer isn't reset. The socket must already be in blocking mode.
+pub(crate) fn run_udp_server_demux_receiver(
+    socket: Arc<std::net::UdpSocket>,
+    routes: std::collections::HashMap<std::net::SocketAddr, UdpDemuxRoute>,
+    done: Arc<AtomicBool>,
+    use_64bit: bool,
+) -> Result<()> {
+    // 65536 >= MAX_UDP_BLKSIZE (65507), so a full UDP datagram never truncates;
+    // this is the same floor run_udp_receiver_blocking caps to via blksize.max().
+    let mut buf = vec![0u8; 65536];
+    // Match run_udp_receiver_blocking: blocking + a read timeout so the thread
+    // parks between datagrams instead of busy-spinning, and so `done` is observed
+    // promptly during idle gaps.
+    socket
+        .set_nonblocking(false)
+        .map_err(crate::error::RiperfError::Io)?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(crate::error::RiperfError::Io)?;
+
+    let mut drain = false;
+    loop {
+        if done.load(Ordering::Relaxed) {
+            drain = true;
+            break;
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                // Route by source address. An unknown source is a late connect
+                // retransmit or stray — drop it (do not count it against any
+                // stream). Unlike the connected receiver, a 0-byte datagram is
+                // NOT a loop-exit here: it must not tear down an N-stream demux
+                // (iperf3 never sends empty data datagrams anyway); it just routes
+                // and records 0 bytes with no header.
+                if let Some(route) = routes.get(&src) {
+                    route.counters.record_received(n as u64);
+                    if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {
+                        let arrival = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        if let Ok(mut stats) = route.stats.lock() {
+                            stats.update(&header, arrival);
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+    if drain {
+        drain_udp_demux_after_done(&socket, &mut buf);
+    }
+    Ok(())
+}
+
+/// `recv_from` analogue of [`drain_udp_after_done`] for the single-socket demux:
+/// after the test ends, keep the shared socket open and discard late datagrams
+/// (from any source) until one read-timeout of silence, bounded by
+/// [`UDP_RECEIVER_DRAIN_TIMEOUT`]. See [`drain_udp_after_done`] for the why.
+fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
+    let deadline = Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
+    while Instant::now() < deadline {
+        match socket.recv_from(buf) {
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// Hard cap on the post-test UDP drain (issue #48). The normal exit is a single

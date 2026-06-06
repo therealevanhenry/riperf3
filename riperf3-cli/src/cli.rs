@@ -809,6 +809,9 @@ mod cli_tests {
             assert_eq!(c.window, Some(512 * 1024));
         }
 
+        // build() rejects -C/--congestion (TCP congestion control) on non-Unix
+        // (cfg(not(unix)) → Unsupported), so gate the wiring test to match.
+        #[cfg(unix)]
         #[test]
         fn congestion_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-C", "bbr"]);
@@ -882,6 +885,9 @@ mod cli_tests {
             assert!(c.verbose);
         }
 
+        // Combines the Unix-only flags above (congestion/bind-dev/affinity),
+        // which build() rejects on non-Unix, so gate to match.
+        #[cfg(unix)]
         #[test]
         fn all_flags_combined() {
             let cli = Cli::parse_from([
@@ -1029,6 +1035,9 @@ mod cli_tests {
             assert_eq!(c.bind_address, Some("10.0.0.1".to_string()));
         }
 
+        // build() rejects --bind-dev (SO_BINDTODEVICE/IP_BOUND_IF) on non-Unix,
+        // so gate the wiring test to match.
+        #[cfg(unix)]
         #[test]
         fn bind_dev_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
@@ -1092,6 +1101,9 @@ mod cli_tests {
             assert_eq!(c.file, Some("/tmp/data".to_string()));
         }
 
+        // build() rejects -A/--affinity (CPU affinity) on non-Unix, so gate the
+        // wiring test to match.
+        #[cfg(unix)]
         #[test]
         fn affinity_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-A", "2,3"]);

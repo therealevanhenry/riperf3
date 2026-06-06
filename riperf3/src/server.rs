@@ -98,6 +98,30 @@ pub struct Server {
     pub json_stream: bool,
 }
 
+/// Best-effort source IP the kernel would use to reach `client_addr`, paired
+/// with `server_port` — the per-stream `local_host`/`local_port` for the `-J`
+/// connected block on the single-socket UDP demux path (#80). The demux socket
+/// is never `connect()`'d, so its own `local_addr` is the wildcard bind; the
+/// recycling path reports the connected socket's source IP instead. Reproduce
+/// that by connecting a throwaway socket to the client and reading its local IP.
+/// Returns `None` on any error so the caller can fall back to the shared socket.
+fn demux_local_addr_for(
+    client_addr: std::net::SocketAddr,
+    server_port: u16,
+) -> Option<std::net::SocketAddr> {
+    let bind: std::net::SocketAddr = if client_addr.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let probe = std::net::UdpSocket::bind(bind).ok()?;
+    probe.connect(client_addr).ok()?;
+    Some(std::net::SocketAddr::new(
+        probe.local_addr().ok()?.ip(),
+        server_port,
+    ))
+}
+
 impl Server {
     pub async fn run(&self) -> Result<()> {
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
@@ -249,6 +273,12 @@ impl Server {
         };
         let total = recv_count + send_count;
 
+        // Single-socket UDP server demux (#80): one demux receiver thread serves
+        // every receiving stream, so its handle lives outside the per-stream
+        // `DataStream`s and is joined alongside them at teardown. `None` on the
+        // recycling path and on pure-reverse demux tests (no receivers).
+        let mut udp_demux_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
+
         match cfg.protocol {
             TransportProtocol::Tcp => {
                 protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
@@ -323,19 +353,6 @@ impl Server {
                 }
             }
             TransportProtocol::Udp => {
-                // Create the initial UDP listener with SO_REUSEADDR.
-                // For each stream: accept the connect handshake on the listener,
-                // which locks that socket to the client. Then create a fresh
-                // listener for the next stream (iperf3's recycling pattern).
-                let mut udp_listener = net::udp_bind_reusable(
-                    self.bind_address.as_deref(),
-                    self.port,
-                    self.ip_version,
-                )
-                .await?;
-
-                protocol::send_state(&mut ctrl, TestState::CreateStreams).await?;
-
                 // Max send duration the server's UDP senders self-enforce
                 // (issue #5): in bidir/reverse the server sends too, and at a
                 // high `-b` those CPU-bound senders can starve this side's
@@ -344,111 +361,51 @@ impl Server {
                 let max_duration = (params.num.is_none() && params.blockcount.is_none())
                     .then(|| std::time::Duration::from_secs(cfg.duration as u64));
 
-                for i in 0..total {
-                    // Accept: recv magic, connect() to client, send reply.
-                    // Bounded so a client that never connects fails the test
-                    // instead of hanging setup forever (#11); uses the same
-                    // budget as the client's handshake so neither side aborts
-                    // while the other is still retrying.
-                    let _client_addr = protocol::udp_connect_server(
-                        &udp_listener,
-                        protocol::UDP_CONNECT_TOTAL_TIMEOUT,
+                // Two server UDP designs, same wire protocol. The default Unix
+                // path mirrors iperf3: one connected data socket per stream, all
+                // sharing the port via SO_REUSEADDR, with the kernel demuxing by
+                // 4-tuple. Native winsock silently drops a new source's datagram
+                // when a connected and a wildcard socket share a port, so that
+                // design hangs `-P > 1` setup on Windows (#80). The demux path
+                // binds ONE unconnected socket and routes by source address in
+                // userspace — correct on every platform.
+                //
+                // Default: demux on Windows (recycling cannot work there),
+                // recycling on Unix (faithful to iperf3, kernel-parallel
+                // receive). RIPERF3_UDP_SERVER_DEMUX overrides either way —
+                // `0`/`false`/`no`/empty force recycling, any other value forces
+                // demux — so both paths are exercisable on one build (the Windows
+                // red→green sets it to `0` to reproduce the old hang).
+                let udp_use_demux = match std::env::var("RIPERF3_UDP_SERVER_DEMUX") {
+                    Ok(v) => !matches!(v.as_str(), "" | "0" | "false" | "no"),
+                    Err(_) => cfg!(windows),
+                };
+
+                if udp_use_demux {
+                    self.setup_udp_demux_streams(
+                        &mut ctrl,
+                        &cfg,
+                        recv_count,
+                        total,
+                        max_duration,
+                        &done,
+                        &start,
+                        &mut streams,
+                        &mut udp_demux_handle,
                     )
                     .await?;
-                    // The listener is now locked to this client — use it as the data socket
-                    let data_sock = udp_listener;
-
-                    // Create a fresh listener for the next stream (if any)
-                    if i + 1 < total {
-                        udp_listener = net::udp_bind_reusable(
-                            self.bind_address.as_deref(),
-                            self.port,
-                            self.ip_version,
-                        )
-                        .await?;
-                    } else {
-                        // Last stream — create a dummy that won't be used
-                        udp_listener = net::udp_bind(None, 0, false).await?;
-                    }
-
-                    let stream_id = iperf3_stream_id(i);
-                    let is_sender = i >= recv_count;
-                    let counters = Arc::new(StreamCounters::new());
-
-                    // Socket addresses + buffer sizes for the `-J` blob (#50),
-                    // captured before the socket is converted to std + moved.
-                    let local_addr = data_sock.local_addr().ok();
-                    let peer_addr_s = data_sock.peer_addr().ok();
-                    let (sndbuf_actual, rcvbuf_actual) = {
-                        let sock = socket2::SockRef::from(&data_sock);
-                        // Honor -w/--window on the server's UDP data socket too
-                        // (#59) so reverse/bidir UDP matches iperf3; set before the
-                        // read-back below.
-                        net::apply_socket_window(&sock, cfg.window);
-                        (
-                            sock.send_buffer_size().ok().map(|v| v as u64),
-                            sock.recv_buffer_size().ok().map(|v| v as u64),
-                        )
-                    };
-
-                    let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
-
-                    if is_sender {
-                        let c = counters.clone();
-                        let d = done.clone();
-                        let bs = cfg.blksize;
-                        // Already resolved in TestConfig (#17); 0 = unlimited.
-                        let rate = cfg.bandwidth;
-                        let u64bit = cfg.udp_counters_64bit;
-                        let st = start.clone();
-                        let md = max_duration;
-                        let task = tokio::task::spawn_blocking(move || {
-                            stream::run_udp_sender_blocking(
-                                std_sock, c, bs, d, rate, u64bit, st, md,
-                            )
-                        });
-                        streams.push(DataStream {
-                            id: stream_id,
-                            is_sender,
-                            counters,
-                            udp_recv_stats: None,
-                            task,
-                            raw_fd: None,
-                            local_addr,
-                            peer_addr: peer_addr_s,
-                            sndbuf_actual,
-                            rcvbuf_actual,
-                        });
-                    } else {
-                        let c = counters.clone();
-                        let d = done.clone();
-                        let bs = cfg.blksize;
-                        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
-                        let stats_clone = stats.clone();
-                        let u64bit = cfg.udp_counters_64bit;
-                        let task = tokio::task::spawn_blocking(move || {
-                            stream::run_udp_receiver_blocking(
-                                std_sock,
-                                c,
-                                stats_clone,
-                                bs,
-                                d,
-                                u64bit,
-                            )
-                        });
-                        streams.push(DataStream {
-                            id: stream_id,
-                            is_sender,
-                            counters,
-                            udp_recv_stats: Some(stats),
-                            task,
-                            raw_fd: None,
-                            local_addr,
-                            peer_addr: peer_addr_s,
-                            sndbuf_actual,
-                            rcvbuf_actual,
-                        });
-                    }
+                } else {
+                    self.setup_udp_recycling_streams(
+                        &mut ctrl,
+                        &cfg,
+                        recv_count,
+                        total,
+                        max_duration,
+                        &done,
+                        &start,
+                        &mut streams,
+                    )
+                    .await?;
                 }
             }
         }
@@ -727,7 +684,355 @@ impl Server {
         for s in streams {
             let _ = s.task.await;
         }
+        // The single-socket UDP demux receiver (#80) serves all receiving streams
+        // and lives outside `streams`; join it too. `None` on the recycling path.
+        if let Some(h) = udp_demux_handle {
+            let _ = h.await;
+        }
 
+        Ok(())
+    }
+
+    /// iperf3's UDP server design (the default on Unix): one connected data
+    /// socket per stream, recycled on the same port via SO_REUSEADDR, with the
+    /// kernel demultiplexing incoming datagrams by 4-tuple. For each stream:
+    /// accept the connect handshake on the listener (which locks that socket to
+    /// the client), then bind a fresh listener on the same port for the next
+    /// stream. This is faithful to iperf3 and gives kernel-parallel receive, but
+    /// relies on kernel demux that native winsock doesn't provide (see
+    /// [`Self::setup_udp_demux_streams`] / #80).
+    #[allow(clippy::too_many_arguments)]
+    async fn setup_udp_recycling_streams(
+        &self,
+        ctrl: &mut tokio::net::TcpStream,
+        cfg: &TestConfig,
+        recv_count: u32,
+        total: u32,
+        max_duration: Option<std::time::Duration>,
+        done: &Arc<AtomicBool>,
+        start: &Arc<AtomicBool>,
+        streams: &mut Vec<DataStream>,
+    ) -> Result<()> {
+        let mut udp_listener =
+            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
+                .await?;
+
+        protocol::send_state(ctrl, TestState::CreateStreams).await?;
+
+        for i in 0..total {
+            // Accept: recv magic, connect() to client, send reply.
+            // Bounded so a client that never connects fails the test
+            // instead of hanging setup forever (#11); uses the same
+            // budget as the client's handshake so neither side aborts
+            // while the other is still retrying.
+            let _client_addr =
+                protocol::udp_connect_server(&udp_listener, protocol::UDP_CONNECT_TOTAL_TIMEOUT)
+                    .await?;
+            // The listener is now locked to this client — use it as the data socket
+            let data_sock = udp_listener;
+
+            // Create a fresh listener for the next stream (if any)
+            if i + 1 < total {
+                udp_listener = net::udp_bind_reusable(
+                    self.bind_address.as_deref(),
+                    self.port,
+                    self.ip_version,
+                )
+                .await?;
+            } else {
+                // Last stream — create a dummy that won't be used
+                udp_listener = net::udp_bind(None, 0, false).await?;
+            }
+
+            let stream_id = iperf3_stream_id(i);
+            let is_sender = i >= recv_count;
+            let counters = Arc::new(StreamCounters::new());
+
+            // Socket addresses + buffer sizes for the `-J` blob (#50),
+            // captured before the socket is converted to std + moved.
+            let local_addr = data_sock.local_addr().ok();
+            let peer_addr_s = data_sock.peer_addr().ok();
+            let (sndbuf_actual, rcvbuf_actual) = {
+                let sock = socket2::SockRef::from(&data_sock);
+                // Honor -w/--window on the server's UDP data socket too
+                // (#59) so reverse/bidir UDP matches iperf3; set before the
+                // read-back below.
+                net::apply_socket_window(&sock, cfg.window);
+                (
+                    sock.send_buffer_size().ok().map(|v| v as u64),
+                    sock.recv_buffer_size().ok().map(|v| v as u64),
+                )
+            };
+
+            let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
+
+            if is_sender {
+                let c = counters.clone();
+                let d = done.clone();
+                let bs = cfg.blksize;
+                // Already resolved in TestConfig (#17); 0 = unlimited.
+                let rate = cfg.bandwidth;
+                let u64bit = cfg.udp_counters_64bit;
+                let st = start.clone();
+                let md = max_duration;
+                let task = tokio::task::spawn_blocking(move || {
+                    stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit, st, md)
+                });
+                streams.push(DataStream {
+                    id: stream_id,
+                    is_sender,
+                    counters,
+                    udp_recv_stats: None,
+                    task,
+                    raw_fd: None,
+                    local_addr,
+                    peer_addr: peer_addr_s,
+                    sndbuf_actual,
+                    rcvbuf_actual,
+                });
+            } else {
+                let c = counters.clone();
+                let d = done.clone();
+                let bs = cfg.blksize;
+                let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+                let stats_clone = stats.clone();
+                let u64bit = cfg.udp_counters_64bit;
+                let task = tokio::task::spawn_blocking(move || {
+                    stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
+                });
+                streams.push(DataStream {
+                    id: stream_id,
+                    is_sender,
+                    counters,
+                    udp_recv_stats: Some(stats),
+                    task,
+                    raw_fd: None,
+                    local_addr,
+                    peer_addr: peer_addr_s,
+                    sndbuf_actual,
+                    rcvbuf_actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-socket UDP server demux (#80; default on Windows). Bind ONE
+    /// unconnected socket for the whole test and demultiplex streams by client
+    /// source address in userspace, instead of one connected socket per stream.
+    /// Native winsock silently drops a new source's datagram when a connected and
+    /// a wildcard UDP socket share a port, which hangs `-P > 1` setup under the
+    /// recycling design; one unconnected socket never forms that pair, so this is
+    /// correct everywhere. The wire protocol is identical, so it interoperates
+    /// with an iperf3 client.
+    ///
+    /// Slots are assigned in connect-arrival order, matching the recycling path's
+    /// positional client/server stream pairing (the client creates streams
+    /// sequentially by index). One demux thread serves every receiving stream;
+    /// each sending stream `send_to`s its own client over the shared socket.
+    #[allow(clippy::too_many_arguments)]
+    async fn setup_udp_demux_streams(
+        &self,
+        ctrl: &mut tokio::net::TcpStream,
+        cfg: &TestConfig,
+        recv_count: u32,
+        total: u32,
+        max_duration: Option<std::time::Duration>,
+        done: &Arc<AtomicBool>,
+        start: &Arc<AtomicBool>,
+        streams: &mut Vec<DataStream>,
+        demux_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    ) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        use std::net::SocketAddr;
+
+        // One unconnected dual-stack socket for the whole test. Never connect()'d
+        // and never sharing its port with a second socket, so there is no
+        // connected+wildcard pair for winsock to drop a new source against (#80).
+        let udp_sock =
+            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
+                .await?;
+
+        protocol::send_state(ctrl, TestState::CreateStreams).await?;
+
+        // Accept the connect handshake from every client stream on the one
+        // socket. Record the source address of each NEW client in arrival order
+        // (slot i == stream i). Reply to every valid magic — including a
+        // retransmit from an already-seen client whose reply was lost — but only
+        // a new source claims a slot. Bounded by the same budget as the client
+        // handshake so a client that never connects fails setup instead of
+        // hanging (#11).
+        let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(total as usize);
+        let mut seen: HashSet<SocketAddr> = HashSet::new();
+        let mut magic_buf = [0u8; 65536];
+        // Each *new* stream gets a fresh budget — matching the recycling path,
+        // which calls udp_connect_server(UDP_CONNECT_TOTAL_TIMEOUT) once per
+        // stream, and the client, which retries each stream's connect for that
+        // long independently. A single aggregate deadline would abort setup while
+        // the client is still legitimately handshaking a later stream.
+        let mut deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
+        while client_addrs.len() < total as usize {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RiperfError::Aborted(
+                    "timed out waiting for UDP stream connect".into(),
+                ));
+            }
+            let (n, src) =
+                match tokio::time::timeout(remaining, udp_sock.recv_from(&mut magic_buf)).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(RiperfError::Aborted(
+                            "timed out waiting for UDP stream connect".into(),
+                        ))
+                    }
+                };
+            // Drop anything that isn't the connect magic (too short, or a stray
+            // datagram) and keep waiting — matches udp_connect_server's check.
+            if n < 4 {
+                continue;
+            }
+            let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
+            if msg != protocol::UDP_CONNECT_MSG {
+                continue;
+            }
+            udp_sock
+                .send_to(&protocol::UDP_CONNECT_REPLY.to_ne_bytes(), src)
+                .await?;
+            if seen.insert(src) {
+                client_addrs.push(src);
+                // Fresh per-stream budget for the next stream's handshake.
+                deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
+            }
+        }
+
+        // Move to a blocking std socket for the data phase and share it across the
+        // demux receiver thread and every sender thread. Set blocking here before
+        // wrapping in `Arc` so no thread observes a nonblocking socket. (The
+        // receiver thread and the senders' `configure_udp_sender` redundantly set
+        // it again, but to the same value, so the result is deterministic.)
+        let udp_std = udp_sock.into_std().map_err(RiperfError::Io)?;
+        udp_std.set_nonblocking(false).map_err(RiperfError::Io)?;
+
+        // `-J` metadata: the shared socket is the same for every stream, so the
+        // buffer sizes are read once; honor -w/--window on it once too.
+        let (sndbuf_actual, rcvbuf_actual) = {
+            let sock = socket2::SockRef::from(&udp_std);
+            net::apply_socket_window(&sock, cfg.window);
+            // The recycling path gives each receiving stream its OWN socket (and
+            // its own SO_RCVBUF), drained by its own thread. This path funnels
+            // every receiving stream through ONE socket drained by a single
+            // thread, so size its receive buffer to the aggregate the recycling
+            // path spreads across `recv_count` sockets. Otherwise riperf3's
+            // batched sender (32-packet bursts per stream) overflows the lone
+            // default buffer and inflates measured UDP loss many-fold (#80 review).
+            if recv_count > 1 {
+                if let Ok(per_stream) = sock.recv_buffer_size() {
+                    let _ =
+                        sock.set_recv_buffer_size(per_stream.saturating_mul(recv_count as usize));
+                }
+            }
+            (
+                sock.send_buffer_size().ok().map(|v| v as u64),
+                sock.recv_buffer_size().ok().map(|v| v as u64),
+            )
+        };
+        // The connected recycling path reports each stream's local_host as the
+        // kernel-selected source IP for that client. The demux socket is never
+        // connect()'d, so its own local_addr is the wildcard bind — only on a
+        // wildcard bind (no -B) do we probe the route per client to reproduce the
+        // recycling/iperf3 local_host; with an explicit -B the bound IP is already
+        // right for every stream. The port is always the shared socket's.
+        let shared_local_addr = udp_std.local_addr().ok();
+        let server_port = shared_local_addr.map_or(self.port, |a| a.port());
+        let bound_wildcard = shared_local_addr.is_none_or(|a| a.ip().is_unspecified());
+        let shared = Arc::new(udp_std);
+
+        // Build the per-stream entries: senders get their own send_to task;
+        // receivers register a route and share the single demux thread.
+        let mut routes: HashMap<SocketAddr, stream::UdpDemuxRoute> = HashMap::new();
+        let bs = cfg.blksize;
+        let rate = cfg.bandwidth;
+        let u64bit = cfg.udp_counters_64bit;
+        for i in 0..total {
+            let stream_id = iperf3_stream_id(i);
+            let is_sender = i >= recv_count;
+            let client_addr = client_addrs[i as usize];
+            let counters = Arc::new(StreamCounters::new());
+            let local_addr = if bound_wildcard {
+                demux_local_addr_for(client_addr, server_port).or(shared_local_addr)
+            } else {
+                shared_local_addr
+            };
+
+            if is_sender {
+                let s = shared.clone();
+                let c = counters.clone();
+                let d = done.clone();
+                let st = start.clone();
+                let md = max_duration;
+                let task = tokio::task::spawn_blocking(move || {
+                    stream::run_udp_server_demux_sender(
+                        s,
+                        client_addr,
+                        c,
+                        bs,
+                        d,
+                        rate,
+                        u64bit,
+                        st,
+                        md,
+                    )
+                });
+                streams.push(DataStream {
+                    id: stream_id,
+                    is_sender,
+                    counters,
+                    udp_recv_stats: None,
+                    task,
+                    raw_fd: None,
+                    local_addr,
+                    peer_addr: Some(client_addr),
+                    sndbuf_actual,
+                    rcvbuf_actual,
+                });
+            } else {
+                let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+                routes.insert(
+                    client_addr,
+                    stream::UdpDemuxRoute {
+                        counters: counters.clone(),
+                        stats: stats.clone(),
+                    },
+                );
+                // Receiving streams are served by the one demux thread spawned
+                // below; give each a resolved placeholder task so the per-stream
+                // join at teardown stays uniform. The real handle is `demux_handle`.
+                let task = tokio::spawn(async { Ok::<(), RiperfError>(()) });
+                streams.push(DataStream {
+                    id: stream_id,
+                    is_sender,
+                    counters,
+                    udp_recv_stats: Some(stats),
+                    task,
+                    raw_fd: None,
+                    local_addr,
+                    peer_addr: Some(client_addr),
+                    sndbuf_actual,
+                    rcvbuf_actual,
+                });
+            }
+        }
+
+        // Spawn the single demux receiver over the shared socket (only if there
+        // is anything to receive — a pure-reverse test has senders only).
+        if !routes.is_empty() {
+            let s = shared.clone();
+            let d = done.clone();
+            *demux_handle = Some(tokio::task::spawn_blocking(move || {
+                stream::run_udp_server_demux_receiver(s, routes, d, u64bit)
+            }));
+        }
         Ok(())
     }
 
