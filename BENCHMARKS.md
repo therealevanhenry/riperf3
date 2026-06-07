@@ -41,10 +41,12 @@ environment-specific.
 ## Compatibility matrix (iperf3 interop)
 
 Every client→server tool pairing across protocol × direction, plus
-param-exchange features. **All 44 cells interoperate** — each completes with a
-valid result and no protocol error. `r` = riperf3, `i` = iperf3; the
-interop-relevant pairings are `r→i` and `i→r`. Throughput here is single-run and
-illustrative (the rigorous figures are the [campaign](#performance--statistical-campaign)
+param-exchange features and an older-iperf3 (3.12) cross-check. **All 48 cells
+interoperate** — each completes with a valid result and no protocol error.
+`r` = riperf3, `i` = iperf3, `o` = older iperf3 (3.12); the interop-relevant
+pairings are `r→i`/`i→r` (and `r→o`/`o→r` for 3.12). Throughput here is
+single-run and illustrative (the rigorous figures are the
+[campaign](#performance--statistical-campaign)
 below); the column to read is PASS/interop, not the Gbps.
 
 ### Base: protocol × direction (Gbps; bidir is per-direction, one way)
@@ -60,9 +62,13 @@ below); the column to read is PASS/interop, not the Gbps.
 
 Feature interop (cross pairs `r→i` and `i→r`, all PASS): `-P 4`, `-l 128K`, `-O`
 (omit), `-w` (window), `-M` (MSS), `--get-server-output`, `-Z` (zerocopy), UDP
-`-l 8192`, `--udp-counters-64bit`, UDP `-P 4`. Plus an older-iperf3 (3.12)
-forward cross-check (TCP + UDP, both directions) guarding the results-decode
-class ([#24](https://github.com/therealevanhenry/riperf3/issues/24)).
+`-l 8192`, `--udp-counters-64bit`, UDP `-P 4`. Plus 4 forward cross-checks
+against older iperf3 (3.12) — TCP and UDP, both pairings (`r→o`, `o→r`) —
+guarding the results-decode class
+([#24](https://github.com/therealevanhenry/riperf3/issues/24)); 3.12
+reverse/bidir is gated on
+[#23](https://github.com/therealevanhenry/riperf3/issues/23). That makes 24
+base + 20 feature + 4 older-iperf3 = 48 cells.
 
 > The earlier 1 Mbit/s throttle on `i→r` UDP reverse/bidir at `-b 0` — iperf3
 > omits the `bandwidth` param for unlimited and riperf3's server defaulted it to
