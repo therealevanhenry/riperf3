@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -316,6 +316,27 @@ pub struct DataStream {
     pub rcvbuf_actual: Option<u64>,
 }
 
+/// Build the shared `-n`/`-k` byte budget the sending streams decrement, or
+/// `None` when there is no limit. A `0` limit means **unlimited** — iperf3 sends
+/// `num`/`blocks` = 0 for a plain `-t` run, so it must be filtered out or a
+/// reverse iperf3 client would make the server build a 0-budget and send
+/// nothing. An absurd N is clamped to `i64::MAX` so the budget can never start
+/// non-positive and stall every sender.
+pub(crate) fn make_byte_budget(
+    bytes: Option<u64>,
+    blocks: Option<u64>,
+    blksize: usize,
+) -> Option<Arc<AtomicI64>> {
+    bytes
+        .filter(|&n| n > 0)
+        .or_else(|| {
+            blocks
+                .filter(|&k| k > 0)
+                .map(|k| k.saturating_mul(blksize as u64))
+        })
+        .map(|n| Arc::new(AtomicI64::new(i64::try_from(n).unwrap_or(i64::MAX))))
+}
+
 // ---------------------------------------------------------------------------
 // TCP send / recv loops
 // ---------------------------------------------------------------------------
@@ -329,6 +350,7 @@ pub async fn run_tcp_sender(
     done: Arc<AtomicBool>,
     file_path: Option<std::path::PathBuf>,
     rate: u64,
+    byte_budget: Option<Arc<AtomicI64>>,
 ) -> Result<()> {
     use std::io::Read;
     let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
@@ -338,6 +360,18 @@ pub async fn run_tcp_sender(
     let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, 0, buf.len().max(1)));
 
     while !done.load(Ordering::Relaxed) {
+        // `-n`/`-k` byte/block limit: claim this block from the shared budget and
+        // stop when it is exhausted, so the sender stops at ~N instead of
+        // free-running until the controller's next 100ms poll. The budget is
+        // shared across the sending streams — iperf3's `-n` is the test-wide
+        // total, consumed across streams as each sends — so the overshoot is
+        // bounded to ~one block per stream rather than ~100ms of line rate.
+        if let Some(b) = &byte_budget {
+            if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
+                break;
+            }
+        }
+
         // Refill buffer from file if specified
         if let Some(ref mut f) = file {
             let n = f.read(&mut buf).unwrap_or(0);
@@ -1395,6 +1429,24 @@ pub fn run_udp_receiver_blocking(
 mod tests {
     use super::*;
 
+    #[test]
+    fn byte_budget_zero_is_unlimited() {
+        let bs = 128 * 1024;
+        // iperf3 sends num=0 / blocks=0 for a plain `-t` run → no budget, or the
+        // server would build a 0-budget and send nothing (regression guard).
+        assert!(make_byte_budget(Some(0), Some(0), bs).is_none());
+        assert!(make_byte_budget(None, None, bs).is_none());
+        // `-n N` → an N-byte budget.
+        let b = make_byte_budget(Some(5_000_000), Some(0), bs).unwrap();
+        assert_eq!(b.load(Ordering::Relaxed), 5_000_000);
+        // `-k K` (num=0 filtered, blocks path) → K*blksize.
+        let b = make_byte_budget(Some(0), Some(10), bs).unwrap();
+        assert_eq!(b.load(Ordering::Relaxed), (10 * bs) as i64);
+        // An absurd N clamps to a positive budget, never negative.
+        let b = make_byte_budget(Some(u64::MAX), None, bs).unwrap();
+        assert!(b.load(Ordering::Relaxed) > 0);
+    }
+
     // #42: zerocopy senders must get distinct temp-file names so `-Z -P >1`
     // can't race create+truncate on a shared path. The race needs concurrency a
     // sequential test can't reproduce, so we assert the mechanism directly: the
@@ -1760,7 +1812,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None, 0).await
+            run_tcp_sender(stream, sc, buf, d, None, 0, None).await
         });
 
         let rc = recv_counters.clone();
