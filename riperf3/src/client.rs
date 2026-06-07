@@ -106,6 +106,25 @@ fn server_receiver_summaries(
         .collect()
 }
 
+/// Bytes transferred so far against an `-n`/`-k` limit. Faithful to iperf3's
+/// `bytes_sent >= N || bytes_received >= N` end check (`iperf_client_api.c`):
+/// the client's senders accumulate in forward, its receivers in reverse, and in
+/// bidir whichever direction reaches the limit first ends the test. Counting
+/// only sent bytes leaves a reverse `-n`/`-k` test spinning forever (#60).
+fn transferred_bytes(streams: &[DataStream]) -> u64 {
+    let sent: u64 = streams
+        .iter()
+        .filter(|s| s.is_sender)
+        .map(|s| s.counters.bytes_sent())
+        .sum();
+    let received: u64 = streams
+        .iter()
+        .filter(|s| !s.is_sender)
+        .map(|s| s.counters.bytes_received())
+        .sum();
+    sent.max(received)
+}
+
 impl Client {
     pub async fn run(&self) -> Result<TestResultsJson> {
         // -T/--title: prefix every client text line with "<title>:  " (#34),
@@ -711,28 +730,17 @@ impl Client {
             EndCondition::Bytes(target) => {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    let total: u64 = streams
-                        .iter()
-                        .filter(|s| s.is_sender)
-                        .map(|s| s.counters.bytes_sent())
-                        .sum();
-                    if total >= target {
+                    if transferred_bytes(streams) >= target {
                         break;
                     }
                 }
                 report_start.elapsed().as_secs_f64()
             }
             EndCondition::Blocks(target) => {
-                // For block-based, approximate by dividing bytes by blksize
+                // Block-based: approximate by dividing transferred bytes by blksize.
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    let total_bytes: u64 = streams
-                        .iter()
-                        .filter(|s| s.is_sender)
-                        .map(|s| s.counters.bytes_sent())
-                        .sum();
-                    let blocks = total_bytes / blksize as u64;
-                    if blocks >= target {
+                    if transferred_bytes(streams) / blksize as u64 >= target {
                         break;
                     }
                 }
