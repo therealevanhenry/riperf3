@@ -277,21 +277,13 @@ impl Server {
         // bidir): they collectively stop at ~N bytes so the server self-limits at
         // the negotiated total instead of free-running to the client's TestEnd —
         // the byte-limit overshoot fix, mirroring the client.
-        // Only the server's TCP senders (reverse/bidir) consume the budget, so it
-        // is built only for a TCP run that has senders; an absurd N is clamped to
-        // i64::MAX so it can't start negative and stall every sender.
+        // Only the server's TCP senders (reverse/bidir) consume the budget, so
+        // build it only for a TCP run that has senders. See `make_byte_budget`
+        // for the 0-is-unlimited (iperf3 sends `num`/`blocks` = 0 for a plain
+        // `-t` run) and overflow-clamp rules.
         let byte_budget: Option<Arc<AtomicI64>> = (matches!(cfg.protocol, TransportProtocol::Tcp)
             && send_count > 0)
-            .then(|| {
-                params
-                    .num
-                    .or_else(|| {
-                        params
-                            .blockcount
-                            .map(|k| k.saturating_mul(cfg.blksize as u64))
-                    })
-                    .map(|n| Arc::new(AtomicI64::new(i64::try_from(n).unwrap_or(i64::MAX))))
-            })
+            .then(|| stream::make_byte_budget(params.num, params.blockcount, cfg.blksize))
             .flatten();
 
         // Single-socket UDP server demux (#80): one demux receiver thread serves
