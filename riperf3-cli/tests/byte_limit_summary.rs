@@ -184,3 +184,56 @@ fn server_json_byte_limited_summary_uses_measured_elapsed() {
         "server test_start.duration {param} should stay the nominal -t param"
     );
 }
+
+/// Block-limited (`-k`) shares the same summary path; lock it in too (#103).
+#[test]
+fn json_block_limited_summary_uses_measured_elapsed() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    // 8000 blocks × 128 KB default ≈ 1 GB: finishes well inside 10 s.
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-k", "8000", "-J"],
+        Duration::from_secs(20),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    let v: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("client -J is not valid JSON ({e}): {out}"));
+    let secs = v["end"]["sum_sent"]["seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("missing end.sum_sent.seconds: {out}"));
+    assert!(
+        secs > 0.0 && secs < 5.0,
+        "block-limited summary seconds {secs} should be the measured elapsed"
+    );
+}
+
+/// Reverse byte-limited (`-n -R`): the client is the receiver, so its summary
+/// comes from `sum_received`; it too must use the measured elapsed (#103). The
+/// reverse `-n` hang was fixed in #60, so this terminates.
+#[test]
+fn json_reverse_byte_limited_summary_uses_measured_elapsed() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-n", "500M", "-R", "-J"],
+        Duration::from_secs(20),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    let v: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("client -R -J is not valid JSON ({e}): {out}"));
+    let secs = v["end"]["sum_received"]["seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("missing end.sum_received.seconds: {out}"));
+    assert!(
+        secs > 0.0 && secs < 5.0,
+        "reverse byte-limited summary seconds {secs} should be the measured elapsed"
+    );
+}
