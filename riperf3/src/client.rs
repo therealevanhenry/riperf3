@@ -469,8 +469,13 @@ impl Client {
                         let c = counters.clone();
                         let d = done.clone();
                         let zc = self.zerocopy;
+                        let rate = self.bandwidth;
                         tokio::spawn(async move {
-                            if zc {
+                            // Zerocopy (sendfile) is used only for an unlimited
+                            // transfer; with `-b` the paced copy sender runs
+                            // instead — sendfile's benefit is moot under a rate
+                            // cap and its retry loop doesn't pace cleanly (#102).
+                            if zc && rate == 0 {
                                 // Zerocopy senders exist only for these targets
                                 // (stream.rs). The gate must match the impls, not
                                 // `unix`: other-Unix (NetBSD/OpenBSD/illumos) is
@@ -492,10 +497,10 @@ impl Client {
                                     target_os = "freebsd"
                                 )))]
                                 {
-                                    stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
                                 }
                             } else {
-                                stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
                             }
                         })
                     } else {
