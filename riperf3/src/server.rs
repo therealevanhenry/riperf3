@@ -536,7 +536,8 @@ impl Server {
         // (`done`) so no received bytes leak past the deadline into the final
         // interval (#55). The reporter prioritises `finish` over `done`, so the
         // final interval still flushes; wait for it before tearing streams down.
-        reporter_end.finish(report_start.elapsed().as_secs_f64());
+        let measured_elapsed = report_start.elapsed().as_secs_f64();
+        reporter_end.finish(measured_elapsed);
         done.store(true, Ordering::Relaxed);
         if let Some(handle) = interval_handle {
             let _ = handle.await;
@@ -547,7 +548,14 @@ impl Server {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let mut result_streams = Vec::new();
-        let test_duration = cfg.duration as f64;
+        // Summary window + bitrate: the measured elapsed for a byte/block-limited
+        // run, exactly `-t` otherwise (#103, mirrors the client). The requested
+        // `-t` is reported separately as the test_start `duration` parameter.
+        let test_duration = if params.num.is_some() || params.blockcount.is_some() {
+            measured_elapsed
+        } else {
+            cfg.duration as f64
+        };
 
         for s in &streams {
             let bytes = if s.is_sender {
@@ -1154,7 +1162,8 @@ impl Server {
             protocol: cfg.protocol,
             reverse: cfg.reverse,
             bidir: cfg.bidir,
-            duration: test_duration,
+            duration: cfg.duration as f64,
+            elapsed: test_duration,
             num_streams: cfg.num_streams as i32,
             blksize: cfg.blksize as i64,
             omit: cfg.omit as i32,
