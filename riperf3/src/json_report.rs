@@ -529,7 +529,13 @@ pub struct ReportInput {
     pub protocol: TransportProtocol,
     pub reverse: bool,
     pub bidir: bool,
+    /// The requested `-t` duration parameter, reported under `test_start`. Stays
+    /// the nominal value even for a byte/block-limited (`-n`/`-k`) run.
     pub duration: f64,
+    /// The measured elapsed test time, used for the summary window and the
+    /// derived per-stream/aggregate bitrate. Equals `duration` for a duration
+    /// run; for `-n`/`-k` it is the actual time the transfer took (#103).
+    pub elapsed: f64,
     pub num_streams: i32,
     pub blksize: i64,
     pub omit: i32,
@@ -919,7 +925,7 @@ impl ReportInput {
     }
 
     fn end_stream(&self, s: &StreamReport) -> EndStream {
-        let dur = self.duration;
+        let dur = self.elapsed;
         // Shape is driven by the test protocol, not by whether stats happen to be
         // present: a UDP stream with missing stats still emits a valid `udp`
         // object (zeroed datagram fields), never a TCP `{sender,receiver}` body.
@@ -1053,7 +1059,7 @@ impl ReportInput {
     }
 
     fn tcp_sum(&self, bytes: u64, sender: bool, retransmits: Option<i64>) -> SumSide {
-        let dur = self.duration;
+        let dur = self.elapsed;
         SumSide {
             start: 0.0,
             end: dur,
@@ -1077,7 +1083,7 @@ impl ReportInput {
         lost: i64,
         jitter_secs: f64,
     ) -> SumSide {
-        let dur = self.duration;
+        let dur = self.elapsed;
         SumSide {
             start: 0.0,
             end: dur,
@@ -1180,6 +1186,7 @@ mod tests {
             reverse: false,
             bidir: false,
             duration: 10.0,
+            elapsed: 10.0,
             num_streams: 1,
             blksize: 131072,
             omit: 0,

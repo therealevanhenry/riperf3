@@ -192,6 +192,9 @@ impl Client {
         let mut streams: Vec<DataStream> = Vec::new();
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
+        // Authoritative test duration captured from run_test: `-t` for a duration
+        // run, the measured elapsed for `-n`/`-k`. Drives the summary window (#103).
+        let mut measured_secs = self.duration as f64;
         // Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
         let mut test_start_millis = 0u64;
 
@@ -239,14 +242,15 @@ impl Client {
                 }
 
                 TestState::TestRunning => {
-                    self.run_test(&mut ctrl, &streams, &done, blksize, interval_data.clone())
+                    measured_secs = self
+                        .run_test(&mut ctrl, &streams, &done, blksize, interval_data.clone())
                         .await?;
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
                 }
 
                 TestState::ExchangeResults => {
-                    let results = self.build_results(&streams, cpu_start.as_ref());
+                    let results = self.build_results(&streams, cpu_start.as_ref(), measured_secs);
                     protocol::send_results(&mut ctrl, &results).await?;
                     server_results = Some(protocol::recv_results(&mut ctrl).await?);
                 }
@@ -264,6 +268,7 @@ impl Client {
                             tcp_mss_default: control_mss,
                             start_time_millis: test_start_millis,
                         },
+                        measured_secs,
                     );
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
@@ -641,7 +646,7 @@ impl Client {
         done: &Arc<AtomicBool>,
         blksize: usize,
         collector: Arc<Mutex<crate::reporter::CollectedIntervals>>,
-    ) -> Result<()> {
+    ) -> Result<f64> {
         // Run the interval reporter whenever intervals are enabled. It prints
         // live for text / json-stream; for plain -J it runs silently to collect
         // intervals for the final blob (#36 PR2).
@@ -759,20 +764,22 @@ impl Client {
             let _ = handle.await;
         }
 
-        Ok(())
+        // The authoritative test duration: exactly `-t` for a duration run, the
+        // measured elapsed for a byte/block-limited run. The summary window and
+        // its derived bitrate use this, not the default `-t` (#103).
+        Ok(end_secs)
     }
 
     fn build_results(
         &self,
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
+        test_duration: f64,
     ) -> TestResultsJson {
         let cpu_end = CpuSnapshot::now();
         let cpu_util = cpu_start
             .map(|start| cpu_end.utilization_since(start))
             .unwrap_or_default();
-
-        let test_duration = self.duration as f64;
 
         let stream_results: Vec<_> = streams
             .iter()
@@ -821,6 +828,7 @@ impl Client {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn print_results(
         &self,
         streams: &[DataStream],
@@ -829,6 +837,7 @@ impl Client {
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
+        test_duration: f64,
     ) {
         if self.json_output {
             self.print_results_json(
@@ -838,6 +847,7 @@ impl Client {
                 blksize,
                 interval_data,
                 start_meta,
+                test_duration,
             );
         } else if self.json_stream {
             // --json-stream: emit the `end` event. (Previously this fell through
@@ -849,14 +859,19 @@ impl Client {
                 blksize,
                 interval_data,
                 start_meta,
+                test_duration,
             );
         } else {
-            self.print_results_text(streams, remote_cpu);
+            self.print_results_text(streams, remote_cpu, test_duration);
         }
     }
 
-    fn print_results_text(&self, streams: &[DataStream], server_results: Option<&TestResultsJson>) {
-        let test_duration = self.duration as f64;
+    fn print_results_text(
+        &self,
+        streams: &[DataStream],
+        server_results: Option<&TestResultsJson>,
+        test_duration: f64,
+    ) {
         crate::reporter::print_separator();
 
         let mut summaries: Vec<crate::reporter::StreamSummary> = streams
@@ -912,6 +927,7 @@ impl Client {
     /// Shared by `-J` (build + pretty-print) and `--json-stream` (build + emit the
     /// `end` event; and at TestStart, the `start` event from a partial input where
     /// only the start fields are meaningful — see `emit_json_stream_start`).
+    #[allow(clippy::too_many_arguments)]
     fn build_report_input(
         &self,
         streams: &[DataStream],
@@ -920,6 +936,7 @@ impl Client {
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
+        test_duration: f64,
     ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
@@ -935,7 +952,6 @@ impl Client {
             Err(_) => (Vec::new(), Vec::new()),
         };
 
-        let test_duration = self.duration as f64;
         let cpu_end = CpuSnapshot::now();
         let cpu_util = cpu_start
             .map(|start| cpu_end.utilization_since(start))
@@ -1041,7 +1057,8 @@ impl Client {
             protocol: self.protocol,
             reverse: self.reverse,
             bidir: self.bidir,
-            duration: test_duration,
+            duration: self.duration as f64,
+            elapsed: test_duration,
             num_streams: self.num_streams as i32,
             blksize: blksize as i64,
             omit: self.omit as i32,
@@ -1095,6 +1112,7 @@ impl Client {
     }
 
     /// `-J`: build and pretty-print the single batched report blob.
+    #[allow(clippy::too_many_arguments)]
     fn print_results_json(
         &self,
         streams: &[DataStream],
@@ -1103,6 +1121,7 @@ impl Client {
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
+        test_duration: f64,
     ) {
         let input = self.build_report_input(
             streams,
@@ -1111,6 +1130,7 @@ impl Client {
             blksize,
             interval_data,
             start_meta,
+            test_duration,
         );
         println!("{}", serde_json::to_string_pretty(&input.build()).unwrap());
     }
@@ -1127,8 +1147,17 @@ impl Client {
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
     ) {
-        let input =
-            self.build_report_input(streams, cpu_start, None, blksize, interval_data, start_meta);
+        // The `start` event carries no summary window, so the elapsed value is
+        // unused here; pass the nominal duration.
+        let input = self.build_report_input(
+            streams,
+            cpu_start,
+            None,
+            blksize,
+            interval_data,
+            start_meta,
+            self.duration as f64,
+        );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "start",
             &input.build().start,
@@ -1137,6 +1166,7 @@ impl Client {
 
     /// `--json-stream`: emit the `end` event (#62) at DisplayResults. The interval
     /// events were already streamed live by the reporter.
+    #[allow(clippy::too_many_arguments)]
     fn emit_json_stream_end(
         &self,
         streams: &[DataStream],
@@ -1145,6 +1175,7 @@ impl Client {
         blksize: usize,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
+        test_duration: f64,
     ) {
         let input = self.build_report_input(
             streams,
@@ -1153,6 +1184,7 @@ impl Client {
             blksize,
             interval_data,
             start_meta,
+            test_duration,
         );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
