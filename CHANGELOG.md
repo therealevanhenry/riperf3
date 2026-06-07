@@ -79,6 +79,13 @@ data-path/throughput changes.
   it mirrors iperf3 and gives one socket and thread per stream (kernel-parallel
   receive that scales better at high `-P`). At modest parallelism the two paths
   measure comparably on throughput and loss.
+- **Reverse byte/block-limited tests (`-R -n` / `-R -k`) now terminate** (#60):
+  the client's end-of-test check summed only the sender streams' bytes, so in
+  reverse — where the client only receives — the total never reached the limit
+  and the transfer ran indefinitely at line rate. The check now trips when
+  either the bytes sent or the bytes received reach the target, matching
+  iperf3's `bytes_sent >= N || bytes_received >= N`; a bidir byte/block limit
+  likewise ends at whichever direction reaches the target first.
 
 ### Added
 - **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
@@ -253,8 +260,6 @@ complete list; the notable user-facing ones:
   `-w`/`--window` ([#59](https://github.com/therealevanhenry/riperf3/issues/59)).
   The server also accepts client-only flags rather than rejecting them as iperf3
   does ([#65](https://github.com/therealevanhenry/riperf3/issues/65)).
-- **Reverse + byte/block limit** (`-R -n` / `-R -k`) never terminates
-  ([#60](https://github.com/therealevanhenry/riperf3/issues/60)).
 - **`-J` fidelity gaps:** `--json-stream` is not valid line-delimited JSON
   ([#62](https://github.com/therealevanhenry/riperf3/issues/62)); integral
   floats render as `N.0` where cJSON omits the decimal

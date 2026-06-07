@@ -391,7 +391,10 @@ async fn tcp_reverse_bytes_limit_terminates() {
     assert!(result.is_ok(), "-R -n hung — issue #60 regression");
     let res = result.unwrap().expect("-R -n errored");
     // In reverse the server is the sender; it must have pushed at least the
-    // requested volume before the test terminated.
+    // requested volume before terminating. Lower bound only: at loopback line
+    // rate the 100ms end-condition poll overshoots the target (a pre-existing
+    // characteristic shared with forward `-n`), so this guards termination +
+    // floor, not an exact byte count.
     let transferred: u64 = res.streams.iter().map(|s| s.bytes).sum();
     assert!(
         transferred >= target,
