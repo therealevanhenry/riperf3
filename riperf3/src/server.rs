@@ -277,14 +277,22 @@ impl Server {
         // bidir): they collectively stop at ~N bytes so the server self-limits at
         // the negotiated total instead of free-running to the client's TestEnd —
         // the byte-limit overshoot fix, mirroring the client.
-        let byte_budget: Option<Arc<AtomicI64>> = params
-            .num
-            .or_else(|| {
+        // Only the server's TCP senders (reverse/bidir) consume the budget, so it
+        // is built only for a TCP run that has senders; an absurd N is clamped to
+        // i64::MAX so it can't start negative and stall every sender.
+        let byte_budget: Option<Arc<AtomicI64>> = (matches!(cfg.protocol, TransportProtocol::Tcp)
+            && send_count > 0)
+            .then(|| {
                 params
-                    .blockcount
-                    .map(|k| k.saturating_mul(cfg.blksize as u64))
+                    .num
+                    .or_else(|| {
+                        params
+                            .blockcount
+                            .map(|k| k.saturating_mul(cfg.blksize as u64))
+                    })
+                    .map(|n| Arc::new(AtomicI64::new(i64::try_from(n).unwrap_or(i64::MAX))))
             })
-            .map(|n| Arc::new(AtomicI64::new(n as i64)));
+            .flatten();
 
         // Single-socket UDP server demux (#80): one demux receiver thread serves
         // every receiving stream, so its handle lives outside the per-stream

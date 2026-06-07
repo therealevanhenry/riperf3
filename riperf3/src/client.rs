@@ -400,14 +400,21 @@ impl Client {
 
         // `-n`/`-k` shared byte budget for the sending streams: they collectively
         // stop at ~N bytes (iperf3's `-n` is the test-wide total), bounding the
-        // overshoot to ~one block per stream instead of ~100ms of line rate.
-        let byte_budget: Option<Arc<AtomicI64>> = self
-            .bytes_to_send
-            .or_else(|| {
-                self.blocks_to_send
-                    .map(|k| k.saturating_mul(blksize as u64))
+        // overshoot to ~one block per stream instead of ~100ms of line rate. Only
+        // the TCP senders consume it (UDP `-n` is left approximate), so it is
+        // built only for a TCP run that has senders; an absurd N is clamped to
+        // i64::MAX so the budget can't start negative and stall every sender.
+        let byte_budget: Option<Arc<AtomicI64>> = (matches!(self.protocol, TransportProtocol::Tcp)
+            && send_count > 0)
+            .then(|| {
+                self.bytes_to_send
+                    .or_else(|| {
+                        self.blocks_to_send
+                            .map(|k| k.saturating_mul(blksize as u64))
+                    })
+                    .map(|n| Arc::new(AtomicI64::new(i64::try_from(n).unwrap_or(i64::MAX))))
             })
-            .map(|n| Arc::new(AtomicI64::new(n as i64)));
+            .flatten();
 
         match self.protocol {
             TransportProtocol::Tcp => {
