@@ -328,9 +328,14 @@ pub async fn run_tcp_sender(
     mut buf: Vec<u8>,
     done: Arc<AtomicBool>,
     file_path: Option<std::path::PathBuf>,
+    rate: u64,
 ) -> Result<()> {
     use std::io::Read;
     let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
+    // `-b` pacing: a token bucket caps the application send rate, matching
+    // iperf3's TCP throttle. 0 = unlimited → no limiter, so the default TCP
+    // path is unchanged (#102; mirrors UDP's `-b 0` per #17).
+    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, 0, buf.len().max(1)));
 
     while !done.load(Ordering::Relaxed) {
         // Refill buffer from file if specified
@@ -342,6 +347,10 @@ pub async fn run_tcp_sender(
                 f.seek(std::io::SeekFrom::Start(0))?;
                 let _ = f.read(&mut buf);
             }
+        }
+
+        if let Some(rl) = limiter.as_mut() {
+            rl.acquire(buf.len() as u64).await;
         }
 
         match stream.write_all(&buf).await {
@@ -1751,7 +1760,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None).await
+            run_tcp_sender(stream, sc, buf, d, None, 0).await
         });
 
         let rc = recv_counters.clone();

@@ -441,6 +441,125 @@ async fn tcp_reverse_blocks_limit_terminates() {
 }
 
 // ---------------------------------------------------------------------------
+// TCP bitrate pacing (-b), issue #102
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_bitrate_is_paced() {
+    // TCP `-b` must pace the sender to the target like iperf3 (#102). Before the
+    // fix the TCP client ignored -b and ran at line rate.
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 200_000_000; // 200 Mbit/s
+    let secs: u64 = 2;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(2)
+        .bandwidth(target)
+        .build()
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    // run() returns the server's results; forward → server received ≈ what we sent.
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let achieved = bytes * 8 / secs;
+    // Unpaced this is line rate (tens of Gbit/s, >100x target). Paced lands near
+    // target; allow a generous band for burst/timing slack.
+    assert!(
+        achieved < target * 2,
+        "TCP -b not paced: {achieved} bps vs target {target}"
+    );
+    assert!(
+        achieved > target / 2,
+        "TCP -b paced far below target: {achieved} bps vs target {target}"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_unlimited_is_not_paced() {
+    // Regression guard: default TCP (no -b ⇒ rate 0) must stay unthrottled.
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .build()
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    // A 200 Mbit cap would yield ~25 MB in 1 s; unthrottled loopback moves far
+    // more. >200 MB confirms pacing didn't leak into the rate-0 path.
+    assert!(
+        bytes > 200_000_000,
+        "unlimited TCP moved only {bytes} bytes in 1s — pacing leaked into the rate-0 path"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_bitrate_reverse_is_paced() {
+    // In reverse the server is the sender, so `-b` must pace the server path too
+    // (#102). The negotiated rate reaches the server via the params.
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 200_000_000;
+    let secs: u64 = 2;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(2)
+        .reverse(true)
+        .bandwidth(target)
+        .build()
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    // Reverse: the server sends; its reported bytes ≈ what it paced out.
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let achieved = bytes * 8 / secs;
+    assert!(
+        achieved < target * 2,
+        "reverse TCP -b not paced (server): {achieved} bps vs target {target}"
+    );
+    assert!(
+        achieved > target / 2,
+        "reverse TCP -b paced far below target: {achieved} bps vs target {target}"
+    );
+    let _ = server_task.await;
+}
+
+// ---------------------------------------------------------------------------
 // UDP loopback tests (expected to fail until UDP fix lands)
 // ---------------------------------------------------------------------------
 

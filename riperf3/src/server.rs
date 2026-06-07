@@ -326,8 +326,11 @@ impl Server {
                         let buf = make_send_buffer(cfg.blksize, false);
                         let c = counters.clone();
                         let d = done.clone();
+                        // `-b` paces the sender in reverse/bidir too (negotiated
+                        // rate; 0 = unlimited). #102
+                        let rate = cfg.bandwidth;
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
                         })
                     } else {
                         let c = counters.clone();
