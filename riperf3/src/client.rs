@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -398,6 +398,17 @@ impl Client {
         let max_duration = (self.bytes_to_send.is_none() && self.blocks_to_send.is_none())
             .then(|| Duration::from_secs(self.duration as u64));
 
+        // `-n`/`-k` shared byte budget for the sending streams: they collectively
+        // stop at ~N bytes (iperf3's `-n` is the test-wide total), bounding the
+        // overshoot to ~one block per stream instead of ~100ms of line rate.
+        let byte_budget: Option<Arc<AtomicI64>> = self
+            .bytes_to_send
+            .or_else(|| {
+                self.blocks_to_send
+                    .map(|k| k.saturating_mul(blksize as u64))
+            })
+            .map(|n| Arc::new(AtomicI64::new(n as i64)));
+
         match self.protocol {
             TransportProtocol::Tcp => {
                 for i in 0..total {
@@ -470,12 +481,14 @@ impl Client {
                         let d = done.clone();
                         let zc = self.zerocopy;
                         let rate = self.bandwidth;
+                        let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            // Zerocopy (sendfile) is used only for an unlimited
-                            // transfer; with `-b` the paced copy sender runs
-                            // instead — sendfile's benefit is moot under a rate
-                            // cap and its retry loop doesn't pace cleanly (#102).
-                            if zc && rate == 0 {
+                            // Zerocopy (sendfile) is used only for an unlimited,
+                            // duration-based transfer; with `-b` (pacing) or
+                            // `-n`/`-k` (byte budget) the copy sender runs instead,
+                            // since the sendfile retry loop self-limits/paces
+                            // neither cleanly (#102 + byte-limit overshoot fix).
+                            if zc && rate == 0 && bb.is_none() {
                                 // Zerocopy senders exist only for these targets
                                 // (stream.rs). The gate must match the impls, not
                                 // `unix`: other-Unix (NetBSD/OpenBSD/illumos) is
@@ -497,10 +510,11 @@ impl Client {
                                     target_os = "freebsd"
                                 )))]
                                 {
-                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
+                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb)
+                                        .await
                                 }
                             } else {
-                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
+                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
                             }
                         })
                     } else {

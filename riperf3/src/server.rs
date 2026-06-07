@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cpu::CpuSnapshot;
@@ -273,6 +273,19 @@ impl Server {
         };
         let total = recv_count + send_count;
 
+        // `-n`/`-k` shared byte budget for the server's sending streams (reverse /
+        // bidir): they collectively stop at ~N bytes so the server self-limits at
+        // the negotiated total instead of free-running to the client's TestEnd —
+        // the byte-limit overshoot fix, mirroring the client.
+        let byte_budget: Option<Arc<AtomicI64>> = params
+            .num
+            .or_else(|| {
+                params
+                    .blockcount
+                    .map(|k| k.saturating_mul(cfg.blksize as u64))
+            })
+            .map(|n| Arc::new(AtomicI64::new(n as i64)));
+
         // Single-socket UDP server demux (#80): one demux receiver thread serves
         // every receiving stream, so its handle lives outside the per-stream
         // `DataStream`s and is joined alongside them at teardown. `None` on the
@@ -329,8 +342,9 @@ impl Server {
                         // `-b` paces the sender in reverse/bidir too (negotiated
                         // rate; 0 = unlimited). #102
                         let rate = cfg.bandwidth;
+                        let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
                         })
                     } else {
                         let c = counters.clone();

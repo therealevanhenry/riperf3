@@ -441,6 +441,81 @@ async fn tcp_reverse_blocks_limit_terminates() {
 }
 
 // ---------------------------------------------------------------------------
+// Byte/block-limit overshoot — sender self-enforces -n/-k (bounded transfer)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tcp_byte_limit_overshoot_bounded_forward() {
+    // The TCP sender self-enforces -n via a shared byte budget, stopping at ~N
+    // instead of free-running until the controller's 100ms poll (~1 GB before
+    // the fix). Forward: the client sends; the server (receiver) reports ≈ N.
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 8 * 1024 * 1024; // 8 MB
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .bytes(target)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    assert!(
+        bytes > target / 2,
+        "transferred {bytes} far below target {target}"
+    );
+    assert!(
+        bytes < target + 2 * 1024 * 1024,
+        "byte-limit overshoot unbounded: {bytes} vs target {target}"
+    );
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_byte_limit_overshoot_bounded_reverse() {
+    // Reverse: the server is the sender and must self-enforce the budget too.
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 8 * 1024 * 1024;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .reverse(true)
+        .bytes(target)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    assert!(
+        bytes > target / 2,
+        "transferred {bytes} far below target {target}"
+    );
+    assert!(
+        bytes < target + 2 * 1024 * 1024,
+        "reverse byte-limit overshoot unbounded: {bytes} vs target {target}"
+    );
+    let _ = server_task.await;
+}
+
+// ---------------------------------------------------------------------------
 // TCP bitrate pacing (-b), issue #102
 // ---------------------------------------------------------------------------
 

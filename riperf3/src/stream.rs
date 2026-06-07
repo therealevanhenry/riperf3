@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -329,6 +329,7 @@ pub async fn run_tcp_sender(
     done: Arc<AtomicBool>,
     file_path: Option<std::path::PathBuf>,
     rate: u64,
+    byte_budget: Option<Arc<AtomicI64>>,
 ) -> Result<()> {
     use std::io::Read;
     let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
@@ -338,6 +339,18 @@ pub async fn run_tcp_sender(
     let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, 0, buf.len().max(1)));
 
     while !done.load(Ordering::Relaxed) {
+        // `-n`/`-k` byte/block limit: claim this block from the shared budget and
+        // stop when it is exhausted, so the sender stops at ~N instead of
+        // free-running until the controller's next 100ms poll. The budget is
+        // shared across the sending streams — iperf3's `-n` is the test-wide
+        // total, consumed across streams as each sends — so the overshoot is
+        // bounded to ~one block per stream rather than ~100ms of line rate.
+        if let Some(b) = &byte_budget {
+            if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
+                break;
+            }
+        }
+
         // Refill buffer from file if specified
         if let Some(ref mut f) = file {
             let n = f.read(&mut buf).unwrap_or(0);
@@ -1760,7 +1773,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None, 0).await
+            run_tcp_sender(stream, sc, buf, d, None, 0, None).await
         });
 
         let rc = recv_counters.clone();
