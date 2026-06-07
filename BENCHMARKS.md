@@ -65,9 +65,7 @@ Feature interop (cross pairs `r→i` and `i→r`, all PASS): `-P 4`, `-l 128K`, 
 `-l 8192`, `--udp-counters-64bit`, UDP `-P 4`. Plus 4 forward cross-checks
 against older iperf3 (3.12) — TCP and UDP, both pairings (`r→o`, `o→r`) —
 guarding the results-decode class
-([#24](https://github.com/therealevanhenry/riperf3/issues/24)); 3.12
-reverse/bidir is gated on
-[#23](https://github.com/therealevanhenry/riperf3/issues/23). That makes 24
+([#24](https://github.com/therealevanhenry/riperf3/issues/24)). That makes 24
 base + 20 feature + 4 older-iperf3 = 48 cells.
 
 > The earlier 1 Mbit/s throttle on `i→r` UDP reverse/bidir at `-b 0` — iperf3
