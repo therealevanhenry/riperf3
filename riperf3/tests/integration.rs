@@ -362,6 +362,81 @@ async fn tcp_bytes_limit() {
     let _ = server_task.await;
 }
 
+#[tokio::test]
+async fn tcp_reverse_bytes_limit_terminates() {
+    // Reverse + byte limit must stop after N bytes, not hang (issue #60). In
+    // reverse the client is the receiver, so the end condition has to count
+    // received bytes; counting only sent bytes (which stay 0 here) spins forever.
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 8 * 1024 * 1024; // 8 MB
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .reverse(true)
+        .bytes(target)
+        .build()
+        .unwrap();
+
+    // On the #60 bug this never returns; cap it so the test fails, not hangs.
+    let result = tokio::time::timeout(Duration::from_secs(15), client.run()).await;
+    assert!(result.is_ok(), "-R -n hung — issue #60 regression");
+    let res = result.unwrap().expect("-R -n errored");
+    // In reverse the server is the sender; it must have pushed at least the
+    // requested volume before the test terminated.
+    let transferred: u64 = res.streams.iter().map(|s| s.bytes).sum();
+    assert!(
+        transferred >= target,
+        "transferred {transferred} < requested {target}"
+    );
+
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn tcp_reverse_blocks_limit_terminates() {
+    // Same guard for the block limit (-R -k), issue #60.
+    let port = next_port();
+
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let blksize: usize = 128 * 1024;
+    let blocks: u64 = 64;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .reverse(true)
+        .blksize(blksize)
+        .blocks(blocks)
+        .build()
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(15), client.run()).await;
+    assert!(result.is_ok(), "-R -k hung — issue #60 regression");
+    let res = result.unwrap().expect("-R -k errored");
+    let transferred: u64 = res.streams.iter().map(|s| s.bytes).sum();
+    assert!(
+        transferred >= blocks * blksize as u64,
+        "transferred {transferred} < requested {blocks} blocks"
+    );
+
+    let _ = server_task.await;
+}
+
 // ---------------------------------------------------------------------------
 // UDP loopback tests (expected to fail until UDP fix lands)
 // ---------------------------------------------------------------------------
