@@ -203,7 +203,11 @@ impl Server {
 
         // ---- ParamExchange ----
         protocol::send_state(&mut ctrl, TestState::ParamExchange).await?;
-        let params = protocol::recv_params(&mut ctrl).await?;
+        let mut params = protocol::recv_params(&mut ctrl).await?;
+        // iperf3 sends num/blockcount = 0 for a plain `-t` run; treat 0 as
+        // unlimited so the byte-limit checks below don't misread a duration test
+        // as byte-limited (#119).
+        params.normalize_unlimited();
         let cfg = TestConfig::from_params(&params);
 
         // ---- Auth validation (after params, before streams) ----
