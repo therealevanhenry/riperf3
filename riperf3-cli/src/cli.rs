@@ -1555,6 +1555,172 @@ mod cli_tests {
             );
         }
 
+        // -- #124: server-side wiring coverage. `build_server` is now the single
+        // source of truth, so cover its setters too (previously only one_off,
+        // idle_timeout, and server_max_duration had dedicated tests). `build_server`
+        // has no unconditional defaults, so the bare `ServerBuilder::new()` is the
+        // correct baseline (unlike the client's `expected_client`).
+
+        #[test]
+        fn server_port_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-p", "5201"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .port(Some(5201))
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_verbose_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-V"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new().verbose(true).build().unwrap()
+            );
+        }
+
+        #[test]
+        fn server_json_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-J"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .json_output(true)
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_json_stream_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--json-stream"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .json_stream(true)
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_forceflush_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--forceflush"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .forceflush(true)
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_bind_address_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-B", "0.0.0.0"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .bind_address("0.0.0.0")
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_ip_version4_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-4"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new().ip_version(4).build().unwrap()
+            );
+        }
+
+        #[test]
+        fn server_ip_version6_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "-6"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new().ip_version(6).build().unwrap()
+            );
+        }
+
+        #[test]
+        fn server_timestamps_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--timestamps", "%H"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .timestamps("%H")
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_bitrate_limit_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "100M"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .server_bitrate_limit_str("100M")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_authorized_users_path_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--authorized-users-path", "/tmp/users"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .authorized_users_path("/tmp/users")
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_rsa_private_key_path_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--rsa-private-key-path", "/tmp/priv.pem"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .rsa_private_key_path("/tmp/priv.pem")
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_time_skew_threshold_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--time-skew-threshold", "5"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .time_skew_threshold(5)
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn server_use_pkcs1_padding_wired() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--use-pkcs1-padding"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .use_pkcs1_padding(true)
+                    .build()
+                    .unwrap()
+            );
+        }
+
         /// Verify every short flag alias parses identically to its long form.
         /// Clap guarantees this, but this test catches typos in the arg declarations.
         #[test]
