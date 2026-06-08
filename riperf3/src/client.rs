@@ -682,7 +682,9 @@ impl Client {
         // authoritative final-interval boundary (#55).
         let reporter_end = Arc::new(crate::reporter::ReporterEnd::new());
         let report_start = std::time::Instant::now();
-        let interval_handle = if interval_secs > 0.0 {
+        // `>= 0.0`: `-i 0` still spawns the reporter, which emits a single
+        // whole-test interval rather than none (#107).
+        let interval_handle = if interval_secs >= 0.0 {
             let stream_refs: Vec<_> = streams
                 .iter()
                 .map(|s| crate::reporter::IntervalStreamRef {
