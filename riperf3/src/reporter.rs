@@ -204,8 +204,9 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
     }
 }
 
-/// Print a single final summary line.
-#[allow(dead_code)]
+/// Print a single final summary line. Test-only: production reporting routes
+/// through `final_report_lines`; this helper exists for unit-testing the format.
+#[cfg(test)]
 pub fn print_summary(summary: &StreamSummary, format_char: char) {
     titled(format_args!(
         "{}",
