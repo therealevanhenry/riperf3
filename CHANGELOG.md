@@ -205,7 +205,7 @@ sides of the connection.
   `extra_data` field.
 - **Native macOS and Windows CI runners plus a musl build check**, so
   cross-platform behavior is observed rather than assumed. (FreeBSD CI is still
-  outstanding — see Known issues, #39.)
+  outstanding — #39.)
 - **`cargo-semver-checks` gate** in CI (a required check) to catch unintended
   public-API breaks before release.
 
@@ -231,7 +231,7 @@ sides of the connection.
   also validating the server's `-J` output (#50).
 - Linux/Unix-only feature tests are gated by target so the native macOS/Windows
   CI runners pass cleanly (#71, #76). (The macOS `--bind-dev` test is gated
-  pending its underlying fix — see Known issues, #72.)
+  pending its underlying fix — #72.)
 
 ### Known issues
 
@@ -245,7 +245,7 @@ complete list; the notable user-facing ones:
   and `-O`/`--omit` (warm-up isn't excluded from the summary)
   ([#31](https://github.com/therealevanhenry/riperf3/issues/31)).
 - **`-J` fidelity gaps:** bidir interval `sum` lumps both directions
-  ([#54](https://github.com/therealevanhenry/riperf3/issues/54)); and
+  ([#54](https://github.com/therealevanhenry/riperf3/issues/54)), and
   `congestion_used` is never populated
   ([#37](https://github.com/therealevanhenry/riperf3/issues/37)).
 
