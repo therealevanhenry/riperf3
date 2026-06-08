@@ -868,39 +868,9 @@ mod json_output_tests {
         let _ = server_task.await;
     }
 
-    // test_params_serializes_all_fields migrated in-crate to src/protocol.rs (#67).
-
-    #[test]
-    fn test_results_json_structure() {
-        use riperf3::{StreamResultJson, TestResultsJson};
-        let r = TestResultsJson {
-            cpu_util_total: 50.0,
-            cpu_util_user: 40.0,
-            cpu_util_system: 10.0,
-            sender_has_retransmits: 5,
-            congestion_used: Some("cubic".to_string()),
-            streams: vec![StreamResultJson {
-                id: 1,
-                bytes: 10_000_000_000,
-                retransmits: 5,
-                jitter: 0.001,
-                errors: 2,
-                omitted_errors: 0,
-                packets: 10000,
-                omitted_packets: 0,
-                start_time: 0.0,
-                end_time: 10.0,
-            }],
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["cpu_util_total"], 50.0);
-        assert_eq!(v["sender_has_retransmits"], 5);
-        assert_eq!(v["congestion_used"], "cubic");
-        assert_eq!(v["streams"][0]["id"], 1);
-        assert_eq!(v["streams"][0]["bytes"], 10_000_000_000u64);
-        assert_eq!(v["streams"][0]["retransmits"], 5);
-    }
+    // test_params_serializes_all_fields migrated in-crate to src/protocol.rs (#67);
+    // test_results_json_structure likewise migrated when TestResultsJson became
+    // #[non_exhaustive] (it can no longer be constructed from an external crate).
 }
 
 // interval_reporter_tests migrated in-crate to src/reporter.rs (#67).

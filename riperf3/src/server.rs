@@ -1667,8 +1667,8 @@ mod tests {
 
 #[cfg(test)]
 mod test_config_tests {
+    use super::TestConfig;
     use crate::protocol::{TestParams, TransportProtocol};
-    use crate::TestConfig;
 
     #[test]
     fn tcp_defaults() {
