@@ -278,6 +278,24 @@ pub struct TestParams {
     pub authtoken: Option<String>,
 }
 
+impl TestParams {
+    /// Normalize a `0` byte/block limit to `None` (= no limit). iperf3
+    /// *unconditionally* serializes `num`/`blockcount`, sending `0` for a plain
+    /// `-t` run, whereas riperf3 omits them — and serde `default` only fills a
+    /// *missing* field, so a real iperf3 client arrives as `Some(0)`. Without
+    /// this, the server's `is_none()`/`is_some()` limit checks misread a duration
+    /// run as byte-limited: it disables the UDP-sender `-t` deadline (#5 hang
+    /// risk) and skews the summary window (#103). Call once at param ingest. #119
+    pub(crate) fn normalize_unlimited(&mut self) {
+        if self.num == Some(0) {
+            self.num = None;
+        }
+        if self.blockcount == Some(0) {
+            self.blockcount = None;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test results — exchanged as JSON during ExchangeResults
 // ---------------------------------------------------------------------------
@@ -493,6 +511,29 @@ pub async fn udp_connect_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_unlimited_maps_zero_to_none() {
+        // iperf3's plain `-t` run arrives as Some(0) → must become None.
+        let mut p = TestParams {
+            num: Some(0),
+            blockcount: Some(0),
+            ..Default::default()
+        };
+        p.normalize_unlimited();
+        assert_eq!(p.num, None);
+        assert_eq!(p.blockcount, None);
+
+        // Real limits and an already-absent limit are untouched.
+        let mut p = TestParams {
+            num: Some(5_000_000),
+            blockcount: None,
+            ..Default::default()
+        };
+        p.normalize_unlimited();
+        assert_eq!(p.num, Some(5_000_000));
+        assert_eq!(p.blockcount, None);
+    }
 
     #[test]
     fn cookie_is_correct_size_and_null_terminated() {
