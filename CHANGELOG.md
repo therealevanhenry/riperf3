@@ -11,11 +11,17 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.7.0] - 2026-06-06
+## [0.7.0] - 2026-06-08
 
-A minor bump (the first `0.x` minor since 0.6.0) because the interval-reporter
-fix needs a new parameter on a public function — see **Changed** below. No
-data-path/throughput changes.
+A minor bump (the first `0.x` minor since 0.6.0). The headline is a deliberate
+**library API narrowing** — encapsulating configuration behind the builders,
+retracting internal modules from the public surface, and marking the remaining
+public types `#[non_exhaustive]` — so that **0.7.0 is the last breaking release**
+for the current set of known issues and every 0.7.x dot release can stay
+non-breaking. It also carries a batch of rate/byte-limited (`-b`/`-n`/`-k`) and
+platform fixes. The default (unlimited) Linux data path is unchanged and was
+re-benchmarked regression-free against 0.6.3 — see
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### Changed
 - **BREAKING (library API): `riperf3::reporter::spawn_interval_reporter` gains a
@@ -29,6 +35,38 @@ data-path/throughput changes.
   `daemon()`/fork *before* constructing its async runtime — doing it from inside
   `run()` cannot work (see Fixed). The CLI is unaffected; `-s -D` behaves as
   before, only correctly.
+- **BREAKING (library API): configuration is encapsulated behind the builders**
+  (#43). Every `Client`/`Server` field was `pub`; they are now `pub(crate)`, so
+  the only way to construct a configured client or server is through
+  `ClientBuilder`/`ServerBuilder`, and `build()`-time validation can no longer be
+  bypassed. The CLI is unaffected.
+- **BREAKING (library API): the public surface was narrowed to the intended API**
+  (#67). The implementation modules — `net`, `protocol`, `reporter`, `stream`,
+  `utils`, `auth`, `cpu`, `tcp_info`, `units` — are now `pub(crate)` rather than
+  `#[doc(hidden)] pub`. The public API is now exactly: `Client`/`ClientBuilder`,
+  `Server`/`ServerBuilder`, `TransportProtocol`, the result model
+  (`TestResultsJson`/`StreamResultJson` and the `json_report` module), the error
+  types (`RiperfError`/`ConfigError`), and `set_cpu_affinity`. A consumer that
+  reached into the old internal items must move to the builder API.
+- **BREAKING (library API): public types are now `#[non_exhaustive]`** (the 0.7.0
+  API freeze). `RiperfError`, `ConfigError`, `TransportProtocol`,
+  `TestResultsJson`, and `StreamResultJson` are marked `#[non_exhaustive]`, so a
+  downstream `match` needs a wildcard arm and the structs can't be built by
+  struct literal — but future error variants, a future transport, and future
+  result fields become *additive*. That is what lets 0.7.0 be the last breaking
+  release for the current API. (The `-J` `json_report` model was already
+  `#[non_exhaustive]`.)
+
+### Removed
+- **BREAKING (library API): `TestConfig` is no longer public.** It is
+  server-internal (built from the received parameter JSON) and was never part of
+  any public signature.
+- **BREAKING (library API): inert builder setters removed** (#122).
+  `ClientBuilder::{pidfile, logfile, affinity}` and `ServerBuilder::{pidfile,
+  logfile}` are gone — they stored values the library never read; the CLI
+  realizes them at the process level (it writes the pidfile, redirects stdout,
+  and calls `set_cpu_affinity` itself). The CLI flags `-I`/`--pidfile`,
+  `--logfile`, and `-A`/`--affinity` are unchanged.
 
 ### Fixed
 - **`-s -D` daemon mode now actually serves** (#81): the server called
@@ -86,6 +124,34 @@ data-path/throughput changes.
   either the bytes sent or the bytes received reach the target, matching
   iperf3's `bytes_sent >= N || bytes_received >= N`; a bidir byte/block limit
   likewise ends at whichever direction reaches the target first.
+- **TCP `-b`/`--bitrate` is now honored by the client** (#102): the client
+  applied `-b` only to UDP, so a rate-limited TCP test ran unthrottled at line
+  rate. The token-bucket rate limiter now paces the TCP sender too (per stream,
+  iperf3 semantics); zerocopy is used only on the unlimited path.
+- **Byte/block-limited summaries report measured elapsed, not the `-t` window**
+  (#103): an `-n`/`-k` run computed its summary bitrate and `seconds` against the
+  default `-t` duration instead of the time the transfer actually took. The
+  report now separates the `-t` parameter (under `test_start`) from the measured
+  elapsed time that drives the summary, on both the client and the `-s -J`
+  server.
+- **Byte/block-limited transfers no longer overshoot the limit** (#117): the
+  sender free-ran between the client's 100 ms polls and pushed ~100 ms of extra
+  line rate past `-n`/`-k` (e.g. `-n 512K` transferred ~925 MB). The sending
+  streams now share an atomic byte budget and stop at ~N, matching iperf3's
+  test-wide total (`-n 512K` is now exactly 0.52 MB).
+- **iperf3's `num=0`/`blocks=0` is read as unlimited at server ingest** (#119): a
+  plain `-t` run from an iperf3 client sends `num=0`, which the server decoded as
+  a zero-byte limit (so an iperf3 reverse-duration client received nothing). The
+  server now normalizes `0` to "no limit" on receipt; also fixes a latent UDP
+  `max_duration` mishandling.
+- **The server rejects client-only options, matching iperf3** (#65): running
+  `-s` with a client-only flag (e.g. the `-A n,m` comma form) was silently
+  accepted and ignored; iperf3's server rejects these with `IECLIENTONLY`.
+  riperf3 now rejects exactly iperf3's client-only set for the flags it exposes
+  (adjudicated against iperf3 3.20), at the top of `main()` before any side
+  effects, with iperf3's canonical error text naming the offending flag. (The
+  bare `-A n`, `--cport`, and `-m`/`--mptcp` stay accepted on a server, as iperf3
+  accepts them.)
 
 ### Added
 - **`StreamCounters::peek_sent_interval` / `peek_received_interval`** (#55):
