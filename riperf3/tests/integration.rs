@@ -832,206 +832,6 @@ async fn cpu_affinity_applied() {
 }
 
 // ---------------------------------------------------------------------------
-// Builder coverage tests
-// ---------------------------------------------------------------------------
-
-mod builder_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn client_builder_protocol() {
-        let c = ClientBuilder::new("h")
-            .protocol(TransportProtocol::Udp)
-            .build()
-            .unwrap();
-        assert_eq!(c.protocol, TransportProtocol::Udp);
-    }
-
-    #[test]
-    fn client_builder_duration() {
-        let c = ClientBuilder::new("h").duration(30).build().unwrap();
-        assert_eq!(c.duration, 30);
-    }
-
-    #[test]
-    fn client_builder_num_streams() {
-        let c = ClientBuilder::new("h").num_streams(8).build().unwrap();
-        assert_eq!(c.num_streams, 8);
-    }
-
-    #[test]
-    fn client_builder_blksize() {
-        let c = ClientBuilder::new("h").blksize(65536).build().unwrap();
-        assert_eq!(c.blksize, 65536);
-    }
-
-    #[test]
-    fn client_builder_blksize_defaults() {
-        let tcp = ClientBuilder::new("h").build().unwrap();
-        assert_eq!(tcp.blksize, 128 * 1024);
-
-        let udp = ClientBuilder::new("h")
-            .protocol(TransportProtocol::Udp)
-            .build()
-            .unwrap();
-        assert_eq!(udp.blksize, 1460);
-    }
-
-    #[test]
-    fn client_builder_reverse() {
-        let c = ClientBuilder::new("h").reverse(true).build().unwrap();
-        assert!(c.reverse);
-    }
-
-    #[test]
-    fn client_builder_bidir() {
-        let c = ClientBuilder::new("h").bidir(true).build().unwrap();
-        assert!(c.bidir);
-    }
-
-    #[test]
-    fn client_builder_omit() {
-        let c = ClientBuilder::new("h").omit(3).build().unwrap();
-        assert_eq!(c.omit, 3);
-    }
-
-    #[test]
-    fn client_builder_no_delay() {
-        let c = ClientBuilder::new("h").no_delay(true).build().unwrap();
-        assert!(c.no_delay);
-    }
-
-    #[test]
-    fn client_builder_mss() {
-        let c = ClientBuilder::new("h").mss(1400).build().unwrap();
-        assert_eq!(c.mss, Some(1400));
-    }
-
-    #[test]
-    fn client_builder_window() {
-        let c = ClientBuilder::new("h").window(524288).build().unwrap();
-        assert_eq!(c.window, Some(524288));
-    }
-
-    #[test]
-    fn client_builder_bandwidth() {
-        let c = ClientBuilder::new("h")
-            .bandwidth(1_000_000)
-            .build()
-            .unwrap();
-        assert_eq!(c.bandwidth, 1_000_000);
-    }
-
-    #[test]
-    fn client_builder_tos() {
-        let c = ClientBuilder::new("h").tos(0x10).build().unwrap();
-        assert_eq!(c.tos, 0x10);
-    }
-
-    // Congestion is a Linux/FreeBSD feature (net.rs); gate to match (#76).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    #[test]
-    fn client_builder_congestion() {
-        let c = ClientBuilder::new("h").congestion("bbr").build().unwrap();
-        assert_eq!(c.congestion, Some("bbr".to_string()));
-    }
-
-    #[test]
-    fn client_builder_udp_64bit() {
-        let c = ClientBuilder::new("h")
-            .udp_counters_64bit(true)
-            .build()
-            .unwrap();
-        assert!(c.udp_counters_64bit);
-    }
-
-    #[test]
-    fn client_builder_connect_timeout() {
-        let c = ClientBuilder::new("h")
-            .connect_timeout(Duration::from_millis(500))
-            .build()
-            .unwrap();
-        assert_eq!(c.connect_timeout, Some(Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn client_builder_title() {
-        let c = ClientBuilder::new("h").title("my test").build().unwrap();
-        assert_eq!(c.title, Some("my test".to_string()));
-    }
-
-    #[test]
-    fn client_builder_extra_data() {
-        let c = ClientBuilder::new("h").extra_data("x").build().unwrap();
-        assert_eq!(c.extra_data, Some("x".to_string()));
-    }
-
-    #[test]
-    fn client_builder_verbose() {
-        let c = ClientBuilder::new("h").verbose(true).build().unwrap();
-        assert!(c.verbose);
-    }
-
-    #[test]
-    fn client_builder_json_output() {
-        let c = ClientBuilder::new("h").json_output(true).build().unwrap();
-        assert!(c.json_output);
-    }
-
-    #[test]
-    fn client_builder_bytes() {
-        let c = ClientBuilder::new("h").bytes(1_000_000).build().unwrap();
-        assert_eq!(c.bytes_to_send, Some(1_000_000));
-    }
-
-    #[test]
-    fn client_builder_blocks() {
-        let c = ClientBuilder::new("h").blocks(100).build().unwrap();
-        assert_eq!(c.blocks_to_send, Some(100));
-    }
-
-    #[test]
-    fn server_builder_one_off() {
-        let s = ServerBuilder::new().one_off(true).build().unwrap();
-        assert!(s.one_off);
-    }
-
-    #[test]
-    fn server_builder_verbose() {
-        let s = ServerBuilder::new().verbose(true).build().unwrap();
-        assert!(s.verbose);
-    }
-
-    #[test]
-    fn server_builder_rejects_version_bind_conflict() {
-        // -4/-6 contradicting an explicit -B of the opposite family is an
-        // error, not silently honored (issue #12).
-        assert!(ServerBuilder::new()
-            .ip_version(6)
-            .bind_address("127.0.0.1")
-            .build()
-            .is_err());
-        assert!(ServerBuilder::new()
-            .ip_version(4)
-            .bind_address("::")
-            .build()
-            .is_err());
-        // Matching family, or a non-literal bind, is fine.
-        assert!(ServerBuilder::new()
-            .ip_version(6)
-            .bind_address("::")
-            .build()
-            .is_ok());
-        assert!(ServerBuilder::new()
-            .ip_version(4)
-            .bind_address("0.0.0.0")
-            .build()
-            .is_ok());
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TestConfig from params
 // ---------------------------------------------------------------------------
 
@@ -2006,12 +1806,8 @@ mod stream_id_tests {
 mod implemented_flag_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn format_flag_kbits() {
-        // -f format is wired to Client.format_char and used in reporter
-        let c = ClientBuilder::new("h").format_char('k').build().unwrap();
-        assert_eq!(c.format_char, 'k');
-    }
+    // format_char / mptcp builder-field assertions moved in-crate to
+    // `client::tests` (#43, fields are now pub(crate)).
 
     #[tokio::test]
     async fn udp_counters_64bit_flag() {
@@ -2252,14 +2048,6 @@ mod implemented_flag_tests {
         let _ = server_task.await;
     }
 
-    #[tokio::test]
-    async fn mptcp_flag_accepted() {
-        // MPTCP may not be available on all kernels. Just verify the flag
-        // is wired and the client attempts to use it (may fail with EPROTONOSUPPORT).
-        let c = ClientBuilder::new("h").mptcp(true).build().unwrap();
-        assert!(c.mptcp);
-    }
-
     #[test]
     fn dscp_symbolic_and_numeric() {
         use riperf3::utils::parse_dscp;
@@ -2292,7 +2080,8 @@ mod implemented_flag_tests {
             .dscp("ef")
             .build()
             .unwrap();
-        assert_eq!(client.tos, 46 << 2); // EF mapped to TOS
+        // The dscp->tos mapping is asserted in-crate (client::tests); this test
+        // verifies the flag works end-to-end against a live server.
         let result = client.run().await;
         assert!(result.is_ok(), "--dscp ef failed: {result:?}");
         let _ = server_task.await;
