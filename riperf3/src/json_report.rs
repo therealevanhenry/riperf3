@@ -905,7 +905,14 @@ impl ReportInput {
                     num_streams: self.num_streams,
                     blksize: self.blksize,
                     omit: self.omit,
-                    duration: dur as i32,
+                    // #114: iperf3 zeroes test_start.duration for byte/block-limited
+                    // (-n/-k) runs — the -t window doesn't apply. bytes/blocks below
+                    // carry the actual limit, mirroring iperf3.
+                    duration: if self.bytes > 0 || self.blocks > 0 {
+                        0
+                    } else {
+                        dur as i32
+                    },
                     bytes: self.bytes,
                     blocks: self.blocks,
                     reverse: self.reverse as i32,
@@ -1412,6 +1419,35 @@ mod tests {
         assert_eq!(test_start["interval"], 1.0);
         assert_eq!(test_start["gso"], 0);
         assert_eq!(test_start["gro"], 0);
+    }
+
+    #[test]
+    fn byte_block_limited_zeroes_test_start_duration() {
+        // #114: iperf3 reports test_start.duration=0 for byte/block-limited
+        // (-n/-k) runs — the -t window doesn't apply; the limit lives in
+        // bytes/blocks. A plain -t run keeps the nominal duration.
+        let mk = || {
+            let mut i = base_input();
+            i.streams = vec![tcp_stream(1, true, 10, 10)];
+            i
+        };
+
+        // -n (byte-limited): duration zeroed, bytes carry the limit.
+        let mut n = mk();
+        n.bytes = 50 * 1024 * 1024;
+        let v = serde_json::to_value(n.build()).unwrap();
+        assert_eq!(v["start"]["test_start"]["duration"], 0);
+        assert_eq!(v["start"]["test_start"]["bytes"], 50 * 1024 * 1024);
+
+        // -k (block-limited): duration zeroed.
+        let mut k = mk();
+        k.blocks = 1000;
+        let v = serde_json::to_value(k.build()).unwrap();
+        assert_eq!(v["start"]["test_start"]["duration"], 0);
+
+        // Control: a plain -t run keeps the nominal -t (base_input duration = 10).
+        let v = serde_json::to_value(mk().build()).unwrap();
+        assert_eq!(v["start"]["test_start"]["duration"], 10);
     }
 
     #[test]
