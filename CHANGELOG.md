@@ -180,13 +180,6 @@ the performance campaign carries forward).
 
 Tracked for a follow-up; the notable user-facing ones:
 
-- **Windows UDP `-P`/`--bidir` multi-stream hangs** during stream setup
-  ([#80](https://github.com/therealevanhenry/riperf3/issues/80)). A native-winsock
-  limitation: a connected UDP data socket and the recycled wildcard listener share
-  one port (`SO_REUSEADDR`), and winsock doesn't route a new stream's handshake to
-  the listener the way Linux/BSD do (iperf3 sidesteps this by running under
-  Cygwin). Single-stream UDP is unaffected. The Windows native CI check stays
-  informational until this is fixed.
 - **TCP `--bind-dev` is applied after `connect()`**
   ([#88](https://github.com/therealevanhenry/riperf3/issues/88)), so it may not
   constrain routing for TCP (the UDP path binds before connect). macOS
@@ -212,7 +205,7 @@ sides of the connection.
   `extra_data` field.
 - **Native macOS and Windows CI runners plus a musl build check**, so
   cross-platform behavior is observed rather than assumed. (FreeBSD CI is still
-  outstanding — see Known issues, #39.)
+  outstanding — #39.)
 - **`cargo-semver-checks` gate** in CI (a required check) to catch unintended
   public-API breaks before release.
 
@@ -238,7 +231,7 @@ sides of the connection.
   also validating the server's `-J` output (#50).
 - Linux/Unix-only feature tests are gated by target so the native macOS/Windows
   CI runners pass cleanly (#71, #76). (The macOS `--bind-dev` test is gated
-  pending its underlying fix — see Known issues, #72.)
+  pending its underlying fix — #72.)
 
 ### Known issues
 
@@ -246,39 +239,15 @@ Tracked for a follow-up cleanup after 0.6.0. See the
 [issue tracker](https://github.com/therealevanhenry/riperf3/issues) for the
 complete list; the notable user-facing ones:
 
-- **`-s -D` daemon mode is broken** — a daemonized server listens but never
-  serves, so any client (riperf3 or iperf3) hangs after connecting. Use a
-  foreground `-s` server (or a process manager) until this is fixed.
-  ([#81](https://github.com/therealevanhenry/riperf3/issues/81))
 - **Options accepted but not yet effective** (silent no-ops):
   `--get-server-output` ([#33](https://github.com/therealevanhenry/riperf3/issues/33)),
   `--pacing-timer` ([#32](https://github.com/therealevanhenry/riperf3/issues/32)),
-  `-O`/`--omit` (warm-up isn't excluded from the summary)
-  ([#31](https://github.com/therealevanhenry/riperf3/issues/31)),
-  `-T`/`--title` (doesn't prefix output lines)
-  ([#34](https://github.com/therealevanhenry/riperf3/issues/34)), and UDP
-  `-w`/`--window` ([#59](https://github.com/therealevanhenry/riperf3/issues/59)).
-  The server also accepts client-only flags rather than rejecting them as iperf3
-  does ([#65](https://github.com/therealevanhenry/riperf3/issues/65)).
-- **`-J` fidelity gaps:** `--json-stream` is not valid line-delimited JSON
-  ([#62](https://github.com/therealevanhenry/riperf3/issues/62)); integral
-  floats render as `N.0` where cJSON omits the decimal
-  ([#57](https://github.com/therealevanhenry/riperf3/issues/57)); the final
-  interval is occasionally dropped
-  ([#55](https://github.com/therealevanhenry/riperf3/issues/55)); bidir interval
-  `sum` lumps both directions
-  ([#54](https://github.com/therealevanhenry/riperf3/issues/54));
+  and `-O`/`--omit` (warm-up isn't excluded from the summary)
+  ([#31](https://github.com/therealevanhenry/riperf3/issues/31)).
+- **`-J` fidelity gaps:** bidir interval `sum` lumps both directions
+  ([#54](https://github.com/therealevanhenry/riperf3/issues/54)), and
   `congestion_used` is never populated
   ([#37](https://github.com/therealevanhenry/riperf3/issues/37)).
-- **Platform-specific:** on Windows, `--cport` fails with `WSAEWOULDBLOCK`
-  ([#79](https://github.com/therealevanhenry/riperf3/issues/79)) and UDP
-  `--bidir -P 4` hangs ([#80](https://github.com/therealevanhenry/riperf3/issues/80));
-  on macOS, retransmit counts always read 0
-  ([#40](https://github.com/therealevanhenry/riperf3/issues/40)) and `--bind-dev`
-  is Linux-only ([#72](https://github.com/therealevanhenry/riperf3/issues/72)).
-  The library does not yet compile on NetBSD/OpenBSD/illumos
-  ([#78](https://github.com/therealevanhenry/riperf3/issues/78)), and FreeBSD has
-  no CI coverage ([#39](https://github.com/therealevanhenry/riperf3/issues/39)).
 
 [0.6.1]: https://github.com/therealevanhenry/riperf3/releases/tag/v0.6.1
 [0.6.0]: https://github.com/therealevanhenry/riperf3/releases/tag/v0.6.0
