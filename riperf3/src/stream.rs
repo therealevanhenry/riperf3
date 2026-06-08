@@ -173,6 +173,9 @@ pub struct UdpRecvStats {
     prev_transit: f64,
 
     // Snapshots taken at the end of the omit period so we can subtract them.
+    // Test-only today: only `snapshot_omit` (now `#[cfg(test)]`) writes non-zero
+    // values here; in production these stay at their 0 init until `-O/--omit` is
+    // wired into the UDP receive path (#31).
     #[allow(dead_code)]
     pub omitted_packet_count: i64,
     #[allow(dead_code)]
@@ -230,7 +233,11 @@ impl UdpRecvStats {
 
     /// Snapshot current values as the omit-period baseline.
     /// Call this at the end of the omit period.
-    #[allow(dead_code)]
+    ///
+    /// Test-only today: `-O/--omit` is not yet wired into the UDP receive path
+    /// (#31), so production never calls this; the unit tests exercise it so the
+    /// omit-accounting fields stay correct for when #31 lands.
+    #[cfg(test)]
     pub fn snapshot_omit(&mut self) {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;

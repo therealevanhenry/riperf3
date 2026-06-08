@@ -389,9 +389,9 @@ pub fn configure_tcp_stream_full(
             unsafe {
                 windows_sys::Win32::Networking::WinSock::setsockopt(
                     raw as usize,
-                    windows_sys::Win32::Networking::WinSock::IPPROTO_TCP as i32,
-                    windows_sys::Win32::Networking::WinSock::TCP_MAXSEG as i32,
-                    &(mss_val as i32) as *const i32 as *const u8,
+                    windows_sys::Win32::Networking::WinSock::IPPROTO_TCP,
+                    windows_sys::Win32::Networking::WinSock::TCP_MAXSEG,
+                    &mss_val as *const i32 as *const u8,
                     std::mem::size_of::<i32>() as i32,
                 );
             }
@@ -569,8 +569,8 @@ pub fn set_dont_fragment(fd: &impl std::os::windows::io::AsSocket) -> Result<()>
     let ret = unsafe {
         windows_sys::Win32::Networking::WinSock::setsockopt(
             raw as usize,
-            windows_sys::Win32::Networking::WinSock::IPPROTO_IP as i32,
-            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT as i32,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
+            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT,
             &val as *const i32 as *const u8,
             std::mem::size_of::<i32>() as i32,
         )

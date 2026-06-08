@@ -11,8 +11,6 @@ pub const DEFAULT_NUM_STREAMS: u32 = 1;
 pub const DEFAULT_TCP_BLKSIZE: usize = 128 * 1024; // 128 KiB
 pub const DEFAULT_UDP_BLKSIZE: usize = 1460;
 pub const DEFAULT_UDP_RATE: u64 = 1024 * 1024; // 1 Mbit/sec in bits
-#[allow(dead_code)]
-pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
