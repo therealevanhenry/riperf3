@@ -426,11 +426,20 @@ pub fn spawn_interval_reporter(
     reporter_end: Arc<ReporterEnd>,
     collector: Option<Arc<Mutex<CollectedIntervals>>>,
 ) -> Option<JoinHandle<()>> {
-    if config.interval_secs <= 0.0 {
+    if config.interval_secs < 0.0 {
         return None;
     }
 
-    let interval_dur = Duration::from_secs_f64(config.interval_secs);
+    // `-i 0` (#107) means "one interval = the whole test" in iperf3, not "no
+    // intervals". Use a period that won't fire within any realistic test so the
+    // periodic tick never runs; the end-of-test flush (#55, below) then emits a
+    // single [0, duration] interval (interval_num stays 0). A zero tokio
+    // interval period panics, so it can't be `from_secs_f64(0.0)`.
+    let interval_dur = if config.interval_secs > 0.0 {
+        Duration::from_secs_f64(config.interval_secs)
+    } else {
+        Duration::from_secs(365 * 24 * 60 * 60)
+    };
     let has_retransmits = tcp_info::has_retransmit_info()
         && config.protocol == TransportProtocol::Tcp
         && streams.iter().any(|s| s.is_sender);
@@ -1096,7 +1105,11 @@ mod interval_reporter_tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn disabled_returns_none() {
+    async fn zero_interval_spawns_whole_test_reporter() {
+        // #107: `-i 0` means "one interval = the whole test" (iperf3 parity), so
+        // the reporter IS spawned — it flushes a single [0, duration] interval at
+        // end rather than ticking periodically. Only a negative interval is
+        // rejected (see negative_interval_returns_none).
         let done = Arc::new(AtomicBool::new(false));
         let config = IntervalReporterConfig {
             interval_secs: 0.0,
@@ -1112,7 +1125,7 @@ mod interval_reporter_tests {
         };
         assert!(
             spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
-                .is_none()
+                .is_some()
         );
     }
 
@@ -1248,6 +1261,79 @@ mod interval_reporter_tests {
             "final interval must be a sub-interval partial; start={} end={} dur={dur}",
             last.sum.start,
             last.sum.end
+        );
+    }
+
+    /// #107: with `-i 0`, the reporter must emit exactly ONE interval covering
+    /// the whole test (`[0, duration]`, all bytes) — not zero, and not periodic
+    /// samples. Drives bytes across what would be several 1s intervals, then ends;
+    /// no periodic tick may fire, and the single flushed interval carries the lot.
+    #[tokio::test]
+    async fn zero_interval_emits_single_whole_test_interval() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: true,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: None,
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: 0.0, // -i 0
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: false, // collect-only; assert on the collector
+            blksize: 128 * 1024,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let report_start = std::time::Instant::now();
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+        )
+        .expect("reporter spawns for -i 0 (#107)");
+
+        // Accrue bytes across ~600ms (would be several 1s ticks); none must fire.
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        counters.record_sent(2000);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        reporter_end.finish(report_start.elapsed().as_secs_f64());
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        assert_eq!(
+            g.intervals.len(),
+            1,
+            "-i 0 must emit exactly one whole-test interval, got {}",
+            g.intervals.len()
+        );
+        let only = &g.intervals[0];
+        assert_eq!(
+            only.sum.bytes, 3000,
+            "whole-test interval carries all bytes"
+        );
+        assert_eq!(only.sum.start, 0.0, "whole-test interval starts at 0");
+        assert!(
+            only.sum.end > 0.0,
+            "whole-test interval ends at the measured duration; got {}",
+            only.sum.end
         );
     }
 

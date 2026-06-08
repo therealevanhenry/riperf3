@@ -120,14 +120,15 @@ fn json_byte_limited_summary_uses_measured_elapsed() {
         "bits_per_second {bps} should match bytes*8/seconds {expected_bps}"
     );
 
-    // The `-t` parameter under start.test_start is unchanged (still the nominal
-    // default), distinct from the measured summary window.
+    // For a byte-limited (-n) run, iperf3 zeroes start.test_start.duration — the
+    // -t window doesn't apply (#114). Distinct from the measured summary window
+    // above, which uses the real elapsed (#103).
     let param = v["start"]["test_start"]["duration"]
         .as_f64()
         .unwrap_or_else(|| panic!("missing start.test_start.duration: {out}"));
-    assert!(
-        param >= 5.0,
-        "test_start.duration {param} should stay the nominal -t param, not the measured elapsed"
+    assert_eq!(
+        param, 0.0,
+        "test_start.duration should be 0 for a byte-limited (-n) run (#114), got {param}"
     );
 }
 
@@ -179,9 +180,9 @@ fn server_json_byte_limited_summary_uses_measured_elapsed() {
     let param = v["start"]["test_start"]["duration"]
         .as_f64()
         .unwrap_or_else(|| panic!("missing start.test_start.duration: {out}"));
-    assert!(
-        param >= 5.0,
-        "server test_start.duration {param} should stay the nominal -t param"
+    assert_eq!(
+        param, 0.0,
+        "server test_start.duration should be 0 for a byte-limited (-n) run (#114), got {param}"
     );
 }
 
