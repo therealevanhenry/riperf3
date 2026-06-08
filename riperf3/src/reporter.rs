@@ -16,9 +16,11 @@ pub struct StreamInterval {
     pub start: f64,
     pub end: f64,
     pub bytes: u64,
+    #[allow(dead_code)]
     pub is_sender: bool,
     pub retransmits: Option<i64>,
     pub snd_cwnd: Option<u64>,
+    #[allow(dead_code)]
     pub rtt: Option<u32>,
     // UDP specific
     pub jitter: Option<f64>,
@@ -203,6 +205,7 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
 }
 
 /// Print a single final summary line.
+#[allow(dead_code)]
 pub fn print_summary(summary: &StreamSummary, format_char: char) {
     titled(format_args!(
         "{}",
@@ -1077,5 +1080,311 @@ mod tests {
         let line = format_summary_line(&s, 'm');
         assert!(line.contains(" 12 "), "Retr value should appear: {line}");
         assert!(line.ends_with("sender"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interval reporter edge cases (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod interval_reporter_tests {
+    use crate::protocol::TransportProtocol;
+    use crate::reporter::{spawn_interval_reporter, IntervalReporterConfig, ReporterEnd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn disabled_returns_none() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: 0.0,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
+        };
+        assert!(
+            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_interval_returns_none() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: -1.0,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
+        };
+        assert!(
+            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_streams_doesnt_panic() {
+        let done = Arc::new(AtomicBool::new(false));
+        let config = IntervalReporterConfig {
+            interval_secs: 0.5,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 0,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: true,
+            blksize: 128 * 1024,
+        };
+        let handle = spawn_interval_reporter(
+            config,
+            vec![],
+            done.clone(),
+            Arc::new(ReporterEnd::new()),
+            None,
+        );
+        assert!(handle.is_some());
+        // Let it tick once then stop via the `done` fallback (no `finish`).
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        done.store(true, Ordering::Relaxed);
+        if let Some(h) = handle {
+            let _ = h.await;
+        }
+    }
+
+    /// #55: a test that ends part-way through an interval must still emit a
+    /// final partial interval carrying the residual bytes, rather than dropping
+    /// it. Drives two full intervals, then a partial third, and asserts the last
+    /// collected interval is the short partial (residual bytes, sub-interval
+    /// duration) — not a full interval and not missing entirely.
+    #[tokio::test]
+    async fn final_partial_interval_is_emitted() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: true,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: None,
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: false, // collect-only; assert on the collector
+            blksize: 128 * 1024,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let report_start = std::time::Instant::now();
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+        )
+        .expect("reporter spawns for a positive interval");
+
+        // Two full intervals, each draining 1000 bytes at its tick. The 650ms
+        // sleeps give ~150ms slack so each tick lands before the next batch.
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5 -> [0,0.5]=1000
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @1.0 -> [0.5,1.0]=1000
+
+        // Partial third interval: residual bytes, then end mid-interval (well
+        // before the @1.5 tick) by signalling the authoritative end time, exactly
+        // as the client/server driver does.
+        counters.record_sent(500);
+        tokio::time::sleep(Duration::from_millis(120)).await; // ~1.42s
+        reporter_end.finish(report_start.elapsed().as_secs_f64());
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        let n = g.intervals.len();
+        assert!(n >= 1, "expected at least one collected interval");
+        let last = &g.intervals[n - 1];
+        // The defining property of the fix: the last interval is the short
+        // partial holding the 500 residual bytes — pre-fix it was dropped, so
+        // the last interval would be a full [0.5,1.0]=1000 instead.
+        assert_eq!(
+            last.sum.bytes, 500,
+            "final partial must carry the residual 500 bytes; got {} (intervals={n})",
+            last.sum.bytes
+        );
+        let dur = last.sum.end - last.sum.start;
+        assert!(
+            dur > 0.0 && dur < interval,
+            "final interval must be a sub-interval partial; start={} end={} dur={dur}",
+            last.sum.start,
+            last.sum.end
+        );
+    }
+
+    /// #55 guard: a run that ends exactly on an interval boundary must NOT emit a
+    /// trailing partial — even when the sender is still writing into the socket
+    /// at that instant (the saturating-TCP case). Records "slack" bytes after the
+    /// last tick to model the live sender, then finishes on the boundary; the
+    /// zero-length remainder must be dropped, so the slack bytes never surface as
+    /// a spurious interval.
+    #[tokio::test]
+    async fn no_spurious_partial_when_ending_on_boundary() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: true,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: None,
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: false,
+            blksize: 128 * 1024,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+        )
+        .expect("reporter spawns for a positive interval");
+
+        // Two full intervals.
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @1.0, now ~1.3s
+
+        // Live sender: bytes are still landing right as the run ends on the 1.0s
+        // boundary. The authoritative end time is exactly 1.0, so the remainder is
+        // zero-length and must be dropped despite these residual bytes.
+        counters.record_sent(777);
+        reporter_end.finish(1.0);
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        assert_eq!(
+            g.intervals.len(),
+            2,
+            "no trailing partial when ending on a boundary; got {} intervals",
+            g.intervals.len()
+        );
+        let last = g.intervals.last().unwrap();
+        assert_eq!(
+            last.sum.bytes, 1000,
+            "last interval is the full [0.5,1.0]; the 777 slack bytes are not a new interval"
+        );
+    }
+
+    /// #55 receiver-side guard: a receiver whose `end_secs` trails the last
+    /// boundary (the control round-trip that delivers TEST_END) but whose tail
+    /// has no residual bytes (the peer already stopped) must not emit a trailing
+    /// empty interval. Mirrors the server's situation.
+    #[tokio::test]
+    async fn no_partial_for_receiver_with_no_residual() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: false, // receiver side
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: None,
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            num_streams: 1,
+            forceflush: false,
+            timestamp_format: None,
+            json_stream: false,
+            print: false,
+            blksize: 128 * 1024,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+        )
+        .expect("reporter spawns for a positive interval");
+
+        // One full interval of received bytes, then the peer stops: no further
+        // bytes arrive before the run ends.
+        counters.record_received(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5 -> [0,0.5]=1000
+
+        // end_secs trails the 0.5 boundary (as TEST_END would), but the tail is
+        // empty — the residual-bytes guard must drop it.
+        reporter_end.finish(0.62);
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        assert_eq!(
+            g.intervals.len(),
+            1,
+            "no trailing empty interval for an idle receiver tail; got {} intervals",
+            g.intervals.len()
+        );
     }
 }

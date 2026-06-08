@@ -27,7 +27,9 @@ pub struct TestConfig {
 }
 
 impl TestConfig {
-    pub fn from_params(params: &TestParams) -> Self {
+    // Crate-internal: takes the wire `TestParams` (now `pub(crate)` per #67),
+    // so it cannot be part of the public API.
+    pub(crate) fn from_params(params: &TestParams) -> Self {
         let is_udp = params.udp.unwrap_or(false);
         let protocol = if is_udp {
             TransportProtocol::Udp
@@ -1656,5 +1658,116 @@ mod tests {
             let s = ServerBuilder::new().port(Some(1234)).build().unwrap();
             assert_eq!(s.port, 1234);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestConfig param resolution (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test_config_tests {
+    use crate::protocol::{TestParams, TransportProtocol};
+    use crate::TestConfig;
+
+    #[test]
+    fn tcp_defaults() {
+        let p = TestParams {
+            tcp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.protocol, TransportProtocol::Tcp);
+        assert_eq!(cfg.duration, 10);
+        assert_eq!(cfg.num_streams, 1);
+        assert_eq!(cfg.blksize, 128 * 1024);
+        assert!(!cfg.reverse);
+        assert!(!cfg.bidir);
+    }
+
+    #[test]
+    fn udp_defaults() {
+        let p = TestParams {
+            udp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.protocol, TransportProtocol::Udp);
+        assert_eq!(cfg.blksize, 1460);
+    }
+
+    #[test]
+    fn full_params() {
+        let p = TestParams {
+            tcp: Some(true),
+            time: Some(30),
+            parallel: Some(4),
+            len: Some(65536),
+            reverse: Some(true),
+            bidirectional: Some(true),
+            omit: Some(2),
+            nodelay: Some(true),
+            mss: Some(1400),
+            window: Some(524288),
+            bandwidth: Some(1_000_000_000),
+            tos: Some(0x10),
+            congestion: Some("bbr".to_string()),
+            udp_counters_64bit: Some(1),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.duration, 30);
+        assert_eq!(cfg.num_streams, 4);
+        assert_eq!(cfg.blksize, 65536);
+        assert!(cfg.reverse);
+        assert!(cfg.bidir);
+        assert_eq!(cfg.omit, 2);
+        assert!(cfg.no_delay);
+        assert_eq!(cfg.mss, Some(1400));
+        assert_eq!(cfg.window, Some(524288));
+        assert_eq!(cfg.bandwidth, 1_000_000_000);
+        assert_eq!(cfg.tos, 0x10);
+        assert_eq!(cfg.congestion, Some("bbr".to_string()));
+        assert!(cfg.udp_counters_64bit);
+    }
+
+    // -- server mirrors the client's rate resolution (#17) --
+
+    #[test]
+    fn udp_absent_bandwidth_is_unlimited() {
+        // iperf3 omits the `bandwidth` param only for -b 0 (unlimited) and sends
+        // it explicitly otherwise (incl. its 1 Mbit/s default); riperf3 clients
+        // always send it. So an ABSENT bandwidth means unlimited (0), matching
+        // iperf3 — NOT the 1 Mbit/s default. Defaulting to 1M throttled an
+        // iperf3 `-b 0` reverse/bidir client's server-side sender (#21).
+        let p = TestParams {
+            udp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 0);
+    }
+
+    #[test]
+    fn udp_explicit_zero_bandwidth_is_unlimited() {
+        // -b 0 carried in params → unlimited server-side, so reverse/bidir
+        // runs flat-out instead of being throttled to 1 Mbit/s.
+        let p = TestParams {
+            udp: Some(true),
+            bandwidth: Some(0),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 0);
+    }
+
+    #[test]
+    fn tcp_absent_bandwidth_is_unlimited() {
+        let p = TestParams {
+            tcp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&p);
+        assert_eq!(cfg.bandwidth, 0);
     }
 }

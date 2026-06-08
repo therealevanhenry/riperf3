@@ -6,12 +6,14 @@ pub struct TcpInfoSnapshot {
     /// Send congestion window in bytes (`tcpi_snd_cwnd * tcpi_snd_mss`).
     pub snd_cwnd: u64,
     /// Send window advertised by the receiver, in bytes.
+    #[allow(dead_code)]
     pub snd_wnd: u64,
     /// Smoothed round-trip time in microseconds.
     pub rtt: u32,
     /// RTT variance in microseconds.
     pub rttvar: u32,
     /// Sender maximum segment size.
+    #[allow(dead_code)]
     pub snd_mss: u32,
     /// Path MTU.
     pub pmtu: u32,

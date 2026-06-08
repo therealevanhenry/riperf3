@@ -173,8 +173,11 @@ pub struct UdpRecvStats {
     prev_transit: f64,
 
     // Snapshots taken at the end of the omit period so we can subtract them.
+    #[allow(dead_code)]
     pub omitted_packet_count: i64,
+    #[allow(dead_code)]
     pub omitted_cnt_error: i64,
+    #[allow(dead_code)]
     pub omitted_outoforder_packets: i64,
 }
 
@@ -227,6 +230,7 @@ impl UdpRecvStats {
 
     /// Snapshot current values as the omit-period baseline.
     /// Call this at the end of the omit period.
+    #[allow(dead_code)]
     pub fn snapshot_omit(&mut self) {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;
@@ -756,6 +760,9 @@ async fn run_tcp_receiver_normal(
 
 /// UDP sender: sends datagrams with a timestamp+sequence header, paced by the
 /// rate limiter if present.
+// Unwired async variant (prod uses the blocking/sendmmsg senders); kept in
+// parity with run_udp_receiver. Retract/gate decision tracked in #125.
+#[allow(dead_code)]
 pub async fn run_udp_sender(
     socket: UdpSocket,
     counters: Arc<StreamCounters>,
@@ -787,6 +794,9 @@ pub async fn run_udp_sender(
 }
 
 /// UDP receiver: receives datagrams, counts bytes, and tracks jitter/loss/OOO.
+// Unwired async variant (see the parity note in its drain block); kept
+// alongside run_udp_sender. Retract/gate decision tracked in #125.
+#[allow(dead_code)]
 pub async fn run_udp_receiver(
     socket: UdpSocket,
     counters: Arc<StreamCounters>,
@@ -2228,5 +2238,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         };
         assert!(res.is_ok(), "receiver returned error: {res:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UDP edge cases (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod udp_edge_tests {
+    use crate::stream::{UdpHeader, UdpRecvStats};
+
+    #[test]
+    fn udp_header_32bit_sequence_max() {
+        let h = UdpHeader {
+            sec: 0,
+            usec: 0,
+            seq: u32::MAX as u64,
+        };
+        let mut buf = [0u8; 16];
+        h.write_to(&mut buf, false);
+        let h2 = UdpHeader::read_from(&buf, false).unwrap();
+        assert_eq!(h2.seq, u32::MAX as u64);
+    }
+
+    #[test]
+    fn udp_header_64bit_sequence_max() {
+        let h = UdpHeader {
+            sec: 0,
+            usec: 0,
+            seq: u64::MAX,
+        };
+        let mut buf = [0u8; 16];
+        h.write_to(&mut buf, true);
+        let h2 = UdpHeader::read_from(&buf, true).unwrap();
+        assert_eq!(h2.seq, u64::MAX);
+    }
+
+    #[test]
+    fn udp_stats_massive_gap() {
+        // Simulate losing 1000 packets at once
+        let mut stats = UdpRecvStats::new();
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.0,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1002,
+            },
+            1.0,
+        );
+        assert_eq!(stats.cnt_error, 1000);
+        assert_eq!(stats.packet_count, 1002);
+    }
+
+    #[test]
+    fn udp_stats_duplicate_packet() {
+        let mut stats = UdpRecvStats::new();
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.0,
+        );
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 2,
+            },
+            0.001,
+        );
+        // Duplicate of packet 1
+        stats.update(
+            &UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: 1,
+            },
+            0.002,
+        );
+        assert_eq!(stats.outoforder_packets, 1);
+        assert_eq!(stats.packet_count, 2);
     }
 }

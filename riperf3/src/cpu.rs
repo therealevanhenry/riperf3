@@ -73,8 +73,11 @@ pub struct CpuUtilization {
     pub host_total: f64,
     pub host_user: f64,
     pub host_system: f64,
+    #[allow(dead_code)]
     pub remote_total: f64,
+    #[allow(dead_code)]
     pub remote_user: f64,
+    #[allow(dead_code)]
     pub remote_system: f64,
 }
 
