@@ -5,6 +5,7 @@ use thiserror::Error;
 /// Configuration errors — validation failures when building Client/Server.
 /// Kept separate so existing tests that match on these variants continue to work.
 #[derive(Error, Debug, PartialEq)]
+#[non_exhaustive] // future validation variants must be additive, not breaking (#100, #45)
 pub enum ConfigError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
@@ -18,6 +19,7 @@ pub enum ConfigError {
 
 /// Runtime errors covering I/O, protocol, and JSON failures.
 #[derive(Error, Debug)]
+#[non_exhaustive] // future error variants must be additive, not breaking
 pub enum RiperfError {
     #[error("{0}")]
     Config(#[from] ConfigError),

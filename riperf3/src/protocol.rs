@@ -93,6 +93,7 @@ impl TestState {
 
 /// Which data-plane transport to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive] // a future transport (e.g. SCTP) must be additive, not breaking
 pub enum TransportProtocol {
     #[default]
     Tcp,
@@ -329,6 +330,7 @@ where
 
 /// Per-stream result data included in the results JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive] // result model: consumers read it; future fields must be additive
 pub struct StreamResultJson {
     pub id: i32,
     pub bytes: u64,
@@ -348,6 +350,7 @@ pub struct StreamResultJson {
 
 /// Top-level results JSON exchanged between client and server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive] // result model: consumers read it; future fields must be additive
 pub struct TestResultsJson {
     pub cpu_util_total: f64,
     pub cpu_util_user: f64,
@@ -1167,6 +1170,39 @@ mod protocol_tests {
         assert_eq!(v["TOS"], 16);
         assert_eq!(v["congestion"], "bbr");
         assert_eq!(v["client_version"], "riperf3 0.1.0");
+    }
+
+    // Migrated in-crate when TestResultsJson/StreamResultJson became
+    // #[non_exhaustive] (an external test crate can no longer construct them).
+    #[test]
+    fn test_results_json_structure() {
+        let r = TestResultsJson {
+            cpu_util_total: 50.0,
+            cpu_util_user: 40.0,
+            cpu_util_system: 10.0,
+            sender_has_retransmits: 5,
+            congestion_used: Some("cubic".to_string()),
+            streams: vec![StreamResultJson {
+                id: 1,
+                bytes: 10_000_000_000,
+                retransmits: 5,
+                jitter: 0.001,
+                errors: 2,
+                omitted_errors: 0,
+                packets: 10000,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: 10.0,
+            }],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cpu_util_total"], 50.0);
+        assert_eq!(v["sender_has_retransmits"], 5);
+        assert_eq!(v["congestion_used"], "cubic");
+        assert_eq!(v["streams"][0]["id"], 1);
+        assert_eq!(v["streams"][0]["bytes"], 10_000_000_000u64);
+        assert_eq!(v["streams"][0]["retransmits"], 5);
     }
 }
 

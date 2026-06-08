@@ -35,7 +35,9 @@ mod client;
 pub use client::{Client, ClientBuilder};
 
 mod server;
-pub use server::{Server, ServerBuilder, TestConfig};
+// TestConfig is server-internal (built from received wire params, not used in
+// any public signature); it stays crate-private rather than a public type (#67).
+pub use server::{Server, ServerBuilder};
 
 // The wire protocol enum and the result model returned by `Client::run()`.
 pub use protocol::{StreamResultJson, TestResultsJson, TransportProtocol};

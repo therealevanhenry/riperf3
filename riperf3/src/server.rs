@@ -9,7 +9,9 @@ use crate::stream::{self, DataStream, StreamCounters, UdpRecvStats};
 use crate::utils::*;
 
 /// Shared test configuration derived from the client's parameter JSON.
-pub struct TestConfig {
+/// Crate-internal (#67): retracted from the public API, so `pub(crate)` keeps a
+/// future stray `pub use` from silently re-leaking it.
+pub(crate) struct TestConfig {
     pub protocol: TransportProtocol,
     pub duration: u32,
     pub num_streams: u32,
@@ -1667,8 +1669,8 @@ mod tests {
 
 #[cfg(test)]
 mod test_config_tests {
+    use super::TestConfig;
     use crate::protocol::{TestParams, TransportProtocol};
-    use crate::TestConfig;
 
     #[test]
     fn tcp_defaults() {
