@@ -173,6 +173,9 @@ pub struct UdpRecvStats {
     prev_transit: f64,
 
     // Snapshots taken at the end of the omit period so we can subtract them.
+    // Test-only today: only `snapshot_omit` (now `#[cfg(test)]`) writes non-zero
+    // values here; in production these stay at their 0 init until `-O/--omit` is
+    // wired into the UDP receive path (#31).
     #[allow(dead_code)]
     pub omitted_packet_count: i64,
     #[allow(dead_code)]
