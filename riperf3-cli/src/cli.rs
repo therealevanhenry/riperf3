@@ -721,20 +721,11 @@ mod cli_tests {
             if let Some(ref path) = cli.file {
                 b = b.file(path);
             }
-            if let Some(ref spec) = cli.affinity {
-                b = b.affinity(spec);
-            }
             if let Some(ref spec) = cli.cntl_ka {
                 b = b.cntl_ka(spec);
             }
             if let Some(ref val) = cli.dscp {
                 b = b.dscp(val);
-            }
-            if let Some(ref path) = cli.pidfile {
-                b = b.pidfile(path);
-            }
-            if let Some(ref path) = cli.logfile {
-                b = b.logfile(path);
             }
             b.build().unwrap()
         }
@@ -1342,21 +1333,8 @@ mod cli_tests {
             );
         }
 
-        // build() rejects -A/--affinity (CPU affinity) on non-Unix, so gate the
-        // wiring test to match.
-        #[cfg(unix)]
-        #[test]
-        fn affinity_wired() {
-            let cli = Cli::parse_from(["riperf3", "-c", "h", "-A", "2,3"]);
-            let c = build_client_from_cli(&cli);
-            assert_eq!(
-                c,
-                riperf3::ClientBuilder::new("h")
-                    .affinity("2,3")
-                    .build()
-                    .unwrap()
-            );
-        }
+        // affinity/pidfile/logfile builder setters were pruned (#122) — the CLI
+        // realizes those at the process level, not via the builder.
 
         #[test]
         fn json_stream_wired() {
@@ -1366,32 +1344,6 @@ mod cli_tests {
                 c,
                 riperf3::ClientBuilder::new("h")
                     .json_stream(true)
-                    .build()
-                    .unwrap()
-            );
-        }
-
-        #[test]
-        fn pidfile_wired() {
-            let cli = Cli::parse_from(["riperf3", "-c", "h", "-I", "/tmp/pid"]);
-            let c = build_client_from_cli(&cli);
-            assert_eq!(
-                c,
-                riperf3::ClientBuilder::new("h")
-                    .pidfile("/tmp/pid")
-                    .build()
-                    .unwrap()
-            );
-        }
-
-        #[test]
-        fn logfile_wired() {
-            let cli = Cli::parse_from(["riperf3", "-c", "h", "--logfile", "/tmp/log"]);
-            let c = build_client_from_cli(&cli);
-            assert_eq!(
-                c,
-                riperf3::ClientBuilder::new("h")
-                    .logfile("/tmp/log")
                     .build()
                     .unwrap()
             );

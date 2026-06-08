@@ -52,9 +52,8 @@ pub struct Client {
     pub(crate) sendmmsg: bool,
     pub(crate) dont_fragment: bool,
     pub(crate) cport: Option<u16>,
-    // Builder-settable but never read by `run()` — the CLI realizes these
-    // elsewhere (affinity via `set_cpu_affinity`, pidfile/logfile pre-runtime)
-    // or they are currently no-ops. Prune-vs-wire tracked in #122.
+    // Set by the builder but not yet consumed by `run()`; to be wired into the
+    // library as non-breaking 0.7.x work — get_server_output (#33), dscp below.
     #[allow(dead_code)]
     pub(crate) get_server_output: bool,
     pub(crate) forceflush: bool,
@@ -69,17 +68,11 @@ pub struct Client {
     pub(crate) rcv_timeout: Option<u64>,
     pub(crate) snd_timeout: Option<u64>,
     pub(crate) file: Option<String>,
-    #[allow(dead_code)] // realized by the CLI, not `run()`; see #122
-    pub(crate) affinity: Option<String>,
-    #[allow(dead_code)] // never applied by `run()` (only `tos` is); see #122
+    #[allow(dead_code)] // not yet applied by `run()` (only `tos` is); wire in 0.7.x
     pub(crate) dscp: Option<String>,
     pub(crate) format_char: char,
     pub(crate) interval: Option<f64>,
     pub(crate) cntl_ka: Option<String>,
-    #[allow(dead_code)] // CLI writes the pidfile pre-runtime, not the library; see #122
-    pub(crate) pidfile: Option<String>,
-    #[allow(dead_code)] // CLI redirects stdout pre-runtime, not the library; see #122
-    pub(crate) logfile: Option<String>,
     pub(crate) username: Option<String>,
     pub(crate) password: Option<String>,
     pub(crate) rsa_public_key_path: Option<String>,
@@ -1281,13 +1274,10 @@ pub struct ClientBuilder {
     rcv_timeout: Option<u64>,
     snd_timeout: Option<u64>,
     file: Option<String>,
-    affinity: Option<String>,
     dscp: Option<String>,
     format_char: char,
     interval: Option<f64>,
     cntl_ka: Option<String>,
-    pidfile: Option<String>,
-    logfile: Option<String>,
     username: Option<String>,
     password: Option<String>,
     rsa_public_key_path: Option<String>,
@@ -1340,13 +1330,10 @@ impl Default for ClientBuilder {
             rcv_timeout: None,
             snd_timeout: None,
             file: None,
-            affinity: None,
             dscp: None,
             format_char: 'a',
             interval: None,
             cntl_ka: None,
-            pidfile: None,
-            logfile: None,
             username: None,
             password: None,
             rsa_public_key_path: None,
@@ -1588,11 +1575,6 @@ impl ClientBuilder {
         self
     }
 
-    pub fn affinity(mut self, spec: &str) -> Self {
-        self.affinity = Some(spec.to_string());
-        self
-    }
-
     pub fn dscp(mut self, val: &str) -> Self {
         self.dscp = Some(val.to_string());
         self
@@ -1610,16 +1592,6 @@ impl ClientBuilder {
 
     pub fn cntl_ka(mut self, spec: &str) -> Self {
         self.cntl_ka = Some(spec.to_string());
-        self
-    }
-
-    pub fn pidfile(mut self, path: &str) -> Self {
-        self.pidfile = Some(path.to_string());
-        self
-    }
-
-    pub fn logfile(mut self, path: &str) -> Self {
-        self.logfile = Some(path.to_string());
         self
     }
 
@@ -1697,11 +1669,6 @@ impl ClientBuilder {
             if self.zerocopy {
                 return Err(ConfigError::Unsupported(
                     "this OS does not support sendfile".into(),
-                ));
-            }
-            if self.affinity.is_some() {
-                return Err(ConfigError::Unsupported(
-                    "CPU affinity is not supported on this platform".into(),
                 ));
             }
             if self.bind_dev.is_some() {
@@ -1794,13 +1761,10 @@ impl ClientBuilder {
             rcv_timeout: self.rcv_timeout,
             snd_timeout: self.snd_timeout,
             file: self.file,
-            affinity: self.affinity,
             dscp: self.dscp,
             format_char: self.format_char,
             interval: self.interval,
             cntl_ka: self.cntl_ka,
-            pidfile: self.pidfile,
-            logfile: self.logfile,
             username: self.username,
             password: self.password,
             rsa_public_key_path: self.rsa_public_key_path,

@@ -239,20 +239,11 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(ref path) = cli.file {
             builder = builder.file(path);
         }
-        if let Some(ref spec) = cli.affinity {
-            builder = builder.affinity(spec);
-        }
         if let Some(ref val) = cli.dscp {
             builder = builder.dscp(val);
         }
         if let Some(ref spec) = cli.cntl_ka {
             builder = builder.cntl_ka(spec);
-        }
-        if let Some(ref path) = cli.pidfile {
-            builder = builder.pidfile(path);
-        }
-        if let Some(ref path) = cli.logfile {
-            builder = builder.logfile(path);
         }
         if let Some(ref name) = cli.username {
             builder = builder.username(name);
@@ -298,12 +289,6 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         }
         if let Some(secs) = cli.server_max_duration {
             builder = builder.server_max_duration(secs);
-        }
-        if let Some(ref path) = cli.pidfile {
-            builder = builder.pidfile(path);
-        }
-        if let Some(ref path) = cli.logfile {
-            builder = builder.logfile(path);
         }
         if cli.forceflush {
             builder = builder.forceflush(true);

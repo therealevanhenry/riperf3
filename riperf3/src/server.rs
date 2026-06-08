@@ -86,12 +86,6 @@ pub struct Server {
     pub(crate) idle_timeout: Option<u32>,
     pub(crate) server_bitrate_limit: Option<u64>,
     pub(crate) server_max_duration: Option<u32>,
-    // Builder-settable but never read by `run()` — the CLI writes the pidfile
-    // and redirects stdout pre-runtime, not the library. Prune-vs-wire in #122.
-    #[allow(dead_code)]
-    pub(crate) pidfile: Option<String>,
-    #[allow(dead_code)] // see above / #122
-    pub(crate) logfile: Option<String>,
     pub(crate) forceflush: bool,
     pub(crate) bind_address: Option<String>,
     pub(crate) ip_version: Option<u8>,
@@ -1359,8 +1353,6 @@ pub struct ServerBuilder {
     idle_timeout: Option<u32>,
     server_bitrate_limit: Option<u64>,
     server_max_duration: Option<u32>,
-    pidfile: Option<String>,
-    logfile: Option<String>,
     forceflush: bool,
     bind_address: Option<String>,
     ip_version: Option<u8>,
@@ -1383,8 +1375,6 @@ impl Default for ServerBuilder {
             idle_timeout: None,
             server_bitrate_limit: None,
             server_max_duration: None,
-            pidfile: None,
-            logfile: None,
             forceflush: false,
             bind_address: None,
             ip_version: None,
@@ -1444,16 +1434,6 @@ impl ServerBuilder {
 
     pub fn server_max_duration(mut self, secs: u32) -> Self {
         self.server_max_duration = Some(secs);
-        self
-    }
-
-    pub fn pidfile(mut self, path: &str) -> Self {
-        self.pidfile = Some(path.to_string());
-        self
-    }
-
-    pub fn logfile(mut self, path: &str) -> Self {
-        self.logfile = Some(path.to_string());
         self
     }
 
@@ -1540,8 +1520,6 @@ impl ServerBuilder {
             idle_timeout: self.idle_timeout,
             server_bitrate_limit: self.server_bitrate_limit,
             server_max_duration: self.server_max_duration,
-            pidfile: self.pidfile,
-            logfile: self.logfile,
             forceflush: self.forceflush,
             bind_address: self.bind_address,
             ip_version: self.ip_version,
