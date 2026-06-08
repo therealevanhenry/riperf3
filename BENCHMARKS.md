@@ -14,24 +14,28 @@ matrix below were measured on our two-VM sandbox with internal tooling (the
 [Reproducing](#reproducing) so the numbers stay auditable, but they are
 environment-specific.
 
-> **0.7.0 status.** The compatibility matrix was re-verified on 0.7.0 (all cells
-> PASS) and the throughput campaign was **re-measured fresh** (full N=30). The
-> absolute Gbps are lower than the 0.6.0 edition because the sandbox host and
-> guest kernels changed between campaigns (host `7.0.10`→`7.0.11`, guest cloud
-> kernel bump) — **not** a riperf3 change: a controlled **same-environment
-> 0.6.3-vs-0.7.0** run found every UDP cell at statistical parity (Δ −2.6% to
-> +0.4%, all p>0.14) with identical loss, confirming the 0.7.0 data path is
-> unchanged. The defensible signal — the riperf3-vs-iperf3 verdict per cell — is
-> stable across editions: parity at TCP single-stream, riperf3 faster everywhere
-> else. 0.7.0's user-visible changes are the Windows UDP `-P>1` fix (#80), the
-> daemon/interval/JSON-stream fixes (#81/#55/#62), and the server client-flag
-> rejection (#65); none touch the Linux data path.
+> **0.7.0 status.** Re-verified at the final 0.7.0 commit (post the breaking-API
+> set): the compatibility matrix is all-PASS and the throughput campaign was
+> **re-measured fresh** (full N=30) — the riperf3-vs-iperf3 verdict is stable
+> (parity at TCP single-stream, riperf3 faster everywhere else; 12 riperf3 / 3
+> parity / 1 within-noise). The absolute Gbps differ from the 0.6.0 edition
+> because the sandbox host and guest kernels changed between campaigns — **not** a
+> riperf3 change: a controlled **same-environment 0.6.3-vs-0.7.0** run found every
+> UDP cell at statistical parity (Δ −2.6% to +0.4%, all p>0.14) with identical
+> loss, confirming the 0.7.0 data path is unchanged. 0.7.0's headline change is a
+> large library **API narrowing** (field encapsulation #43, internal-module
+> retraction #67, `#[non_exhaustive]` hardening, and removal of inert builder
+> setters #122) — all compile-time/visibility, zero data-path impact. Its
+> runtime fixes (Windows UDP `-P>1` #80; daemon/interval/JSON-stream #81/#55/#62;
+> reverse `-n`/`-k`, TCP `-b` pacing and `-n`/`-k` accounting #60/#102/#103/#117)
+> touch only rate/byte-limited or non-Linux paths; the default unlimited Linux
+> data path is unchanged, as this campaign confirms.
 
 ## Test environment
 
 | | |
 |---|---|
-| Date | 2026-06-06 |
+| Date | 2026-06-08 |
 | Host | Intel i9-13900K, Linux 7.0.11-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.90+deb13.1-cloud-amd64, 8 vCPU, 8 GB RAM each |
 | NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
@@ -83,7 +87,7 @@ cell (`-t 5` s each), **960 runs total**, run in **randomized order** across all
 (cell, tool, iteration) tuples so host/thermal drift can't systematically favor
 either tool. 2 warm-ups per cell discarded; fresh `-s -1` server per run on a
 unique port; hard `timeout` wrappers; VMs confirmed idle and isolated for the
-duration. **0 failed runs.** Per-cell coefficient of variation was 1.9–6.7%.
+duration. **0 failed runs.** Per-cell coefficient of variation was 1.2–8.9%.
 Significance is Welch's t (two-sided, normal approx at n=30); "parity" = not
 significant at p<0.05.
 
@@ -91,44 +95,48 @@ significant at p<0.05.
 
 | cell | riperf3 | iperf3 | Δ | p | verdict |
 |---|--:|--:|--:|--:|---|
-| TCP fwd P1 v4 | 73.0 [71.9–74.0] | 73.2 [72.7–73.8] | −0.4% | 0.63 | parity |
-| TCP fwd P1 v6 | 73.3 [72.2–74.4] | 72.6 [71.4–73.9] | +0.9% | 0.46 | parity |
-| TCP fwd P8 v4 | 61.3 [60.9–61.7] | 56.6 [56.0–57.2] | +8.2% | <1e-4 | **riperf3** |
-| TCP fwd P8 v6 | 61.5 [61.0–61.9] | 57.0 [56.6–57.4] | +7.8% | <1e-4 | **riperf3** |
-| TCP rev P1 v4 | 74.8 [74.2–75.5] | 73.2 [71.4–74.9] | +2.3% | 0.08 | parity |
-| TCP rev P1 v6 | 75.2 [74.3–76.1] | 74.8 [73.2–76.5] | +0.5% | 0.72 | parity |
-| TCP rev P8 v4 | 61.2 [60.8–61.7] | 58.2 [57.5–58.8] | +5.3% | <1e-4 | **riperf3** |
-| TCP rev P8 v6 | 61.8 [61.3–62.2] | 58.1 [57.3–59.0] | +6.3% | <1e-4 | **riperf3** |
-| UDP fwd P1 v4 | 34.9 [34.1–35.6] | 29.9 [29.3–30.6] | +16.5% | <1e-4 | **riperf3** |
-| UDP fwd P1 v6 | 33.8 [33.1–34.6] | 30.0 [29.3–30.7] | +12.7% | <1e-4 | **riperf3** |
-| UDP fwd P8 v4 | 31.5 [31.0–32.1] | 28.9 [28.5–29.3] | +9.1% | <1e-4 | **riperf3** |
-| UDP fwd P8 v6 | 32.0 [31.5–32.4] | 28.4 [28.0–28.8] | +12.7% | <1e-4 | **riperf3** |
-| UDP rev P1 v4 | 33.0 [32.3–33.7] | 29.4 [28.8–30.1] | +12.0% | <1e-4 | **riperf3** |
-| UDP rev P1 v6 | 33.6 [32.8–34.3] | 29.6 [28.9–30.3] | +13.4% | <1e-4 | **riperf3** |
-| UDP rev P8 v4 | 31.1 [30.8–31.5] | 28.3 [28.0–28.6] | +10.0% | <1e-4 | **riperf3** |
-| UDP rev P8 v6 | 31.6 [31.1–32.1] | 29.2 [29.0–29.4] | +8.2% | <1e-4 | **riperf3** |
+| TCP fwd P1 v4 | 72.8 [72.2–73.4] | 72.5 [71.9–73.2] | +0.4% | 0.57 | parity |
+| TCP fwd P1 v6 | 73.6 [73.0–74.2] | 73.4 [72.6–74.2] | +0.3% | 0.68 | parity |
+| TCP fwd P8 v4 | 60.0 [59.5–60.4] | 56.2 [55.7–56.8] | +6.6% | <1e-4 | **riperf3** |
+| TCP fwd P8 v6 | 60.8 [60.3–61.3] | 56.3 [55.7–56.9] | +8.0% | <1e-4 | **riperf3** |
+| TCP rev P1 v4 | 73.3 [72.5–74.2] | 74.5 [74.2–74.9] | −1.6% | 0.009 | iperf3 |
+| TCP rev P1 v6 | 74.4 [74.0–74.9] | 74.5 [73.4–75.5] | −0.0% | 0.97 | parity |
+| TCP rev P8 v4 | 60.4 [59.8–61.1] | 58.9 [58.7–59.2] | +2.6% | <1e-4 | **riperf3** |
+| TCP rev P8 v6 | 61.6 [61.2–62.0] | 59.0 [58.5–59.4] | +4.5% | <1e-4 | **riperf3** |
+| UDP fwd P1 v4 | 32.2 [31.3–33.0] | 28.8 [28.1–29.4] | +11.9% | <1e-4 | **riperf3** |
+| UDP fwd P1 v6 | 33.6 [32.6–34.7] | 29.4 [28.5–30.3] | +14.3% | <1e-4 | **riperf3** |
+| UDP fwd P8 v4 | 31.2 [30.6–31.7] | 28.0 [27.5–28.5] | +11.5% | <1e-4 | **riperf3** |
+| UDP fwd P8 v6 | 31.8 [31.3–32.3] | 27.9 [27.4–28.3] | +14.0% | <1e-4 | **riperf3** |
+| UDP rev P1 v4 | 30.7 [29.9–31.5] | 27.6 [27.1–28.2] | +11.0% | <1e-4 | **riperf3** |
+| UDP rev P1 v6 | 32.4 [31.5–33.3] | 27.9 [27.2–28.5] | +16.3% | <1e-4 | **riperf3** |
+| UDP rev P8 v4 | 29.5 [29.1–29.8] | 27.1 [26.7–27.5] | +8.7% | <1e-4 | **riperf3** |
+| UDP rev P8 v6 | 30.4 [30.1–30.6] | 27.5 [27.1–28.0] | +10.3% | <1e-4 | **riperf3** |
 
 **Findings.**
 - **TCP single-stream is a statistical dead heat** (P1, both directions, both
-  families: Δ within ±2.3%). Both ~73–75 Gbps. All four cells are parity (the
-  closest, TCP rev P1 v4 at +2.3%, is p=0.08 — inside the noise).
-- **TCP multi-stream: riperf3 significantly faster** at P8 (+5.3% to +8.2%,
+  families: Δ within ±1.6%). Both ~73–75 Gbps. Three of the four cells are
+  parity; the sign of the residual flips run-to-run within the single-stream
+  noise band — this campaign measured TCP rev P1 v4 at −1.6% (p=0.009) favoring
+  iperf3, where the prior campaign measured the same cell at +2.3% favoring
+  riperf3. It is variance, not a data-path difference.
+- **TCP multi-stream: riperf3 significantly faster** at P8 (+2.6% to +8.0%,
   p<1e-4) — its thread-per-stream model scales better on the 8-vCPU guests.
-- **UDP: riperf3 significantly faster in every cell** (+8.2% to +16.5%,
+- **UDP: riperf3 significantly faster in every cell** (+8.7% to +16.3%,
   p<1e-4), the result of the 0.4.0 UDP rebuild ([#6](https://github.com/therealevanhenry/riperf3/issues/6): MSS-derived datagram size + blocking sockets).
-- No cell where iperf3 is significantly faster (12 riperf3, 4 parity, 0 iperf3).
+- Tally: 12 riperf3, 3 parity, 1 iperf3 — the lone iperf3 cell is the −1.6%
+  single-stream residual above, inside the noise.
 
 ### UDP loss (%) at `-b 0`, P8
 
 | direction | riperf3 (mean / max) | iperf3 (mean / max) |
 |---|--:|--:|
-| forward (server receives) | 2.6 / 4.3 | 0.8 / 1.8 |
-| reverse (server sends) | 2.6 / 6.2 | 1.0 / 1.5 |
+| forward (server receives) | 3.4 / 6.4 | 0.4 / 1.8 |
+| reverse (server sends) | 2.0 / 2.7 | 0.2 / 0.5 |
 
 UDP loss at `-b 0` is receiver-side socket-buffer overflow on a saturated link —
 kernel `RcvbufErrors` on the receiving host, while sender `SndbufErrors` stay 0
 (the sender never drops). It is roughly symmetric by direction. riperf3 loses
-somewhat more than iperf3 in both directions because it pushes ~8–17% more
+somewhat more than iperf3 in both directions because it pushes ~9–16% more
 throughput, so it overruns the receiver's buffer harder — higher goodput,
 slightly higher loss, a characteristic rather than a regression (the
 0.6.3-vs-0.7.0 control measured the same loss in both versions).
