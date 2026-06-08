@@ -1505,6 +1505,10 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").interval(0.5).build().unwrap());
         }
 
+        // zerocopy (sendfile) and gsro (UDP GSO/GRO) are rejected by `build()` on
+        // non-unix (cfg(not(unix)) → Unsupported), so gate these wiring tests to
+        // unix to match — same as congestion_flag_wired / bind_dev_wired.
+        #[cfg(unix)]
         #[test]
         fn zerocopy_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-Z"]);
@@ -1512,6 +1516,7 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").zerocopy(true).build().unwrap());
         }
 
+        #[cfg(unix)]
         #[test]
         fn gsro_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--gsro"]);
