@@ -369,6 +369,46 @@ impl Cli {
         ];
         checks.iter().find(|(set, _)| *set).map(|(_, name)| *name)
     }
+
+    /// The first server-only option set on the command line, or `None`.
+    ///
+    /// iperf3 raises `IESERVERONLY` when a client (`-c`) is given an option that
+    /// only makes sense on the server — every option whose parse arm sets
+    /// `server_flag`, plus `--authorized-users-path` (caught by a separate role
+    /// check). This mirrors that exact set so a riperf3 client rejects the same
+    /// options iperf3 would, before any side effects. Companion to
+    /// `first_client_only_violation` (#65); see #100.
+    ///
+    /// `--use-pkcs1-padding` is included deliberately: iperf3 marks it
+    /// server-only (the server uses PKCS#1 v1.5 to decode tokens from legacy
+    /// clients; modern clients always send OAEP), so a client passing it is an
+    /// error in iperf3 too. The library `ClientBuilder::use_pkcs1_padding` stays
+    /// available to embedders; only the CLI client path matches iperf3.
+    pub fn first_server_only_violation(&self) -> Option<&'static str> {
+        // (was-it-set, canonical flag name) — order is the report priority.
+        // Cross-checked against iperf3's `server_flag` set in iperf_api.c.
+        let checks: [(bool, &'static str); 9] = [
+            (self.daemon, "-D/--daemon"),
+            (self.one_off, "-1/--one-off"),
+            (
+                self.server_bitrate_limit.is_some(),
+                "--server-bitrate-limit",
+            ),
+            (self.idle_timeout.is_some(), "--idle-timeout"),
+            (self.server_max_duration.is_some(), "--server-max-duration"),
+            (
+                self.rsa_private_key_path.is_some(),
+                "--rsa-private-key-path",
+            ),
+            (
+                self.authorized_users_path.is_some(),
+                "--authorized-users-path",
+            ),
+            (self.time_skew_threshold.is_some(), "--time-skew-threshold"),
+            (self.use_pkcs1_padding, "--use-pkcs1-padding"),
+        ];
+        checks.iter().find(|(set, _)| *set).map(|(_, name)| *name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
@@ -571,6 +611,72 @@ mod cli_tests {
                 let cli = Cli::parse_from(&argv);
                 assert_eq!(
                     cli.first_client_only_violation(),
+                    Some(want),
+                    "expected {want} flagged for args {args:?}"
+                );
+            }
+        }
+
+        // #100: the client rejects server-only options, like iperf3 (IESERVERONLY).
+        #[test]
+        fn client_flags_server_only_violation() {
+            // A bare client, and a client with only client/common-valid
+            // options (including the client-side auth options), are clean.
+            assert_eq!(
+                Cli::parse_from(["riperf3", "-c", "host"]).first_server_only_violation(),
+                None
+            );
+            let clean = Cli::parse_from([
+                "riperf3",
+                "-c",
+                "host",
+                "-t",
+                "5",
+                "-u",
+                "-R",
+                "-P",
+                "4",
+                "-b",
+                "100M",
+                "-p",
+                "5201",
+                "-i",
+                "1",
+                "-J",
+                "--username",
+                "alice",
+                "--rsa-public-key-path",
+                "/tmp/key.pem",
+            ]);
+            assert_eq!(clean.first_server_only_violation(), None);
+
+            // Each server-only option is flagged on the client. Cross-checked
+            // against iperf3's `server_flag` set (raises IESERVERONLY).
+            for (args, want) in [
+                (vec!["-D"], "-D/--daemon"),
+                (vec!["-1"], "-1/--one-off"),
+                (
+                    vec!["--server-bitrate-limit", "100M"],
+                    "--server-bitrate-limit",
+                ),
+                (vec!["--idle-timeout", "30"], "--idle-timeout"),
+                (vec!["--server-max-duration", "60"], "--server-max-duration"),
+                (
+                    vec!["--rsa-private-key-path", "/tmp/priv.pem"],
+                    "--rsa-private-key-path",
+                ),
+                (
+                    vec!["--authorized-users-path", "/tmp/users"],
+                    "--authorized-users-path",
+                ),
+                (vec!["--time-skew-threshold", "5"], "--time-skew-threshold"),
+                (vec!["--use-pkcs1-padding"], "--use-pkcs1-padding"),
+            ] {
+                let mut argv = vec!["riperf3", "-c", "host"];
+                argv.extend(args.iter().copied());
+                let cli = Cli::parse_from(&argv);
+                assert_eq!(
+                    cli.first_server_only_violation(),
                     Some(want),
                     "expected {want} flagged for args {args:?}"
                 );

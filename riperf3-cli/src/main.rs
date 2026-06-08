@@ -30,6 +30,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Reject server-only options on the client (#100), symmetric to the
+    // client-only check above. iperf3 raises IESERVERONLY at parse time for any
+    // option whose parse arm sets `server_flag` (e.g. -D, -1, --idle-timeout,
+    // --rsa-private-key-path, --use-pkcs1-padding); mirror that exact set so a
+    // riperf3 client rejects the same options, before any side effects.
+    if cli.client.is_some() {
+        if let Some(flag) = cli.first_server_only_violation() {
+            return Err(format!(
+                "some option you are trying to set is server only: \
+                 {flag} cannot be used with -c/--client"
+            )
+            .into());
+        }
+    }
+
     // Daemonize BEFORE building the tokio runtime. `daemon()` forks, and forking
     // a process that already has a multi-threaded runtime leaves the child with
     // only the calling thread — no tokio workers — so the daemon would accept the
@@ -251,9 +266,10 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
         if let Some(ref path) = cli.rsa_public_key_path {
             builder = builder.rsa_public_key_path(path);
         }
-        if cli.use_pkcs1_padding {
-            builder = builder.use_pkcs1_padding(true);
-        }
+        // `--use-pkcs1-padding` is server-only and is rejected for clients in
+        // `main` (#100), mirroring iperf3, so it is intentionally not wired on
+        // the client here. The library `ClientBuilder::use_pkcs1_padding` stays
+        // available to embedders.
 
         let client = builder.build()?;
         client.run().await?;
