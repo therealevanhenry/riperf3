@@ -390,11 +390,20 @@ impl Cli {
         let checks: [(bool, &'static str); 9] = [
             (self.daemon, "-D/--daemon"),
             (self.one_off, "-1/--one-off"),
-            (self.server_bitrate_limit.is_some(), "--server-bitrate-limit"),
+            (
+                self.server_bitrate_limit.is_some(),
+                "--server-bitrate-limit",
+            ),
             (self.idle_timeout.is_some(), "--idle-timeout"),
             (self.server_max_duration.is_some(), "--server-max-duration"),
-            (self.rsa_private_key_path.is_some(), "--rsa-private-key-path"),
-            (self.authorized_users_path.is_some(), "--authorized-users-path"),
+            (
+                self.rsa_private_key_path.is_some(),
+                "--rsa-private-key-path",
+            ),
+            (
+                self.authorized_users_path.is_some(),
+                "--authorized-users-path",
+            ),
             (self.time_skew_threshold.is_some(), "--time-skew-threshold"),
             (self.use_pkcs1_padding, "--use-pkcs1-padding"),
         ];
@@ -646,11 +655,20 @@ mod cli_tests {
             for (args, want) in [
                 (vec!["-D"], "-D/--daemon"),
                 (vec!["-1"], "-1/--one-off"),
-                (vec!["--server-bitrate-limit", "100M"], "--server-bitrate-limit"),
+                (
+                    vec!["--server-bitrate-limit", "100M"],
+                    "--server-bitrate-limit",
+                ),
                 (vec!["--idle-timeout", "30"], "--idle-timeout"),
                 (vec!["--server-max-duration", "60"], "--server-max-duration"),
-                (vec!["--rsa-private-key-path", "/tmp/priv.pem"], "--rsa-private-key-path"),
-                (vec!["--authorized-users-path", "/tmp/users"], "--authorized-users-path"),
+                (
+                    vec!["--rsa-private-key-path", "/tmp/priv.pem"],
+                    "--rsa-private-key-path",
+                ),
+                (
+                    vec!["--authorized-users-path", "/tmp/users"],
+                    "--authorized-users-path",
+                ),
                 (vec!["--time-skew-threshold", "5"], "--time-skew-threshold"),
                 (vec!["--use-pkcs1-padding"], "--use-pkcs1-padding"),
             ] {
