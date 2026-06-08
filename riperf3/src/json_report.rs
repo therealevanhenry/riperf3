@@ -822,11 +822,11 @@ impl ReportInput {
             (None, None)
         } else if self.is_server {
             // The peer's (client's) congestion algorithm is never exchanged to the
-            // server, so only one side is emitted — the server's local algorithm,
-            // on the side matching its role: receiver in forward, sender in reverse
-            // and bidir (iperf_api.c:4544 swaps by stream_must_be_sender). Until
-            // #37 reads the applied algorithm back, `congestion_used` is None on
-            // both client and server, so both currently omit the field.
+            // server, so only one side is emitted — the server's local algorithm
+            // (read back via getsockopt(TCP_CONGESTION), #37), on the side matching
+            // its role: receiver in forward, sender in reverse and bidir
+            // (iperf_api.c:4544 swaps by stream_must_be_sender). None for UDP /
+            // platforms without TCP_CONGESTION, in which case the field is omitted.
             let local = self.congestion_used.clone();
             if self.reverse || self.bidir {
                 (local, None)
