@@ -2188,3 +2188,56 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Client::run return-value error path (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod client_run_return_value {
+    use crate::ClientBuilder;
+    use crate::RiperfError;
+
+    /// Error path: a server that ends the session via `IperfDone` without an
+    /// `ExchangeResults` round now yields `Protocol("missing server results...")`
+    /// instead of the previous `Ok(())`. Uses a mock TCP server because the real
+    /// riperf3 server always performs `ExchangeResults`.
+    #[tokio::test]
+    async fn run_errors_when_server_skips_results_exchange() {
+        use crate::protocol::{self, TestState};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            // Skip ExchangeResults / DisplayResults entirely.
+            protocol::send_state(&mut stream, TestState::IperfDone)
+                .await
+                .unwrap();
+        });
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let err = client
+            .run()
+            .await
+            .expect_err("expected missing-results error");
+        match err {
+            RiperfError::Protocol(msg) => assert!(
+                msg.contains("missing server results"),
+                "unexpected protocol message: {msg}"
+            ),
+            other => panic!("expected RiperfError::Protocol, got {other:?}"),
+        }
+
+        let _ = server_task.await;
+    }
+}

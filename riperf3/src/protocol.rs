@@ -970,3 +970,292 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Protocol param/results round-trip (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod protocol_tests {
+    use crate::protocol::{self, StreamResultJson, TestParams, TestResultsJson};
+
+    #[tokio::test]
+    async fn params_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let params = TestParams {
+            tcp: Some(true),
+            time: Some(30),
+            parallel: Some(4),
+            len: Some(65536),
+            reverse: Some(true),
+            nodelay: Some(true),
+            mss: Some(1400),
+            bandwidth: Some(1_000_000),
+            congestion: Some("cubic".to_string()),
+            client_version: Some("test 1.0".to_string()),
+            ..Default::default()
+        };
+
+        let params_clone = params.clone();
+        let writer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            protocol::send_params(&mut stream, &params_clone)
+                .await
+                .unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let received = protocol::recv_params(&mut stream).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(received.tcp, Some(true));
+        assert_eq!(received.time, Some(30));
+        assert_eq!(received.parallel, Some(4));
+        assert_eq!(received.len, Some(65536));
+        assert_eq!(received.reverse, Some(true));
+        assert_eq!(received.nodelay, Some(true));
+        assert_eq!(received.mss, Some(1400));
+        assert_eq!(received.bandwidth, Some(1_000_000));
+        assert_eq!(received.congestion, Some("cubic".to_string()));
+        assert_eq!(received.client_version, Some("test 1.0".to_string()));
+        // Unset fields should remain None
+        assert_eq!(received.udp, None);
+        assert_eq!(received.bidirectional, None);
+    }
+
+    #[tokio::test]
+    async fn results_round_trip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let results = TestResultsJson {
+            cpu_util_total: 42.5,
+            cpu_util_user: 30.0,
+            cpu_util_system: 12.5,
+            sender_has_retransmits: 3,
+            congestion_used: Some("bbr".to_string()),
+            streams: vec![
+                StreamResultJson {
+                    id: 1,
+                    bytes: 10_000_000,
+                    retransmits: 3,
+                    jitter: 0.0,
+                    errors: 0,
+                    omitted_errors: 0,
+                    packets: 0,
+                    omitted_packets: 0,
+                    start_time: 0.0,
+                    end_time: 10.0,
+                },
+                StreamResultJson {
+                    id: 3,
+                    bytes: 9_500_000,
+                    retransmits: 0,
+                    jitter: 0.0,
+                    errors: 0,
+                    omitted_errors: 0,
+                    packets: 0,
+                    omitted_packets: 0,
+                    start_time: 0.0,
+                    end_time: 10.0,
+                },
+            ],
+        };
+
+        let results_clone = results.clone();
+        let writer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            protocol::send_results(&mut stream, &results_clone)
+                .await
+                .unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let received = protocol::recv_results(&mut stream).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(received.cpu_util_total, 42.5);
+        assert_eq!(received.sender_has_retransmits, 3);
+        assert_eq!(received.congestion_used, Some("bbr".to_string()));
+        assert_eq!(received.streams.len(), 2);
+        assert_eq!(received.streams[0].id, 1);
+        assert_eq!(received.streams[0].bytes, 10_000_000);
+        assert_eq!(received.streams[1].id, 3);
+    }
+
+    #[tokio::test]
+    async fn oversized_json_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Write a JSON payload larger than MAX_PARAMS_JSON_LEN (8KB)
+            let big = serde_json::json!({"data": "x".repeat(10_000)});
+            protocol::json_write(&mut stream, &big).await.unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let result = protocol::json_read(&mut stream, protocol::MAX_PARAMS_JSON_LEN).await;
+        writer.await.unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn params_with_unknown_fields_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Simulate a future iperf3 version sending extra fields
+        let writer = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let json = serde_json::json!({
+                "tcp": true,
+                "time": 10,
+                "some_future_field": 42,
+                "another_new_thing": "hello"
+            });
+            protocol::json_write(&mut stream, &json).await.unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let result = protocol::recv_params(&mut stream).await;
+        writer.await.unwrap();
+
+        // Should succeed — unknown fields are ignored by serde default
+        let params = result.unwrap();
+        assert_eq!(params.tcp, Some(true));
+        assert_eq!(params.time, Some(10));
+    }
+
+    // -- migrated from json_output_tests: TestParams serialization --
+
+    #[test]
+    fn test_params_serializes_all_fields() {
+        use crate::protocol::TestParams;
+        let p = TestParams {
+            tcp: Some(true),
+            time: Some(10),
+            parallel: Some(4),
+            len: Some(131072),
+            reverse: Some(true),
+            bidirectional: Some(true),
+            nodelay: Some(true),
+            mss: Some(1400),
+            window: Some(524288),
+            bandwidth: Some(1_000_000),
+            tos: Some(16),
+            congestion: Some("bbr".to_string()),
+            client_version: Some("riperf3 0.1.0".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tcp"], true);
+        assert_eq!(v["time"], 10);
+        assert_eq!(v["parallel"], 4);
+        assert_eq!(v["len"], 131072);
+        assert_eq!(v["reverse"], true);
+        assert_eq!(v["bidirectional"], true);
+        assert_eq!(v["nodelay"], true);
+        assert_eq!(v["MSS"], 1400);
+        assert_eq!(v["window"], 524288);
+        assert_eq!(v["bandwidth"], 1_000_000);
+        assert_eq!(v["TOS"], 16);
+        assert_eq!(v["congestion"], "bbr");
+        assert_eq!(v["client_version"], "riperf3 0.1.0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol error state tests (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod protocol_error_tests {
+    use crate::protocol::{self, TestState};
+
+    #[tokio::test]
+    async fn client_handles_access_denied() {
+        // Server sends AccessDenied state — client should return AccessDenied error
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read cookie (37 bytes)
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            // Send AccessDenied
+            protocol::send_state(&mut stream, TestState::AccessDenied)
+                .await
+                .unwrap();
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on AccessDenied");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("access denied") || err.contains("protocol"),
+            "error should mention access denied, got: {err}"
+        );
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn client_handles_server_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            protocol::send_state(&mut stream, TestState::ServerError)
+                .await
+                .unwrap();
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on ServerError");
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn client_handles_peer_disconnect_during_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Accept connection then immediately close it
+            drop(stream);
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "client should error on peer disconnect");
+        let _ = server_task.await;
+    }
+}

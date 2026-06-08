@@ -37,31 +37,26 @@ pub use client::{Client, ClientBuilder};
 mod server;
 pub use server::{Server, ServerBuilder, TestConfig};
 
-pub use protocol::TransportProtocol;
+// The wire protocol enum and the result model returned by `Client::run()`.
+pub use protocol::{StreamResultJson, TestResultsJson, TransportProtocol};
 
 pub use net::set_cpu_affinity;
 
-// --- Internal modules: exposed for the CLI crate and integration tests ---
-// These are implementation details, not part of the stable library API.
-// Use `#[doc(hidden)]` to keep them out of rustdoc while remaining accessible.
+// --- Internal modules: implementation detail, NOT part of the public API. ---
+// Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
+// few genuinely-public types are re-exported at the crate root above (#67).
+// `json_report` is the exception — it is the iperf3-schema result model and
+// stays publicly accessible (kept `#[doc(hidden)]` to keep its ~25 structs out
+// of the rendered API surface).
 
-#[doc(hidden)]
-pub mod auth;
-#[doc(hidden)]
-pub mod cpu;
+pub(crate) mod auth;
+pub(crate) mod cpu;
 #[doc(hidden)]
 pub mod json_report;
-#[doc(hidden)]
-pub mod net;
-#[doc(hidden)]
-pub mod protocol;
-#[doc(hidden)]
-pub mod reporter;
-#[doc(hidden)]
-pub mod stream;
-#[doc(hidden)]
-pub mod tcp_info;
-#[doc(hidden)]
-pub mod units;
-#[doc(hidden)]
-pub mod utils;
+pub(crate) mod net;
+pub(crate) mod protocol;
+pub(crate) mod reporter;
+pub(crate) mod stream;
+pub(crate) mod tcp_info;
+pub(crate) mod units;
+pub(crate) mod utils;

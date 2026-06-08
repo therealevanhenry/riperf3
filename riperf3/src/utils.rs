@@ -11,6 +11,7 @@ pub const DEFAULT_NUM_STREAMS: u32 = 1;
 pub const DEFAULT_TCP_BLKSIZE: usize = 128 * 1024; // 128 KiB
 pub const DEFAULT_UDP_BLKSIZE: usize = 1460;
 pub const DEFAULT_UDP_RATE: u64 = 1024 * 1024; // 1 Mbit/sec in bits
+#[allow(dead_code)]
 pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%c ";
 
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
@@ -420,5 +421,146 @@ mod tests {
         assert_eq!(buf[255], 255);
         assert_eq!(buf[256], 0); // wraps
         assert_eq!(buf[511], 255);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream ID assignment (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stream_id_tests {
+    use crate::utils::iperf3_stream_id;
+
+    #[test]
+    fn matches_iperf3_pattern() {
+        assert_eq!(iperf3_stream_id(0), 1);
+        assert_eq!(iperf3_stream_id(1), 3);
+        assert_eq!(iperf3_stream_id(2), 4);
+        assert_eq!(iperf3_stream_id(3), 5);
+        assert_eq!(iperf3_stream_id(4), 6);
+        assert_eq!(iperf3_stream_id(9), 11);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error path tests (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod error_tests {
+    use crate::utils::{parse_bitrate, parse_kmg};
+    use crate::ClientBuilder;
+    use crate::ConfigError;
+
+    #[test]
+    fn build_without_host_fails() {
+        let r = ClientBuilder::default().build();
+        assert!(matches!(r, Err(ConfigError::MissingField("host"))));
+    }
+
+    #[test]
+    fn parse_kmg_negative() {
+        assert!(parse_kmg("-1").is_err());
+    }
+
+    #[test]
+    fn parse_kmg_fractional() {
+        // #73: fractional suffixes are now accepted (iperf3 parses with %lf).
+        // 1.5 * 1024^2 = 1_572_864.
+        assert_eq!(parse_kmg("1.5M").unwrap(), 1_572_864);
+        // Still rejects genuinely-malformed numbers.
+        assert!(parse_kmg("1.5.5M").is_err());
+    }
+
+    #[test]
+    fn parse_kmg_empty_suffix() {
+        assert!(parse_kmg("K").is_err());
+    }
+
+    #[test]
+    fn parse_bitrate_empty() {
+        assert!(parse_bitrate("").is_err());
+    }
+
+    #[test]
+    fn parse_bitrate_bad_burst() {
+        assert!(parse_bitrate("100M/abc").is_err());
+    }
+
+    // -- Error type display messages --
+
+    #[test]
+    fn error_display_variants() {
+        use crate::RiperfError;
+        assert_eq!(
+            format!("{}", RiperfError::CookieMismatch),
+            "cookie mismatch"
+        );
+        assert_eq!(
+            format!("{}", RiperfError::AccessDenied),
+            "access denied by server"
+        );
+        assert_eq!(
+            format!("{}", RiperfError::PeerDisconnected),
+            "peer disconnected"
+        );
+        assert!(format!("{}", RiperfError::Aborted("test".into())).contains("test"));
+        assert_eq!(
+            format!("{}", RiperfError::ConnectionTimeout),
+            "connection timed out"
+        );
+        assert!(format!("{}", RiperfError::Protocol("bad".into())).contains("bad"));
+        assert!(format!("{}", RiperfError::Aborted("reason".into())).contains("reason"));
+    }
+
+    // -- Edge cases --
+
+    #[tokio::test]
+    async fn connect_to_wrong_port_fails() {
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(1)) // port 1 — almost certainly not listening
+            .duration(1)
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "connecting to port 1 should fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// utils unit tests pulled out of implemented_flag_tests
+// (migrated in-crate from tests/integration.rs, #67)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod implemented_flag_unit_tests {
+    #[test]
+    fn repeating_payload_buffer() {
+        let buf = crate::utils::make_send_buffer(256, true);
+        assert_eq!(buf.len(), 256);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1], 1);
+        assert_eq!(buf[255], 255);
+
+        let zeros = crate::utils::make_send_buffer(256, false);
+        assert!(zeros.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn dscp_symbolic_and_numeric() {
+        use crate::utils::parse_dscp;
+        // Symbolic names
+        assert_eq!(parse_dscp("ef").unwrap(), 46 << 2); // EF = 184
+        assert_eq!(parse_dscp("af11").unwrap(), 10 << 2); // AF11 = 40
+        assert_eq!(parse_dscp("cs1").unwrap(), 8 << 2); // CS1 = 32
+                                                        // Numeric
+        assert_eq!(parse_dscp("46").unwrap(), 46 << 2);
+        assert_eq!(parse_dscp("0x2e").unwrap(), 46 << 2); // 0x2e = 46
+        assert_eq!(parse_dscp("056").unwrap(), 46 << 2); // 056 octal = 46
+                                                         // Out of range
+        assert!(parse_dscp("64").is_err());
+        assert!(parse_dscp("abc").is_err());
     }
 }
