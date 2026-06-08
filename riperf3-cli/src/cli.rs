@@ -743,70 +743,134 @@ mod cli_tests {
         fn json_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-J"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.json_output);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .json_output(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn udp_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-u"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.protocol, TransportProtocol::Udp);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .protocol(TransportProtocol::Udp)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn duration_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-t", "30"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.duration, 30);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .duration(30)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn bytes_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-n", "1M"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.bytes_to_send, Some(1024 * 1024));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .bytes_str("1M")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn blockcount_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-k", "100"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.blocks_to_send, Some(100));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .blocks_str("100")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn length_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-l", "64K"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.blksize, 64 * 1024);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .blksize_str("64K")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn parallel_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-P", "8"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.num_streams, 8);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .num_streams(8)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn reverse_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-R"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.reverse);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .reverse(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn bidir_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "--bidir"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.bidir);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .bidir(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn window_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-w", "512K"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.window, Some(512 * 1024));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .window_str("512K")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         // build() rejects -C/--congestion (TCP congestion control) on non-Unix
@@ -816,56 +880,99 @@ mod cli_tests {
         fn congestion_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-C", "bbr"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.congestion, Some("bbr".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .congestion("bbr")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn mss_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-M", "1400"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.mss, Some(1400));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .mss(1400)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn no_delay_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-N"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.no_delay);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .no_delay(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn bitrate_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-b", "100M"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.bandwidth, 100 * 1_000_000); // -b is decimal, like iperf3 (#56)
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .bandwidth_str("100M")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn tos_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "16"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.tos, 16);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host").tos(16).build().unwrap()
+            );
         }
 
         #[test]
         fn omit_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-O", "3"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.omit, 3);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host").omit(3).build().unwrap()
+            );
         }
 
         #[test]
         fn title_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-T", "my test"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.title, Some("my test".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .title("my test")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn extra_data_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "--extra-data", "abc"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.extra_data, Some("abc".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .extra_data("abc")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -873,8 +980,11 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "--connect-timeout", "500"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(
-                c.connect_timeout,
-                Some(std::time::Duration::from_millis(500))
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .connect_timeout(std::time::Duration::from_millis(500))
+                    .build()
+                    .unwrap()
             );
         }
 
@@ -882,7 +992,13 @@ mod cli_tests {
         fn verbose_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-V"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.verbose);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .verbose(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         // Combines the Unix-only flags above (congestion/bind-dev/affinity),
@@ -926,23 +1042,33 @@ mod cli_tests {
                 "500",
             ]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.protocol, TransportProtocol::Udp);
-            assert_eq!(c.duration, 30);
-            assert_eq!(c.num_streams, 4);
-            assert!(c.reverse);
-            assert!(c.bidir);
-            assert!(c.no_delay);
-            assert_eq!(c.blksize, 1460);
-            assert_eq!(c.bandwidth, 100 * 1_000_000); // -b is decimal, like iperf3 (#56)
-            assert!(c.json_output);
-            assert_eq!(c.window, Some(512 * 1024));
-            assert_eq!(c.mss, Some(1400));
-            assert_eq!(c.congestion, Some("bbr".to_string()));
-            assert_eq!(c.tos, 16);
-            assert_eq!(c.omit, 2);
-            assert_eq!(c.title, Some("test".to_string()));
-            assert_eq!(c.extra_data, Some("x".to_string()));
-            assert!(c.verbose);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("host")
+                    .protocol(TransportProtocol::Udp)
+                    .duration(30)
+                    .num_streams(4)
+                    .reverse(true)
+                    .bidir(true)
+                    .no_delay(true)
+                    .blksize_str("1460")
+                    .unwrap()
+                    .bandwidth_str("100M")
+                    .unwrap()
+                    .json_output(true)
+                    .verbose(true)
+                    .window_str("512K")
+                    .unwrap()
+                    .mss(1400)
+                    .congestion("bbr")
+                    .tos(16)
+                    .omit(2)
+                    .title("test")
+                    .extra_data("x")
+                    .connect_timeout(std::time::Duration::from_millis(500))
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -953,7 +1079,10 @@ mod cli_tests {
                 b = b.one_off(true);
             }
             let s = b.build().unwrap();
-            assert!(s.one_off);
+            assert_eq!(
+                s,
+                riperf3::ServerBuilder::new().one_off(true).build().unwrap()
+            );
         }
 
         // -- New flag wiring tests --
@@ -962,63 +1091,117 @@ mod cli_tests {
         fn udp_counters_64bit_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--udp-counters-64bit"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.udp_counters_64bit);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .udp_counters_64bit(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn repeating_payload_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--repeating-payload"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.repeating_payload);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .repeating_payload(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn dont_fragment_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--dont-fragment"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.dont_fragment);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .dont_fragment(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn cport_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--cport", "12345"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.cport, Some(12345));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .cport(12345)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn get_server_output_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--get-server-output"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.get_server_output);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .get_server_output(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn forceflush_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--forceflush"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.forceflush);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .forceflush(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn timestamps_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--timestamps", "%H:%M"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.timestamps, Some("%H:%M".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .timestamps("%H:%M")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn version4_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-4"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.ip_version, Some(4));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .ip_version(4)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn version6_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-6"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.ip_version, Some(6));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .ip_version(6)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -1032,7 +1215,13 @@ mod cli_tests {
         fn bind_address_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-B", "10.0.0.1"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.bind_address, Some("10.0.0.1".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .bind_address("10.0.0.1")
+                    .build()
+                    .unwrap()
+            );
         }
 
         // build() rejects --bind-dev (SO_BINDTODEVICE/IP_BOUND_IF) on non-Unix,
@@ -1042,63 +1231,115 @@ mod cli_tests {
         fn bind_dev_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.bind_dev, Some("eth0".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .bind_dev("eth0")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn fq_rate_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--fq-rate", "1G"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.fq_rate, Some(1_000_000_000)); // --fq-rate is decimal (#56)
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .fq_rate_str("1G")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn flowlabel_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-L", "42"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.flowlabel, Some(42));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .flowlabel(42)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn dscp_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--dscp", "46"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.dscp, Some("46".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h").dscp("46").build().unwrap()
+            );
         }
 
         #[test]
         fn mptcp_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-m"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.mptcp);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .mptcp(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn skip_rx_copy_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--skip-rx-copy"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.skip_rx_copy);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .skip_rx_copy(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn rcv_timeout_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--rcv-timeout", "5000"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.rcv_timeout, Some(5000));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .rcv_timeout(5000)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn snd_timeout_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--snd-timeout", "3000"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.snd_timeout, Some(3000));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .snd_timeout(3000)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn file_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-F", "/tmp/data"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.file, Some("/tmp/data".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .file("/tmp/data")
+                    .build()
+                    .unwrap()
+            );
         }
 
         // build() rejects -A/--affinity (CPU affinity) on non-Unix, so gate the
@@ -1108,28 +1349,52 @@ mod cli_tests {
         fn affinity_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-A", "2,3"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.affinity, Some("2,3".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .affinity("2,3")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn json_stream_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--json-stream"]);
             let c = build_client_from_cli(&cli);
-            assert!(c.json_stream);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .json_stream(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn pidfile_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-I", "/tmp/pid"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.pidfile, Some("/tmp/pid".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .pidfile("/tmp/pid")
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
         fn logfile_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--logfile", "/tmp/log"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c.logfile, Some("/tmp/log".to_string()));
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .logfile("/tmp/log")
+                    .build()
+                    .unwrap()
+            );
         }
 
         // sendmmsg(2) is Linux/FreeBSD/NetBSD-only (stream.rs); build() rejects
@@ -1140,7 +1405,14 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-u", "--sendmmsg"]);
             assert!(cli.sendmmsg);
             let c = build_client_from_cli(&cli);
-            assert!(c.sendmmsg);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .protocol(TransportProtocol::Udp)
+                    .sendmmsg(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -1148,7 +1420,13 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-u"]);
             assert!(!cli.sendmmsg);
             let c = build_client_from_cli(&cli);
-            assert!(!c.sendmmsg);
+            assert_eq!(
+                c,
+                riperf3::ClientBuilder::new("h")
+                    .protocol(TransportProtocol::Udp)
+                    .build()
+                    .unwrap()
+            );
         }
 
         // Server new flags
@@ -1171,7 +1449,13 @@ mod cli_tests {
                 b = b.idle_timeout(secs);
             }
             let s = b.build().unwrap();
-            assert_eq!(s.idle_timeout, Some(30));
+            assert_eq!(
+                s,
+                riperf3::ServerBuilder::new()
+                    .idle_timeout(30)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]
@@ -1182,7 +1466,13 @@ mod cli_tests {
                 b = b.server_max_duration(secs);
             }
             let s = b.build().unwrap();
-            assert_eq!(s.server_max_duration, Some(60));
+            assert_eq!(
+                s,
+                riperf3::ServerBuilder::new()
+                    .server_max_duration(60)
+                    .build()
+                    .unwrap()
+            );
         }
 
         /// Verify every short flag alias parses identically to its long form.

@@ -73,29 +73,34 @@ impl TestConfig {
 // Constructed only via ServerBuilder; #[non_exhaustive] keeps future field
 // additions (like json_output/json_stream in #50) from being breaking changes
 // for downstream crates (#43 semver-proofing, the cheap half).
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Server {
-    pub port: u16,
-    pub one_off: bool,
-    pub verbose: bool,
-    pub idle_timeout: Option<u32>,
-    pub server_bitrate_limit: Option<u64>,
-    pub server_max_duration: Option<u32>,
-    pub pidfile: Option<String>,
-    pub logfile: Option<String>,
-    pub forceflush: bool,
-    pub bind_address: Option<String>,
-    pub ip_version: Option<u8>,
-    pub timestamps: Option<String>,
-    pub file: Option<String>,
-    pub rsa_private_key_path: Option<String>,
-    pub authorized_users_path: Option<String>,
-    pub time_skew_threshold: u32,
-    pub use_pkcs1_padding: bool,
+    pub(crate) port: u16,
+    pub(crate) one_off: bool,
+    pub(crate) verbose: bool,
+    pub(crate) idle_timeout: Option<u32>,
+    pub(crate) server_bitrate_limit: Option<u64>,
+    pub(crate) server_max_duration: Option<u32>,
+    // Builder-settable but never read by `run()` — the CLI writes the pidfile
+    // and redirects stdout pre-runtime, not the library. Prune-vs-wire in #122.
+    #[allow(dead_code)]
+    pub(crate) pidfile: Option<String>,
+    #[allow(dead_code)] // see above / #122
+    pub(crate) logfile: Option<String>,
+    pub(crate) forceflush: bool,
+    pub(crate) bind_address: Option<String>,
+    pub(crate) ip_version: Option<u8>,
+    pub(crate) timestamps: Option<String>,
+    pub(crate) file: Option<String>,
+    pub(crate) rsa_private_key_path: Option<String>,
+    pub(crate) authorized_users_path: Option<String>,
+    pub(crate) time_skew_threshold: u32,
+    pub(crate) use_pkcs1_padding: bool,
     /// Emit the test results as iperf3-schema JSON on stdout instead of text (#50).
-    pub json_output: bool,
+    pub(crate) json_output: bool,
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
-    pub json_stream: bool,
+    pub(crate) json_stream: bool,
 }
 
 /// Best-effort source IP the kernel would use to reach `client_addr`, paired
@@ -1555,6 +1560,52 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Per-setter builder tests migrated in-crate from `tests/integration.rs`
+    // when `Server`'s fields became `pub(crate)` (#43): an external test crate
+    // can no longer read `s.one_off`, `s.verbose`, etc.
+    mod builder_setter_tests {
+        use super::*;
+
+        #[test]
+        fn server_builder_one_off() {
+            let s = ServerBuilder::new().one_off(true).build().unwrap();
+            assert!(s.one_off);
+        }
+
+        #[test]
+        fn server_builder_verbose() {
+            let s = ServerBuilder::new().verbose(true).build().unwrap();
+            assert!(s.verbose);
+        }
+
+        #[test]
+        fn server_builder_rejects_version_bind_conflict() {
+            // -4/-6 contradicting an explicit -B of the opposite family is an
+            // error, not silently honored (issue #12).
+            assert!(ServerBuilder::new()
+                .ip_version(6)
+                .bind_address("127.0.0.1")
+                .build()
+                .is_err());
+            assert!(ServerBuilder::new()
+                .ip_version(4)
+                .bind_address("::")
+                .build()
+                .is_err());
+            // Matching family, or a non-literal bind, is fine.
+            assert!(ServerBuilder::new()
+                .ip_version(6)
+                .bind_address("::")
+                .build()
+                .is_ok());
+            assert!(ServerBuilder::new()
+                .ip_version(4)
+                .bind_address("0.0.0.0")
+                .build()
+                .is_ok());
+        }
+    }
 
     mod server_builder_tests {
         use super::*;

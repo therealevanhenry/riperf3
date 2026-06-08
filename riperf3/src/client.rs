@@ -15,67 +15,75 @@ use crate::utils::*;
 // Client
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Client {
-    pub host: String,
-    pub port: u16,
-    pub protocol: TransportProtocol,
-    pub duration: u32,
-    pub num_streams: u32,
-    pub blksize: usize,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) protocol: TransportProtocol,
+    pub(crate) duration: u32,
+    pub(crate) num_streams: u32,
+    pub(crate) blksize: usize,
     /// Whether `blksize` came from an explicit `-l`. When false for UDP, the
     /// datagram size is derived from the control-socket MSS at run time
     /// (iperf3 parity, issue #6) rather than using the `blksize` default.
     /// Internal: set by the builder from whether `.blksize()` was called.
     blksize_explicit: bool,
-    pub reverse: bool,
-    pub bidir: bool,
-    pub omit: u32,
-    pub no_delay: bool,
-    pub mss: Option<i32>,
-    pub window: Option<i32>,
-    pub bandwidth: u64,
-    pub tos: i32,
-    pub congestion: Option<String>,
-    pub udp_counters_64bit: bool,
-    pub connect_timeout: Option<Duration>,
-    pub title: Option<String>,
-    pub extra_data: Option<String>,
-    pub verbose: bool,
-    pub json_output: bool,
-    pub json_stream: bool,
-    pub bytes_to_send: Option<u64>,
-    pub blocks_to_send: Option<u64>,
-    pub repeating_payload: bool,
-    pub zerocopy: bool,
-    pub gsro: bool,
-    pub sendmmsg: bool,
-    pub dont_fragment: bool,
-    pub cport: Option<u16>,
-    pub get_server_output: bool,
-    pub forceflush: bool,
-    pub timestamps: Option<String>,
-    pub bind_address: Option<String>,
-    pub bind_dev: Option<String>,
-    pub fq_rate: Option<u64>,
-    pub flowlabel: Option<i32>,
-    pub ip_version: Option<u8>,
-    pub mptcp: bool,
-    pub skip_rx_copy: bool,
-    pub rcv_timeout: Option<u64>,
-    pub snd_timeout: Option<u64>,
-    pub file: Option<String>,
-    pub affinity: Option<String>,
-    pub dscp: Option<String>,
-    pub format_char: char,
-    pub interval: Option<f64>,
-    pub cntl_ka: Option<String>,
-    pub pidfile: Option<String>,
-    pub logfile: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub rsa_public_key_path: Option<String>,
-    pub use_pkcs1_padding: bool,
+    pub(crate) reverse: bool,
+    pub(crate) bidir: bool,
+    pub(crate) omit: u32,
+    pub(crate) no_delay: bool,
+    pub(crate) mss: Option<i32>,
+    pub(crate) window: Option<i32>,
+    pub(crate) bandwidth: u64,
+    pub(crate) tos: i32,
+    pub(crate) congestion: Option<String>,
+    pub(crate) udp_counters_64bit: bool,
+    pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) title: Option<String>,
+    pub(crate) extra_data: Option<String>,
+    pub(crate) verbose: bool,
+    pub(crate) json_output: bool,
+    pub(crate) json_stream: bool,
+    pub(crate) bytes_to_send: Option<u64>,
+    pub(crate) blocks_to_send: Option<u64>,
+    pub(crate) repeating_payload: bool,
+    pub(crate) zerocopy: bool,
+    pub(crate) gsro: bool,
+    pub(crate) sendmmsg: bool,
+    pub(crate) dont_fragment: bool,
+    pub(crate) cport: Option<u16>,
+    // Builder-settable but never read by `run()` — the CLI realizes these
+    // elsewhere (affinity via `set_cpu_affinity`, pidfile/logfile pre-runtime)
+    // or they are currently no-ops. Prune-vs-wire tracked in #122.
+    #[allow(dead_code)]
+    pub(crate) get_server_output: bool,
+    pub(crate) forceflush: bool,
+    pub(crate) timestamps: Option<String>,
+    pub(crate) bind_address: Option<String>,
+    pub(crate) bind_dev: Option<String>,
+    pub(crate) fq_rate: Option<u64>,
+    pub(crate) flowlabel: Option<i32>,
+    pub(crate) ip_version: Option<u8>,
+    pub(crate) mptcp: bool,
+    pub(crate) skip_rx_copy: bool,
+    pub(crate) rcv_timeout: Option<u64>,
+    pub(crate) snd_timeout: Option<u64>,
+    pub(crate) file: Option<String>,
+    #[allow(dead_code)] // realized by the CLI, not `run()`; see #122
+    pub(crate) affinity: Option<String>,
+    #[allow(dead_code)] // never applied by `run()` (only `tos` is); see #122
+    pub(crate) dscp: Option<String>,
+    pub(crate) format_char: char,
+    pub(crate) interval: Option<f64>,
+    pub(crate) cntl_ka: Option<String>,
+    #[allow(dead_code)] // CLI writes the pidfile pre-runtime, not the library; see #122
+    pub(crate) pidfile: Option<String>,
+    #[allow(dead_code)] // CLI redirects stdout pre-runtime, not the library; see #122
+    pub(crate) logfile: Option<String>,
+    pub(crate) username: Option<String>,
+    pub(crate) password: Option<String>,
+    pub(crate) rsa_public_key_path: Option<String>,
+    pub(crate) use_pkcs1_padding: bool,
 }
 
 /// Build receiver-perspective summaries from the server's results. In a forward
@@ -1808,6 +1816,187 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Per-setter builder tests migrated in-crate from `tests/integration.rs`
+    // when `Client`'s fields became `pub(crate)` (#43): an external test crate
+    // can no longer read `c.protocol`, `c.duration`, etc.
+    mod builder_setter_tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn client_builder_protocol() {
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .build()
+                .unwrap();
+            assert_eq!(c.protocol, TransportProtocol::Udp);
+        }
+
+        #[test]
+        fn client_builder_duration() {
+            let c = ClientBuilder::new("h").duration(30).build().unwrap();
+            assert_eq!(c.duration, 30);
+        }
+
+        #[test]
+        fn client_builder_num_streams() {
+            let c = ClientBuilder::new("h").num_streams(8).build().unwrap();
+            assert_eq!(c.num_streams, 8);
+        }
+
+        #[test]
+        fn client_builder_blksize() {
+            let c = ClientBuilder::new("h").blksize(65536).build().unwrap();
+            assert_eq!(c.blksize, 65536);
+        }
+
+        #[test]
+        fn client_builder_blksize_defaults() {
+            let tcp = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(tcp.blksize, 128 * 1024);
+
+            let udp = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .build()
+                .unwrap();
+            assert_eq!(udp.blksize, 1460);
+        }
+
+        #[test]
+        fn client_builder_reverse() {
+            let c = ClientBuilder::new("h").reverse(true).build().unwrap();
+            assert!(c.reverse);
+        }
+
+        #[test]
+        fn client_builder_bidir() {
+            let c = ClientBuilder::new("h").bidir(true).build().unwrap();
+            assert!(c.bidir);
+        }
+
+        #[test]
+        fn client_builder_omit() {
+            let c = ClientBuilder::new("h").omit(3).build().unwrap();
+            assert_eq!(c.omit, 3);
+        }
+
+        #[test]
+        fn client_builder_no_delay() {
+            let c = ClientBuilder::new("h").no_delay(true).build().unwrap();
+            assert!(c.no_delay);
+        }
+
+        #[test]
+        fn client_builder_mss() {
+            let c = ClientBuilder::new("h").mss(1400).build().unwrap();
+            assert_eq!(c.mss, Some(1400));
+        }
+
+        #[test]
+        fn client_builder_window() {
+            let c = ClientBuilder::new("h").window(524288).build().unwrap();
+            assert_eq!(c.window, Some(524288));
+        }
+
+        #[test]
+        fn client_builder_bandwidth() {
+            let c = ClientBuilder::new("h")
+                .bandwidth(1_000_000)
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, 1_000_000);
+        }
+
+        #[test]
+        fn client_builder_tos() {
+            let c = ClientBuilder::new("h").tos(0x10).build().unwrap();
+            assert_eq!(c.tos, 0x10);
+        }
+
+        // Congestion is a Linux/FreeBSD feature (net.rs); gate to match (#76).
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[test]
+        fn client_builder_congestion() {
+            let c = ClientBuilder::new("h").congestion("bbr").build().unwrap();
+            assert_eq!(c.congestion, Some("bbr".to_string()));
+        }
+
+        #[test]
+        fn client_builder_udp_64bit() {
+            let c = ClientBuilder::new("h")
+                .udp_counters_64bit(true)
+                .build()
+                .unwrap();
+            assert!(c.udp_counters_64bit);
+        }
+
+        #[test]
+        fn client_builder_connect_timeout() {
+            let c = ClientBuilder::new("h")
+                .connect_timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            assert_eq!(c.connect_timeout, Some(Duration::from_millis(500)));
+        }
+
+        #[test]
+        fn client_builder_title() {
+            let c = ClientBuilder::new("h").title("my test").build().unwrap();
+            assert_eq!(c.title, Some("my test".to_string()));
+        }
+
+        #[test]
+        fn client_builder_extra_data() {
+            let c = ClientBuilder::new("h").extra_data("x").build().unwrap();
+            assert_eq!(c.extra_data, Some("x".to_string()));
+        }
+
+        #[test]
+        fn client_builder_verbose() {
+            let c = ClientBuilder::new("h").verbose(true).build().unwrap();
+            assert!(c.verbose);
+        }
+
+        #[test]
+        fn client_builder_json_output() {
+            let c = ClientBuilder::new("h").json_output(true).build().unwrap();
+            assert!(c.json_output);
+        }
+
+        #[test]
+        fn client_builder_bytes() {
+            let c = ClientBuilder::new("h").bytes(1_000_000).build().unwrap();
+            assert_eq!(c.bytes_to_send, Some(1_000_000));
+        }
+
+        #[test]
+        fn client_builder_blocks() {
+            let c = ClientBuilder::new("h").blocks(100).build().unwrap();
+            assert_eq!(c.blocks_to_send, Some(100));
+        }
+
+        #[test]
+        fn client_builder_format_char() {
+            // -f format is wired to Client.format_char and used in the reporter.
+            let c = ClientBuilder::new("h").format_char('k').build().unwrap();
+            assert_eq!(c.format_char, 'k');
+        }
+
+        #[test]
+        fn client_builder_mptcp() {
+            let c = ClientBuilder::new("h").mptcp(true).build().unwrap();
+            assert!(c.mptcp);
+        }
+
+        #[test]
+        fn client_builder_dscp_maps_to_tos() {
+            // --dscp folds into the TOS byte: EF (46) << 2 == 184. The end-to-end
+            // run lives in tests/integration.rs; here we pin the mapping precisely.
+            let c = ClientBuilder::new("h").dscp("ef").build().unwrap();
+            assert_eq!(c.tos, 46 << 2);
+        }
+    }
 
     mod client_builder_tests {
         use super::*;
