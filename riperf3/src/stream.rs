@@ -325,6 +325,10 @@ pub struct DataStream {
     /// for the `-J` `start.sndbuf_actual`/`rcvbuf_actual` fields (#36 PR3).
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
+    /// The TCP congestion-control algorithm actually in effect on this stream's
+    /// socket (read back via `getsockopt(TCP_CONGESTION)`), for the `congestion_used`
+    /// report field (#37). `None` for UDP and on platforms without TCP_CONGESTION.
+    pub congestion_used: Option<String>,
 }
 
 /// Build the shared `-n`/`-k` byte budget the sending streams decrement, or

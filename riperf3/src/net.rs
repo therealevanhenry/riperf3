@@ -363,6 +363,58 @@ pub(crate) fn apply_socket_window(sock: &socket2::SockRef<'_>, window: Option<i3
     }
 }
 
+/// Verify the kernel granted at least the requested `-w/--window` size. iperf3
+/// sets `SO_SNDBUF`/`SO_RCVBUF` to the requested value and ABORTS the test
+/// (IESETBUF2, "socket buffer size not set correctly") when the realized size is
+/// smaller — i.e. the kernel clamped below the request (`wmem_max`/`rmem_max`).
+/// Mirror that: error when `requested > realized` on either buffer. A `None`
+/// window or an unreadable realized size is a no-op (best-effort, like the
+/// readback the values come from). The kernel doubles the set value, so this
+/// only fires on a genuine clamp, exactly as in iperf3. (#97)
+pub(crate) fn check_socket_window(
+    window: Option<i32>,
+    sndbuf_actual: Option<u64>,
+    rcvbuf_actual: Option<u64>,
+) -> Result<()> {
+    if let Some(req) = window {
+        if req > 0 {
+            let req = req as u64;
+            if sndbuf_actual.is_some_and(|a| req > a) || rcvbuf_actual.is_some_and(|a| req > a) {
+                return Err(RiperfError::Aborted(
+                    "socket buffer size not set correctly".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the TCP congestion-control algorithm actually in effect on a connected
+/// stream, via `getsockopt(TCP_CONGESTION)`, for the `congestion_used` report
+/// (#37). Returns the algorithm name (e.g. "cubic", "bbr"); iperf3 reports the
+/// in-effect CC, which defaults to the kernel default when `-C` is unset. `None`
+/// when unreadable or on a platform without TCP_CONGESTION.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) fn tcp_congestion_used(stream: &TcpStream) -> Option<String> {
+    use nix::sys::socket::{self, sockopt};
+    // getsockopt(TCP_CONGESTION) returns a fixed-size, nul-padded buffer (e.g.
+    // "bbr\0\0…"); trim to the C-string so we emit a clean "bbr" like iperf3.
+    socket::getsockopt(stream, sockopt::TcpCongestion)
+        .ok()
+        .map(|os| {
+            os.to_string_lossy()
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub(crate) fn tcp_congestion_used(_stream: &TcpStream) -> Option<String> {
+    None
+}
+
 /// Configure a connected TCP stream with all negotiated socket options.
 pub fn configure_tcp_stream_full(
     stream: &TcpStream,
@@ -1277,6 +1329,54 @@ mod tests {
             "TCP_MAXSEG should be readable on a connected socket"
         );
         assert!(mss.unwrap() > 0, "MSS should be positive, got {mss:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[tokio::test]
+    async fn tcp_congestion_used_returns_clean_name() {
+        // #37: a connected TCP stream reports its in-effect congestion algorithm,
+        // trimmed to a clean C-string (no nul padding / trailing whitespace) like
+        // iperf3 — getsockopt(TCP_CONGESTION) returns a fixed-size padded buffer.
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client_task = tokio::spawn(async move {
+            tcp_connect("127.0.0.1", port, None, None, None, false, None)
+                .await
+                .unwrap()
+        });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap();
+
+        let cc =
+            tcp_congestion_used(&client).expect("TCP_CONGESTION readable on a connected socket");
+        assert!(!cc.is_empty(), "congestion name must be non-empty");
+        assert!(
+            !cc.contains('\0'),
+            "must be trimmed of nul padding, got {cc:?}"
+        );
+        assert_eq!(cc, cc.trim(), "no leading/trailing whitespace, got {cc:?}");
+    }
+
+    #[test]
+    fn check_socket_window_errors_only_when_clamped() {
+        // #97: error iff the realized buffer is smaller than the requested -w
+        // (the kernel clamped below the request); otherwise proceed.
+        assert!(check_socket_window(None, Some(1024), Some(1024)).is_ok());
+        assert!(check_socket_window(Some(0), Some(1), Some(1)).is_ok());
+        // realized >= requested (the common case; the kernel doubles the set value).
+        assert!(check_socket_window(Some(1000), Some(2000), Some(2000)).is_ok());
+        assert!(check_socket_window(Some(1000), Some(1000), Some(1000)).is_ok());
+        // either buffer clamped below the request -> error.
+        assert!(check_socket_window(Some(1000), Some(999), Some(2000)).is_err());
+        assert!(check_socket_window(Some(1000), Some(2000), Some(999)).is_err());
+        // an unreadable realized size is a no-op (best-effort).
+        assert!(check_socket_window(Some(1000), None, None).is_ok());
+        // matches iperf3's IESETBUF2 text.
+        let e = check_socket_window(Some(1000), Some(10), Some(10)).unwrap_err();
+        assert!(
+            format!("{e}").contains("socket buffer size not set correctly"),
+            "unexpected error: {e}"
+        );
     }
 
     #[cfg(unix)]

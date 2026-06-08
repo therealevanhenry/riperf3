@@ -469,6 +469,12 @@ impl Client {
                     let sock = socket2::SockRef::from(&data_stream);
                     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
                     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
+                    // #97: abort if the kernel clamped -w below the request, like
+                    // iperf3 (IESETBUF2). Before the stream moves into its task.
+                    net::check_socket_window(self.window, sndbuf_actual, rcvbuf_actual)?;
+                    // #37: the congestion algorithm actually in effect (the kernel
+                    // default when -C is unset), for `congestion_used`.
+                    let congestion_used = net::tcp_congestion_used(&data_stream);
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i < send_count;
@@ -538,6 +544,7 @@ impl Client {
                         peer_addr,
                         sndbuf_actual,
                         rcvbuf_actual,
+                        congestion_used,
                     });
                 }
             }
@@ -588,6 +595,8 @@ impl Client {
                     net::apply_socket_window(&sock, self.window);
                     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
                     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
+                    // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
+                    net::check_socket_window(self.window, sndbuf_actual, rcvbuf_actual)?;
 
                     // Convert tokio UdpSocket to std for blocking I/O
                     let std_sock = udp_sock.into_std().map_err(RiperfError::Io)?;
@@ -635,6 +644,7 @@ impl Client {
                             peer_addr,
                             sndbuf_actual,
                             rcvbuf_actual,
+                            congestion_used: None,
                         });
                         continue;
                     };
@@ -650,6 +660,7 @@ impl Client {
                         peer_addr,
                         sndbuf_actual,
                         rcvbuf_actual,
+                        congestion_used: None,
                     });
                 }
             }
@@ -844,7 +855,9 @@ impl Client {
             } else {
                 -1
             },
-            congestion_used: None,
+            // #37: the congestion algorithm actually in effect (read back at stream
+            // creation); None for UDP / unsupported platforms.
+            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
             streams: stream_results,
         }
     }
@@ -1102,10 +1115,10 @@ impl Client {
                 remote_user,
                 remote_system,
             },
-            // Reporting the *actually-applied* congestion algorithm is #37; omit
-            // the field until that read-back lands rather than emit the requested
-            // value (which may differ from what the kernel used).
-            congestion_used: None,
+            // #37: the congestion algorithm actually in effect on the data socket,
+            // read back via getsockopt(TCP_CONGESTION) at stream creation (the
+            // kernel default when -C is unset). None for UDP / unsupported platforms.
+            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
             cookie: start_meta.cookie.clone(),
             tcp_mss_default: start_meta.tcp_mss_default,
             // -M/--set-mss request: emitted as start.tcp_mss (TCP only), which

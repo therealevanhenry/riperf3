@@ -341,6 +341,10 @@ impl Server {
                     let sock = socket2::SockRef::from(&data_stream);
                     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
                     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
+                    // #97: abort if the kernel clamped -w below the request (iperf3 IESETBUF2).
+                    net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+                    // #37: congestion algorithm actually in effect on this stream.
+                    let congestion_used = net::tcp_congestion_used(&data_stream);
 
                     let task = if is_sender {
                         let buf = make_send_buffer(cfg.blksize, false);
@@ -373,6 +377,7 @@ impl Server {
                         peer_addr: peer_addr_s,
                         sndbuf_actual,
                         rcvbuf_actual,
+                        congestion_used,
                     });
                 }
             }
@@ -623,7 +628,9 @@ impl Server {
             } else {
                 -1
             },
-            congestion_used: None,
+            // #37: the congestion algorithm actually in effect (read back at stream
+            // creation); None for UDP / unsupported platforms.
+            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
             streams: result_streams,
         };
 
@@ -795,6 +802,8 @@ impl Server {
                     sock.recv_buffer_size().ok().map(|v| v as u64),
                 )
             };
+            // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
+            net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
 
             let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
 
@@ -821,6 +830,7 @@ impl Server {
                     peer_addr: peer_addr_s,
                     sndbuf_actual,
                     rcvbuf_actual,
+                    congestion_used: None,
                 });
             } else {
                 let c = counters.clone();
@@ -843,6 +853,7 @@ impl Server {
                     peer_addr: peer_addr_s,
                     sndbuf_actual,
                     rcvbuf_actual,
+                    congestion_used: None,
                 });
             }
         }
@@ -969,6 +980,10 @@ impl Server {
                 sock.recv_buffer_size().ok().map(|v| v as u64),
             )
         };
+        // #97: abort if -w was clamped below the request (iperf3 IESETBUF2). On the
+        // single-socket demux path the recv buffer is sized to the aggregate, but a
+        // genuine wmem/rmem_max clamp still drives the readback below the request.
+        net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
         // The connected recycling path reports each stream's local_host as the
         // kernel-selected source IP for that client. The demux socket is never
         // connect()'d, so its own local_addr is the wildcard bind — only on a
@@ -1027,6 +1042,7 @@ impl Server {
                     peer_addr: Some(client_addr),
                     sndbuf_actual,
                     rcvbuf_actual,
+                    congestion_used: None,
                 });
             } else {
                 let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
@@ -1052,6 +1068,7 @@ impl Server {
                     peer_addr: Some(client_addr),
                     sndbuf_actual,
                     rcvbuf_actual,
+                    congestion_used: None,
                 });
             }
         }
@@ -1213,9 +1230,10 @@ impl Server {
                 remote_user: 0.0,
                 remote_system: 0.0,
             },
-            // Reporting the server's actually-applied congestion is #37; until then
-            // it stays None (omitted), consistent with the client.
-            congestion_used: None,
+            // #37: the congestion algorithm actually in effect on the server's data
+            // socket, read back via getsockopt(TCP_CONGESTION). None for UDP /
+            // unsupported platforms.
+            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
             cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1]).to_string(),
             // iperf3's server emits tcp_mss_default = 0 (it never reads the control
             // socket MSS); the requested -M (via params) still surfaces as tcp_mss.
