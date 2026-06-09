@@ -422,6 +422,26 @@ impl Cli {
             .client
             .as_deref()
             .ok_or("client mode requires a host (-c <host>)")?;
+
+        // iperf3 permits only ONE explicit test end condition (IEENDCONDITIONS,
+        // checked pairwise over duration_flag/bytes/blocks in parse_arguments);
+        // riperf3 silently let -n/-k win over -t (#140). The check is on
+        // EXPLICIT flags — the default duration never conflicts — which is why
+        // it lives here at the CLI, where explicitness is knowable, not in the
+        // builder (whose duration always holds a value).
+        if [
+            self.time.is_some(),
+            self.bytes.is_some(),
+            self.blockcount.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count()
+            > 1
+        {
+            return Err("only one test end condition (-t, -n, -k) may be specified".into());
+        }
+
         let mut builder = riperf3::ClientBuilder::new(host);
 
         // Format: K/M/G/T → lowercase char for bits, uppercase for bytes
@@ -1529,6 +1549,43 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka", "10/5/3"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").cntl_ka("10/5/3").build().unwrap());
+        }
+
+        // #140: iperf3 permits only ONE test end condition; -t with -n/-k (or
+        // -n with -k) fails with IEENDCONDITIONS. riperf3 silently let the
+        // byte/block condition win, so a script relying on iperf3's rejection
+        // got a different test instead of an error.
+        #[test]
+        fn conflicting_end_conditions_rejected() {
+            for args in [
+                ["riperf3", "-c", "h", "-t", "5", "-n", "1G"],
+                ["riperf3", "-c", "h", "-t", "5", "-k", "100"],
+                ["riperf3", "-c", "h", "-n", "1G", "-k", "100"],
+            ] {
+                let cli = Cli::parse_from(args);
+                let err = cli
+                    .build_client()
+                    .expect_err("conflicting end conditions must be rejected")
+                    .to_string();
+                assert!(
+                    err.contains("only one test end condition (-t, -n, -k) may be specified"),
+                    "iperf3 IEENDCONDITIONS wording expected, got: {err}"
+                );
+            }
+        }
+
+        // Each end condition alone stays valid (iperf3's check fires only on
+        // explicit combinations — a default duration never conflicts).
+        #[test]
+        fn single_end_conditions_accepted() {
+            for args in [
+                ["riperf3", "-c", "h", "-t", "5"],
+                ["riperf3", "-c", "h", "-n", "1G"],
+                ["riperf3", "-c", "h", "-k", "100"],
+            ] {
+                let cli = Cli::parse_from(args);
+                assert!(cli.build_client().is_ok(), "single end condition rejected");
+            }
         }
 
         #[test]

@@ -566,13 +566,19 @@ impl Client {
                     udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
-                    // Apply GSO/GRO if requested (no-ops on non-Linux)
+                    // GSO/GRO is deliberately best-effort (#45): it's a
+                    // riperf3-exclusive optimization (no iperf3 counterpart),
+                    // so a kernel lacking UDP_SEGMENT/UDP_GRO degrades to
+                    // plain sends rather than failing the test.
                     if self.gsro {
                         let _ = net::set_udp_gso(&udp_sock, blksize as u16);
                         let _ = net::set_udp_gro(&udp_sock);
                     }
                     if self.tos != 0 {
-                        let _ = net::set_tos(&udp_sock, self.tos as u32);
+                        // Fatal like the TCP path (#45): iperf3's
+                        // iperf_common_sockopts errors (IESETTOS) when IP_TOS
+                        // can't be applied, on both roles and both protocols.
+                        net::set_tos(&udp_sock, self.tos as u32)?;
                     }
 
                     let stream_id = iperf3_stream_id(i);

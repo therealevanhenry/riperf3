@@ -318,7 +318,10 @@ impl Server {
                         cfg.congestion.as_deref(),
                     )?;
                     if cfg.tos != 0 {
-                        let _ = net::set_tos(&data_stream, cfg.tos as u32);
+                        // Fatal like every other set_tos site (#45): iperf3's
+                        // iperf_common_sockopts errors (IESETTOS) when IP_TOS
+                        // can't be applied, on both roles and both protocols.
+                        net::set_tos(&data_stream, cfg.tos as u32)?;
                     }
 
                     let stream_id = iperf3_stream_id(i);
