@@ -63,16 +63,68 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     })
 }
 
+/// Apple's `struct tcp_connection_info` (xnu `bsd/netinet/tcp.h`), hand-rolled
+/// because libc 0.2.x's binding is wrong twice over (#96): it omits the final
+/// `tcpi_txretransmitpackets` field — the sender retransmit packet count iperf3
+/// reads for the macOS Retr column — and it declares the 15 one-bit
+/// `tcpi_tfo_*` flags as fifteen separate `u32` fields where the kernel packs
+/// them (plus a 17-bit pad) into ONE `u32`, which shifts every trailing `u64`
+/// counter 60 bytes past where the kernel writes it. Layout pinned against the
+/// xnu header by the const asserts below; the `u64` block needs no explicit
+/// align attribute because offset 56 is already 8-aligned under `repr(C)`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[allow(dead_code)] // kernel ABI mirror — every field is required for layout
+struct TcpConnectionInfo {
+    tcpi_state: u8,
+    tcpi_snd_wscale: u8,
+    tcpi_rcv_wscale: u8,
+    __pad1: u8,
+    tcpi_options: u32,
+    tcpi_flags: u32,
+    tcpi_rto: u32,
+    tcpi_maxseg: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_snd_sbbytes: u32,
+    tcpi_rcv_wnd: u32,
+    tcpi_rttcur: u32,
+    tcpi_srtt: u32,
+    tcpi_rttvar: u32,
+    /// The 15 one-bit `tcpi_tfo_*` flags + `__pad2:17`, packed in one word.
+    tcpi_tfo_bits: u32,
+    tcpi_txpackets: u64,
+    tcpi_txbytes: u64,
+    tcpi_txretransmitbytes: u64,
+    tcpi_rxpackets: u64,
+    tcpi_rxbytes: u64,
+    tcpi_rxoutoforderbytes: u64,
+    tcpi_txretransmitpackets: u64,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = {
+    // xnu's layout: 4×u8 + 13×u32 = 56, then seven 8-aligned u64s = 112 total.
+    assert!(std::mem::size_of::<TcpConnectionInfo>() == 112);
+    assert!(std::mem::offset_of!(TcpConnectionInfo, tcpi_txpackets) == 56);
+    assert!(std::mem::offset_of!(TcpConnectionInfo, tcpi_txretransmitpackets) == 104);
+};
+
 /// Query TCP_CONNECTION_INFO for a connected TCP socket (macOS).
 #[cfg(target_os = "macos")]
 pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     use std::mem::{self, MaybeUninit};
 
-    // SAFETY: getsockopt(TCP_CONNECTION_INFO) is a read-only kernel query on a valid fd.
-    // Same irreducible kernel boundary as the Linux TCP_INFO variant.
+    // SAFETY: getsockopt(TCP_CONNECTION_INFO) is a read-only kernel query on a
+    // valid fd — the same irreducible kernel boundary as the Linux TCP_INFO
+    // variant, against the hand-rolled struct above (layout const-asserted).
+    // The buffer is ZEROED, not uninit: an older kernel that predates the
+    // trailing counters returns a shorter length and the unwritten tail must
+    // read as 0, not as uninitialized memory.
     let info = unsafe {
-        let mut info = MaybeUninit::<libc::tcp_connection_info>::uninit();
-        let mut len = mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+        let mut info = MaybeUninit::<TcpConnectionInfo>::zeroed();
+        let mut len = mem::size_of::<TcpConnectionInfo>() as libc::socklen_t;
         let ret = libc::getsockopt(
             fd,
             libc::IPPROTO_TCP,
@@ -87,8 +139,13 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     };
 
     Some(TcpInfoSnapshot {
-        total_retransmits: 0, // macOS only has tcpi_txretransmitbytes, not packet count
-        snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_maxseg as u64,
+        // The real sender retransmit packet count (#96) — the same field
+        // iperf3 reads on macOS. Saturate into the cross-platform u32.
+        total_retransmits: info.tcpi_txretransmitpackets.min(u32::MAX as u64) as u32,
+        // xnu reports tcpi_snd_cwnd in BYTES (unlike Linux's segments), and
+        // iperf3 uses it raw — multiplying by maxseg here would inflate the
+        // Cwnd column ~1500x (#96).
+        snd_cwnd: info.tcpi_snd_cwnd as u64,
         snd_wnd: info.tcpi_snd_wnd as u64,
         rtt: info.tcpi_srtt,
         rttvar: info.tcpi_rttvar,
@@ -141,20 +198,18 @@ pub fn get_tcp_info(_fd: i32) -> Option<TcpInfoSnapshot> {
 /// Whether this platform provides a usable TCP **retransmit packet count** for
 /// the sender (the `Retr` column / JSON `sender_has_retransmits`).
 ///
-/// macOS is deliberately excluded (#40). iperf3 *does* report retransmits on
-/// macOS — it reads `tcp_connection_info.tcpi_txretransmitpackets` (a sender
-/// retransmit packet count) and shows the Retr+Cwnd columns. But the Rust `libc`
-/// binding's `tcp_connection_info` does not expose that field — its sender-side
-/// retransmit member is `tcpi_txretransmitbytes` (retransmitted *bytes*) — so
-/// riperf3's `get_tcp_info` can only hard-code `total_retransmits: 0`. Rather
-/// than print a perpetual, misleading `Retr 0` (implying a loss-free transfer),
-/// we report no retransmit info on macOS. The Retr and Cwnd columns are gated
-/// together (iperf3 couples them on the same flag), so Cwnd is suppressed with
-/// it. This is a deliberate divergence from iperf3 for now; the faithful fix —
-/// reading `tcpi_txretransmitpackets` via a custom struct binding to show the
-/// real macOS Retr/Cwnd — is a deferred follow-up, not patch scope.
+/// macOS qualifies since #96: `get_tcp_info` reads the kernel's real
+/// `tcpi_txretransmitpackets` via the hand-rolled `TcpConnectionInfo` binding
+/// (the `libc` crate's `tcp_connection_info` both omits that field and mislays
+/// the struct's tail — see the binding's doc comment), restoring the Retr+Cwnd
+/// columns iperf3 shows on macOS. The columns are gated together (iperf3
+/// couples them on the same flag).
 pub fn has_retransmit_info() -> bool {
-    cfg!(any(target_os = "linux", target_os = "freebsd"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    ))
 }
 
 #[cfg(test)]
