@@ -16,12 +16,8 @@ pub struct StreamInterval {
     pub start: f64,
     pub end: f64,
     pub bytes: u64,
-    #[allow(dead_code)]
-    pub is_sender: bool,
     pub retransmits: Option<i64>,
     pub snd_cwnd: Option<u64>,
-    #[allow(dead_code)]
-    pub rtt: Option<u32>,
     // UDP specific
     pub jitter: Option<f64>,
     pub lost: Option<i64>,
@@ -687,10 +683,8 @@ pub fn spawn_interval_reporter(
                         start,
                         end,
                         bytes,
-                        is_sender: stream.is_sender,
                         retransmits,
                         snd_cwnd,
-                        rtt,
                         jitter,
                         lost,
                         total_packets: total,
@@ -782,14 +776,12 @@ pub fn spawn_interval_reporter(
                     start,
                     end,
                     bytes: fwd.bytes + rev.bytes,
-                    is_sender: fwd_is_sender,
                     retransmits: if has_retransmits {
                         Some(fwd.retransmits + rev.retransmits)
                     } else {
                         None
                     },
                     snd_cwnd: None,
-                    rtt: None,
                     jitter: if is_udp { Some(last_jitter) } else { None },
                     lost: if is_udp {
                         Some(fwd.lost + rev.lost)
@@ -944,10 +936,8 @@ mod tests {
             start: 0.0,
             end: 1.0,
             bytes: 1024 * 1024 * 1024,
-            is_sender: true,
             retransmits: None,
             snd_cwnd: None,
-            rtt: None,
             jitter: None,
             lost: None,
             total_packets: None,
@@ -979,10 +969,8 @@ mod tests {
             start: 0.0,
             end: 1.0,
             bytes: 1_000_000,
-            is_sender: true,
             retransmits: Some(3),
             snd_cwnd: None,
-            rtt: None,
             jitter: None,
             lost: None,
             total_packets: None,

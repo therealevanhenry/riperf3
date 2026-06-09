@@ -68,8 +68,6 @@ pub struct Client {
     pub(crate) rcv_timeout: Option<u64>,
     pub(crate) snd_timeout: Option<u64>,
     pub(crate) file: Option<String>,
-    #[allow(dead_code)] // not yet applied by `run()` (only `tos` is); wire in 0.7.x
-    pub(crate) dscp: Option<String>,
     pub(crate) format_char: char,
     pub(crate) interval: Option<f64>,
     pub(crate) cntl_ka: Option<String>,
@@ -1776,7 +1774,6 @@ impl ClientBuilder {
             rcv_timeout: self.rcv_timeout,
             snd_timeout: self.snd_timeout,
             file: self.file,
-            dscp: self.dscp,
             format_char: self.format_char,
             interval: self.interval,
             cntl_ka: self.cntl_ka,
