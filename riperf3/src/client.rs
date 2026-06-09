@@ -53,7 +53,7 @@ pub struct Client {
     pub(crate) dont_fragment: bool,
     pub(crate) cport: Option<u16>,
     // Set by the builder but not yet consumed by `run()`; to be wired into the
-    // library as non-breaking 0.7.x work — get_server_output (#33), dscp below.
+    // library as non-breaking 0.7.x work (#33).
     #[allow(dead_code)]
     pub(crate) get_server_output: bool,
     pub(crate) forceflush: bool,
