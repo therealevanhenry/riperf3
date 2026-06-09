@@ -23,6 +23,7 @@ pub(crate) struct TestConfig {
     pub mss: Option<i32>,
     pub window: Option<i32>,
     pub bandwidth: u64,
+    pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
     pub udp_counters_64bit: bool,
@@ -63,6 +64,13 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
+            // The client's --pacing-timer quantum (#32); iperf3 always sends
+            // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
+            pacing_timer: params
+                .pacing_timer
+                .filter(|&us| us > 0)
+                .map(|us| us as u32)
+                .unwrap_or(crate::utils::DEFAULT_PACING_TIMER_US),
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
@@ -351,11 +359,13 @@ impl Server {
                         let c = counters.clone();
                         let d = done.clone();
                         // `-b` paces the sender in reverse/bidir too (negotiated
-                        // rate; 0 = unlimited). #102
+                        // rate; 0 = unlimited), on the client's pacing-timer
+                        // quantum. #102/#32
                         let rate = cfg.bandwidth;
+                        let pt = cfg.pacing_timer;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb).await
                         })
                     } else {
                         let c = counters.clone();
@@ -1727,6 +1737,25 @@ mod test_config_tests {
         assert_eq!(cfg.tos, 0x10);
         assert_eq!(cfg.congestion, Some("bbr".to_string()));
         assert!(cfg.udp_counters_64bit);
+    }
+
+    // #32: the server's reverse/bidir sender must pace on the CLIENT's
+    // pacing-timer quantum — iperf3 always sends it and the server honors it.
+    // Absent/zero (older peers) falls back to iperf3's 1000 µs default.
+    #[test]
+    fn from_params_honors_peer_pacing_timer() {
+        let p = TestParams {
+            pacing_timer: Some(250),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 250);
+        let p = TestParams::default();
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
+        let p = TestParams {
+            pacing_timer: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
     }
 
     // -- server mirrors the client's rate resolution (#17) --

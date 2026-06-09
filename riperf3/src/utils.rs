@@ -11,6 +11,9 @@ pub const DEFAULT_NUM_STREAMS: u32 = 1;
 pub const DEFAULT_TCP_BLKSIZE: usize = 128 * 1024; // 128 KiB
 pub const DEFAULT_UDP_BLKSIZE: usize = 1460;
 pub const DEFAULT_UDP_RATE: u64 = 1024 * 1024; // 1 Mbit/sec in bits
+/// iperf3's default `--pacing-timer` interval (µs): the wakeup quantum of its
+/// cumulative-average `-b` throttle (`iperf_check_throttle`).
+pub const DEFAULT_PACING_TIMER_US: u32 = 1000;
 
 /// Minimum UDP datagram size: 4 (sec) + 4 (usec) + 8 (64-bit counter)
 pub const MIN_UDP_BLKSIZE: usize = 16;
