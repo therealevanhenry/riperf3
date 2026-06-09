@@ -413,27 +413,26 @@ impl Cli {
         checks.iter().find(|(set, _)| *set).map(|(_, name)| *name)
     }
 
-    /// Build a configured [`riperf3::Client`] from the parsed CLI.
-    ///
-    /// The single source of truth for the client arg→builder mapping, called by
-    /// both `main` and the wiring tests (#124) so the tests exercise the real
-    /// mapping rather than a hand-maintained copy. Process-level concerns
-    /// (daemonize, pidfile, logfile, CPU affinity) stay in `main`; this is pure
-    /// arg → builder → `build()`.
     /// Whether a `-n`/`-k` argument carries a non-zero value. iperf3's
-    /// IEENDCONDITIONS legs test the PARSED value (`bytes != 0`), not flag
-    /// presence — `unit_atof("0") == 0` means "not set", so `-t 5 -n 0` runs a
-    /// plain duration test. A string that doesn't parse returns false here so
-    /// the real parse error (riperf3's documented improvement over iperf3's
-    /// silent garbage-as-0) surfaces from `bytes_str`/`blocks_str`, not as a
-    /// bogus conflict.
+    /// IEENDCONDITIONS legs test the PARSED value, not flag presence, and
+    /// `unit_atoi` scales the suffix then TRUNCATES to an integer — so
+    /// `-n 0`, `-n 0K`, and even `-n 0.5` (truncates to 0) all mean "not
+    /// set" and run a plain duration test (review r2). A string that doesn't
+    /// parse returns false so the real parse error surfaces from
+    /// `bytes_str`/`blocks_str`, not as a bogus conflict.
     fn end_condition_set(arg: Option<&str>) -> bool {
         arg.is_some_and(|s| {
             let s = s.trim();
-            let num = s
-                .strip_suffix(['k', 'K', 'm', 'M', 'g', 'G', 't', 'T'])
-                .unwrap_or(s);
-            num.parse::<f64>().map(|n| n != 0.0).unwrap_or(false)
+            let (num, mult) = match s.as_bytes().last() {
+                Some(b'k' | b'K') => (&s[..s.len() - 1], 1024f64),
+                Some(b'm' | b'M') => (&s[..s.len() - 1], 1024f64 * 1024.0),
+                Some(b'g' | b'G') => (&s[..s.len() - 1], 1024f64 * 1024.0 * 1024.0),
+                Some(b't' | b'T') => (&s[..s.len() - 1], 1024f64 * 1024.0 * 1024.0 * 1024.0),
+                _ => (s, 1.0),
+            };
+            num.parse::<f64>()
+                .map(|n| (n * mult) as u64 != 0)
+                .unwrap_or(false)
         })
     }
 
@@ -449,6 +448,13 @@ impl Cli {
         (self.time.is_some() && (bytes_set || blocks_set)) || (bytes_set && blocks_set)
     }
 
+    /// Build a configured [`riperf3::Client`] from the parsed CLI.
+    ///
+    /// The single source of truth for the client arg→builder mapping, called by
+    /// both `main` and the wiring tests (#124) so the tests exercise the real
+    /// mapping rather than a hand-maintained copy. Process-level concerns
+    /// (daemonize, pidfile, logfile, CPU affinity) stay in `main`; this is pure
+    /// arg → builder → `build()`.
     pub fn build_client(&self) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
         let host = self
             .client

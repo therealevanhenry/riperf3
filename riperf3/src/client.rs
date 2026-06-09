@@ -1478,11 +1478,15 @@ impl ClientBuilder {
         self
     }
 
+    /// `-n/--bytes`: end the test after this many bytes. 0 means "no byte
+    /// limit" (iperf3 semantics) and is normalized to unset at build().
     pub fn bytes(mut self, bytes: u64) -> Self {
         self.bytes_to_send = Some(bytes);
         self
     }
 
+    /// `-k/--blockcount`: end the test after this many blocks. 0 means "no
+    /// block limit" (iperf3 semantics) and is normalized to unset at build().
     pub fn blocks(mut self, blocks: u64) -> Self {
         self.blocks_to_send = Some(blocks);
         self

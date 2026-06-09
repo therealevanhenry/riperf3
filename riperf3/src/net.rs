@@ -849,8 +849,9 @@ pub fn set_tos(fd: &impl std::os::unix::io::AsFd, tos: u32) -> Result<()> {
         .map(|a| a.domain() == socket2::Domain::IPV6)
         .unwrap_or(false);
     if is_v6 {
-        nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Ipv6TClass, &(tos as i32))
-            .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+        // socket2's set_tclass_v6 covers linux/macos/freebsd/netbsd (feature
+        // "all", enabled) — nix's Ipv6TClass is Linux-only (review r2).
+        sock.set_tclass_v6(tos)?;
         // iperf3 also sets IP_TOS on a v6 socket for the v4-mapped case and
         // ignores any failure ("ignore any failure of v4 TOS in IPv6 case").
         let _ = sock.set_tos(tos);
