@@ -11,6 +11,53 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.7.1] - 2026-06-08
+
+The first non-breaking `0.7.x` patch — a batch of iperf3 **output-faithfulness**
+fixes (flags and report fields that diverged from iperf3) plus internal cleanup
+from the 0.7.0 API refactor. No public API change. The default data path is
+unchanged: the cross-tool compatibility matrix is all-PASS and a fresh full N=30
+throughput campaign vs iperf3 is regression-free (parity-or-faster) — see
+[BENCHMARKS.md](BENCHMARKS.md).
+
+### Added
+- **`congestion_used` now reports the congestion-control algorithm actually in
+  effect** (#37). Read back via `getsockopt(TCP_CONGESTION)` at stream creation
+  (the kernel default when `-C` is unset) and surfaced in the `end` block's
+  `sender_tcp_congestion`/`receiver_tcp_congestion`, matching iperf3; previously
+  it was always absent. TCP-only (Linux/FreeBSD).
+
+### Changed
+- **A `-w/--window` the kernel cannot satisfy now aborts the test** (#97),
+  matching iperf3's `IESETBUF2` ("socket buffer size not set correctly"). When the
+  realized `SO_SNDBUF`/`SO_RCVBUF` is smaller than requested (the kernel clamped to
+  `wmem_max`/`rmem_max`), riperf3 errors instead of silently running with a smaller
+  buffer. **Behavior change**: a previously-tolerated oversized `-w` now fails the
+  run, surfacing the misconfiguration rather than hiding it.
+- **The client rejects server-only options** (#100), like iperf3's `IESERVERONLY`.
+  `-D/--daemon`, `-1/--one-off`, `--idle-timeout`, `--server-bitrate-limit`,
+  `--server-max-duration`, `--rsa-private-key-path`, `--authorized-users-path`,
+  `--time-skew-threshold`, and `--use-pkcs1-padding` are now rejected on a client,
+  before any side effects. (`--use-pkcs1-padding` was previously accepted on the
+  client; it is server-only in iperf3.)
+
+### Fixed
+- **`-i 0` now emits one whole-test interval** (#107) covering `0.00`–`<duration>`,
+  matching iperf3's "one interval = the whole test"; riperf3 emitted none. Affects
+  text, `-J`, and `--json-stream`.
+- **`test_start.duration` is now `0` for byte/block-limited (`-n`/`-k`) runs**
+  (#114), matching iperf3 — the `-t` window doesn't apply; the limit is reported in
+  `bytes`/`blocks`. riperf3 reported the default `-t`.
+
+### Internal
+- Extracted the CLI arg→builder mapping into `Cli::build_client`/`build_server` so
+  the wiring tests exercise the real `main.rs` mapping instead of a hand-maintained
+  copy (#124) — closing the drift blind spot and covering every previously-untested
+  flag (49 → 80 CLI wiring tests).
+- Triaged dead/test-only code surfaced by the 0.7.0 module retraction (#125) and
+  dropped redundant Windows-target `as i32` casts flagged by clippy (#129). No
+  behavior change.
+
 ## [0.7.0] - 2026-06-08
 
 A minor bump (the first `0.x` minor since 0.6.0). The headline is a deliberate

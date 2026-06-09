@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 authors = ["Evan Henry"]
 edition = "2021"
 homepage = "https://github.com/therealevanhenry/riperf3"
