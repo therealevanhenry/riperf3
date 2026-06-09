@@ -30,6 +30,11 @@ pub struct StreamCounters {
     bytes_received: AtomicU64,
     bytes_sent_interval: AtomicU64,
     bytes_received_interval: AtomicU64,
+    // `-O/--omit` warm-up baselines (#31): cumulative counts at the omit
+    // boundary. The net getters subtract them so summaries cover only the
+    // post-omit window, like iperf3's stats reset in iperf_reset_stats.
+    bytes_sent_omit: AtomicU64,
+    bytes_received_omit: AtomicU64,
 }
 
 impl Default for StreamCounters {
@@ -45,7 +50,34 @@ impl StreamCounters {
             bytes_received: AtomicU64::new(0),
             bytes_sent_interval: AtomicU64::new(0),
             bytes_received_interval: AtomicU64::new(0),
+            bytes_sent_omit: AtomicU64::new(0),
+            bytes_received_omit: AtomicU64::new(0),
         }
+    }
+
+    /// Record the omit boundary (#31): cumulative counts so far become the
+    /// warm-up baseline the net getters subtract.
+    pub fn snapshot_omit(&self) {
+        self.bytes_sent_omit
+            .store(self.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.bytes_received_omit.store(
+            self.bytes_received.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Bytes sent since the omit boundary (the whole run when `-O` is unused).
+    pub fn bytes_sent_net(&self) -> u64 {
+        self.bytes_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_sent_omit.load(Ordering::Relaxed))
+    }
+
+    /// Bytes received since the omit boundary (see [`Self::bytes_sent_net`]).
+    pub fn bytes_received_net(&self) -> u64 {
+        self.bytes_received
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_received_omit.load(Ordering::Relaxed))
     }
 
     /// Record bytes sent (called from the send loop hot path).
@@ -172,15 +204,11 @@ pub struct UdpRecvStats {
     /// Previous one-way transit time for jitter calculation.
     prev_transit: f64,
 
-    // Snapshots taken at the end of the omit period so we can subtract them.
-    // Test-only today: only `snapshot_omit` (now `#[cfg(test)]`) writes non-zero
-    // values here; in production these stay at their 0 init until `-O/--omit` is
-    // wired into the UDP receive path (#31).
-    #[allow(dead_code)]
+    // Snapshots taken at the omit boundary (#31): the results exchange carries
+    // gross packets/errors plus these omitted_* baselines, and the reading side
+    // subtracts — exactly iperf3's accounting.
     pub omitted_packet_count: i64,
-    #[allow(dead_code)]
     pub omitted_cnt_error: i64,
-    #[allow(dead_code)]
     pub omitted_outoforder_packets: i64,
 }
 
@@ -232,12 +260,7 @@ impl UdpRecvStats {
     }
 
     /// Snapshot current values as the omit-period baseline.
-    /// Call this at the end of the omit period.
-    ///
-    /// Test-only today: `-O/--omit` is not yet wired into the UDP receive path
-    /// (#31), so production never calls this; the unit tests exercise it so the
-    /// omit-accounting fields stay correct for when #31 lands.
-    #[cfg(test)]
+    /// Called by the reporter at the omit boundary (#31).
     pub fn snapshot_omit(&mut self) {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;

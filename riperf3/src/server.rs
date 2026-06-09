@@ -388,7 +388,7 @@ impl Server {
                 // runtime so it never processes the client's TestEnd. Only in
                 // duration mode; byte/block-limited tests stop on `done`.
                 let max_duration = (params.num.is_none() && params.blockcount.is_none())
-                    .then(|| std::time::Duration::from_secs(cfg.duration as u64));
+                    .then(|| std::time::Duration::from_secs((cfg.duration + cfg.omit) as u64));
 
                 // Two server UDP designs, same wire protocol. The default Unix
                 // path mirrors iperf3: one connected data socket per stream, all
@@ -587,21 +587,30 @@ impl Server {
         };
 
         for s in &streams {
+            // Net (post-omit) bytes; packets/errors stay GROSS with the
+            // omitted_* baselines alongside, like iperf3's exchange (#31).
             let bytes = if s.is_sender {
-                s.counters.bytes_sent()
+                s.counters.bytes_sent_net()
             } else {
-                s.counters.bytes_received()
+                s.counters.bytes_received_net()
             };
 
-            let (jitter, errors, packets) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                if let Ok(stats) = udp_stats.lock() {
-                    (stats.jitter, stats.cnt_error, stats.packet_count)
+            let (jitter, errors, packets, omitted_errors, omitted_packets) =
+                if let Some(ref udp_stats) = s.udp_recv_stats {
+                    if let Ok(st) = udp_stats.lock() {
+                        (
+                            st.jitter,
+                            st.cnt_error,
+                            st.packet_count,
+                            st.omitted_cnt_error,
+                            st.omitted_packet_count,
+                        )
+                    } else {
+                        (0.0, 0, 0, 0, 0)
+                    }
                 } else {
-                    (0.0, 0, 0)
-                }
-            } else {
-                (0.0, 0, 0)
-            };
+                    (0.0, 0, 0, 0, 0)
+                };
 
             result_streams.push(protocol::StreamResultJson {
                 id: s.id,
@@ -609,9 +618,9 @@ impl Server {
                 retransmits: -1,
                 jitter,
                 errors,
-                omitted_errors: 0,
+                omitted_errors,
                 packets,
-                omitted_packets: 0,
+                omitted_packets,
                 start_time: 0.0,
                 end_time: test_duration,
             });
@@ -689,9 +698,9 @@ impl Server {
                 .iter()
                 .map(|s| {
                     let bytes = if s.is_sender {
-                        s.counters.bytes_sent()
+                        s.counters.bytes_sent_net()
                     } else {
-                        s.counters.bytes_received()
+                        s.counters.bytes_received_net()
                     };
 
                     let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
@@ -1127,9 +1136,9 @@ impl Server {
             .iter()
             .map(|s| {
                 let local_bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
                 // The server measures UDP loss/jitter on the streams it receives.

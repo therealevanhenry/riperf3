@@ -99,8 +99,11 @@ fn server_receiver_summaries(
             is_sender: false,
             retransmits: None,
             jitter: is_udp.then_some(s.jitter),
-            lost: is_udp.then_some(s.errors),
-            total_packets: is_udp.then_some(s.packets),
+            // The exchange carries GROSS packets/errors plus omitted_*
+            // baselines; subtract for the post-omit summary (#31). This also
+            // reads a real iperf3 server's omit results correctly.
+            lost: is_udp.then_some(s.errors - s.omitted_errors),
+            total_packets: is_udp.then_some(s.packets - s.omitted_packets),
         })
         .collect()
 }
@@ -111,15 +114,17 @@ fn server_receiver_summaries(
 /// bidir whichever direction reaches the limit first ends the test. Counting
 /// only sent bytes leaves a reverse `-n`/`-k` test spinning forever (#60).
 fn transferred_bytes(streams: &[DataStream]) -> u64 {
+    // Net (post-omit) getters: with -O, iperf3 resets byte progress at the
+    // boundary so the -n/-k limit applies to the measured window (#31).
     let sent: u64 = streams
         .iter()
         .filter(|s| s.is_sender)
-        .map(|s| s.counters.bytes_sent())
+        .map(|s| s.counters.bytes_sent_net())
         .sum();
     let received: u64 = streams
         .iter()
         .filter(|s| !s.is_sender)
-        .map(|s| s.counters.bytes_received())
+        .map(|s| s.counters.bytes_received_net())
         .sum();
     sent.max(received)
 }
@@ -394,7 +399,7 @@ impl Client {
         // being set by a CPU-starved runtime. Only in duration mode;
         // byte/block-limited tests stop on `done`.
         let max_duration = (self.bytes_to_send.is_none() && self.blocks_to_send.is_none())
-            .then(|| Duration::from_secs(self.duration as u64));
+            .then(|| Duration::from_secs((self.duration + self.omit) as u64));
 
         // `-n`/`-k` shared byte budget for the sending streams: they collectively
         // stop at ~N bytes (iperf3's `-n` is the test-wide total), bounding the
@@ -748,8 +753,13 @@ impl Client {
                 // and starve this async timer, so they must not depend on it to
                 // stop (issue #5). Once they self-terminate, CPU frees and this
                 // timer fires normally to drive the rest of the shutdown.
+                // The wall clock runs omit + time (#31): iperf3 extends the
+                // run by the warm-up so the measured window is a full `-t`.
+                // The authoritative end time handed to the reporter stays the
+                // post-omit `-t` (its timeline restarts at the boundary).
+                let wall = dur + Duration::from_secs(self.omit as u64);
                 tokio::select! {
-                    _ = tokio::time::sleep(dur) => {}
+                    _ = tokio::time::sleep(wall) => {}
                     state = protocol::recv_state(ctrl) => {
                         // Server sent something unexpected during the test
                         if let Ok(TestState::ServerTerminate) = state {
@@ -811,20 +821,32 @@ impl Client {
         let stream_results: Vec<_> = streams
             .iter()
             .map(|s| {
+                // Net (post-omit) bytes; packets/errors stay GROSS with the
+                // omitted_* baselines alongside — the reading side subtracts,
+                // exactly iperf3's exchange accounting (#31).
                 let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
-                let (jitter, errors, packets) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                    udp_stats
-                        .lock()
-                        .map(|stats| (stats.jitter, stats.cnt_error, stats.packet_count))
-                        .unwrap_or((0.0, 0, 0))
-                } else {
-                    (0.0, 0, 0)
-                };
+                let (jitter, errors, packets, omitted_errors, omitted_packets) =
+                    if let Some(ref udp_stats) = s.udp_recv_stats {
+                        udp_stats
+                            .lock()
+                            .map(|st| {
+                                (
+                                    st.jitter,
+                                    st.cnt_error,
+                                    st.packet_count,
+                                    st.omitted_cnt_error,
+                                    st.omitted_packet_count,
+                                )
+                            })
+                            .unwrap_or((0.0, 0, 0, 0, 0))
+                    } else {
+                        (0.0, 0, 0, 0, 0)
+                    };
 
                 protocol::StreamResultJson {
                     id: s.id,
@@ -832,9 +854,9 @@ impl Client {
                     retransmits: -1,
                     jitter,
                     errors,
-                    omitted_errors: 0,
+                    omitted_errors,
                     packets,
-                    omitted_packets: 0,
+                    omitted_packets,
                     start_time: 0.0,
                     end_time: test_duration,
                 }
@@ -907,9 +929,9 @@ impl Client {
             .iter()
             .map(|s| {
                 let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
                 let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
@@ -1009,17 +1031,20 @@ impl Client {
                 // UDP datagram stats: from our local receiver if we measured them,
                 // else (forward UDP) from the server's results for this stream (#25).
                 let udp = if let Some(ref lock) = s.udp_recv_stats {
+                    // Local receiver: post-omit stats (#31) — gross counters
+                    // minus the boundary baselines.
                     lock.lock().ok().map(|st| UdpStreamStats {
                         jitter_secs: st.jitter,
-                        lost_packets: st.cnt_error,
-                        packets: st.packet_count,
-                        out_of_order: st.outoforder_packets,
+                        lost_packets: st.cnt_error - st.omitted_cnt_error,
+                        packets: st.packet_count - st.omitted_packet_count,
+                        out_of_order: st.outoforder_packets - st.omitted_outoforder_packets,
                     })
                 } else if is_forward_udp && s.is_sender {
+                    // Peer's gross counts minus its omitted_* baselines (#31).
                     server_stream.map(|x| UdpStreamStats {
                         jitter_secs: x.jitter,
-                        lost_packets: x.errors,
-                        packets: x.packets,
+                        lost_packets: x.errors - x.omitted_errors,
+                        packets: x.packets - x.omitted_packets,
                         out_of_order: 0,
                     })
                 } else {
@@ -1670,6 +1695,14 @@ impl ClientBuilder {
                     ));
                 }
             }
+        }
+
+        // iperf3 caps the warm-up at MAX_OMIT_TIME (60 s) with IEOMIT (#31).
+        if self.omit > 60 {
+            return Err(ConfigError::InvalidValue(
+                "omit",
+                format!("bogus value for --omit (maximum = 60 seconds): {}", self.omit),
+            ));
         }
 
         // Reject flags that require OS support not available on this platform.
