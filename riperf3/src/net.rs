@@ -199,12 +199,15 @@ pub async fn resolve_bind_ip(
 /// Connect to a TCP (or MPTCP) endpoint.
 /// Uses socket2 when a local port (`--cport`), a bind address (`-B`),
 /// `--bind-dev`, or mptcp is set; tokio's built-in connect otherwise.
-/// `ip_version` constrains address-family selection for hostnames (`-4`/`-6`);
-/// when `None`, the OS resolver's full address list is tried. A `bind_address`
-/// is resolved honoring `ip_version` and must share the target's address
-/// family (it's the client source address). `bind_dev` is applied to the
-/// unconnected socket — the device option steers the routing decision made at
-/// connect time, so post-connect application is a silent no-op (#88).
+/// `ip_version` constrains address-family selection for hostnames (`-4`/`-6`).
+/// On the tokio path with `None`, the OS resolver's full address list is
+/// tried; the socket2 path connects to the FIRST resolved address only —
+/// which matches iperf3 (`netdial` connects to `getaddrinfo`'s first result
+/// in all cases). A `bind_address` is resolved honoring `ip_version` and must
+/// share the target's address family (it's the client source address).
+/// `bind_dev` is applied to the unconnected socket — the device option steers
+/// the routing decision made at connect time, so post-connect application is
+/// a silent no-op (#88).
 #[allow(clippy::too_many_arguments)] // connect tuning knobs map 1:1 to CLI flags
 pub async fn tcp_connect(
     host: &str,
