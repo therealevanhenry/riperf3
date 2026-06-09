@@ -14,6 +14,17 @@ matrix below were measured on our two-VM sandbox with internal tooling (the
 [Reproducing](#reproducing) so the numbers stay auditable, but they are
 environment-specific.
 
+> **0.7.1 status.** Re-verified at the `0.7.1` patch: the compatibility matrix is
+> all-PASS (incl. iperf3 3.12 interop and the `-w 256K` cell that exercises #97) and
+> a fresh full N=30 throughput campaign reproduces the **same verdict** as 0.7.0 —
+> parity-or-faster vs iperf3 (12 riperf3 / 3 parity / 1 within-noise; the lone noise
+> cell is again TCP rev P1 v4, this run −1.8% at p=0.012). 0.7.1 is a batch of iperf3
+> output-faithfulness fixes (#100 client server-only rejection, #114/#107 report
+> fields, #37 `congestion_used` read-back, #97 `-w` clamp abort) plus internal
+> cleanup (#124/#125/#129) — all CLI / reporting / socket-setup, with **zero
+> throughput-data-path impact**, so the tables below carry forward from the 0.7.0
+> campaign and this re-run confirms them regression-free.
+>
 > **0.7.0 status.** Re-verified at the final 0.7.0 commit (post the breaking-API
 > set): the compatibility matrix is all-PASS and the throughput campaign was
 > **re-measured fresh** (full N=30) — the riperf3-vs-iperf3 verdict is stable
@@ -39,7 +50,7 @@ environment-specific.
 | Host | Intel i9-13900K, Linux 7.0.11-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.90+deb13.1-cloud-amd64, 8 vCPU, 8 GB RAM each |
 | NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
-| riperf3 | 0.7.0 |
+| riperf3 | 0.7.1 |
 | iperf3 | 3.20+ (cJSON 1.7.15), built from source |
 
 ## Compatibility matrix (iperf3 interop)
