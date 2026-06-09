@@ -246,10 +246,10 @@ impl UdpRecvStats {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiter (token bucket for UDP pacing)
+// Rate limiter (cumulative-average throttle for `-b` pacing, TCP path)
 // ---------------------------------------------------------------------------
 
-/// Token-bucket rate limiter for application-level send pacing.
+/// Cumulative-average rate limiter for application-level send pacing.
 pub struct RateLimiter {
     rate_bytes_per_sec: f64,
     /// Wakeup quantum when behind schedule (`--pacing-timer`, iperf3 default
@@ -268,7 +268,9 @@ impl RateLimiter {
     /// with TCP's 128 KiB default block (#116). High rates self-correct the
     /// other way: after an oversleep the average is behind, so blocks go out
     /// back-to-back with no sleep — burstiness ≈ rate × pacing quantum,
-    /// exactly iperf3's behavior.
+    /// matching the documented `--pacing-timer` semantics (iperf3 <= 3.15's
+    /// timer-driven throttle; 3.17+ deprecated the quantum and sleeps exactly
+    /// to the green-light instant — same long-run average either way).
     ///
     /// - `rate_bits_per_sec`: target send rate
     /// - `pacing_timer_us`: wakeup quantum when behind (`--pacing-timer`,
@@ -298,8 +300,9 @@ impl RateLimiter {
                 break;
             }
             // Sleep to the green-light instant, but never less than the pacing
-            // quantum — iperf3's minimum wakeup is one pacing-timer tick, and
-            // the cumulative math absorbs any oversleep.
+            // quantum — the documented --pacing-timer semantics (iperf3
+            // <= 3.15's minimum wakeup was one tick; 3.17+ deprecated the
+            // quantum). The cumulative math absorbs any oversleep.
             let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
             tokio::time::sleep(to_green.max(self.pacing)).await;
         }
