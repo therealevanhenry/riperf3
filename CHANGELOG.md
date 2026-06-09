@@ -11,7 +11,7 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.7.1] - 2026-06-08
+## [0.7.1] - 2026-06-09
 
 The first non-breaking `0.7.x` patch — a batch of iperf3 **output-faithfulness**
 fixes (flags and report fields that diverged from iperf3) plus internal cleanup
