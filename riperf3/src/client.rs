@@ -35,6 +35,7 @@ pub struct Client {
     pub(crate) mss: Option<i32>,
     pub(crate) window: Option<i32>,
     pub(crate) bandwidth: u64,
+    pub(crate) pacing_timer: u32,
     pub(crate) tos: i32,
     pub(crate) congestion: Option<String>,
     pub(crate) udp_counters_64bit: bool,
@@ -1254,6 +1255,7 @@ pub struct ClientBuilder {
     mss: Option<i32>,
     window: Option<i32>,
     bandwidth: Option<u64>,
+    pacing_timer: u32,
     tos: i32,
     congestion: Option<String>,
     udp_counters_64bit: bool,
@@ -1310,6 +1312,7 @@ impl Default for ClientBuilder {
             mss: None,
             window: None,
             bandwidth: None,
+            pacing_timer: 0,
             tos: 0,
             congestion: None,
             udp_counters_64bit: false,
@@ -1421,6 +1424,13 @@ impl ClientBuilder {
         // `Some` even for 0: an explicit `-b 0` means unlimited and must be
         // distinguishable from "unset" (which resolves to the UDP default) (#17).
         self.bandwidth = Some(bps);
+        self
+    }
+
+    /// `--pacing-timer`: the `-b` throttle's wakeup quantum in microseconds
+    /// (iperf3 default 1000). 0 falls back to the default.
+    pub fn pacing_timer(mut self, us: u32) -> Self {
+        self.pacing_timer = us;
         self
     }
 
@@ -1741,6 +1751,13 @@ impl ClientBuilder {
                 TransportProtocol::Udp => DEFAULT_UDP_RATE,
                 TransportProtocol::Tcp => 0,
             }),
+            // 0 = unset → iperf3's default quantum, like its pacing_timer
+            // option parsing (it never sends 0).
+            pacing_timer: if self.pacing_timer == 0 {
+                crate::utils::DEFAULT_PACING_TIMER_US
+            } else {
+                self.pacing_timer
+            },
             tos,
             congestion: self.congestion,
             udp_counters_64bit: self.udp_counters_64bit,
@@ -2088,6 +2105,17 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(c.build_params(1460).bandwidth, Some(0));
+        }
+
+        // #32: iperf3 ALWAYS sends pacing_timer in the param exchange (default
+        // 1000 µs), so the server's reverse/bidir sender paces on the same
+        // quantum. riperf3 left it unset.
+        #[test]
+        fn build_params_always_sends_pacing_timer() {
+            let c = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(c.build_params(1460).pacing_timer, Some(1000));
+            let c = ClientBuilder::new("h").pacing_timer(500).build().unwrap();
+            assert_eq!(c.build_params(1460).pacing_timer, Some(500));
         }
 
         // -- forward UDP receiver-loss reporting (issue #25) --

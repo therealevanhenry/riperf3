@@ -1729,6 +1729,31 @@ mod tests {
 
     // -- RateLimiter --
 
+    // #116: with TCP's 128 KiB default block, the old token bucket's burst
+    // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
+    // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
+    // total sent to elapsed*rate + one in-flight block at any rate/blksize.
+    #[tokio::test]
+    async fn rate_limiter_total_accuracy_low_rate_large_blocks() {
+        let rate_bits: u64 = 1_000_000; // 1 Mbit/s
+        let blk: u64 = 128 * 1024; // TCP default block
+        let mut limiter = RateLimiter::new(rate_bits, 0, blk as usize);
+        let start = Instant::now();
+        let mut sent: u64 = 0;
+        while start.elapsed() < Duration::from_millis(1000) {
+            limiter.acquire(blk).await;
+            sent += blk;
+        }
+        let budget = (rate_bits as f64 / 8.0) * start.elapsed().as_secs_f64();
+        let bound = budget * 1.25 + blk as f64;
+        assert!(
+            (sent as f64) <= bound,
+            "sent {sent} bytes in {:?}; budget {budget:.0} (+25% + one block = {bound:.0}) — \
+             initial burst overshoots the target rate (#116)",
+            start.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn rate_limiter_allows_burst() {
         let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbit/s, 1000-byte blocks

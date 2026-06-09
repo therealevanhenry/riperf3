@@ -1531,6 +1531,14 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").cntl_ka("10/5/3").build().unwrap());
         }
 
+        // #32: --pacing-timer was parsed but never wired — a silent no-op.
+        #[test]
+        fn pacing_timer_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "500"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").pacing_timer(500).build().unwrap());
+        }
+
         #[test]
         fn format_wired() {
             // The CLI always sets a format (default 'm'); `-f g` must propagate.
