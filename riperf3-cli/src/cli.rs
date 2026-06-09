@@ -199,7 +199,9 @@ pub struct Cli {
     pub cport: Option<u16>,
 
     /// Set the server timing for pacing in microseconds (deprecated)
-    #[arg(long, value_name = "usec")]
+    // Capped at i32::MAX: the wire TestParams field is i32 (a larger u32
+    // would wrap negative on the wire — review r1).
+    #[arg(long, value_name = "usec", value_parser = clap::value_parser!(u32).range(..=i32::MAX as i64))]
     pub pacing_timer: Option<u32>,
 
     /// Only use IPv4
