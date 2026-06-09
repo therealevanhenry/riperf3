@@ -3,7 +3,8 @@
 pub struct TcpInfoSnapshot {
     /// Cumulative retransmissions over the connection lifetime.
     pub total_retransmits: u32,
-    /// Send congestion window in bytes (`tcpi_snd_cwnd * tcpi_snd_mss`).
+    /// Send congestion window in bytes (Linux/FreeBSD report segments, so
+    /// those readers multiply by mss; macOS reports bytes directly).
     pub snd_cwnd: u64,
     /// Send window advertised by the receiver, in bytes.
     #[allow(dead_code)]
