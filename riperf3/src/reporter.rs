@@ -409,12 +409,6 @@ impl Default for ReporterEnd {
     }
 }
 
-/// Spawn an async task that prints interval reports periodically.
-///
-/// Returns `None` if interval reporting is disabled (interval_secs <= 0). On a
-/// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
-/// interval and stop the task; `done` is the fallback stop signal for error/early
-/// teardown paths. The handle should be awaited after `finish`/`done`.
 /// Per-direction interval aggregates (#54). In bidir both directions run
 /// concurrently; iperf3 sums each separately (`sum` + `sum_bidir_reverse`).
 #[derive(Default)]
@@ -485,6 +479,12 @@ fn direction_interval_sum(
     }
 }
 
+/// Spawn an async task that prints interval reports periodically.
+///
+/// Returns `None` if interval reporting is disabled (interval_secs <= 0). On a
+/// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
+/// interval and stop the task; `done` is the fallback stop signal for error/early
+/// teardown paths. The handle should be awaited after `finish`/`done`.
 pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
