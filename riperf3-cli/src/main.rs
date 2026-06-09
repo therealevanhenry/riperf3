@@ -103,25 +103,83 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async_main(cli))
+    // The pidfile (written above) must be unlinked on EVERY exit path —
+    // normal completion, error, or termination signal — like iperf3, which
+    // deletes it after the server/client loop and in its sigend path (#105).
+    // Keep one cleanup point here, after the runtime returns.
+    let pidfile = cli.pidfile.clone();
+    let is_server = cli.server;
+    let outcome = rt.block_on(async_main(cli));
+    if let Some(ref path) = pidfile {
+        let _ = std::fs::remove_file(path);
+    }
+    match outcome {
+        // iperf3 treats SIGTERM/SIGINT/SIGHUP as a NORMAL exit
+        // (iperf_got_sigend → iperf_signormalexit → exit 0), printing an
+        // interrupt notice first.
+        Ok(Exit::Signal(sig)) => {
+            let role = if is_server { "server" } else { "client" };
+            eprintln!("riperf3: interrupt - the {role} has terminated by signal {sig}");
+            Ok(())
+        }
+        Ok(Exit::Normal) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
-async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if cli.client.is_some() {
-        // Client mode. Client-only options on a server and server-only options
-        // on a client are both rejected up front in `main` (#65/#100), before
-        // any side effects. The arg→builder mapping lives in `Cli::build_client`
-        // (cli.rs) so the wiring tests exercise the same code path (#124).
-        cli.build_client()?.run().await?;
-    } else if cli.server {
-        // Server mode. See `Cli::build_server` (cli.rs). `-D`/`--daemon` is
-        // handled before the runtime is built (daemonize block in `main`).
-        cli.build_server()?.run().await?;
-    } else {
-        eprintln!("No mode specified. Use -s for server or -c <host> for client.");
-    }
+/// How the async role future ended: normally, or cut short by a termination
+/// signal (which iperf3 reports and treats as a clean exit — see `main`).
+enum Exit {
+    Normal,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Signal(&'static str),
+}
 
-    Ok(())
+/// Resolves when a termination signal arrives — the same set iperf3 catches
+/// in `iperf_catch_sigend` (SIGTERM/SIGINT/SIGHUP). Returns iperf3's
+/// `strsignal(sig)(num)` rendering for the interrupt notice.
+#[cfg(unix)]
+async fn sigend() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    tokio::select! {
+        _ = term.recv() => "Terminated(15)",
+        _ = int.recv() => "Interrupt(2)",
+        _ = hup.recv() => "Hangup(1)",
+    }
+}
+
+async fn async_main(cli: Cli) -> std::result::Result<Exit, Box<dyn std::error::Error>> {
+    let role = async {
+        if cli.client.is_some() {
+            // Client mode. Client-only options on a server and server-only options
+            // on a client are both rejected up front in `main` (#65/#100), before
+            // any side effects. The arg→builder mapping lives in `Cli::build_client`
+            // (cli.rs) so the wiring tests exercise the same code path (#124).
+            cli.build_client()?.run().await?;
+        } else if cli.server {
+            // Server mode. See `Cli::build_server` (cli.rs). `-D`/`--daemon` is
+            // handled before the runtime is built (daemonize block in `main`).
+            cli.build_server()?.run().await?;
+        } else {
+            eprintln!("No mode specified. Use -s for server or -c <host> for client.");
+        }
+        Ok(Exit::Normal)
+    };
+
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            r = role => r,
+            sig = sigend() => Ok(Exit::Signal(sig)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        role.await
+    }
 }
 
 fn configure_log4rs(verbosity: u8) {
