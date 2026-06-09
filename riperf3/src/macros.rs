@@ -13,6 +13,57 @@ use std::sync::RwLock;
 /// so concurrent client runs in one process can't interleave coherently anyway.
 static OUTPUT_TITLE: RwLock<Option<String>> = RwLock::new(None);
 
+/// `--get-server-output` capture sink (#33): when active, the server's report
+/// lines (vprintln! + the reporter's `titled` printers) append here instead of
+/// stdout — faithful to iperf3's tmpfile diversion, whose text-mode server
+/// console is silent for the test while its output rides the results exchange.
+/// Shares the OUTPUT_TITLE process-global caveat (one server run at a time).
+static OUTPUT_CAPTURE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Append `line` to the active capture; returns false when no capture is
+/// active (caller prints normally).
+pub(crate) fn capture_line(line: &str) -> bool {
+    if let Ok(mut g) = OUTPUT_CAPTURE.write() {
+        if let Some(buf) = g.as_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+            return true;
+        }
+    }
+    false
+}
+
+/// RAII capture for the server's `--get-server-output` diversion (#33). Drop
+/// clears the sink even on early `?` returns; `take()` finishes the capture
+/// and returns the buffered text.
+pub(crate) struct OutputCaptureGuard;
+
+impl OutputCaptureGuard {
+    pub(crate) fn start() -> Self {
+        if let Ok(mut g) = OUTPUT_CAPTURE.write() {
+            *g = Some(String::new());
+        }
+        OutputCaptureGuard
+    }
+
+    pub(crate) fn take(self) -> String {
+        OUTPUT_CAPTURE
+            .write()
+            .ok()
+            .and_then(|mut g| g.take())
+            .unwrap_or_default()
+        // self drops here; Drop sees the sink already cleared.
+    }
+}
+
+impl Drop for OutputCaptureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = OUTPUT_CAPTURE.write() {
+            *g = None;
+        }
+    }
+}
+
 pub(crate) fn set_output_title(title: Option<String>) {
     if let Ok(mut g) = OUTPUT_TITLE.write() {
         *g = title;
@@ -52,11 +103,14 @@ macro_rules! vprintln {
     ($($arg:tt)*) => {
         {
             log::info!($($arg)*);
-            println!(
+            let line = format!(
                 "{}{}",
                 $crate::macros::output_title_prefix(),
                 format_args!($($arg)*)
             );
+            if !$crate::macros::capture_line(&line) {
+                println!("{line}");
+            }
         }
     };
 }

@@ -57,7 +57,12 @@ fn fmt_id(id: i32) -> String {
 /// when a title is active (#34). Every report line routes through this so the
 /// prefix matches iperf3 without changing the public printer signatures.
 fn titled(line: std::fmt::Arguments) {
-    println!("{}{}", crate::macros::output_title_prefix(), line);
+    let rendered = format!("{}{}", crate::macros::output_title_prefix(), line);
+    // --get-server-output (#33): a capturing server diverts its report lines
+    // into the results exchange instead of stdout, like iperf3's tmpfile.
+    if !crate::macros::capture_line(&rendered) {
+        println!("{rendered}");
+    }
 }
 
 /// Print the header line for interval reports.

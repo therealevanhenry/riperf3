@@ -52,9 +52,6 @@ pub struct Client {
     pub(crate) sendmmsg: bool,
     pub(crate) dont_fragment: bool,
     pub(crate) cport: Option<u16>,
-    // Set by the builder but not yet consumed by `run()`; to be wired into the
-    // library as non-breaking 0.7.x work (#33).
-    #[allow(dead_code)]
     pub(crate) get_server_output: bool,
     pub(crate) forceflush: bool,
     pub(crate) timestamps: Option<String>,
@@ -327,6 +324,11 @@ impl Client {
         // it. `bandwidth` is the effective rate after the build-time default
         // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
         p.bandwidth = Some(self.bandwidth);
+        // --get-server-output (#33): ask the server to return its output in
+        // the results exchange, exactly like iperf3's param.
+        if self.get_server_output {
+            p.get_server_output = Some(1);
+        }
         if self.tos != 0 {
             p.tos = Some(self.tos);
         }
@@ -842,6 +844,9 @@ impl Client {
             .collect();
 
         TestResultsJson {
+            // Client → server payload never carries server output (#33).
+            server_output_text: None,
+            server_output_json: None,
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
@@ -892,6 +897,22 @@ impl Client {
             );
         } else {
             self.print_results_text(streams, remote_cpu, test_duration);
+        }
+    }
+
+    /// `--get-server-output` (#33): print the server's returned output after
+    /// our own report, like iperf3 ("Server output:" then the text, or the
+    /// pretty-printed JSON when the server ran -J).
+    fn print_server_output(server_results: Option<&TestResultsJson>) {
+        let Some(server) = server_results else { return };
+        if let Some(text) = &server.server_output_text {
+            crate::vprintln!("\nServer output:");
+            print!("{text}");
+        } else if let Some(json) = &server.server_output_json {
+            crate::vprintln!("\nServer output:");
+            if let Ok(s) = serde_json::to_string_pretty(json) {
+                println!("{s}");
+            }
         }
     }
 
@@ -950,6 +971,7 @@ impl Client {
         // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
         // (issue #4), via the shared path the server also uses.
         crate::reporter::print_final_summaries(&summaries, self.format_char);
+        Self::print_server_output(server_results);
     }
 
     /// Assemble the typed iperf3-schema report input from the finished test.
@@ -1133,6 +1155,10 @@ impl Client {
             gro: i32::from(self.gsro),
             start_time_millis: start_meta.start_time_millis,
             extra_data: self.extra_data.clone(),
+            // --get-server-output (#33): the server's returned output rides the
+            // -J report tail; None unless the flag asked for it.
+            server_output_text: remote_cpu.and_then(|r| r.server_output_text.clone()),
+            server_output_json: remote_cpu.and_then(|r| r.server_output_json.clone()),
             intervals: collected_intervals,
             streams: stream_reports,
         };
@@ -2104,6 +2130,8 @@ mod tests {
                 cpu_util_system: 0.0,
                 sender_has_retransmits: -1,
                 congestion_used: None,
+                server_output_text: None,
+                server_output_json: None,
                 streams: vec![protocol::StreamResultJson {
                     id: 1,
                     bytes: 2_000_000,
