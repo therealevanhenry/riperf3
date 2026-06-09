@@ -268,8 +268,8 @@ impl RateLimiter {
     /// with TCP's 128 KiB default block (#116). High rates self-correct the
     /// other way: after an oversleep the average is behind, so blocks go out
     /// back-to-back with no sleep — burstiness ≈ rate × pacing quantum,
-    /// matching the documented `--pacing-timer` semantics (iperf3 <= 3.15's
-    /// timer-driven throttle; 3.17+ deprecated the quantum and sleeps exactly
+    /// matching the documented `--pacing-timer` semantics (iperf3 <= 3.17's
+    /// timer-driven throttle; 3.18+ deprecated the quantum and sleeps exactly
     /// to the green-light instant — same long-run average either way).
     ///
     /// - `rate_bits_per_sec`: target send rate
@@ -301,7 +301,7 @@ impl RateLimiter {
             }
             // Sleep to the green-light instant, but never less than the pacing
             // quantum — the documented --pacing-timer semantics (iperf3
-            // <= 3.15's minimum wakeup was one tick; 3.17+ deprecated the
+            // <= 3.17's minimum wakeup was one tick; 3.18+ deprecated the
             // quantum). The cumulative math absorbs any oversleep.
             let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
             tokio::time::sleep(to_green.max(self.pacing)).await;
