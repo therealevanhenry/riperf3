@@ -190,15 +190,53 @@ mod tests {
         }
     }
 
-    // #40: only platforms with a real sender retransmit *packet* count advertise
-    // retransmit info. macOS (bytes only) and other targets must report false so
-    // the Retr column isn't a misleading 0. Runs on every platform; the macOS
-    // assertion is validated by the macOS native CI job.
+    // #40/#96: only platforms with a real sender retransmit *packet* count
+    // advertise retransmit info. iperf3 shows Retr+Cwnd on macOS by reading
+    // tcp_connection_info.tcpi_txretransmitpackets, so macOS belongs on the
+    // "has" side (#96 restores it via the hand-rolled binding). Runs on every
+    // platform; the macOS assertion is validated by the macOS native CI job.
     #[test]
     fn retransmit_info_only_where_packet_count_exists() {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
         assert!(has_retransmit_info());
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
         assert!(!has_retransmit_info());
+    }
+
+    // #96: on macOS the snapshot must come from the hand-rolled
+    // tcp_connection_info binding — sane prefix fields (maxseg) prove the
+    // struct layout lines up with what the kernel wrote (a mislaid struct
+    // reads garbage or zeros here), and total_retransmits comes from the real
+    // tcpi_txretransmitpackets counter (0 is the expected value on loopback).
+    // Validated by the macOS native CI job.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_snapshot_reads_sane_values() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap();
+
+        let info = get_tcp_info(server_stream.as_raw_fd()).expect("TCP_CONNECTION_INFO");
+        assert!(
+            info.snd_mss > 0 && info.snd_mss < 65_536,
+            "maxseg implausible — struct layout suspect: {}",
+            info.snd_mss
+        );
+        assert_eq!(
+            info.total_retransmits, 0,
+            "loopback handshake should have no retransmits"
+        );
+        // xnu reports tcpi_snd_cwnd in BYTES; iperf3 uses it raw. A cwnd below
+        // one segment or above 1 GiB would indicate a unit or layout error.
+        assert!(
+            info.snd_cwnd >= info.snd_mss as u64 && info.snd_cwnd < (1 << 30),
+            "snd_cwnd implausible: {}",
+            info.snd_cwnd
+        );
     }
 }
