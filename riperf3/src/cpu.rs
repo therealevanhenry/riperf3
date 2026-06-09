@@ -59,26 +59,18 @@ impl CpuSnapshot {
             host_total: (user_diff + system_diff) / wall_usec * 100.0,
             host_user: user_diff / wall_usec * 100.0,
             host_system: system_diff / wall_usec * 100.0,
-            remote_total: 0.0,
-            remote_user: 0.0,
-            remote_system: 0.0,
         }
     }
 }
 
-/// CPU utilization percentages for both local and remote hosts.
-/// Remote values are filled in from the peer's results JSON after exchange.
+/// This process's CPU utilization percentages. The peer's figures never pass
+/// through here — they flow from the results exchange straight into
+/// `json_report::CpuUtilization` (#139).
 #[derive(Debug, Clone, Default)]
 pub struct CpuUtilization {
     pub host_total: f64,
     pub host_user: f64,
     pub host_system: f64,
-    #[allow(dead_code)]
-    pub remote_total: f64,
-    #[allow(dead_code)]
-    pub remote_user: f64,
-    #[allow(dead_code)]
-    pub remote_system: f64,
 }
 
 #[cfg(test)]
@@ -105,7 +97,6 @@ mod tests {
         let util = after.utilization_since(&before);
         assert!(util.host_user >= 0.0);
         assert!(util.host_total >= 0.0);
-        assert_eq!(util.remote_total, 0.0);
     }
 
     #[test]
