@@ -442,6 +442,9 @@ impl Cli {
         if let Some(t) = self.time {
             builder = builder.duration(t);
         }
+        if let Some(us) = self.pacing_timer {
+            builder = builder.pacing_timer(us);
+        }
         if let Some(ref s) = self.bytes {
             builder = builder.bytes_str(s)?;
         }

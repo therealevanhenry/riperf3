@@ -328,6 +328,9 @@ impl Client {
         // it. `bandwidth` is the effective rate after the build-time default
         // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
         p.bandwidth = Some(self.bandwidth);
+        // Always sent, like iperf3 (default 1000 µs): the server's
+        // reverse/bidir sender paces on the client's quantum (#32).
+        p.pacing_timer = Some(self.pacing_timer as i32);
         if self.tos != 0 {
             p.tos = Some(self.tos);
         }
@@ -483,6 +486,7 @@ impl Client {
                         let d = done.clone();
                         let zc = self.zerocopy;
                         let rate = self.bandwidth;
+                        let pt = self.pacing_timer;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
                             // Zerocopy (sendfile) is used only for an unlimited,
@@ -512,11 +516,12 @@ impl Client {
                                     target_os = "freebsd"
                                 )))]
                                 {
-                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb)
+                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb)
                                         .await
                                 }
                             } else {
-                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
+                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb)
+                                    .await
                             }
                         })
                     } else {

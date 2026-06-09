@@ -64,7 +64,13 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
-            pacing_timer: crate::utils::DEFAULT_PACING_TIMER_US,
+            // The client's --pacing-timer quantum (#32); iperf3 always sends
+            // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
+            pacing_timer: params
+                .pacing_timer
+                .filter(|&us| us > 0)
+                .map(|us| us as u32)
+                .unwrap_or(crate::utils::DEFAULT_PACING_TIMER_US),
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
@@ -353,11 +359,13 @@ impl Server {
                         let c = counters.clone();
                         let d = done.clone();
                         // `-b` paces the sender in reverse/bidir too (negotiated
-                        // rate; 0 = unlimited). #102
+                        // rate; 0 = unlimited), on the client's pacing-timer
+                        // quantum. #102/#32
                         let rate = cfg.bandwidth;
+                        let pt = cfg.pacing_timer;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb).await
                         })
                     } else {
                         let c = counters.clone();
