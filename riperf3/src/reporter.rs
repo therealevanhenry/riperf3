@@ -419,6 +419,76 @@ impl Default for ReporterEnd {
 /// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
 /// interval and stop the task; `done` is the fallback stop signal for error/early
 /// teardown paths. The handle should be awaited after `finish`/`done`.
+/// Per-direction interval aggregates (#54). In bidir both directions run
+/// concurrently; iperf3 sums each separately (`sum` + `sum_bidir_reverse`).
+#[derive(Default)]
+struct DirAcc {
+    count: usize,
+    bytes: u64,
+    retransmits: i64,
+    // UDP
+    lost: i64,
+    packets: i64,
+    last_jitter: f64,
+    udp_recv: bool,
+}
+
+/// Build the typed `-J` interval sum for one direction's aggregates.
+#[allow(clippy::too_many_arguments)] // interval geometry + direction flags, 1:1 with the emit site
+fn direction_interval_sum(
+    start: f64,
+    end: f64,
+    seconds: f64,
+    acc: &DirAcc,
+    dir_is_sender: bool,
+    has_retransmits: bool,
+    is_udp: bool,
+    blk: u64,
+    omitted: bool,
+) -> crate::json_report::IntervalSum {
+    let bps = if seconds > 0.0 {
+        acc.bytes as f64 * 8.0 / seconds
+    } else {
+        0.0
+    };
+    // UDP: a receiving direction reports measured loss/jitter; a pure sending
+    // direction reports only the sent packet count, like iperf3.
+    let (jitter_ms, lost_packets, packets, lost_pct) = if is_udp && acc.udp_recv {
+        (
+            Some(acc.last_jitter * 1000.0),
+            Some(acc.lost),
+            Some(acc.packets),
+            Some(lost_percent(acc.lost, acc.packets)),
+        )
+    } else if is_udp {
+        (None, None, Some((acc.bytes / blk) as i64), None)
+    } else {
+        (None, None, None, None)
+    };
+    crate::json_report::IntervalSum {
+        start,
+        end,
+        seconds,
+        bytes: acc.bytes,
+        bits_per_second: bps,
+        // iperf3 emits the sum's retransmits only on a sender-direction sum
+        // (sender_has_retransmits && stream_must_be_sender). On a received-flow
+        // sum (sender=false) it must be omitted, not just gated on "any stream
+        // sends" — otherwise the received-flow sum carries a spurious count.
+        retransmits: if has_retransmits && dir_is_sender {
+            Some(acc.retransmits)
+        } else {
+            None
+        },
+        jitter_ms,
+        lost_packets,
+        packets,
+        lost_percent: lost_pct,
+        omitted,
+        sender: dir_is_sender,
+    }
+}
+
 pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
@@ -512,12 +582,14 @@ pub fn spawn_interval_reporter(
                 header_printed = true;
             }
 
-            let mut sum_bytes: u64 = 0;
-            let mut sum_retransmits: i64 = 0;
-            // UDP sums
-            let mut sum_lost: i64 = 0;
-            let mut sum_packets: i64 = 0;
-            let mut last_jitter: f64 = 0.0;
+            // Per-direction aggregates (#54): `fwd` covers streams flowing the
+            // same way as the first stream — the forward (client→server) flow
+            // on both roles, since the client lists its senders first and the
+            // server its receivers — `rev` the opposite. Non-bidir runs leave
+            // `rev` empty.
+            let fwd_is_sender = streams.first().is_none_or(|s| s.is_sender);
+            let mut fwd = DirAcc::default();
+            let mut rev = DirAcc::default();
             let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
 
             for (i, stream) in streams.iter().enumerate() {
@@ -591,7 +663,6 @@ pub fn spawn_interval_reporter(
                         let delta_packets = st.packet_count - prev_packet_count[i];
                         prev_cnt_error[i] = st.cnt_error;
                         prev_packet_count[i] = st.packet_count;
-                        last_jitter = st.jitter;
                         (Some(st.jitter), Some(delta_error), Some(delta_packets))
                     } else {
                         (None, None, None)
@@ -672,89 +743,101 @@ pub fn spawn_interval_reporter(
                     });
                 }
 
-                sum_bytes += bytes;
+                let acc = if stream.is_sender == fwd_is_sender {
+                    &mut fwd
+                } else {
+                    &mut rev
+                };
+                acc.count += 1;
+                acc.bytes += bytes;
                 if let Some(r) = retransmits {
-                    sum_retransmits += r;
+                    acc.retransmits += r;
+                }
+                if stream.udp_recv_stats.is_some() {
+                    acc.udp_recv = true;
+                    if let Some(j) = jitter {
+                        acc.last_jitter = j;
+                    }
                 }
                 if let Some(l) = lost {
-                    sum_lost += l;
+                    acc.lost += l;
                 }
                 if let Some(p) = total {
-                    sum_packets += p;
+                    acc.packets += p;
                 }
             }
 
             // Print [SUM] line for parallel streams (text only; the json-stream
             // `interval` event below carries the typed `sum` instead).
             if config.print && !config.json_stream && config.num_streams > 1 {
+                // The text [SUM] stays one combined line (both directions in
+                // bidir); only the typed -J/json-stream sums split per direction.
+                let last_jitter = if rev.udp_recv {
+                    rev.last_jitter
+                } else {
+                    fwd.last_jitter
+                };
                 let sum_interval = StreamInterval {
                     stream_id: -1, // renders as "SUM"
                     start,
                     end,
-                    bytes: sum_bytes,
-                    is_sender: streams.first().is_none_or(|s| s.is_sender),
+                    bytes: fwd.bytes + rev.bytes,
+                    is_sender: fwd_is_sender,
                     retransmits: if has_retransmits {
-                        Some(sum_retransmits)
+                        Some(fwd.retransmits + rev.retransmits)
                     } else {
                         None
                     },
                     snd_cwnd: None,
                     rtt: None,
                     jitter: if is_udp { Some(last_jitter) } else { None },
-                    lost: if is_udp { Some(sum_lost) } else { None },
-                    total_packets: if is_udp { Some(sum_packets) } else { None },
+                    lost: if is_udp {
+                        Some(fwd.lost + rev.lost)
+                    } else {
+                        None
+                    },
+                    total_packets: if is_udp {
+                        Some(fwd.packets + rev.packets)
+                    } else {
+                        None
+                    },
                     omitted,
                 };
                 print_interval(&sum_interval, config.format_char);
             }
 
             if collecting {
-                let sum_bps = if seconds > 0.0 {
-                    sum_bytes as f64 * 8.0 / seconds
-                } else {
-                    0.0
-                };
-                // UDP sum: a receiving side reports measured loss/jitter; a pure
-                // sending side reports only the sent packet count, like iperf3.
-                let any_udp_recv = streams.iter().any(|s| s.udp_recv_stats.is_some());
-                let (sum_j, sum_lostp, sum_pkts, sum_lostpct) = if is_udp && any_udp_recv {
-                    (
-                        Some(last_jitter * 1000.0),
-                        Some(sum_lost),
-                        Some(sum_packets),
-                        Some(lost_percent(sum_lost, sum_packets)),
-                    )
-                } else if is_udp {
-                    (None, None, Some((sum_bytes / blk) as i64), None)
-                } else {
-                    (None, None, None, None)
-                };
-                // iperf3 emits the sum's retransmits only on a sender-direction
-                // sum (sender_has_retransmits && stream_must_be_sender). On the
-                // server's bidir `sum` (which describes the received flow, so
-                // sender=false) it must be omitted, not just gated on "any stream
-                // sends" — otherwise the received-flow sum carries a spurious count.
-                let sum_is_sender = streams.first().is_none_or(|s| s.is_sender);
-                let interval = crate::json_report::Interval {
-                    streams: collected_streams,
-                    sum: crate::json_report::IntervalSum {
+                // #54: iperf3 emits per-direction interval sums in bidir — `sum`
+                // for the forward flow, `sum_bidir_reverse` for the reverse —
+                // mirroring the end block's sum_*_bidir_reverse split.
+                let sum = direction_interval_sum(
+                    start,
+                    end,
+                    seconds,
+                    &fwd,
+                    fwd_is_sender,
+                    has_retransmits,
+                    is_udp,
+                    blk,
+                    omitted,
+                );
+                let sum_bidir_reverse = (rev.count > 0).then(|| {
+                    direction_interval_sum(
                         start,
                         end,
                         seconds,
-                        bytes: sum_bytes,
-                        bits_per_second: sum_bps,
-                        retransmits: if has_retransmits && sum_is_sender {
-                            Some(sum_retransmits)
-                        } else {
-                            None
-                        },
-                        jitter_ms: sum_j,
-                        lost_packets: sum_lostp,
-                        packets: sum_pkts,
-                        lost_percent: sum_lostpct,
+                        &rev,
+                        !fwd_is_sender,
+                        has_retransmits,
+                        is_udp,
+                        blk,
                         omitted,
-                        sender: sum_is_sender,
-                    },
+                    )
+                });
+                let interval = crate::json_report::Interval {
+                    streams: collected_streams,
+                    sum,
+                    sum_bidir_reverse,
                 };
                 // `-J` collects intervals for the final batched blob; `--json-stream`
                 // emits each one live as `{"event":"interval","data":{...}}`.
@@ -970,6 +1053,72 @@ mod tests {
         // Bidir -P 1: one sender + one receiver → neither direction gets a SUM.
         let streams = vec![tcp_summary(1, true, 1_000), tcp_summary(3, false, 2_000)];
         assert!(sum_summaries(&streams).is_empty());
+    }
+
+    // ---- direction_interval_sum (#54: bidir per-direction interval sums) ----
+
+    #[test]
+    fn direction_sum_tcp_sender_carries_retransmits() {
+        let acc = DirAcc {
+            count: 2,
+            bytes: 2_000,
+            retransmits: 3,
+            ..Default::default()
+        };
+        let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, true, true, false, 128, false);
+        assert!(s.sender);
+        assert_eq!(s.bytes, 2_000);
+        assert_eq!(s.bits_per_second, 16_000.0);
+        assert_eq!(s.retransmits, Some(3));
+        assert!(
+            s.jitter_ms.is_none() && s.packets.is_none(),
+            "TCP sum has no UDP detail"
+        );
+    }
+
+    #[test]
+    fn direction_sum_tcp_receiver_omits_retransmits() {
+        // Even when the test HAS retransmit info (the other direction sends),
+        // a received-flow sum must not carry a retransmit count.
+        let acc = DirAcc {
+            count: 2,
+            bytes: 4_000,
+            retransmits: 0,
+            ..Default::default()
+        };
+        let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, true, false, 128, false);
+        assert!(!s.sender);
+        assert_eq!(s.retransmits, None);
+    }
+
+    #[test]
+    fn direction_sum_udp_receiving_reports_measured_stats() {
+        let acc = DirAcc {
+            count: 1,
+            bytes: 14_480,
+            lost: 2,
+            packets: 10,
+            last_jitter: 0.0015,
+            udp_recv: true,
+            ..Default::default()
+        };
+        let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, false, true, 1448, false);
+        assert_eq!(s.jitter_ms, Some(1.5));
+        assert_eq!(s.lost_packets, Some(2));
+        assert_eq!(s.packets, Some(10));
+        assert_eq!(s.lost_percent, Some(20.0));
+    }
+
+    #[test]
+    fn direction_sum_udp_sending_reports_sent_packet_count_only() {
+        let acc = DirAcc {
+            count: 1,
+            bytes: 14_480,
+            ..Default::default()
+        };
+        let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, true, false, true, 1448, false);
+        assert_eq!(s.packets, Some(10), "sent packets = bytes / blksize");
+        assert!(s.jitter_ms.is_none() && s.lost_packets.is_none() && s.lost_percent.is_none());
     }
 
     #[test]

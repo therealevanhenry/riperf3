@@ -247,6 +247,10 @@ pub struct TestStart {
 pub struct Interval {
     pub streams: Vec<IntervalStream>,
     pub sum: IntervalSum,
+    /// Bidir only (#54): the reverse direction's aggregate, split out of `sum`
+    /// per interval exactly like the end block's `sum_*_bidir_reverse` pair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sum_bidir_reverse: Option<IntervalSum>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1849,6 +1853,58 @@ mod tests {
     // ---- PR2: intervals + sender extremes -----------------------------------
 
     #[test]
+    fn interval_sum_bidir_reverse_serialized_only_when_present() {
+        // #54: bidir intervals carry `sum` + `sum_bidir_reverse` (forward /
+        // reverse split); non-bidir intervals must not emit the key at all.
+        let sum = IntervalSum {
+            start: 0.0,
+            end: 1.0,
+            seconds: 1.0,
+            bytes: 1000,
+            bits_per_second: 8000.0,
+            retransmits: None,
+            jitter_ms: None,
+            lost_packets: None,
+            packets: None,
+            lost_percent: None,
+            omitted: false,
+            sender: true,
+        };
+        let bidir = Interval {
+            streams: vec![],
+            sum: sum.clone(),
+            sum_bidir_reverse: Some(IntervalSum {
+                bytes: 2000,
+                sender: false,
+                ..sum.clone()
+            }),
+        };
+        let v = serde_json::to_value(&bidir).unwrap();
+        assert_eq!(v["sum"]["sender"], true);
+        assert_eq!(v["sum_bidir_reverse"]["bytes"], 2000);
+        assert_eq!(v["sum_bidir_reverse"]["sender"], false);
+        // iperf3 key order: streams, sum, sum_bidir_reverse.
+        let s = serde_json::to_string(&bidir).unwrap();
+        let (p_streams, p_sum, p_rev) = (
+            s.find("\"streams\"").unwrap(),
+            s.find("\"sum\"").unwrap(),
+            s.find("\"sum_bidir_reverse\"").unwrap(),
+        );
+        assert!(p_streams < p_sum && p_sum < p_rev, "key order: {s}");
+
+        let forward = Interval {
+            streams: vec![],
+            sum,
+            sum_bidir_reverse: None,
+        };
+        let v = serde_json::to_value(&forward).unwrap();
+        assert!(
+            v.get("sum_bidir_reverse").is_none(),
+            "non-bidir interval must omit the key: {v}"
+        );
+    }
+
+    #[test]
     fn intervals_and_sender_extremes_are_emitted() {
         let mut input = base_input();
         input.intervals = vec![Interval {
@@ -1887,6 +1943,7 @@ mod tests {
                 omitted: false,
                 sender: true,
             },
+            sum_bidir_reverse: None,
         }];
         let mut s = tcp_stream(1, true, 1000, 1000);
         s.retransmits = Some(2);
