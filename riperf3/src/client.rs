@@ -1701,7 +1701,10 @@ impl ClientBuilder {
         if self.omit > 60 {
             return Err(ConfigError::InvalidValue(
                 "omit",
-                format!("bogus value for --omit (maximum = 60 seconds): {}", self.omit),
+                format!(
+                    "bogus value for --omit (maximum = 60 seconds): {}",
+                    self.omit
+                ),
             ));
         }
 
