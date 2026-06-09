@@ -1587,7 +1587,37 @@ mod unimplemented_flags {
             result.is_err(),
             "--bind-dev nonexistent should fail but succeeded"
         );
-        let _ = server_task.await;
+        // Post-#88 the client errors BEFORE connecting, so the one-off server
+        // never sees a connection and would block a `.await` forever — abort it.
+        server_task.abort();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn bind_device_applied_before_connect() {
+        // #88: SO_BINDTODEVICE / IP_BOUND_IF affect routing decided at connect
+        // time, so the option must be applied BEFORE connect(). Pin the ordering
+        // behaviorally: with NO server listening, an invalid device must surface
+        // the device error (raised pre-connect), not the connection-refused error
+        // a post-connect application hits first.
+        let port = next_port(); // nothing listens here
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .bind_dev("nonexistent_dev_xyz")
+            .build()
+            .unwrap();
+        let err = match client.run().await {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("--bind-dev nonexistent with no server must fail"),
+        };
+        if err.contains("Operation not permitted") {
+            return; // old kernel: SO_BINDTODEVICE needs CAP_NET_RAW; ordering not observable
+        }
+        assert!(
+            !err.to_lowercase().contains("refused"),
+            "device error must surface before connect; got a connect error instead: {err}"
+        );
     }
 
     #[tokio::test]
