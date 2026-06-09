@@ -10,6 +10,9 @@ members = [
 version = "0.7.1"
 authors = ["Evan Henry"]
 edition = "2021"
+# MSRV floor: std::mem::offset_of! (1.77) in tcp_info's layout asserts is the
+# newest language feature in use; verified by the pinned-MSRV CI job.
+rust-version = "1.77"
 homepage = "https://github.com/therealevanhenry/riperf3"
 repository = "https://github.com/therealevanhenry/riperf3"
 keywords = ["riperf3", "iperf3", "iperf", "network", "speedtest"]

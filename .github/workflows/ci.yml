@@ -19,6 +19,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  msrv:
+    name: MSRV (1.77)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.77
+      - uses: Swatinem/rust-cache@v2
+      # Check (not test) on the declared floor: proves the rust-version claim
+      # in Cargo.toml without doubling the test wall-clock.
+      - run: cargo check --workspace --all-targets
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
