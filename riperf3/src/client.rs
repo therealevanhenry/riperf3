@@ -142,6 +142,7 @@ impl Client {
             self.connect_timeout,
             None,
             self.bind_address.as_deref(),
+            self.bind_dev.as_deref(),
             self.mptcp,
             self.ip_version,
         )
@@ -163,10 +164,8 @@ impl Client {
             self.blksize
         };
 
-        // Apply control connection options
-        if let Some(ref dev) = self.bind_dev {
-            net::set_bind_dev(&ctrl, dev)?;
-        }
+        // Apply control connection options (bind_dev is applied inside
+        // tcp_connect, pre-connect — #88)
         if let Some(ref spec) = self.cntl_ka {
             let (idle, intv, cnt) = parse_keepalive(spec);
             net::set_tcp_keepalive(&ctrl, idle, intv, cnt)?;
@@ -416,6 +415,7 @@ impl Client {
                         self.connect_timeout,
                         self.cport,
                         self.bind_address.as_deref(),
+                        self.bind_dev.as_deref(),
                         self.mptcp,
                         self.ip_version,
                     )
@@ -443,9 +443,6 @@ impl Client {
                     }
                     if let Some(label) = self.flowlabel {
                         net::set_ipv6_flowlabel(&data_stream, label)?;
-                    }
-                    if let Some(ref dev) = self.bind_dev {
-                        net::set_bind_dev(&data_stream, dev)?;
                     }
                     if self.tos != 0 {
                         net::set_tos(&data_stream, self.tos as u32)?;
@@ -564,7 +561,7 @@ impl Client {
                 for i in 0..total {
                     let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
-                        net::set_bind_dev(&udp_sock, dev)?;
+                        net::set_bind_dev(&udp_sock, dev, remote.is_ipv6())?;
                     }
                     udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
