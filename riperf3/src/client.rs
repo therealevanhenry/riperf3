@@ -1020,9 +1020,9 @@ impl Client {
             .iter()
             .map(|s| {
                 let local_bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
                 // The peer's per-stream result is the opposite side of this stream.
                 let server_stream =
