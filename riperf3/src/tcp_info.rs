@@ -3,15 +3,20 @@
 pub struct TcpInfoSnapshot {
     /// Cumulative retransmissions over the connection lifetime.
     pub total_retransmits: u32,
-    /// Send congestion window in bytes (Linux/FreeBSD report segments, so
-    /// those readers multiply by mss; macOS reports bytes directly).
+    /// Send congestion window in bytes. Linux reports segments, so that
+    /// reader multiplies by mss; macOS reports bytes and is used raw, like
+    /// iperf3. (FreeBSD also reports bytes but its reader still multiplies —
+    /// pre-existing unit bug, #155.)
     pub snd_cwnd: u64,
     /// Send window advertised by the receiver, in bytes.
     #[allow(dead_code)]
     pub snd_wnd: u64,
-    /// Smoothed round-trip time in microseconds.
+    /// Smoothed round-trip time in microseconds. On macOS the kernel's
+    /// `tcpi_srtt` is MILLIseconds and is kept raw — iperf3 has the identical
+    /// quirk (its APPLE `get_rtt` feeds tcpi_srtt into a usec-treated field),
+    /// so converting here would diverge from iperf3's output.
     pub rtt: u32,
-    /// RTT variance in microseconds.
+    /// RTT variance in microseconds (macOS: milliseconds, raw — see `rtt`).
     pub rttvar: u32,
     /// Sender maximum segment size.
     #[allow(dead_code)]
@@ -65,14 +70,16 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
 }
 
 /// Apple's `struct tcp_connection_info` (xnu `bsd/netinet/tcp.h`), hand-rolled
-/// because libc 0.2.x's binding is wrong twice over (#96): it omits the final
-/// `tcpi_txretransmitpackets` field — the sender retransmit packet count iperf3
-/// reads for the macOS Retr column — and it declares the 15 one-bit
-/// `tcpi_tfo_*` flags as fifteen separate `u32` fields where the kernel packs
-/// them (plus a 17-bit pad) into ONE `u32`, which shifts every trailing `u64`
-/// counter 60 bytes past where the kernel writes it. Layout pinned against the
-/// xnu header by the const asserts below; the `u64` block needs no explicit
-/// align attribute because offset 56 is already 8-aligned under `repr(C)`.
+/// because libc 0.2.x's binding is wrong twice over (#96): it has no
+/// `tcpi_txretransmitpackets` — the sender retransmit packet count iperf3
+/// reads for the macOS Retr column; its seventh trailing u64 is misnamed
+/// `tcpi_rxretransmitpackets`, a field xnu does not have — and it declares the
+/// 15 one-bit `tcpi_tfo_*` flags as fifteen separate `u32` fields where the
+/// kernel packs them (plus a 17-bit pad) into ONE `u32`, which lands its u64
+/// tail at offset 120 where the kernel writes at 56 — every trailing counter
+/// read 64 bytes past the data. Layout pinned against the xnu header by the
+/// const asserts below; the `u64` block needs no explicit align attribute
+/// because offset 56 is already 8-aligned under `repr(C)`.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[allow(dead_code)] // kernel ABI mirror — every field is required for layout
