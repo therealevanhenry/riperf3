@@ -566,10 +566,11 @@ impl Client {
                     udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
-                    // GSO/GRO is deliberately best-effort (#45): it's a
-                    // riperf3-exclusive optimization (no iperf3 counterpart),
-                    // so a kernel lacking UDP_SEGMENT/UDP_GRO degrades to
-                    // plain sends rather than failing the test.
+                    // GSO/GRO is deliberately best-effort (#45), matching
+                    // iperf3 3.20+'s --gsro: its iperf_udp_gso/iperf_udp_gro
+                    // disable the feature and continue when the setsockopt
+                    // fails, so a kernel lacking UDP_SEGMENT/UDP_GRO degrades
+                    // to plain sends rather than failing the test.
                     if self.gsro {
                         let _ = net::set_udp_gso(&udp_sock, blksize as u16);
                         let _ = net::set_udp_gro(&udp_sock);
@@ -1756,8 +1757,11 @@ impl ClientBuilder {
             verbose: self.verbose,
             json_output: self.json_output,
             json_stream: self.json_stream,
-            bytes_to_send: self.bytes_to_send,
-            blocks_to_send: self.blocks_to_send,
+            // 0 means "no limit" in iperf3 (`-n 0`/`-k 0` run a plain duration
+            // test — its end-condition checks gate on the value), so normalize
+            // to unset here rather than ending the test instantly (#140).
+            bytes_to_send: self.bytes_to_send.filter(|&b| b != 0),
+            blocks_to_send: self.blocks_to_send.filter(|&b| b != 0),
             repeating_payload: self.repeating_payload,
             zerocopy: self.zerocopy,
             gsro: self.gsro,

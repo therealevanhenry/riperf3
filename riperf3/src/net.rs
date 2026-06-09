@@ -836,11 +836,27 @@ pub fn set_udp_gro<F>(_fd: &F) -> Result<()> {
     Ok(())
 }
 
-/// Set IP_TOS on a socket. Cross-platform via socket2.
+/// Set the TOS/traffic-class byte on a socket, family-aware like iperf3's
+/// `iperf_common_sockopts` (#45 review): an AF_INET6 socket needs
+/// IPV6_TCLASS (fatal, IESETCOS) — IP_TOS on a v6 socket "succeeds" on Linux
+/// without marking anything — plus a tolerated IP_TOS for the
+/// v4-mapped-address case; an AF_INET socket sets IP_TOS (fatal, IESETTOS).
 #[cfg(unix)]
 pub fn set_tos(fd: &impl std::os::unix::io::AsFd, tos: u32) -> Result<()> {
     let sock = socket2::SockRef::from(fd);
-    sock.set_tos(tos)?;
+    let is_v6 = sock
+        .local_addr()
+        .map(|a| a.domain() == socket2::Domain::IPV6)
+        .unwrap_or(false);
+    if is_v6 {
+        nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Ipv6TClass, &(tos as i32))
+            .map_err(|e| RiperfError::Io(std::io::Error::from(e)))?;
+        // iperf3 also sets IP_TOS on a v6 socket for the v4-mapped case and
+        // ignores any failure ("ignore any failure of v4 TOS in IPv6 case").
+        let _ = sock.set_tos(tos);
+    } else {
+        sock.set_tos(tos)?;
+    }
     Ok(())
 }
 

@@ -1,5 +1,8 @@
 use clap::{ArgGroup, Parser, ValueEnum};
 
+/// iperf3's IEENDCONDITIONS text, verbatim (#140).
+pub const END_CONDITIONS_MSG: &str = "only one test end condition (-t, -n, -k) may be specified";
+
 #[derive(Parser, Debug)]
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
 #[command(group(
@@ -417,29 +420,43 @@ impl Cli {
     /// mapping rather than a hand-maintained copy. Process-level concerns
     /// (daemonize, pidfile, logfile, CPU affinity) stay in `main`; this is pure
     /// arg → builder → `build()`.
+    /// Whether a `-n`/`-k` argument carries a non-zero value. iperf3's
+    /// IEENDCONDITIONS legs test the PARSED value (`bytes != 0`), not flag
+    /// presence — `unit_atof("0") == 0` means "not set", so `-t 5 -n 0` runs a
+    /// plain duration test. A string that doesn't parse returns false here so
+    /// the real parse error (riperf3's documented improvement over iperf3's
+    /// silent garbage-as-0) surfaces from `bytes_str`/`blocks_str`, not as a
+    /// bogus conflict.
+    fn end_condition_set(arg: Option<&str>) -> bool {
+        arg.is_some_and(|s| {
+            let s = s.trim();
+            let num = s
+                .strip_suffix(['k', 'K', 'm', 'M', 'g', 'G', 't', 'T'])
+                .unwrap_or(s);
+            num.parse::<f64>().map(|n| n != 0.0).unwrap_or(false)
+        })
+    }
+
+    /// iperf3 permits only ONE test end condition (IEENDCONDITIONS,
+    /// `parse_arguments`): `-t` explicit with a non-zero `-n` or `-k`, or
+    /// non-zero `-n` with non-zero `-k`. Only `-t` is flag-based; the `-n`/`-k`
+    /// legs are value-based (#140). Called from `main` BEFORE any side effects
+    /// (pidfile/logfile/affinity), like iperf3, and again from `build_client`
+    /// so the library-path mapping is covered by the wiring tests (#124).
+    pub fn end_conditions_conflict(&self) -> bool {
+        let bytes_set = Self::end_condition_set(self.bytes.as_deref());
+        let blocks_set = Self::end_condition_set(self.blockcount.as_deref());
+        (self.time.is_some() && (bytes_set || blocks_set)) || (bytes_set && blocks_set)
+    }
+
     pub fn build_client(&self) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
         let host = self
             .client
             .as_deref()
             .ok_or("client mode requires a host (-c <host>)")?;
 
-        // iperf3 permits only ONE explicit test end condition (IEENDCONDITIONS,
-        // checked pairwise over duration_flag/bytes/blocks in parse_arguments);
-        // riperf3 silently let -n/-k win over -t (#140). The check is on
-        // EXPLICIT flags — the default duration never conflicts — which is why
-        // it lives here at the CLI, where explicitness is knowable, not in the
-        // builder (whose duration always holds a value).
-        if [
-            self.time.is_some(),
-            self.bytes.is_some(),
-            self.blockcount.is_some(),
-        ]
-        .iter()
-        .filter(|set| **set)
-        .count()
-            > 1
-        {
-            return Err("only one test end condition (-t, -n, -k) may be specified".into());
+        if self.end_conditions_conflict() {
+            return Err(END_CONDITIONS_MSG.into());
         }
 
         let mut builder = riperf3::ClientBuilder::new(host);
@@ -1574,18 +1591,35 @@ mod cli_tests {
             }
         }
 
-        // Each end condition alone stays valid (iperf3's check fires only on
-        // explicit combinations — a default duration never conflicts).
+        // Each end condition alone stays valid, and — like iperf3, whose -n/-k
+        // legs test the PARSED VALUE (bytes != 0), not flag presence — a
+        // zero-valued -n/-k never conflicts: iperf3 runs `-t 5 -n 0` as a plain
+        // 5-second duration test (0 means "not set").
         #[test]
         fn single_end_conditions_accepted() {
             for args in [
-                ["riperf3", "-c", "h", "-t", "5"],
-                ["riperf3", "-c", "h", "-n", "1G"],
-                ["riperf3", "-c", "h", "-k", "100"],
+                &["riperf3", "-c", "h", "-t", "5"][..],
+                &["riperf3", "-c", "h", "-n", "1G"][..],
+                &["riperf3", "-c", "h", "-k", "100"][..],
+                &["riperf3", "-c", "h", "-t", "5", "-n", "0"][..],
+                &["riperf3", "-c", "h", "-t", "5", "-k", "0"][..],
+                &["riperf3", "-c", "h", "-n", "0", "-k", "100"][..],
             ] {
                 let cli = Cli::parse_from(args);
-                assert!(cli.build_client().is_ok(), "single end condition rejected");
+                assert!(
+                    cli.build_client().is_ok(),
+                    "iperf3 accepts {args:?}; riperf3 must not reject it"
+                );
             }
+        }
+
+        // `-n 0` means "no byte limit" in iperf3 (the value gates everything);
+        // it must wire to a plain duration test, not an instant-end Bytes(0).
+        #[test]
+        fn zero_byte_limit_is_unset() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-n", "0"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").build().unwrap());
         }
 
         #[test]

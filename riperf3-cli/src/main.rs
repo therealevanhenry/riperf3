@@ -41,6 +41,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        // Conflicting end conditions (#140): iperf3 raises IEENDCONDITIONS in
+        // parse_arguments — before pidfile/logfile/affinity — so this check
+        // also runs ahead of the side effects below.
+        if cli.end_conditions_conflict() {
+            return Err(cli::END_CONDITIONS_MSG.into());
+        }
     }
 
     // Daemonize BEFORE building the tokio runtime. `daemon()` forks, and forking
