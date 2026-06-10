@@ -425,10 +425,10 @@ struct DirAcc {
     lost: i64,
     packets: i64,
     /// Sum of receiving streams' jitter — emitted as the MEAN, like iperf3's
-    /// avg_jitter (#142).
+    /// avg_jitter (#142). `udp_recv_count > 0` doubles as "this direction has
+    /// UDP receiving streams".
     jitter_sum: f64,
     udp_recv_count: usize,
-    udp_recv: bool,
 }
 
 /// Build the typed `-J` interval sum for one direction's aggregates.
@@ -451,7 +451,7 @@ fn direction_interval_sum(
     };
     // UDP: a receiving direction reports measured loss/jitter; a pure sending
     // direction reports only the sent packet count, like iperf3.
-    let (jitter_ms, lost_packets, packets, lost_pct) = if is_udp && acc.udp_recv {
+    let (jitter_ms, lost_packets, packets, lost_pct) = if is_udp && acc.udp_recv_count > 0 {
         (
             // iperf3 averages jitter across the direction's receiving
             // streams (avg_jitter /= num_streams, #142) — not last-wins.
@@ -758,7 +758,6 @@ pub fn spawn_interval_reporter(
                     acc.retransmits += r;
                 }
                 if stream.udp_recv_stats.is_some() {
-                    acc.udp_recv = true;
                     acc.udp_recv_count += 1;
                     if let Some(j) = jitter {
                         acc.jitter_sum += j;
@@ -778,7 +777,7 @@ pub fn spawn_interval_reporter(
                 // The text [SUM] stays one combined line (both directions in
                 // bidir); only the typed -J/json-stream sums split per direction.
                 // Jitter is the mean across receiving streams (#142).
-                let sum_jitter = if rev.udp_recv {
+                let sum_jitter = if rev.udp_recv_count > 0 {
                     rev.jitter_sum / rev.udp_recv_count.max(1) as f64
                 } else {
                     fwd.jitter_sum / fwd.udp_recv_count.max(1) as f64
@@ -1103,7 +1102,6 @@ mod tests {
             packets: 20,
             jitter_sum: 0.0030, // two receivers: 1ms + 2ms
             udp_recv_count: 2,
-            udp_recv: true,
             ..Default::default()
         };
         let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, false, true, 1448, false);
@@ -1119,7 +1117,6 @@ mod tests {
             packets: 10,
             jitter_sum: 0.0015,
             udp_recv_count: 1,
-            udp_recv: true,
             ..Default::default()
         };
         let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, false, true, 1448, false);

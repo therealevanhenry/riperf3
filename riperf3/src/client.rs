@@ -858,13 +858,20 @@ impl Client {
                 // #156: when sender_has_retransmits=1, the peer prints this
                 // value (iperf3 get_results stores it into stream_retrans and
                 // the summary renders it) — it must be the REAL end-of-test
-                // total, read directly from the kernel, not a sentinel.
+                // total. The sender task snapshots it into the counters while
+                // its socket is still open; by exchange time the socket is
+                // closed, so a live fd read here only serves as a fallback
+                // for paths that never reached the snapshot.
                 let retransmits =
                     if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                        s.raw_fd
-                            .and_then(crate::tcp_info::get_tcp_info)
-                            .map(|i| i.total_retransmits as i64)
-                            .unwrap_or(-1)
+                        match s.counters.final_retransmits() {
+                            n if n >= 0 => n,
+                            _ => s
+                                .raw_fd
+                                .and_then(crate::tcp_info::get_tcp_info)
+                                .map(|i| i.total_retransmits as i64)
+                                .unwrap_or(-1),
+                        }
                     } else {
                         -1
                     };
@@ -1945,6 +1952,79 @@ mod tests {
              (a parked reporter still holds the collector Arc)"
         );
         srv.abort();
+    }
+
+    // #156 (review r2): build_results runs at ExchangeResults — strictly after
+    // the sender task has dropped (closed) its socket — so the retransmit
+    // total must be captured while the socket was alive. A kernel read from
+    // the dead fd fails and ships the -1 sentinel beside
+    // sender_has_retransmits=1, which iperf3 peers render as a bogus Retr
+    // count (u64::MAX on 3.12). `raw_fd: None` models the dead-fd state
+    // deterministically: under parallel tests a real closed fd can be
+    // recycled by another test's socket, making get_tcp_info spuriously
+    // succeed; the pinned property is identical — the exchange value must
+    // not depend on an exchange-time fd read.
+    #[tokio::test]
+    async fn exchange_retransmits_survive_sender_socket_close() {
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        if !crate::tcp_info::has_retransmit_info() {
+            return; // flag is never 1 here; there is no contract to pin
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let drain = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            while sock.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let counters = Arc::new(crate::stream::StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        // 1 MiB budget: the sender finishes on its own and drops the socket,
+        // exactly like a real run reaching ExchangeResults.
+        let budget = Arc::new(AtomicI64::new(1 << 20));
+        crate::stream::run_tcp_sender(
+            sock,
+            counters.clone(),
+            vec![0u8; 131072],
+            done,
+            None,
+            0,
+            1000,
+            Some(budget),
+        )
+        .await
+        .unwrap();
+        drain.await.unwrap();
+
+        let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
+        let ds = crate::stream::DataStream {
+            id: 1,
+            is_sender: true,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        assert_eq!(results.sender_has_retransmits, 1);
+        assert!(
+            results.streams[0].retransmits >= 0,
+            "#156: a TCP sender whose socket has closed must still report \
+             its real end-of-test retransmit total (got {})",
+            results.streams[0].retransmits
+        );
+        ds.task.abort();
     }
 
     use super::*;

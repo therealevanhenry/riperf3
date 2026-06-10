@@ -632,13 +632,20 @@ impl Server {
             // #156: when sender_has_retransmits=1, the peer prints this
             // value (iperf3 get_results stores it into stream_retrans and
             // the summary renders it) — it must be the REAL end-of-test
-            // total, read directly from the kernel, not a sentinel.
+            // total. The sender task snapshots it into the counters while
+            // its socket is still open; by exchange time the socket is
+            // closed, so a live fd read here only serves as a fallback for
+            // paths that never reached the snapshot.
             let retransmits =
                 if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                    s.raw_fd
-                        .and_then(crate::tcp_info::get_tcp_info)
-                        .map(|i| i.total_retransmits as i64)
-                        .unwrap_or(-1)
+                    match s.counters.final_retransmits() {
+                        n if n >= 0 => n,
+                        _ => s
+                            .raw_fd
+                            .and_then(crate::tcp_info::get_tcp_info)
+                            .map(|i| i.total_retransmits as i64)
+                            .unwrap_or(-1),
+                    }
                 } else {
                     -1
                 };
