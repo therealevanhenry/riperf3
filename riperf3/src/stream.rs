@@ -30,6 +30,12 @@ pub struct StreamCounters {
     bytes_received: AtomicU64,
     bytes_sent_interval: AtomicU64,
     bytes_received_interval: AtomicU64,
+    /// #156: the sender's end-of-test retransmit total, snapshotted by the
+    /// sender task while its socket is still open. The results exchange runs
+    /// after the task has dropped (closed) the socket, so an exchange-time
+    /// TCP_INFO read hits a dead fd. -1 = not captured (receiver, UDP, or no
+    /// platform support).
+    final_retransmits: AtomicI64,
 }
 
 impl Default for StreamCounters {
@@ -45,7 +51,19 @@ impl StreamCounters {
             bytes_received: AtomicU64::new(0),
             bytes_sent_interval: AtomicU64::new(0),
             bytes_received_interval: AtomicU64::new(0),
+            final_retransmits: AtomicI64::new(-1),
         }
+    }
+
+    /// Store the end-of-test retransmit total (#156; sender task only, while
+    /// the socket is still open).
+    pub fn set_final_retransmits(&self, n: i64) {
+        self.final_retransmits.store(n, Ordering::Relaxed);
+    }
+
+    /// The snapshotted end-of-test retransmit total, or -1 if never captured.
+    pub fn final_retransmits(&self) -> i64 {
+        self.final_retransmits.load(Ordering::Relaxed)
     }
 
     /// Record bytes sent (called from the send loop hot path).
@@ -365,6 +383,24 @@ pub(crate) fn make_byte_budget(
 // TCP send / recv loops
 // ---------------------------------------------------------------------------
 
+/// #156: snapshot the sender's final retransmit total into its counters while
+/// the socket is still open. Called by every TCP sender just before it
+/// returns (and drops the socket): the results exchange runs after that drop,
+/// so an exchange-time TCP_INFO read would hit a closed fd and ship the -1
+/// sentinel beside `sender_has_retransmits=1` — which an iperf3 peer renders
+/// as a bogus Retr count (u64::MAX on 3.12).
+fn snapshot_final_retransmits(stream: &TcpStream, counters: &StreamCounters) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Some(info) = crate::tcp_info::get_tcp_info(stream.as_raw_fd()) {
+            counters.set_final_retransmits(info.total_retransmits as i64);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (stream, counters);
+}
+
 /// TCP sender: writes full blocks as fast as the kernel will accept them.
 /// If `file_path` is set, reads from the file into the buffer each iteration.
 #[allow(clippy::too_many_arguments)] // hot-path sender; knobs map 1:1 to CLI flags
@@ -425,6 +461,7 @@ pub async fn run_tcp_sender(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -472,6 +509,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -530,6 +568,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -590,6 +629,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 

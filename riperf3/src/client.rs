@@ -763,14 +763,27 @@ impl Client {
                 // and starve this async timer, so they must not depend on it to
                 // stop (issue #5). Once they self-terminate, CPU frees and this
                 // timer fires normally to drive the rest of the shutdown.
+                let mut aborted = false;
                 tokio::select! {
                     _ = tokio::time::sleep(dur) => {}
                     state = protocol::recv_state(ctrl) => {
                         // Server sent something unexpected during the test
                         if let Ok(TestState::ServerTerminate) = state {
-                            return Err(RiperfError::Aborted("server terminated".into()));
+                            aborted = true;
                         }
                     }
+                }
+                if aborted {
+                    // #147: stop the senders and the reporter BEFORE
+                    // propagating — the early return leaked a forever-ticking
+                    // reporter task (and running senders) into a library
+                    // consumer's runtime.
+                    reporter_end.finish(report_start.elapsed().as_secs_f64());
+                    done.store(true, Ordering::Relaxed);
+                    if let Some(handle) = interval_handle {
+                        let _ = handle.await;
+                    }
+                    return Err(RiperfError::Aborted("server terminated".into()));
                 }
                 dur.as_secs_f64()
             }
@@ -840,11 +853,33 @@ impl Client {
                 } else {
                     (0.0, 0, 0)
                 };
+                let is_udp_stream = self.protocol == TransportProtocol::Udp;
+
+                // #156: when sender_has_retransmits=1, the peer prints this
+                // value (iperf3 get_results stores it into stream_retrans and
+                // the summary renders it) — it must be the REAL end-of-test
+                // total. The sender task snapshots it into the counters while
+                // its socket is still open; by exchange time the socket is
+                // closed, so a live fd read here only serves as a fallback
+                // for paths that never reached the snapshot.
+                let retransmits =
+                    if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
+                        match s.counters.final_retransmits() {
+                            n if n >= 0 => n,
+                            _ => s
+                                .raw_fd
+                                .and_then(crate::tcp_info::get_tcp_info)
+                                .map(|i| i.total_retransmits as i64)
+                                .unwrap_or(-1),
+                        }
+                    } else {
+                        -1
+                    };
 
                 protocol::StreamResultJson {
                     id: s.id,
                     bytes,
-                    retransmits: -1,
+                    retransmits,
                     jitter,
                     errors,
                     omitted_errors: 0,
@@ -863,8 +898,15 @@ impl Client {
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
+            // #156: iperf3 sends 1 when this side is a retransmit-capable TCP
+            // sender (check_sender_has_retransmits) — the PEER gates display
+            // of our Retr column on it; 0 suppressed it cross-tool even where
+            // riperf3 measures retransmits.
             sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
-                0
+                i64::from(
+                    self.protocol == TransportProtocol::Tcp
+                        && crate::tcp_info::has_retransmit_info(),
+                )
             } else {
                 -1
             },
@@ -1863,6 +1905,128 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    // #147 (review r1): the discriminating leak test. The e2e mock below can't
+    // pin the fix — run()'s DoneOnDrop guard already stops the SENDERS on any
+    // exit, pre-fix included. The real pre-fix leak was the REPORTER task:
+    // `done` was never set on the ServerTerminate early-return, so it stayed
+    // parked holding the collector Arc (forever under -i 0's year-long
+    // ticker). Calling run_test directly bypasses DoneOnDrop, and the
+    // collector's strong count observes the reporter's clone: pre-fix this
+    // asserts 2 (parked reporter), post-fix 1 (joined before propagating).
+    #[tokio::test]
+    async fn abort_path_joins_the_reporter() {
+        use crate::protocol::{self, TestState};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut ctrl, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            protocol::send_state(&mut ctrl, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Keep the control socket open past the client's assertions.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        });
+
+        // json_output(true) makes the reporter take the collector clone.
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .duration(10)
+            .json_output(true)
+            .build()
+            .unwrap();
+        let mut ctrl = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
+
+        let res = client
+            .run_test(&mut ctrl, &[], &done, 131072, collector.clone())
+            .await;
+        assert!(res.is_err(), "ServerTerminate must abort the test");
+        assert_eq!(
+            Arc::strong_count(&collector),
+            1,
+            "#147: the reporter must be JOINED before the abort propagates \
+             (a parked reporter still holds the collector Arc)"
+        );
+        srv.abort();
+    }
+
+    // #156 (review r2): build_results runs at ExchangeResults — strictly after
+    // the sender task has dropped (closed) its socket — so the retransmit
+    // total must be captured while the socket was alive. A kernel read from
+    // the dead fd fails and ships the -1 sentinel beside
+    // sender_has_retransmits=1, which iperf3 peers render as a bogus Retr
+    // count (u64::MAX on 3.12). `raw_fd: None` models the dead-fd state
+    // deterministically: under parallel tests a real closed fd can be
+    // recycled by another test's socket, making get_tcp_info spuriously
+    // succeed; the pinned property is identical — the exchange value must
+    // not depend on an exchange-time fd read.
+    #[tokio::test]
+    async fn exchange_retransmits_survive_sender_socket_close() {
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        if !crate::tcp_info::has_retransmit_info() {
+            return; // flag is never 1 here; there is no contract to pin
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let drain = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            while sock.read(&mut buf).await.unwrap_or(0) > 0 {}
+        });
+
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let counters = Arc::new(crate::stream::StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        // 1 MiB budget: the sender finishes on its own and drops the socket,
+        // exactly like a real run reaching ExchangeResults.
+        let budget = Arc::new(AtomicI64::new(1 << 20));
+        crate::stream::run_tcp_sender(
+            sock,
+            counters.clone(),
+            vec![0u8; 131072],
+            done,
+            None,
+            0,
+            1000,
+            Some(budget),
+        )
+        .await
+        .unwrap();
+        drain.await.unwrap();
+
+        let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
+        let ds = crate::stream::DataStream {
+            id: 1,
+            is_sender: true,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        assert_eq!(results.sender_has_retransmits, 1);
+        assert!(
+            results.streams[0].retransmits >= 0,
+            "#156: a TCP sender whose socket has closed must still report \
+             its real end-of-test retransmit total (got {})",
+            results.streams[0].retransmits
+        );
+        ds.task.abort();
+    }
+
     use super::*;
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
@@ -2300,5 +2464,86 @@ mod client_run_return_value {
         }
 
         let _ = server_task.await;
+    }
+
+    /// End-to-end abort sanity: a mid-test `ServerTerminate` aborts `run()`
+    /// and the data flow stops promptly. NOTE this does NOT discriminate the
+    /// #147 fix — run()'s DoneOnDrop guard stops the senders on any exit; the
+    /// real pre-fix leak (a parked reporter task) is pinned by
+    /// `abort_path_joins_the_reporter` in the in-module tests.
+    #[tokio::test]
+    async fn server_terminate_stops_senders_and_reporter() {
+        use crate::protocol::{self, TestState};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let drained = Arc::new(AtomicU64::new(0));
+        let drained_srv = drained.clone();
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            let (mut ctrl, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            ctrl.read_exact(&mut cookie).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::ParamExchange)
+                .await
+                .unwrap();
+            let _params = protocol::recv_params(&mut ctrl).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::CreateStreams)
+                .await
+                .unwrap();
+            let (mut data, _) = listener.accept().await.unwrap();
+            let mut dcookie = [0u8; 37];
+            data.read_exact(&mut dcookie).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::TestStart)
+                .await
+                .unwrap();
+            protocol::send_state(&mut ctrl, TestState::TestRunning)
+                .await
+                .unwrap();
+            // Let the test run briefly, then terminate mid-test.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            protocol::send_state(&mut ctrl, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Wait until run() has returned, then measure post-abort flow.
+            let _ = err_rx.await;
+            let mut buf = vec![0u8; 64 * 1024];
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+            loop {
+                tokio::select! {
+                    r = data.read(&mut buf) => match r {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { drained_srv.fetch_add(n as u64, Ordering::Relaxed); }
+                    },
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        });
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(10)
+            .build()
+            .unwrap();
+        let err = client.run().await.expect_err("expected Aborted");
+        assert!(
+            matches!(err, RiperfError::Aborted(_)),
+            "expected Aborted, got {err:?}"
+        );
+        // Kernel socket buffers legitimately hold a few MB in flight on
+        // loopback; the LEAK signature is continued line-rate production
+        // (hundreds of MB over the 800 ms drain window). 64 MB cleanly
+        // separates the two: pre-fix this reads GBs, post-fix single-digit MB.
+        let _ = err_tx.send(());
+        let _ = server_task.await;
+        let post = drained.load(Ordering::Relaxed);
+        assert!(
+            post <= 64 * 1024 * 1024,
+            "senders still producing after run() returned (#147 leak): {post} bytes post-abort"
+        );
     }
 }

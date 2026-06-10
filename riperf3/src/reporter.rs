@@ -424,8 +424,11 @@ struct DirAcc {
     // UDP
     lost: i64,
     packets: i64,
-    last_jitter: f64,
-    udp_recv: bool,
+    /// Sum of receiving streams' jitter — emitted as the MEAN, like iperf3's
+    /// avg_jitter (#142). `udp_recv_count > 0` doubles as "this direction has
+    /// UDP receiving streams".
+    jitter_sum: f64,
+    udp_recv_count: usize,
 }
 
 /// Build the typed `-J` interval sum for one direction's aggregates.
@@ -448,9 +451,11 @@ fn direction_interval_sum(
     };
     // UDP: a receiving direction reports measured loss/jitter; a pure sending
     // direction reports only the sent packet count, like iperf3.
-    let (jitter_ms, lost_packets, packets, lost_pct) = if is_udp && acc.udp_recv {
+    let (jitter_ms, lost_packets, packets, lost_pct) = if is_udp && acc.udp_recv_count > 0 {
         (
-            Some(acc.last_jitter * 1000.0),
+            // iperf3 averages jitter across the direction's receiving
+            // streams (avg_jitter /= num_streams, #142) — not last-wins.
+            Some(acc.jitter_sum / acc.udp_recv_count.max(1) as f64 * 1000.0),
             Some(acc.lost),
             Some(acc.packets),
             Some(lost_percent(acc.lost, acc.packets)),
@@ -753,9 +758,9 @@ pub fn spawn_interval_reporter(
                     acc.retransmits += r;
                 }
                 if stream.udp_recv_stats.is_some() {
-                    acc.udp_recv = true;
+                    acc.udp_recv_count += 1;
                     if let Some(j) = jitter {
-                        acc.last_jitter = j;
+                        acc.jitter_sum += j;
                     }
                 }
                 if let Some(l) = lost {
@@ -771,10 +776,11 @@ pub fn spawn_interval_reporter(
             if config.print && !config.json_stream && config.num_streams > 1 {
                 // The text [SUM] stays one combined line (both directions in
                 // bidir); only the typed -J/json-stream sums split per direction.
-                let last_jitter = if rev.udp_recv {
-                    rev.last_jitter
+                // Jitter is the mean across receiving streams (#142).
+                let sum_jitter = if rev.udp_recv_count > 0 {
+                    rev.jitter_sum / rev.udp_recv_count.max(1) as f64
                 } else {
-                    fwd.last_jitter
+                    fwd.jitter_sum / fwd.udp_recv_count.max(1) as f64
                 };
                 let sum_interval = StreamInterval {
                     stream_id: -1, // renders as "SUM"
@@ -787,7 +793,7 @@ pub fn spawn_interval_reporter(
                         None
                     },
                     snd_cwnd: None,
-                    jitter: if is_udp { Some(last_jitter) } else { None },
+                    jitter: if is_udp { Some(sum_jitter) } else { None },
                     lost: if is_udp {
                         Some(fwd.lost + rev.lost)
                     } else {
@@ -1085,14 +1091,32 @@ mod tests {
     }
 
     #[test]
+    fn direction_sum_udp_receiving_jitter_is_mean_across_streams() {
+        // #142: iperf3's interval-sum jitter is the AVERAGE across the
+        // direction's receiving streams (avg_jitter /= num_streams), not the
+        // last stream's value.
+        let acc = DirAcc {
+            count: 2,
+            bytes: 28_960,
+            lost: 0,
+            packets: 20,
+            jitter_sum: 0.0030, // two receivers: 1ms + 2ms
+            udp_recv_count: 2,
+            ..Default::default()
+        };
+        let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, false, true, 1448, false);
+        assert_eq!(s.jitter_ms, Some(1.5), "mean of 1ms and 2ms");
+    }
+
+    #[test]
     fn direction_sum_udp_receiving_reports_measured_stats() {
         let acc = DirAcc {
             count: 1,
             bytes: 14_480,
             lost: 2,
             packets: 10,
-            last_jitter: 0.0015,
-            udp_recv: true,
+            jitter_sum: 0.0015,
+            udp_recv_count: 1,
             ..Default::default()
         };
         let s = direction_interval_sum(0.0, 1.0, 1.0, &acc, false, false, true, 1448, false);
