@@ -1529,16 +1529,18 @@ impl ClientBuilder {
     }
 
     /// `-Z/--zerocopy`: use a zero-copy (`sendfile`) method of sending data;
-    /// Linux/macOS/FreeBSD only. Elsewhere — and whenever `-b` pacing or an
-    /// `-n`/`-k` byte budget is in effect — it silently falls back to the
-    /// normal copying sender.
+    /// Linux/macOS/FreeBSD only. On other unix — and on any platform whenever
+    /// `-b` pacing or an `-n`/`-k` byte budget is in effect — it silently
+    /// falls back to the normal copying sender; rejected at `build()` on
+    /// non-unix.
     pub fn zerocopy(mut self, enabled: bool) -> Self {
         self.zerocopy = enabled;
         self
     }
 
     /// `--gsro`: enable UDP GSO/GRO (generic segmentation/receive offload);
-    /// Linux only; a silent no-op elsewhere.
+    /// Linux only; a silent no-op elsewhere on unix, rejected at `build()` on
+    /// non-unix.
     pub fn gsro(mut self, enabled: bool) -> Self {
         self.gsro = enabled;
         self
@@ -1591,7 +1593,8 @@ impl ClientBuilder {
     }
 
     /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
-    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere.
+    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere on
+    /// unix, rejected at `build()` on non-unix.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self

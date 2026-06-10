@@ -96,7 +96,7 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--gsro` UDP GSO/GRO | yes | | | |
 | `--sendmmsg` batched UDP | yes | | yes | |
 
-All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
+All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. On Windows, unsupported flags return a clear error at startup; on Unix platforms a blank cell means the option is silently unavailable (the underlying call is a no-op).
 
 ## CLI Reference
 
