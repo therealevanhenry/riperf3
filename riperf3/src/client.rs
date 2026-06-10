@@ -1529,14 +1529,16 @@ impl ClientBuilder {
     }
 
     /// `-Z/--zerocopy`: use a zero-copy (`sendfile`) method of sending data;
-    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
+    /// Linux/macOS/FreeBSD only. Elsewhere — and whenever `-b` pacing or an
+    /// `-n`/`-k` byte budget is in effect — it silently falls back to the
+    /// normal copying sender.
     pub fn zerocopy(mut self, enabled: bool) -> Self {
         self.zerocopy = enabled;
         self
     }
 
     /// `--gsro`: enable UDP GSO/GRO (generic segmentation/receive offload);
-    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
+    /// Linux only; a silent no-op elsewhere.
     pub fn gsro(mut self, enabled: bool) -> Self {
         self.gsro = enabled;
         self
@@ -1588,8 +1590,8 @@ impl ClientBuilder {
         self
     }
 
-    /// `--bind-dev`: bind to a network interface with `SO_BINDTODEVICE`;
-    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
+    /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
+    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
@@ -1642,7 +1644,7 @@ impl ClientBuilder {
     }
 
     /// `--snd-timeout`: timeout for unacknowledged TCP data, in milliseconds
-    /// (`TCP_USER_TIMEOUT`).
+    /// (`TCP_USER_TIMEOUT`, Linux only).
     pub fn snd_timeout(mut self, ms: u64) -> Self {
         self.snd_timeout = Some(ms);
         self
