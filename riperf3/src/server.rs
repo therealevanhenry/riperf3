@@ -1561,16 +1561,20 @@ impl ServerBuilder {
         Self::default()
     }
 
+    /// `-p/--port`: server port to listen on (default 5201); `None` resolves
+    /// back to the default at `build()`.
     pub fn port(mut self, port: Option<u16>) -> Self {
         self.port = port;
         self
     }
 
+    /// `-1/--one-off`: handle one client connection, then exit.
     pub fn one_off(mut self, one_off: bool) -> Self {
         self.one_off = one_off;
         self
     }
 
+    /// `-V/--verbose`: enable verbose output.
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
@@ -1588,26 +1592,34 @@ impl ServerBuilder {
         self
     }
 
+    /// `--idle-timeout`: restart the listener if no client connects within
+    /// `secs` seconds (with `-1/--one-off`, exit instead).
     pub fn idle_timeout(mut self, secs: u32) -> Self {
         self.idle_timeout = Some(secs);
         self
     }
 
+    /// `--server-bitrate-limit`: abort a test whose aggregate throughput
+    /// exceeds `rate` bits/sec (unset: no limit).
     pub fn server_bitrate_limit(mut self, rate: u64) -> Self {
         self.server_bitrate_limit = Some(rate);
         self
     }
 
+    /// `--server-max-duration`: abort any test that runs longer than `secs`
+    /// seconds (unset: no limit).
     pub fn server_max_duration(mut self, secs: u32) -> Self {
         self.server_max_duration = Some(secs);
         self
     }
 
+    /// `--forceflush`: force flushing output at every interval.
     pub fn forceflush(mut self, enabled: bool) -> Self {
         self.forceflush = enabled;
         self
     }
 
+    /// `-B/--bind`: bind the listener to a specific local address.
     pub fn bind_address(mut self, addr: &str) -> Self {
         self.bind_address = Some(addr.to_string());
         self
@@ -1625,36 +1637,50 @@ impl ServerBuilder {
         self
     }
 
+    /// `--timestamps`: prefix each output line with a timestamp in the given
+    /// `strftime` format (the CLI defaults to `"%c "` when no format is given).
     pub fn timestamps(mut self, fmt: &str) -> Self {
         self.timestamps = Some(fmt.to_string());
         self
     }
 
+    /// `-F/--file`: receiving streams write received data to this file;
+    /// sending streams (reverse mode) read the payload from it.
     pub fn file(mut self, path: &str) -> Self {
         self.file = Some(path.to_string());
         self
     }
 
+    /// `--rsa-private-key-path`: path to the RSA private key used to decrypt
+    /// client authentication credentials.
     pub fn rsa_private_key_path(mut self, path: &str) -> Self {
         self.rsa_private_key_path = Some(path.to_string());
         self
     }
 
+    /// `--authorized-users-path`: path to the file of users authorized to run
+    /// authenticated tests.
     pub fn authorized_users_path(mut self, path: &str) -> Self {
         self.authorized_users_path = Some(path.to_string());
         self
     }
 
+    /// `--time-skew-threshold`: allowed clock skew in seconds when validating
+    /// an authentication token's timestamp (default 10).
     pub fn time_skew_threshold(mut self, secs: u32) -> Self {
         self.time_skew_threshold = secs;
         self
     }
 
+    /// `--use-pkcs1-padding`: decrypt credentials with PKCS#1 v1.5 padding
+    /// instead of OAEP (for tokens from pre-3.17 iperf3 clients).
     pub fn use_pkcs1_padding(mut self, enabled: bool) -> Self {
         self.use_pkcs1_padding = enabled;
         self
     }
 
+    /// Like [`Self::server_bitrate_limit`], accepting an iperf3 rate string
+    /// (`--server-bitrate-limit 1G`; decimal, 1000-based).
     pub fn server_bitrate_limit_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         // A bitrate limit is a rate: decimal (1000-based) suffixes, like iperf3 (#56).
         use crate::utils::parse_rate;

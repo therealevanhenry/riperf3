@@ -2,6 +2,7 @@
 name = "riperf3-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Wire-compatible Rust implementation of iperf3 — network performance testing CLI"
 homepage.workspace = true

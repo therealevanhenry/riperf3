@@ -19,6 +19,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      # Check (not test) on the declared floor: proves the rust-version claim
+      # in Cargo.toml without doubling the test wall-clock.
+      - run: cargo check --workspace --all-targets
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -69,11 +80,10 @@ jobs:
   # tcp_connection_info path, winsock) is unverified. These jobs run the real test
   # suite on native runners.
   #
-  # INFORMATIONAL for now: they are deliberately NOT in branch protection's
-  # required checks, because turning native tests on may surface pre-existing
-  # platform bugs (e.g. #40, macOS retransmits always 0). They report without
-  # blocking merges; issues get filed + fixed, then the checks are promoted to
-  # required. fail-fast: false so a failure on one OS doesn't cancel the other.
+  # Status (review of the live main ruleset, 2026-06): Native test
+  # (windows-latest) IS a required branch-protection check; macOS remains
+  # informational (reports without blocking; promoted when consistently
+  # clean). fail-fast: false so a failure on one OS doesn't cancel the other.
   native-test:
     name: Native test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -116,9 +126,8 @@ jobs:
   # FreeBSD `rust` package). `release` is pinned for reproducibility.
   #
   # REQUIRED check (added informational in 0.6.1, promoted the same release once
-  # the first runs were clean): it gates merges like the Linux jobs. The
-  # macOS/Windows native jobs above stay informational for now — Windows has the
-  # open UDP multi-stream issue (#80) and macOS isn't promoted yet.
+  # the first runs were clean): it gates merges like the Linux and Windows
+  # native jobs. macOS stays informational for now.
   freebsd-test:
     name: Native test (FreeBSD)
     runs-on: ubuntu-latest

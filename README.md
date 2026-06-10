@@ -11,7 +11,7 @@ riperf3 speaks iperf3's exact wire protocol: a riperf3 client interoperates with
 - **Safe Rust** — `unsafe` is used only for platform-specific kernel syscalls (`setsockopt`/`getsockopt`) with no safe wrapper. No unsafe in any application logic or public API. See the [audit table](https://github.com/therealevanhenry/riperf3/blob/main/riperf3/src/lib.rs) for the full inventory.
 - **Single static binary** with no runtime dependencies.
 - **Idiomatic Rust** — not a C port. Uses tokio for async I/O, serde for JSON, clap for CLI parsing, nix for safe Unix syscalls.
-- **369 tests** — unit, integration, and full client-server loopback with interchange verification.
+- **430+ tests** — unit, integration, and full client-server loopback with interchange verification.
 
 ## Quick Start
 
@@ -72,7 +72,7 @@ tests, the compatibility matrix, and full methodology.
 
 ## Platform Support
 
-riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference platform (full feature set, primary CI); macOS is verified in native CI; Windows compiles and is cross-checked in CI, with a few runtime gaps still under triage in the [issue tracker](https://github.com/therealevanhenry/riperf3/issues); FreeBSD is supported via conditional compilation but is not yet exercised in CI. Platform-specific features use safe Rust wrappers where available, with graceful degradation or a clear error message where a flag is unavailable.
+riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference platform (full feature set; the required CI gate runs the full suite plus a real-iperf3 interop matrix). FreeBSD and Windows run the full native test suite as **required** CI checks that gate every merge. macOS runs the full native suite in CI as an informational check — tested on every change, promoted to required once consistently clean. Platform-specific features use safe Rust wrappers where available, with graceful degradation or a clear error message where a flag is unavailable.
 
 | Feature | Linux | macOS | FreeBSD | Windows |
 |---|:---:|:---:|:---:|:---:|
@@ -96,7 +96,7 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `--gsro` UDP GSO/GRO | yes | | | |
 | `--sendmmsg` batched UDP | yes | | yes | |
 
-All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. Unsupported flags return a clear error at startup.
+All platform-specific flags match iperf3's support matrix exactly for flags shared with iperf3. `--sendmmsg` is a riperf3-exclusive experimental optimization. Blank cells indicate the feature is unavailable on that platform in both riperf3 and iperf3. On Windows, unsupported flags return a clear error at startup; on Unix platforms a blank cell is a silent no-op at the socket layer, except `-D` and `--sendmmsg`, which error at startup wherever unsupported.
 
 ## CLI Reference
 
@@ -225,7 +225,7 @@ cargo clippy --all-targets -- -D warnings      # lint
 
 ## Status
 
-Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux and macOS are fully supported and exercised in native CI; Windows compiles and cross-checks but has a few runtime gaps under active triage; FreeBSD is supported via conditional compilation. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
+Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux (full suite + interop matrix), FreeBSD, and Windows (native suites) are required CI checks gating every merge; macOS runs the full native suite as informational CI. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
 
 See [CHANGELOG.md](CHANGELOG.md) for the release notes and current known issues — including a handful of options that are accepted but not yet fully effective.
 

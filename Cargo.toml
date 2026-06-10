@@ -10,6 +10,11 @@ members = [
 version = "0.7.1"
 authors = ["Evan Henry"]
 edition = "2021"
+# MSRV floor 1.85 (review r1, verified empirically): the locked base64ct 1.8
+# (rsa chain) is edition 2024, which needs Cargo >= 1.85. Our own code's floor
+# is 1.82 (Option::is_none_or); the v4 lockfile itself parses fine on older
+# Cargo (>= 1.78). Enforced by the pinned-MSRV CI check job.
+rust-version = "1.85"
 homepage = "https://github.com/therealevanhenry/riperf3"
 repository = "https://github.com/therealevanhenry/riperf3"
 keywords = ["riperf3", "iperf3", "iperf", "network", "speedtest"]

@@ -2,6 +2,7 @@
 name = "riperf3"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Wire-compatible Rust implementation of iperf3 — safe, cross-platform network performance testing library"
 homepage.workspace = true
