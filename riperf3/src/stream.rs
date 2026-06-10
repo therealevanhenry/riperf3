@@ -1077,10 +1077,13 @@ impl StreamThreadGate {
         match tokio::time::timeout(timeout, self.sem.acquire_many(self.expected)).await {
             Ok(Ok(_permits)) => true,
             _ => {
+                // No late/total breakdown: a thread can check in between the
+                // timeout firing and any count we'd read, making a precise
+                // number a lie exactly when it matters (review r2).
                 log::warn!(
-                    "{} stream data thread(s) not started within {timeout:?}; \
+                    "not all of {} stream data thread(s) started within {timeout:?}; \
                      proceeding degraded (#178)",
-                    self.expected as usize - self.sem.available_permits()
+                    self.expected
                 );
                 false
             }

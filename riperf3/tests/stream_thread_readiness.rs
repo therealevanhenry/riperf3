@@ -24,9 +24,13 @@ mod common;
 #[test]
 fn udp_bidir_window_waits_for_stream_threads() {
     // Hogs == max_blocking_threads, so every spawn_blocking'd stream thread
-    // queues until the hogs exit (1.5 s — past the whole 1 s test duration).
+    // queues until the hogs exit — 2.5 s, past the whole 1 s test duration
+    // with margin: the wave starts at attempt start, so the control handshake
+    // would have to outlive it for the test to pass without exercising the
+    // gate (review r2 — vacuous-pass, not false-fail, is the failure mode of
+    // a too-short wave).
     const HOGS: usize = 4;
-    const HOG_LIFETIME: Duration = Duration::from_millis(1500);
+    const HOG_LIFETIME: Duration = Duration::from_millis(2500);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
