@@ -1186,9 +1186,6 @@ impl Client {
             .unwrap_or((0.0, 0.0, 0.0));
 
         let is_udp = matches!(self.protocol, TransportProtocol::Udp);
-        // Forward UDP: the server is the receiver, so its loss lives only in the
-        // results it returned — attach it to the (sender) streams (#25).
-        let is_forward_udp = is_udp && !self.reverse && !self.bidir;
 
         let stream_reports: Vec<StreamReport> = streams
             .iter()
@@ -1202,8 +1199,9 @@ impl Client {
                 let server_stream =
                     remote_cpu.and_then(|r| r.streams.iter().find(|x| x.id == s.id));
 
-                // UDP datagram stats: from our local receiver if we measured them,
-                // else (forward UDP) from the server's results for this stream (#25).
+                // UDP datagram stats: from our local receiver if we measured
+                // them, else (any UDP sending stream) from the server's
+                // results for this stream (#25, #182).
                 let udp = if let Some(ref lock) = s.udp_recv_stats {
                     // Local receiver: post-omit stats (#31) — gross counters
                     // minus the boundary baselines.
@@ -1213,7 +1211,11 @@ impl Client {
                         packets: st.packet_count - st.omitted_packet_count,
                         out_of_order: st.outoforder_packets - st.omitted_outoforder_packets,
                     })
-                } else if is_forward_udp && s.is_sender {
+                } else if is_udp && s.is_sender {
+                    // A sending stream's datagram stats are measured at the
+                    // peer's receiver and live only in the results it returned
+                    // — attach them to the sender entry, in bidir exactly as
+                    // in forward mode (#25, #182; iperf3 does the same).
                     // Peer's gross counts minus its omitted_* baselines (#31).
                     server_stream.map(|x| UdpStreamStats {
                         jitter_secs: x.jitter,
