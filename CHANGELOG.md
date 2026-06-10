@@ -11,7 +11,76 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.7.1] - 2026-06-09
+## [0.7.2] - 2026-06-10
+
+A non-breaking patch closing out the long-standing faithfulness backlog: every
+accepted-but-inert or diverging flag now behaves like iperf3. No public API
+break (`cargo-semver-checks`: no semver update required). Release gate: the
+cross-tool compatibility matrix is all-PASS (48/48, incl. iperf3 3.12
+interop), a fresh full N=30 throughput campaign vs iperf3 is regression-free
+(12 cells faster / 3 parity / 1 within single-stream noise, confirmed by a
+controlled same-environment 0.7.1-vs-0.7.2 A/B at parity), and the new
+`-O`/`--get-server-output` paths are cross-tool verified in both roles — see
+[BENCHMARKS.md](BENCHMARKS.md).
+
+### Added
+- **Real `-O/--omit` semantics** (#31): the run lasts `omit + time`, statistics
+  reset at the boundary (interval timeline restarts at 0), the summary covers
+  only the post-omit window, and `-J` carries `test_start.omit` plus
+  `"omitted"` intervals. The `-n`/`-k` end check copies iperf3's asymmetric
+  test-level accounting — sent counts post-omit net, received counts gross —
+  so reverse/bidir limits end at the boundary exactly like iperf3. Capped at
+  600 s (`MAX_OMIT_TIME`).
+- **`--get-server-output` wired end to end** (#33): the server returns its
+  rendered output (text) or report (`-J`) in the results exchange; the client
+  prints it after its own report or attaches it to the `-J` blob — closing the
+  last inert builder field (#122).
+- **`--pacing-timer` wired** (#32): the `-b` throttle wakes on the configured
+  quantum (default 1000 µs, always sent in the param exchange like iperf3).
+- **Real macOS Retr/Cwnd** (#96): `tcpi_txretransmitpackets` via a hand-rolled
+  `tcp_connection_info` binding (the `libc` crate's layout is mislaid),
+  restoring the Retr and Cwnd columns on macOS.
+- **MSRV declared**: `rust-version = "1.85"` (floor set by the dependency
+  tree), enforced by a pinned-toolchain CI job. Plus CONTRIBUTING.md,
+  SECURITY.md (private vulnerability reporting enabled), a README accuracy
+  pass, and rustdoc for all 71 builder setters (#165).
+
+### Changed
+- **The `-b` rate limiter is iperf3's cumulative-average throttle** (#116): a
+  send is green-lit while cumulative bytes ≤ elapsed × rate, bounding
+  overshoot to one block. The old token bucket's burst floor overshot a
+  low-rate `-b` by up to 2× with TCP's 128 KiB default block. Cross-tool
+  byte-parity verified at 1M/200M/5G/10G.
+- **Per-option socket-option error policy** (#45), matching iperf3: `-S/--tos`
+  failures are fatal (`IESETTOS`, incl. IPv6 `IPV6_TCLASS`); best-effort
+  options stay tolerated, each documented at its call site.
+- **Conflicting end conditions are rejected** (#140): `-t` with `-n`/`-k`
+  errors like iperf3's `IEENDCONDITIONS` (value-based, after `unit_atoi`-style
+  scale-then-truncate parsing); `-i` outside {0} ∪ [0.1, 60] errors like
+  `IEINTERVAL`.
+- **`--bind-dev` applies before `connect()`** (#88) for TCP control and data
+  sockets (previously bound after, so routing didn't take effect), with macOS
+  IPv6 support via `IPV6_BOUND_IF`.
+
+### Fixed
+- **Bidir `-J` interval sums split per direction** (#54): `sum` +
+  `sum_bidir_reverse`, mirroring the end block; interval jitter is the mean
+  across receiving streams (#142), like iperf3's `avg_jitter`.
+- **The pidfile is unlinked on every exit path** (#105): SIGINT/SIGTERM
+  handlers (installed before the pidfile is written) and normal exit; signal
+  exits report code 0 with iperf3's interrupt notice.
+- **Exchanged retransmit totals are real** (#156): `sender_has_retransmits: 1`
+  now ships per-stream kernel totals snapshotted while the socket is open
+  (previously `-1`, which iperf3 3.12 renders as a huge bogus count), rebased
+  to the post-omit window under `-O` (#171).
+- **The abort path joins the interval reporter** (#147): a server-initiated
+  abort no longer leaks a parked reporter task into a library consumer's
+  runtime.
+- **FreeBSD `snd_cwnd` is bytes, not bytes×MSS** (#155).
+
+### Internal
+- Dead duplicate report fields removed (#139); per-PR post-merge drift gates
+  (compat + bench vs baseline) ran clean throughout the campaign.
 
 The first non-breaking `0.7.x` patch — a batch of iperf3 **output-faithfulness**
 fixes (flags and report fields that diverged from iperf3) plus internal cleanup
