@@ -538,6 +538,9 @@ impl Server {
                 byte_budget
                     .as_ref()
                     .map(|b| (b.clone(), b.load(Ordering::Relaxed))),
+                // The server has no -n/-k end-check driver — the client ends
+                // the test — so it never waits on the boundary signal.
+                None,
             )
         };
 

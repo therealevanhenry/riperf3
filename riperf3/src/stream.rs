@@ -417,17 +417,24 @@ pub async fn run_tcp_sender(
         // stop when it is exhausted, so the sender stops at ~N instead of
         // free-running until the controller's next 100ms poll. The budget is
         // shared across the sending streams — iperf3's `-n` is the test-wide
-        // total, consumed across streams as each sends — so the overshoot is
-        // bounded to ~one block per stream rather than ~100ms of line rate.
+        // total, consumed across streams as each sends. The claim has NO undo:
+        // a fetch_sub + compensating fetch_add could interleave with the omit
+        // boundary's refill store and land the undo on the fresh budget,
+        // leaking a block past the target (review r3). fetch_update claims
+        // only from a positive budget, so only one claim can drive it
+        // non-positive — total overshoot is bounded to less than one block.
         if let Some(b) = &byte_budget {
-            if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
+            let len = buf.len() as i64;
+            if b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v > 0).then_some(v - len)
+            })
+            .is_err()
+            {
                 // iperf3's sender IDLES at the limit instead of exiting (its
                 // mt sender checks bytes_sent >= N per burst, including during
                 // an -O warm-up, and resumes when the boundary resets the
-                // counter). Undo the claim and wait for a refill (#31) or the
-                // driver's `done` (the normal end, set once the post-omit net
-                // target is reached).
-                b.fetch_add(buf.len() as i64, Ordering::Relaxed);
+                // counter). Wait for a refill (#31) or the driver's `done`
+                // (the normal end, set once the post-omit target is reached).
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }

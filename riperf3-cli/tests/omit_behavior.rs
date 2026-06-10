@@ -232,12 +232,18 @@ fn omit_with_byte_limit_applies_post_omit() {
     );
 }
 
-/// Reverse `-R -n + -O` (r2 blocker 1): the SERVER's senders hit the same
-/// budget design — pre-fix they exhausted the gross budget during warm-up and
-/// broke permanently, so the client's post-omit net target was unreachable
-/// (infinite zero-byte intervals).
+/// Reverse `-R -n + -O` (r3 blocker 1): iperf3's receive-side limit counts
+/// GROSS bytes — `test->bytes_received` is never reset by `iperf_reset_stats`
+/// (iperf_api.c:3675 zeroes only `bytes_sent`; end check at
+/// iperf_client_api.c:771-772) — so a reverse run whose warm-up already moved
+/// part of the target ends when warm-up + post-omit gross reaches `-n`, NOT
+/// after a fresh post-omit N (the pre-r3 refill semantics, which also raced
+/// the two reporters' boundaries into a ~50% hang). `-b 20M` pins the rate so
+/// the shape is CI-stable: the 1 s warm-up moves ~2.5 MB of the 5 MB target,
+/// so the post-omit (net) receive lands around target − warm-up ≈ 2.5 MB —
+/// far below the ≈5 MB a fresh-N refill would transfer.
 #[test]
-fn omit_with_reverse_byte_limit_terminates() {
+fn omit_with_reverse_byte_limit_ends_on_gross_bytes() {
     let port = free_port();
     let ps = port.to_string();
     let mut server = spawn_server(&ps);
@@ -252,7 +258,9 @@ fn omit_with_reverse_byte_limit_terminates() {
             "-O",
             "1",
             "-n",
-            "50M",
+            "5M",
+            "-b",
+            "20M",
             "-J",
         ],
         Duration::from_secs(60),
@@ -262,15 +270,63 @@ fn omit_with_reverse_byte_limit_terminates() {
 
     assert!(
         elapsed < Duration::from_secs(20),
-        "reverse -n + -O must terminate (r2 blocker 1)"
+        "reverse -n + -O must terminate (r2/r3 blocker 1)"
     );
     let v: Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
     let bytes = v["end"]["sum_received"]["bytes"].as_u64().expect("bytes");
     assert!(
-        (47_500_000..=53_000_000).contains(&bytes),
-        "reverse post-omit budget must land on ~50M, got {bytes}: {out}"
+        (200_000..4_400_000).contains(&(bytes as usize)),
+        "reverse post-omit receive must be gross-limited (≈ target − warm-up ≈ 2.5M), \
+         got {bytes}: {out}"
     );
+}
+
+/// Bidir `-n + -O`: the same gross-received rule ends the whole test when
+/// EITHER side's counter (sent net, received gross) reaches the target —
+/// iperf3's OR-check (iperf_client_api.c:771-772). Pre-r3 this raced the two
+/// reporters' boundaries (observed: one block short / intermittent hang).
+#[test]
+fn omit_with_bidir_byte_limit_terminates() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    let (out, elapsed) = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "--bidir",
+            "-O",
+            "1",
+            "-n",
+            "5M",
+            "-b",
+            "20M",
+            "-J",
+        ],
+        Duration::from_secs(60),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "bidir -n + -O must terminate"
+    );
+    let v: Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
+    // Both directions must be present and bounded: nothing may balloon past
+    // the gross target plus generous stop-latency slop.
+    for key in ["sum_received", "sum_sent"] {
+        let bytes = v["end"][key]["bytes"].as_u64().expect(key);
+        assert!(
+            bytes < 8_000_000,
+            "bidir {key} must stay near the 5M gross target, got {bytes}: {out}"
+        );
+    }
 }
 
 /// #31 r1 blocker 2: the server's reporter end time must be rebased to the

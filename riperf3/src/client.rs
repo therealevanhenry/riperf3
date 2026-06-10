@@ -112,8 +112,15 @@ fn server_receiver_summaries(
 /// bidir whichever direction reaches the limit first ends the test. Counting
 /// only sent bytes leaves a reverse `-n`/`-k` test spinning forever (#60).
 fn transferred_bytes(streams: &[DataStream]) -> u64 {
-    // Net (post-omit) getters: with -O, iperf3 resets byte progress at the
-    // boundary so the -n/-k limit applies to the measured window (#31).
+    // The two sides are deliberately asymmetric, copying iperf3's test-level
+    // counters (#31, review r3): iperf_reset_stats zeroes test->bytes_sent at
+    // the omit boundary (iperf_api.c:3675) so the SEND side counts post-omit
+    // NET — but it never touches test->bytes_received, so the RECEIVE side
+    // counts GROSS, warm-up included (end check, iperf_client_api.c:771-772).
+    // The asymmetry is load-bearing: gross received is monotonic, so a
+    // reverse/bidir limit cannot race either reporter's boundary baselines
+    // (the pre-r3 net-received check hung when a mistimed baseline swallowed
+    // warm-up bytes).
     let sent: u64 = streams
         .iter()
         .filter(|s| s.is_sender)
@@ -122,7 +129,7 @@ fn transferred_bytes(streams: &[DataStream]) -> u64 {
     let received: u64 = streams
         .iter()
         .filter(|s| !s.is_sender)
-        .map(|s| s.counters.bytes_received_net())
+        .map(|s| s.counters.bytes_received())
         .sum();
     sent.max(received)
 }
@@ -711,16 +718,28 @@ impl Client {
         streams: &[DataStream],
         target: u64,
         report_start: &std::time::Instant,
+        boundary: Option<&Arc<crate::reporter::OmitBoundary>>,
     ) -> f64 {
-        let omit = Duration::from_secs(self.omit as u64);
+        // With -O the limit applies from the boundary on — iperf3 gates its
+        // end check on `!test->omitting`. Wait on the reporter's boundary
+        // signal, not a parallel wall clock: the wall gate provably opened
+        // before the boundary's re-baselining and read gross-as-net (review
+        // r3, race C). The fallback bounds the wait for liveness if the
+        // reporter died before its boundary fired.
+        if let Some(b) = boundary {
+            let fallback = Duration::from_secs(self.omit as u64 + 2);
+            b.crossed(fallback).await;
+        }
+        // First check BEFORE any sleep: a warm-up that already covered the
+        // gross receive target ends the test AT the boundary, like iperf3
+        // (its select loop re-checks per wake, stopping within ~1 ms of the
+        // omit flip — a 100 ms first poll would leak a poll's worth of line
+        // rate into the post-omit window).
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if report_start.elapsed() < omit {
-                continue; // still warming up — the limit doesn't apply yet
-            }
             if transferred_bytes(streams) >= target {
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         (report_start.elapsed().as_secs_f64() - self.omit as f64).max(0.0)
     }
@@ -750,6 +769,11 @@ impl Client {
         // before spawning it, so `report_start.elapsed()` at end-of-test is the
         // authoritative final-interval boundary (#55).
         let reporter_end = Arc::new(crate::reporter::ReporterEnd::new());
+        // -O + -n/-k: the reporter signals here when its omit boundary has
+        // fully crossed (baselines snapshotted, budget refilled), gating the
+        // byte-limit driver's first end check (#31, review r3).
+        let omit_boundary =
+            (self.omit > 0).then(|| Arc::new(crate::reporter::OmitBoundary::new()));
         let report_start = std::time::Instant::now();
         // `>= 0.0`: `-i 0` still spawns the reporter, which emits a single
         // whole-test interval rather than none (#107).
@@ -782,6 +806,7 @@ impl Client {
                 reporter_end.clone(),
                 want_collector.then(|| collector.clone()),
                 byte_budget.cloned(),
+                omit_boundary.clone(),
             )
         } else {
             None
@@ -829,7 +854,8 @@ impl Client {
                 dur.as_secs_f64()
             }
             EndCondition::Bytes(target) => {
-                self.wait_byte_limit(streams, target, &report_start).await
+                self.wait_byte_limit(streams, target, &report_start, omit_boundary.as_ref())
+                    .await
             }
             EndCondition::Blocks(target) => {
                 // Block-based: approximate by dividing transferred bytes by blksize.
@@ -837,6 +863,7 @@ impl Client {
                     streams,
                     target.saturating_mul(blksize as u64),
                     &report_start,
+                    omit_boundary.as_ref(),
                 )
                 .await
             }
@@ -1818,6 +1845,20 @@ impl ClientBuilder {
             ));
         }
 
+        // iperf3 rejects -i outside {0} ∪ [MIN_INTERVAL, MAX_INTERVAL] with
+        // IEINTERVAL (iperf_api.c:1261; 0.1/60 in iperf.h). Load-bearing for
+        // -O: the reporter owns the omit boundary, so an out-of-range
+        // interval silently disabling it would silently disable omit
+        // semantics too (#31, review r3).
+        if let Some(i) = self.interval {
+            if i != 0.0 && !(0.1..=60.0).contains(&i) {
+                return Err(ConfigError::InvalidValue(
+                    "interval",
+                    format!("invalid report interval (min = 0.1, max = 60 seconds): {i}"),
+                ));
+            }
+        }
+
         // Reject flags that require OS support not available on this platform.
         // Matches iperf3 behavior: error at build/parse time, not at runtime.
         #[cfg(not(unix))]
@@ -1945,6 +1986,69 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #31 (review r3 blocker 1): iperf3's -n/-k end check uses test-level
+    // counters (iperf_client_api.c:771-772) — bytes_sent is zeroed at the
+    // omit boundary by iperf_reset_stats (iperf_api.c:3675) but
+    // test->bytes_received never is, so the receive side counts GROSS,
+    // warm-up included. Counting net on the receive side hangs a reverse
+    // -n -O run whenever a mistimed boundary baseline swallows warm-up bytes.
+    #[tokio::test]
+    async fn byte_limit_counts_received_gross_and_sent_net() {
+        use crate::stream::{DataStream, StreamCounters};
+
+        let sender = Arc::new(StreamCounters::new());
+        sender.record_sent(1_000);
+        sender.snapshot_omit();
+        sender.record_sent(300); // post-omit net: 300
+        let receiver = Arc::new(StreamCounters::new());
+        receiver.record_received(1_000);
+        receiver.snapshot_omit(); // the boundary must NOT hide warm-up receive
+        receiver.record_received(300);
+
+        let mk = |is_sender: bool, counters: Arc<StreamCounters>| DataStream {
+            id: 1,
+            is_sender,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let streams = [mk(true, sender), mk(false, receiver)];
+        assert_eq!(
+            transferred_bytes(&streams),
+            1_300,
+            "received counts gross (1300), sent counts net (300)"
+        );
+        for s in &streams {
+            s.task.abort();
+        }
+    }
+
+    // iperf3 rejects -i outside {0} ∪ [0.1, 60] with IEINTERVAL
+    // (iperf_api.c:1261, MIN_INTERVAL/MAX_INTERVAL in iperf.h). With -O the
+    // reporter is load-bearing (it owns the omit boundary), so an invalid
+    // interval silently disabling it must be impossible (review r3 nit).
+    #[test]
+    fn client_builder_rejects_out_of_range_interval() {
+        for bad in [-1.0, 0.05, 60.1] {
+            assert!(
+                ClientBuilder::new("h").interval(bad).build().is_err(),
+                "interval {bad} must be rejected"
+            );
+        }
+        for ok in [0.0, 0.1, 1.0, 60.0] {
+            assert!(
+                ClientBuilder::new("h").interval(ok).build().is_ok(),
+                "interval {ok} must be accepted"
+            );
+        }
+    }
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
     // when `Client`'s fields became `pub(crate)` (#43): an external test crate

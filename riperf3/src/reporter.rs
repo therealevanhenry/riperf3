@@ -414,6 +414,53 @@ impl Default for ReporterEnd {
     }
 }
 
+/// Omit-boundary-crossed signal for the `-n`/`-k` driver (#31, review r3):
+/// the reporter sets it at the END of its boundary block — after the byte
+/// baselines are snapshotted and the budget refilled — so the driver's first
+/// post-warm-up end check runs against consistent net accounting. Gating that
+/// check on a parallel wall clock instead provably opened before the
+/// boundary's re-baselining (race C) and read gross-as-net.
+pub struct OmitBoundary {
+    passed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl OmitBoundary {
+    pub fn new() -> Self {
+        Self {
+            passed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Reporter side: mark the boundary crossed and wake the waiting driver.
+    /// `notify_one` stores a permit, so a driver that starts waiting after
+    /// the boundary fired still wakes immediately.
+    fn cross(&self) {
+        self.passed.store(true, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    /// Driver side: wait until the boundary has been crossed. `fallback`
+    /// bounds the wait for liveness if the reporter died before its boundary
+    /// (error paths); the caller then degrades to wall-clock gating.
+    pub async fn crossed(&self, fallback: Duration) {
+        if self.passed.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::select! {
+            _ = self.notify.notified() => {}
+            _ = tokio::time::sleep(fallback) => {}
+        }
+    }
+}
+
+impl Default for OmitBoundary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-direction interval aggregates (#54). In bidir both directions run
 /// concurrently; iperf3 sums each separately (`sum` + `sum_bidir_reverse`).
 #[derive(Default)]
@@ -498,6 +545,7 @@ pub fn spawn_interval_reporter(
     reporter_end: Arc<ReporterEnd>,
     collector: Option<Arc<Mutex<CollectedIntervals>>>,
     byte_budget: Option<(Arc<std::sync::atomic::AtomicI64>, i64)>,
+    boundary_signal: Option<Arc<OmitBoundary>>,
 ) -> Option<JoinHandle<()>> {
     if config.interval_secs < 0.0 {
         return None;
@@ -879,14 +927,13 @@ pub fn spawn_interval_reporter(
             // be stale), and the end-block extremes restart. Lives inside
             // this closure because prev_*/acc_extremes are its captures.
             if omit_boundary {
-                // -n/-k + -O (#31): refill the shared sender budget HERE,
-                // where the byte baselines are snapshotted, so the limit and
-                // the net accounting share one boundary instant — refilling
-                // from the driver's 100ms poll overshot by up to a poll's
-                // worth of line rate (review r2).
-                if let Some((b, target)) = &byte_budget {
-                    b.store(*target, std::sync::atomic::Ordering::Relaxed);
-                }
+                // Order is load-bearing (review r3 blocker 3): baselines
+                // FIRST, budget refill second. Refill-first let a sender wake
+                // in the store→snapshot gap, claim post-refill budget, and
+                // record bytes BEFORE the baseline — consumed budget excluded
+                // from net, so net topped out below target and the forward
+                // run hung. Baselines-first is safe: paused senders cannot
+                // record new bytes until the refill lands.
                 for (i, s) in streams.iter().enumerate() {
                     let _ = s.counters.take_sent_interval();
                     let _ = s.counters.take_received_interval();
@@ -911,6 +958,18 @@ pub fn spawn_interval_reporter(
                         min_rtt: u32::MAX,
                         ..Default::default()
                     };
+                }
+                // -n/-k + -O (#31): refill the shared sender budget at the
+                // boundary, where the byte baselines were just snapshotted,
+                // so the limit and the net accounting share one boundary
+                // instant (review r2).
+                if let Some((b, target)) = &byte_budget {
+                    b.store(*target, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Wake the -n/-k driver LAST: its first post-warm-up check
+                // must observe the baselines and the refill (review r3).
+                if let Some(ob) = &boundary_signal {
+                    ob.cross();
                 }
             }
         };
@@ -1353,6 +1412,7 @@ mod interval_reporter_tests {
             done,
             Arc::new(ReporterEnd::new()),
             None,
+            None,
             None
         )
         .is_some());
@@ -1379,6 +1439,7 @@ mod interval_reporter_tests {
             done,
             Arc::new(ReporterEnd::new()),
             None,
+            None,
             None
         )
         .is_none());
@@ -1404,6 +1465,7 @@ mod interval_reporter_tests {
             vec![],
             done.clone(),
             Arc::new(ReporterEnd::new()),
+            None,
             None,
             None,
         );
@@ -1460,6 +1522,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
             None,
         )
         .expect("reporter spawns for a positive interval");
@@ -1543,6 +1606,7 @@ mod interval_reporter_tests {
             reporter_end.clone(),
             Some(collector.clone()),
             None,
+            None,
         )
         .expect("reporter spawns for -i 0 (#107)");
 
@@ -1619,6 +1683,7 @@ mod interval_reporter_tests {
             reporter_end.clone(),
             Some(collector.clone()),
             None,
+            None,
         )
         .expect("reporter spawns for a positive interval");
 
@@ -1691,6 +1756,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
             None,
         )
         .expect("reporter spawns for a positive interval");
