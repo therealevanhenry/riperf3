@@ -1011,6 +1011,43 @@ fn await_start(start: &AtomicBool, done: &AtomicBool) -> bool {
     true
 }
 
+/// How long the control plane waits for spawned stream data threads to check
+/// in before opening the test window anyway (#178). Generous: the worst stall
+/// observed on loaded windows-latest runners was ~3.5 s; a barrier timeout
+/// only recreates the pre-fix behavior, so erring long costs nothing in the
+/// normal case (the wait ends the moment the threads are up).
+pub(crate) const STREAM_THREAD_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait (bounded) until `expected` stream data threads have checked in (#178).
+///
+/// The UDP data plane runs on `spawn_blocking` OS threads while the `-t` test
+/// clock is driven by the async control plane. On a loaded host (2-core CI
+/// runners), OS-thread creation can stall for seconds — the whole test window
+/// can elapse before a single data thread runs, completing a run "normally"
+/// with zero bytes (the late receiver goes straight to its post-test drain and
+/// discards everything the peer sent). Each blocking task bumps `entered` as
+/// its first action; the control plane calls this before letting the test
+/// window open, so the duration clock cannot start ahead of the data plane.
+///
+/// Returns whether all threads checked in. On timeout the caller proceeds
+/// anyway — a degraded run (today's behavior) beats failing a test that would
+/// have moved most of its bytes.
+pub(crate) async fn await_stream_threads_entered(
+    entered: &std::sync::atomic::AtomicU32,
+    expected: u32,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while entered.load(Ordering::Acquire) < expected {
+        if tokio::time::Instant::now() >= deadline {
+            log::debug!("stream data threads not all started within {timeout:?} (#178)");
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    true
+}
+
 /// Sets `done` when dropped, so every exit path of a test handler — including
 /// early `?` error returns before the normal `done.store(true)` — signals the
 /// data tasks to stop. Without this, a UDP sender parked in `await_start`
@@ -1599,6 +1636,37 @@ pub fn run_udp_receiver_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #178 readiness barrier: returns true immediately when the threads are
+    // already in, true once they arrive late, false only past the deadline.
+    #[tokio::test]
+    async fn await_stream_threads_entered_counts_and_times_out() {
+        use std::sync::atomic::AtomicU32;
+
+        let entered = Arc::new(AtomicU32::new(2));
+        assert!(
+            await_stream_threads_entered(&entered, 2, Duration::from_millis(50)).await,
+            "already-entered threads must satisfy the barrier instantly"
+        );
+
+        let entered = Arc::new(AtomicU32::new(0));
+        let e = entered.clone();
+        let bumper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            e.fetch_add(2, Ordering::Release);
+        });
+        assert!(
+            await_stream_threads_entered(&entered, 2, Duration::from_secs(5)).await,
+            "late arrivals within the deadline must satisfy the barrier"
+        );
+        bumper.await.unwrap();
+
+        let entered = Arc::new(AtomicU32::new(1));
+        assert!(
+            !await_stream_threads_entered(&entered, 2, Duration::from_millis(40)).await,
+            "missing threads must time out, not hang"
+        );
+    }
 
     // #178: a connection-reset-class error on a UDP socket is ICMP
     // port-unreachable noise from something WE sent — Windows surfaces it as

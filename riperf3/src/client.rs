@@ -594,6 +594,11 @@ impl Client {
                     ),
                     None => None,
                 };
+                // #178: every UDP stream gets a dedicated spawn_blocking OS
+                // thread; each checks in here as its first action so the
+                // barrier below can hold the test window until the data plane
+                // actually exists.
+                let threads_entered = Arc::new(std::sync::atomic::AtomicU32::new(0));
                 for i in 0..total {
                     let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
@@ -650,7 +655,9 @@ impl Client {
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
                         let md = max_duration;
+                        let te = threads_entered.clone();
                         tokio::task::spawn_blocking(move || {
+                            te.fetch_add(1, std::sync::atomic::Ordering::Release);
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
                                     std_sock, c, bs, d, rate, u64bit, st, md,
@@ -668,7 +675,9 @@ impl Client {
                         let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                         let sc = stats.clone();
                         let u64bit = self.udp_counters_64bit;
+                        let te = threads_entered.clone();
                         let task = tokio::task::spawn_blocking(move || {
+                            te.fetch_add(1, std::sync::atomic::Ordering::Release);
                             stream::run_udp_receiver_blocking(std_sock, c, sc, bs, d, u64bit)
                         });
                         streams.push(DataStream {
@@ -701,6 +710,17 @@ impl Client {
                         congestion_used: None,
                     });
                 }
+                // #178: hold CreateStreams until every data thread is running
+                // (parked at its start gate). The server's TestStart — and with
+                // it this side's test clock — must not outrun OS-thread
+                // creation, which stalls for seconds on loaded hosts. On
+                // timeout proceed anyway (degraded = pre-fix behavior).
+                stream::await_stream_threads_entered(
+                    &threads_entered,
+                    total,
+                    stream::STREAM_THREAD_START_TIMEOUT,
+                )
+                .await;
             }
         }
 
