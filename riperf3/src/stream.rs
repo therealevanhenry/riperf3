@@ -41,6 +41,11 @@ pub struct StreamCounters {
     /// TCP_INFO read hits a dead fd. -1 = not captured (receiver, UDP, or no
     /// platform support).
     final_retransmits: AtomicI64,
+    /// #171: the cumulative retransmit count at the omit boundary, stored by
+    /// the reporter's boundary block — iperf3's iperf_reset_stats records
+    /// stream_prev_total_retrans the same way, so the exchanged total covers
+    /// the post-omit window only. -1 = no boundary crossed.
+    omit_retransmits: AtomicI64,
 }
 
 impl Default for StreamCounters {
@@ -59,6 +64,7 @@ impl StreamCounters {
             bytes_sent_omit: AtomicU64::new(0),
             bytes_received_omit: AtomicU64::new(0),
             final_retransmits: AtomicI64::new(-1),
+            omit_retransmits: AtomicI64::new(-1),
         }
     }
 
@@ -96,6 +102,24 @@ impl StreamCounters {
     /// The snapshotted end-of-test retransmit total, or -1 if never captured.
     pub fn final_retransmits(&self) -> i64 {
         self.final_retransmits.load(Ordering::Relaxed)
+    }
+
+    /// Record the omit-boundary retransmit baseline (#171; reporter boundary
+    /// block only).
+    pub fn set_omit_retransmits(&self, n: i64) {
+        self.omit_retransmits.store(n, Ordering::Relaxed);
+    }
+
+    /// Adjust a connection-lifetime retransmit total to the post-omit window
+    /// (#171): subtract the boundary baseline when one was recorded, exactly
+    /// iperf3's stream_retrans accounting after iperf_reset_stats.
+    pub fn omit_adjusted_retransmits(&self, lifetime: i64) -> i64 {
+        let base = self.omit_retransmits.load(Ordering::Relaxed);
+        if base >= 0 {
+            (lifetime - base).max(0)
+        } else {
+            lifetime
+        }
     }
 
     /// Record bytes sent (called from the send loop hot path).

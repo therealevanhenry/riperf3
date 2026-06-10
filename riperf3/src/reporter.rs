@@ -957,6 +957,10 @@ pub fn spawn_interval_reporter(
                                 prev_retransmits[i] = info.total_retransmits;
                             }
                         }
+                        // #171: the exchange subtracts this baseline from the
+                        // sender's lifetime total, like iperf3's
+                        // stream_prev_total_retrans at iperf_reset_stats.
+                        s.counters.set_omit_retransmits(prev_retransmits[i] as i64);
                     }
                     omit_retransmits[i] = prev_retransmits[i];
                     acc_extremes[i] = StreamExtremes {

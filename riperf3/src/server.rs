@@ -657,17 +657,21 @@ impl Server {
             // total. The sender task snapshots it into the counters while
             // its socket is still open; by exchange time the socket is
             // closed, so a live fd read here only serves as a fallback for
-            // paths that never reached the snapshot.
+            // paths that never reached the snapshot. With -O the boundary
+            // baseline is subtracted (#171), like iperf3's stream_retrans
+            // after iperf_reset_stats.
             let retransmits =
                 if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                    match s.counters.final_retransmits() {
-                        n if n >= 0 => n,
+                    let lifetime = match s.counters.final_retransmits() {
+                        n if n >= 0 => Some(n),
                         _ => s
                             .raw_fd
                             .and_then(crate::tcp_info::get_tcp_info)
-                            .map(|i| i.total_retransmits as i64)
-                            .unwrap_or(-1),
-                    }
+                            .map(|i| i.total_retransmits as i64),
+                    };
+                    lifetime
+                        .map(|t| s.counters.omit_adjusted_retransmits(t))
+                        .unwrap_or(-1)
                 } else {
                     -1
                 };

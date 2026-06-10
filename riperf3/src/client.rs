@@ -946,17 +946,21 @@ impl Client {
                 // total. The sender task snapshots it into the counters while
                 // its socket is still open; by exchange time the socket is
                 // closed, so a live fd read here only serves as a fallback
-                // for paths that never reached the snapshot.
+                // for paths that never reached the snapshot. With -O the
+                // boundary baseline is subtracted (#171), like iperf3's
+                // stream_retrans after iperf_reset_stats.
                 let retransmits =
                     if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                        match s.counters.final_retransmits() {
-                            n if n >= 0 => n,
+                        let lifetime = match s.counters.final_retransmits() {
+                            n if n >= 0 => Some(n),
                             _ => s
                                 .raw_fd
                                 .and_then(crate::tcp_info::get_tcp_info)
-                                .map(|i| i.total_retransmits as i64)
-                                .unwrap_or(-1),
-                        }
+                                .map(|i| i.total_retransmits as i64),
+                        };
+                        lifetime
+                            .map(|t| s.counters.omit_adjusted_retransmits(t))
+                            .unwrap_or(-1)
                     } else {
                         -1
                     };
@@ -2197,6 +2201,45 @@ mod tests {
         for s in &streams {
             s.task.abort();
         }
+    }
+
+    // #171: with -O, the exchanged per-stream retransmit total must cover
+    // the post-omit window only — iperf3's iperf_reset_stats records
+    // stream_prev_total_retrans at the boundary (iperf_api.c:3687-3692) and
+    // stream_retrans accumulates from there. The reporter's boundary block
+    // stores the same baseline into StreamCounters; the exchange subtracts.
+    #[tokio::test]
+    async fn exchange_retransmits_subtract_the_omit_baseline() {
+        use crate::stream::{DataStream, StreamCounters};
+
+        if !crate::tcp_info::has_retransmit_info() {
+            return;
+        }
+
+        let counters = Arc::new(StreamCounters::new());
+        counters.set_omit_retransmits(5); // boundary baseline (warm-up retransmits)
+        counters.set_final_retransmits(8); // connection-lifetime total at exit
+        let ds = DataStream {
+            id: 1,
+            is_sender: true,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        assert_eq!(
+            results.streams[0].retransmits, 3,
+            "#171: warm-up retransmits (5) must be subtracted from the \
+             lifetime total (8)"
+        );
+        ds.task.abort();
     }
 
     // iperf3 rejects -i outside {0} ∪ [0.1, 60] with IEINTERVAL
