@@ -1436,12 +1436,12 @@ pub(crate) fn run_udp_server_demux_receiver(
             {
                 continue
             }
-            // #178: ConnectionReset on a UDP socket is ICMP port-unreachable
-            // noise from something WE sent (Windows surfaces it as
-            // WSAECONNRESET/ConnectionReset; Linux connected-UDP as
-            // ECONNREFUSED/ConnectionRefused) — not EOF. On this
-            // SHARED demux socket a break here would silently end reception
-            // for every stream at once.
+            // #178: reset-class errors on a UDP socket are port-unreachable
+            // noise from something WE sent — not EOF. This demux socket is
+            // UNCONNECTED, so on Linux it never even surfaces ICMP errors
+            // (that needs IP_RECVERR); the arm is live on Windows, where
+            // winsock latches WSAECONNRESET per send_to target. A break here
+            // would silently end reception for EVERY stream at once.
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1611,7 +1611,13 @@ mod tests {
     // with `sum_bidir_reverse: 0` throughout, the windows-latest CI
     // signature.
     #[test]
-    #[cfg_attr(not(target_os = "linux"), ignore)] // poison injection relies on Linux loopback ICMP
+    // Runs where the poison injection is verified: Linux (loopback ICMP →
+    // ECONNREFUSED on the connected socket) and Windows (winsock latches
+    // WSAECONNRESET locally for loopback sends to closed ports — no ICMP
+    // path needed; it is the canonical home of the mechanism AND the only
+    // platform exercising the ConnectionReset arm). macOS/FreeBSD are
+    // ignored as unverified, not impossible.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), ignore)]
     fn udp_receiver_survives_connection_reset() {
         use std::net::UdpSocket as StdUdp;
         use std::sync::atomic::AtomicBool;
@@ -1654,9 +1660,10 @@ mod tests {
         receiver_thread.join().unwrap().unwrap();
 
         assert!(
-            counters.bytes_received() > 0,
+            counters.bytes_received() >= 10 * 64,
             "#178: the receiver must survive a ConnectionReset (ICMP noise) \
-             and keep counting datagrams; it received nothing"
+             and KEEP receiving (>= half the 20 x 64B datagrams); got {}",
+            counters.bytes_received()
         );
     }
 
