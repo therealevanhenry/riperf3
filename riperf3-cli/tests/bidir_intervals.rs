@@ -6,16 +6,15 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
+mod common;
+
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
 }
 
 /// Kills the wrapped child on drop so a spawned server is reaped on panic.
@@ -27,54 +26,21 @@ impl Drop for ChildGuard {
     }
 }
 
-/// See json_stream.rs: a generous fixed margin for the server to bind before the
-/// client connects, robust on loaded CI runners.
-const SERVER_BIND_WAIT: Duration = Duration::from_secs(2);
-
-/// Spawn `riperf3` with `args`, bound its run, and return captured stdout.
+/// Run the client to completion (with refused-retry) and return its stdout.
 fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{who}: timed out");
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    out
+    common::run_client_ok(args, timeout, who).stdout
 }
 
 fn spawn_server(port_str: &str) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    let g = ChildGuard(
+    ChildGuard(
         Command::new(bin)
             .args(["-s", "-1", "-p", port_str])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn server"),
-    );
-    std::thread::sleep(SERVER_BIND_WAIT);
-    g
+    )
 }
 
 /// Every interval must carry the direction-split pair with the expected sender
@@ -174,7 +140,6 @@ fn tcp_bidir_server_intervals_split_directions() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
 
     let _client = run_capturing(
         &[

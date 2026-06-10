@@ -28,12 +28,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod common;
+
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
 }
 
 /// Kills the wrapped child on drop, so a spawned server is reaped even if the

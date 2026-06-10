@@ -18,23 +18,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
+mod common;
 
-/// How long to wait for a freshly spawned `-s` server to bind its control
-/// listener before connecting a client. 300 ms intermittently lost the race on a
-/// loaded Windows CI runner — these three tests each spawn a server concurrently,
-/// and a client that connected first got an empty stream ("no events", a #62 test
-/// flake). The server normally binds in well under this; 2 s is ample headroom.
-/// (A connect poll would be tighter, but a probe connection consumes the `-1`
-/// one-off server, and a bind probe is unreliable under the listener's
-/// `SO_REUSEADDR` on Windows — so a generous fixed margin is the robust choice.)
-const SERVER_BIND_WAIT: Duration = Duration::from_secs(2);
+fn free_port() -> u16 {
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
+}
 
 /// Assert `stdout` is a valid `--json-stream` document: every non-empty line is a
 /// JSON object with `event` + `data`, and the events run `start`, one or more
@@ -126,25 +115,9 @@ fn wait_bounded(
     }
 }
 
-/// Spawn `riperf3`, bound its run, and return captured stdout.
+/// Run the client to completion (with refused-retry) and return its stdout.
 fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
-
-    wait_bounded(&mut child, timeout, who);
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    out
+    common::run_client_ok(args, timeout, who).stdout
 }
 
 /// Client `--json-stream` against a plain one-off server.
@@ -161,7 +134,6 @@ fn client_json_stream_tcp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
 
     let out = run_capturing(
         &[
@@ -196,7 +168,6 @@ fn client_json_stream_udp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
 
     let out = run_capturing(
         &[
@@ -235,17 +206,14 @@ fn server_json_stream_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
 
-    // Drive one test, bounded so a non-serving server can't hang the suite.
-    let mut client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn client");
-    let status = wait_bounded(&mut client, Duration::from_secs(20), "client");
-    assert!(status.success(), "client failed: {status:?}");
+    // Drive one test, bounded so a non-serving server can't hang the suite;
+    // its stdout is irrelevant here — only the server's NDJSON is asserted.
+    let _ = common::run_client_ok(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"],
+        Duration::from_secs(20),
+        "client",
+    );
 
     // The one-off server now finishes and closes stdout; bound that wait too.
     // (Output is a handful of small lines, well under the pipe buffer, so
