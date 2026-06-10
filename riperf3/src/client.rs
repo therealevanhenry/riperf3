@@ -902,8 +902,9 @@ impl Client {
 
     /// `--get-server-output` (#33): print the server's returned output after
     /// our own report, like iperf3 — "Server output:" for text, "Server JSON
-    /// output:" for a -J server's report (iperf_api.c), each block followed by
-    /// a blank line. Only consulted when WE requested it, like iperf3's
+    /// output:" for a -J server's report (iperf_api.c); the text block ends
+    /// with a blank line, the JSON block with a single newline, matching
+    /// iperf3's format strings. Only consulted when WE requested it, like
     /// test->get_server_output gate (a misbehaving server can't inject).
     fn print_server_output(&self, server_results: Option<&TestResultsJson>) {
         if !self.get_server_output {

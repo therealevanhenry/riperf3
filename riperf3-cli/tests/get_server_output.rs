@@ -93,8 +93,8 @@ fn collect_stdout(mut child: ChildGuard) -> String {
 }
 
 /// text client × text server: the client prints `Server output:` followed by
-/// the server's report lines; the server's own stdout is silent for the test
-/// (iperf3 diverts its console to the exchange).
+/// the server's report lines, while the server's own stdout stays LIVE with
+/// the same report (iperf3 dual-writes — console and exchange).
 #[test]
 fn text_client_gets_text_server_output() {
     let port = free_port();
