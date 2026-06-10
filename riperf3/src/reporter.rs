@@ -38,6 +38,11 @@ pub struct StreamSummary {
     pub jitter: Option<f64>,
     pub lost: Option<i64>,
     pub total_packets: Option<i64>,
+    /// Bidir role tag (`TX-C`/`RX-C`/`TX-S`/`RX-S`), rendered as iperf3's
+    /// `[ ID][Role]` column (#184). `None` outside bidir. Tags the STREAM's
+    /// direction, so both halves of a pair carry the same tag, and `[SUM]`
+    /// grouping never mixes directions.
+    pub role_tag: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +55,15 @@ fn fmt_id(id: i32) -> String {
         "SUM".to_string()
     } else {
         format!("{id:3}")
+    }
+}
+
+/// The line prefix: `[ ID]`, or `[ ID][Role]` when the summary carries a bidir
+/// role tag (#184) — matching iperf3's bidir column.
+fn fmt_id_role(id: i32, role_tag: Option<&'static str>) -> String {
+    match role_tag {
+        Some(tag) => format!("{}][{tag}", fmt_id(id)),
+        None => fmt_id(id),
     }
 }
 
@@ -161,7 +175,7 @@ pub fn lost_percent(lost: i64, total: i64) -> f64 {
 /// Format a single final-summary line (no trailing newline). Pure, so the
 /// rendered output can be unit-tested without capturing stdout.
 pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String {
-    let id = fmt_id(summary.stream_id);
+    let id = fmt_id_role(summary.stream_id, summary.role_tag);
     let transfer = units::format_bytes(summary.bytes as f64, format_char.to_ascii_uppercase());
     let seconds = summary.end - summary.start;
     let bits_per_sec = if seconds > 0.0 {
@@ -240,17 +254,28 @@ pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
 }
 
 /// Derive the aggregate `[SUM]` rows for the final report from the per-stream
-/// summaries. Returns one SUM per direction (sender / receiver) that has more
+/// summaries. Returns one SUM per (role, line-direction) group that has more
 /// than one stream — matching iperf3, which prints a `[SUM]` for parallel
-/// streams and omits it for a single stream. Bidir runs yield up to two SUM
-/// rows (one per direction). UDP SUM rows aggregate lost/total datagrams and
-/// carry the worst-case (max) jitter across the grouped streams.
+/// streams and omits it for a single stream. Grouping by the bidir role tag
+/// keeps a `[SUM]` from ever mixing the two directions of a bidir run (#184):
+/// a `P=1` bidir end block (one stream per direction, two lines each) gets no
+/// SUM at all, exactly like iperf3. UDP SUM rows aggregate lost/total
+/// datagrams and carry the worst-case (max) jitter across the grouped streams.
 pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
+    // Distinct (role_tag, is_sender) keys in first-seen order, so SUM rows
+    // come out in the same order iperf3 lists the groups.
+    let mut keys: Vec<(Option<&'static str>, bool)> = Vec::new();
+    for s in streams {
+        let key = (s.role_tag, s.is_sender);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
     let mut out = Vec::new();
-    for is_sender in [true, false] {
+    for (role_tag, is_sender) in keys {
         let group: Vec<&StreamSummary> = streams
             .iter()
-            .filter(|s| s.is_sender == is_sender)
+            .filter(|s| s.is_sender == is_sender && s.role_tag == role_tag)
             .collect();
         if group.len() <= 1 {
             continue;
@@ -288,9 +313,30 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
             jitter,
             lost,
             total_packets,
+            role_tag,
         });
     }
     out
+}
+
+/// Print the column header iperf3 reprints above the final (end-block)
+/// summaries (#184) — like the interval header, but TCP drops the `Cwnd`
+/// column (per-stream cwnd is an interval-only figure) and bidir adds the
+/// `[Role]` column.
+pub fn print_final_header(protocol: TransportProtocol, with_role: bool) {
+    let role = if with_role { "[Role]" } else { "" };
+    match protocol {
+        TransportProtocol::Tcp => {
+            titled(format_args!(
+                "[ ID]{role} Interval           Transfer     Bitrate         Retr"
+            ));
+        }
+        TransportProtocol::Udp => {
+            titled(format_args!(
+                "[ ID]{role} Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1163,7 @@ mod tests {
             jitter: Some(0.012),
             lost: Some(5),
             total_packets: Some(100),
+            role_tag: None,
         };
         print_summary(&summary, 'm');
     }
@@ -1152,6 +1199,7 @@ mod tests {
             jitter: None,
             lost: None,
             total_packets: None,
+            role_tag: None,
         }
     }
 
@@ -1308,6 +1356,7 @@ mod tests {
                 jitter: Some(0.010),
                 lost: Some(2),
                 total_packets: Some(1000),
+                role_tag: None,
             },
             StreamSummary {
                 stream_id: 3,
@@ -1319,6 +1368,7 @@ mod tests {
                 jitter: Some(0.025),
                 lost: Some(5),
                 total_packets: Some(2000),
+                role_tag: None,
             },
         ];
         let sums = sum_summaries(&streams);

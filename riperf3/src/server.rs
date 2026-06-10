@@ -648,6 +648,17 @@ impl Server {
                     } else {
                         (0.0, 0, 0, 0, 0)
                     }
+                } else if s.is_sender && matches!(cfg.protocol, TransportProtocol::Udp) {
+                    // iperf3's UDP sender counts every datagram it sends
+                    // (iperf_udp.c `++sp->packet_count`) and exchanges that
+                    // count unconditionally (iperf_api.c `"packets"`); the
+                    // peer's sender line renders it. Fill the equivalent from
+                    // sent bytes, keeping the gross+baseline convention (#184
+                    // — a zero here made an iperf3 client print `0/0` for a
+                    // riperf3 server's reverse stream).
+                    let gross = (s.counters.bytes_sent() / cfg.blksize as u64) as i64;
+                    let net = (bytes / cfg.blksize as u64) as i64;
+                    (0.0, 0, gross, 0, gross - net)
                 } else {
                     (0.0, 0, 0, 0, 0)
                 };
@@ -700,7 +711,9 @@ impl Server {
         // report), or attach the full -J report for a JSON-mode server.
         let mut prebuilt_report: Option<crate::json_report::Report> = None;
         let (server_output_text, server_output_json) = if let Some(capture) = capture {
-            let summaries = Self::text_summaries(&streams, test_duration);
+            let summaries = Self::text_summaries(&streams, test_duration, &cfg);
+            crate::reporter::print_separator();
+            crate::reporter::print_final_header(cfg.protocol, cfg.bidir);
             crate::reporter::print_final_summaries(&summaries, 'a');
             (Some(capture.take()), None)
         } else if want_server_output && self.json_output {
@@ -804,7 +817,9 @@ impl Server {
             // the pre-exchange render TEE'd to console + capture (iperf3 also
             // prints at TEST_END, before its exchange), so printing here again
             // would duplicate the lines.
-            let summaries = Self::text_summaries(&streams, test_duration);
+            let summaries = Self::text_summaries(&streams, test_duration, &cfg);
+            crate::reporter::print_separator();
+            crate::reporter::print_final_header(cfg.protocol, cfg.bidir);
             crate::reporter::print_final_summaries(&summaries, 'a');
         }
 
@@ -1198,7 +1213,9 @@ impl Server {
     fn text_summaries(
         streams: &[DataStream],
         test_duration: f64,
+        cfg: &TestConfig,
     ) -> Vec<crate::reporter::StreamSummary> {
+        let is_udp = matches!(cfg.protocol, TransportProtocol::Udp);
         streams
             .iter()
             .map(|s| {
@@ -1222,6 +1239,14 @@ impl Server {
                             )
                         })
                         .unwrap_or((None, None, None))
+                } else if is_udp && s.is_sender {
+                    // iperf3's sender line shows zero jitter/loss over the
+                    // sent datagram count, not blank columns (#184).
+                    (
+                        Some(0.0),
+                        Some(0),
+                        Some((bytes / cfg.blksize as u64) as i64),
+                    )
                 } else {
                     (None, None, None)
                 };
@@ -1236,6 +1261,10 @@ impl Server {
                     jitter,
                     lost,
                     total_packets: total,
+                    // Bidir tags every line with the stream's direction (#184).
+                    role_tag: cfg
+                        .bidir
+                        .then_some(if s.is_sender { "TX-S" } else { "RX-S" }),
                 }
             })
             .collect()
