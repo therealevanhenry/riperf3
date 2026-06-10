@@ -224,6 +224,63 @@ fn udp_bidir_interval_sums_split_udp_stats() {
     }
 }
 
+/// #182: the client's end-block entry for its UDP *sending* stream must carry
+/// the peer-measured datagram stats — iperf3 attaches the server's
+/// receiver-side packets/jitter/loss to the sender entry in bidir exactly as
+/// it does in forward mode (verified against iperf3 3.20 ground truth).
+/// Pre-fix, a bidir sender matched neither stats source and reported a
+/// zero-filled udp block: `packets: 0` despite real bytes.
+#[test]
+fn udp_bidir_sender_end_stream_carries_peer_measured_stats() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-u",
+            "--bidir",
+            "-t",
+            "1",
+            "-J",
+        ],
+        Duration::from_secs(20),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    let v: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("client -u --bidir -J is not valid JSON ({e}): {out}"));
+    let streams = v["end"]["streams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing end.streams: {v}"));
+    assert_eq!(streams.len(), 2, "bidir run has two streams: {v}");
+
+    for st in streams {
+        let u = &st["udp"];
+        let sender = u["sender"].as_bool().expect("udp.sender");
+        let bytes = u["bytes"].as_u64().expect("udp.bytes");
+        let packets = u["packets"].as_i64().expect("udp.packets");
+        assert!(bytes > 0, "stream moved no bytes: {st}");
+        assert!(
+            packets > 0,
+            "end-block {} stream reports packets=0 despite bytes={bytes} (#182): {st}",
+            if sender { "sender" } else { "receiver" },
+        );
+        // Like iperf3, both entries carry measured datagram stats (the
+        // sender's are the peer's receiver-side measurements).
+        assert!(
+            u.get("jitter_ms").is_some_and(Value::is_number)
+                && u.get("lost_packets").is_some_and(Value::is_number),
+            "end-block udp entry must carry measured stats: {st}"
+        );
+    }
+}
+
 /// A plain forward run must not grow a `sum_bidir_reverse` key.
 #[test]
 fn tcp_forward_intervals_have_no_bidir_reverse() {
