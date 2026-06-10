@@ -1451,7 +1451,7 @@ impl ClientBuilder {
     }
 
     /// `-C/--congestion`: TCP congestion control algorithm (e.g. `cubic`,
-    /// `bbr`); rejected at `build()` on platforms without support.
+    /// `bbr`); Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
     pub fn congestion(mut self, algo: &str) -> Self {
         self.congestion = Some(algo.to_string());
         self
@@ -1529,14 +1529,14 @@ impl ClientBuilder {
     }
 
     /// `-Z/--zerocopy`: use a zero-copy (`sendfile`) method of sending data;
-    /// rejected at `build()` on platforms without support.
+    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
     pub fn zerocopy(mut self, enabled: bool) -> Self {
         self.zerocopy = enabled;
         self
     }
 
     /// `--gsro`: enable UDP GSO/GRO (generic segmentation/receive offload);
-    /// rejected at `build()` on platforms without support.
+    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
     pub fn gsro(mut self, enabled: bool) -> Self {
         self.gsro = enabled;
         self
@@ -1589,7 +1589,7 @@ impl ClientBuilder {
     }
 
     /// `--bind-dev`: bind to a network interface with `SO_BINDTODEVICE`;
-    /// rejected at `build()` on platforms without support.
+    /// Linux/FreeBSD only; silently unavailable elsewhere on unix, rejected at `build()` on non-unix.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
@@ -1632,8 +1632,10 @@ impl ClientBuilder {
         self
     }
 
-    /// `--rcv-timeout`: idle timeout for receiving data, in milliseconds
-    /// (`SO_RCVTIMEO`).
+    /// `--rcv-timeout`: idle-receive timeout in ms. Sets `SO_RCVTIMEO` on the
+    /// data socket; note tokio sockets are nonblocking, where the kernel
+    /// timeout does not fire on reads — parity with iperf3's flag surface,
+    /// effective behavior under review.
     pub fn rcv_timeout(mut self, ms: u64) -> Self {
         self.rcv_timeout = Some(ms);
         self

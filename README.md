@@ -72,7 +72,7 @@ tests, the compatibility matrix, and full methodology.
 
 ## Platform Support
 
-riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference platform (full feature set; the required CI gate runs the full suite plus a real-iperf3 interop matrix). FreeBSD runs the full native test suite as a required CI check. macOS and Windows run the full native suite in CI as informational checks — they are tested on every change but do not block a merge; Windows has a small number of runtime gaps under triage in the [issue tracker](https://github.com/therealevanhenry/riperf3/issues). Platform-specific features use safe Rust wrappers where available, with graceful degradation or a clear error message where a flag is unavailable.
+riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference platform (full feature set; the required CI gate runs the full suite plus a real-iperf3 interop matrix). FreeBSD and Windows run the full native test suite as **required** CI checks that gate every merge. macOS runs the full native suite in CI as an informational check — tested on every change, promoted to required once consistently clean. Platform-specific features use safe Rust wrappers where available, with graceful degradation or a clear error message where a flag is unavailable.
 
 | Feature | Linux | macOS | FreeBSD | Windows |
 |---|:---:|:---:|:---:|:---:|
@@ -225,7 +225,7 @@ cargo clippy --all-targets -- -D warnings      # lint
 
 ## Status
 
-Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux (required CI: full suite + interop matrix) and FreeBSD (required CI: native suite) gate every merge; macOS and Windows run the full native suite as informational CI, with a small number of Windows runtime gaps under triage. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
+Feature-complete for the core iperf3 flag set, with full interchange compatibility verified against real iperf3 (current and 3.12) in both directions across all modes. Linux (full suite + interop matrix), FreeBSD, and Windows (native suites) are required CI checks gating every merge; macOS runs the full native suite as informational CI. Platform-specific flags match iperf3's support matrix (see [Platform Support](#platform-support)).
 
 See [CHANGELOG.md](CHANGELOG.md) for the release notes and current known issues — including a handful of options that are accepted but not yet fully effective.
 
