@@ -266,17 +266,15 @@ fn udp_bidir_sender_end_stream_carries_peer_measured_stats() {
         let bytes = u["bytes"].as_u64().expect("udp.bytes");
         let packets = u["packets"].as_i64().expect("udp.packets");
         assert!(bytes > 0, "stream moved no bytes: {st}");
+        // packets > 0 is the discriminator: pre-fix the sender entry was a
+        // zero-filled block (jitter_ms/lost_packets keys are serialized
+        // unconditionally, so key presence can't tell measured from filled).
+        // The sender's values are the peer's receiver-side measurements,
+        // matching iperf3's JSON.
         assert!(
             packets > 0,
             "end-block {} stream reports packets=0 despite bytes={bytes} (#182): {st}",
             if sender { "sender" } else { "receiver" },
-        );
-        // Like iperf3, both entries carry measured datagram stats (the
-        // sender's are the peer's receiver-side measurements).
-        assert!(
-            u.get("jitter_ms").is_some_and(Value::is_number)
-                && u.get("lost_packets").is_some_and(Value::is_number),
-            "end-block udp entry must carry measured stats: {st}"
         );
     }
 }

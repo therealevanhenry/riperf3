@@ -1199,8 +1199,9 @@ impl Client {
                 let server_stream =
                     remote_cpu.and_then(|r| r.streams.iter().find(|x| x.id == s.id));
 
-                // UDP datagram stats: from our local receiver if we measured them,
-                // else (forward UDP) from the server's results for this stream (#25).
+                // UDP datagram stats: from our local receiver if we measured
+                // them, else (any UDP sending stream) from the server's
+                // results for this stream (#25, #182).
                 let udp = if let Some(ref lock) = s.udp_recv_stats {
                     // Local receiver: post-omit stats (#31) — gross counters
                     // minus the boundary baselines.
