@@ -29,7 +29,7 @@ done
 
 ## CI gates
 
-Required: Linux full suite, FreeBSD and Windows native suites, lint (fmt + clippy -D warnings), SemVer (cargo-semver-checks), cross-platform `cargo check`s, and a **real-iperf3 interop matrix** (current + 3.12). The macOS native suite runs informationally. The lib crate is API-only (no clap); CLI↔builder wiring is tested by comparing built `Client`s, not by lib test backdoors.
+Required (every merge is gated on all 12): Linux full suite, FreeBSD/Windows/macOS native suites, lint (fmt + clippy -D warnings), SemVer (cargo-semver-checks), MSRV (pinned-toolchain check), musl check, cross-platform `cargo check`s, and a **real-iperf3 interop matrix** (current + 3.12). The lib crate is API-only (no clap); CLI↔builder wiring is tested by comparing built `Client`s, not by lib test backdoors.
 
 ## Releases
 

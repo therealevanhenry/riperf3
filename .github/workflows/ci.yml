@@ -80,10 +80,11 @@ jobs:
   # tcp_connection_info path, winsock) is unverified. These jobs run the real test
   # suite on native runners.
   #
-  # Status (review of the live main ruleset, 2026-06): Native test
-  # (windows-latest) IS a required branch-protection check; macOS remains
-  # informational (reports without blocking; promoted when consistently
-  # clean). fail-fast: false so a failure on one OS doesn't cancel the other.
+  # Status (live main ruleset, 2026-06-10): BOTH matrix legs are required
+  # branch-protection checks — Native test (windows-latest) and Native test
+  # (macos-latest); macOS was promoted from informational after running
+  # consistently clean through the 0.7.2 campaign. fail-fast: false so a
+  # failure on one OS doesn't cancel the other.
   native-test:
     name: Native test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -103,7 +104,7 @@ jobs:
 
   # Static/musl build check (#39). riperf3 ships in containers; musl is where
   # libc differences (the libc/nix syscall surface) tend to bite. cargo check
-  # doesn't link, so musl-gcc isn't needed. Informational, like native-test.
+  # doesn't link, so musl-gcc isn't needed. REQUIRED check since 2026-06-10.
   musl-check:
     name: musl check
     runs-on: ubuntu-latest
@@ -126,8 +127,8 @@ jobs:
   # FreeBSD `rust` package). `release` is pinned for reproducibility.
   #
   # REQUIRED check (added informational in 0.6.1, promoted the same release once
-  # the first runs were clean): it gates merges like the Linux and Windows
-  # native jobs. macOS stays informational for now.
+  # the first runs were clean): it gates merges like the Linux, Windows, and
+  # macOS native jobs (macOS promoted 2026-06-10).
   freebsd-test:
     name: Native test (FreeBSD)
     runs-on: ubuntu-latest
