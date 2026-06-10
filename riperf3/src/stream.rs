@@ -408,6 +408,34 @@ pub struct DataStream {
     pub congestion_used: Option<String>,
 }
 
+impl DataStream {
+    /// The omit-adjusted lifetime retransmit total to render/exchange for a TCP
+    /// sending stream, or `None` for a receiver, a UDP stream, or a platform
+    /// without TCP_INFO retransmits (Windows) — where iperf3 omits the `Retr`
+    /// column entirely. The sender task snapshots the count while the socket is
+    /// open (#156); a live fd read is only a fallback. With `-O` the boundary
+    /// baseline is subtracted (#171), like iperf3's `stream_retrans` after
+    /// `iperf_reset_stats`. `Some(-1)` means info exists but the value was
+    /// unavailable (iperf3's sentinel, rendered literally).
+    pub(crate) fn sender_retransmits(&self, is_udp: bool) -> Option<i64> {
+        if !self.is_sender || is_udp || !crate::tcp_info::has_retransmit_info() {
+            return None;
+        }
+        let lifetime = match self.counters.final_retransmits() {
+            n if n >= 0 => Some(n),
+            _ => self
+                .raw_fd
+                .and_then(crate::tcp_info::get_tcp_info)
+                .map(|i| i.total_retransmits as i64),
+        };
+        Some(
+            lifetime
+                .map(|t| self.counters.omit_adjusted_retransmits(t))
+                .unwrap_or(-1),
+        )
+    }
+}
+
 /// Build the shared `-n`/`-k` byte budget the sending streams decrement, or
 /// `None` when there is no limit. A `0` limit means **unlimited** — iperf3 sends
 /// `num`/`blocks` = 0 for a plain `-t` run, so it must be filtered out or a

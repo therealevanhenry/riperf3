@@ -75,35 +75,53 @@ pub struct Client {
     pub(crate) use_pkcs1_padding: bool,
 }
 
-/// Build receiver-perspective summaries from the server's results. In a forward
-/// test the local streams are senders, so the receiver's view — most importantly
-/// UDP loss — lives only in the results the server returned. Surfacing it as a
-/// `receiver` line matches iperf3; without it, forward UDP looks loss-free even
-/// when the link is dropping packets (issue #25). `is_udp` gates the datagram
-/// loss/jitter columns so a forward TCP run shows a plain receiver byte line.
-fn server_receiver_summaries(
-    server: &TestResultsJson,
-    end: f64,
+/// Build the peer half of a stream's end-block pair from the server's
+/// per-stream results entry (#184, generalizing #25): the opposite role of
+/// the local stream. When the peer RECEIVED (local sender), its measured
+/// loss/jitter is the only receiver view that exists — without it, forward
+/// UDP looks loss-free even when the link drops packets (#25). When the peer
+/// SENT, iperf3's sender line shows zero jitter/loss over the sent datagram
+/// count. The exchange carries GROSS packets/errors plus omitted_* baselines;
+/// subtract for the post-omit summary (#31) — this also reads a real iperf3
+/// server's omit results correctly. `is_udp` gates the datagram columns so a
+/// TCP pair line stays a plain byte line.
+fn peer_half_summary(
+    x: &protocol::StreamResultJson,
+    local_is_sender: bool,
     is_udp: bool,
-) -> Vec<crate::reporter::StreamSummary> {
-    server
-        .streams
-        .iter()
-        .map(|s| crate::reporter::StreamSummary {
-            stream_id: s.id,
-            start: 0.0,
-            end,
-            bytes: s.bytes,
-            is_sender: false,
-            retransmits: None,
-            jitter: is_udp.then_some(s.jitter),
-            // The exchange carries GROSS packets/errors plus omitted_*
-            // baselines; subtract for the post-omit summary (#31). This also
-            // reads a real iperf3 server's omit results correctly.
-            lost: is_udp.then_some(s.errors - s.omitted_errors),
-            total_packets: is_udp.then_some(s.packets - s.omitted_packets),
-        })
-        .collect()
+    peer_has_retransmits: bool,
+    end: f64,
+    role_tag: Option<&'static str>,
+) -> crate::reporter::StreamSummary {
+    let peer_is_sender = !local_is_sender;
+    let (jitter, lost, total) = if !is_udp {
+        (None, None, None)
+    } else if peer_is_sender {
+        // Peer sent: zero jitter/loss over its sent count.
+        (Some(0.0), Some(0), Some(x.packets - x.omitted_packets))
+    } else {
+        // Peer received: its measured stats.
+        (
+            Some(x.jitter),
+            Some(x.errors - x.omitted_errors),
+            Some(x.packets - x.omitted_packets),
+        )
+    };
+    // A TCP peer sender renders the retransmit total it exchanged (#156/#184),
+    // when it reported having one; receivers and UDP carry none.
+    let retransmits = (!is_udp && peer_is_sender && peer_has_retransmits).then_some(x.retransmits);
+    crate::reporter::StreamSummary {
+        stream_id: x.id,
+        start: 0.0,
+        end,
+        bytes: x.bytes,
+        is_sender: peer_is_sender,
+        retransmits,
+        jitter,
+        lost,
+        total_packets: total,
+        role_tag,
+    }
 }
 
 /// Bytes transferred so far against an `-n`/`-k` limit. Faithful to iperf3's
@@ -267,7 +285,8 @@ impl Client {
                 }
 
                 TestState::ExchangeResults => {
-                    let results = self.build_results(&streams, cpu_start.as_ref(), measured_secs);
+                    let results =
+                        self.build_results(&streams, cpu_start.as_ref(), blksize, measured_secs);
                     protocol::send_results(&mut ctrl, &results).await?;
                     server_results = Some(protocol::recv_results(&mut ctrl).await?);
                 }
@@ -919,6 +938,7 @@ impl Client {
         &self,
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
+        blksize: usize,
         test_duration: f64,
     ) -> TestResultsJson {
         let cpu_end = CpuSnapshot::now();
@@ -952,35 +972,24 @@ impl Client {
                                 )
                             })
                             .unwrap_or((0.0, 0, 0, 0, 0))
+                    } else if s.is_sender && self.protocol == TransportProtocol::Udp {
+                        // iperf3's UDP sender counts every datagram it sends
+                        // (iperf_udp.c `++sp->packet_count`) and exchanges
+                        // that count unconditionally (iperf_api.c
+                        // `"packets"`). Fill the equivalent from sent bytes,
+                        // keeping the gross+baseline convention (#184).
+                        let blk = blksize.max(1) as u64;
+                        let gross = (s.counters.bytes_sent() / blk) as i64;
+                        let net = (bytes / blk) as i64;
+                        (0.0, 0, gross, 0, gross - net)
                     } else {
                         (0.0, 0, 0, 0, 0)
                     };
                 let is_udp_stream = self.protocol == TransportProtocol::Udp;
-
-                // #156: when sender_has_retransmits=1, the peer prints this
-                // value (iperf3 get_results stores it into stream_retrans and
-                // the summary renders it) — it must be the REAL end-of-test
-                // total. The sender task snapshots it into the counters while
-                // its socket is still open; by exchange time the socket is
-                // closed, so a live fd read here only serves as a fallback
-                // for paths that never reached the snapshot. With -O the
-                // boundary baseline is subtracted (#171), like iperf3's
-                // stream_retrans after iperf_reset_stats.
-                let retransmits =
-                    if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                        let lifetime = match s.counters.final_retransmits() {
-                            n if n >= 0 => Some(n),
-                            _ => s
-                                .raw_fd
-                                .and_then(crate::tcp_info::get_tcp_info)
-                                .map(|i| i.total_retransmits as i64),
-                        };
-                        lifetime
-                            .map(|t| s.counters.omit_adjusted_retransmits(t))
-                            .unwrap_or(-1)
-                    } else {
-                        -1
-                    };
+                // #156 sentinel: -1 = "no retransmit total" (receiver/UDP/no
+                // TCP_INFO); the wire carries it, the peer renders it (#171
+                // omit-adjustment and the fd fallback live in the method).
+                let retransmits = s.sender_retransmits(is_udp_stream).unwrap_or(-1);
 
                 protocol::StreamResultJson {
                     id: s.id,
@@ -1057,7 +1066,7 @@ impl Client {
                 test_duration,
             );
         } else {
-            self.print_results_text(streams, remote_cpu, test_duration);
+            self.print_results_text(streams, remote_cpu, blksize, test_duration);
         }
     }
 
@@ -1087,61 +1096,100 @@ impl Client {
         &self,
         streams: &[DataStream],
         server_results: Option<&TestResultsJson>,
+        blksize: usize,
         test_duration: f64,
     ) {
         crate::reporter::print_separator();
 
-        let mut summaries: Vec<crate::reporter::StreamSummary> = streams
-            .iter()
-            .map(|s| {
-                let bytes = if s.is_sender {
-                    s.counters.bytes_sent_net()
-                } else {
-                    s.counters.bytes_received_net()
-                };
+        let is_udp = matches!(self.protocol, TransportProtocol::Udp);
+        // iperf3's end block pairs BOTH halves of every stream — a `sender`
+        // line and a `receiver` line — in every mode (#184): the local half
+        // from our counters/stats, the peer half from the results the server
+        // returned (#25 generalized; pre-#184 only forward runs got the peer
+        // line, so reverse lacked its sender line and bidir paired nothing).
+        // Sender lines carry `0.000 ms 0/<sent>` like iperf3 — the sent count
+        // is bytes/blksize locally, or the peer's reported packets.
+        let mut summaries: Vec<crate::reporter::StreamSummary> = Vec::new();
+        for s in streams {
+            // Bidir tags every line with the STREAM's direction (#184).
+            let role_tag = self
+                .bidir
+                .then_some(if s.is_sender { "TX-C" } else { "RX-C" });
+            let bytes = if s.is_sender {
+                s.counters.bytes_sent_net()
+            } else {
+                s.counters.bytes_received_net()
+            };
 
-                let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                    udp_stats
-                        .lock()
-                        .map(|st| {
-                            // Post-omit stats (#31): gross minus baselines.
-                            (
-                                Some(st.jitter),
-                                Some(st.cnt_error - st.omitted_cnt_error),
-                                Some(st.packet_count - st.omitted_packet_count),
-                            )
-                        })
-                        .unwrap_or((None, None, None))
-                } else {
-                    (None, None, None)
-                };
+            let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                udp_stats
+                    .lock()
+                    .map(|st| {
+                        // Post-omit stats (#31): gross minus baselines.
+                        (
+                            Some(st.jitter),
+                            Some(st.cnt_error - st.omitted_cnt_error),
+                            Some(st.packet_count - st.omitted_packet_count),
+                        )
+                    })
+                    .unwrap_or((None, None, None))
+            } else if is_udp {
+                // Local sending stream: iperf3's sender line shows zero
+                // jitter/loss over the sent datagram count.
+                (
+                    Some(0.0),
+                    Some(0),
+                    Some((bytes / blksize.max(1) as u64) as i64),
+                )
+            } else {
+                (None, None, None)
+            };
 
-                crate::reporter::StreamSummary {
-                    stream_id: s.id,
-                    start: 0.0,
-                    end: test_duration,
-                    bytes,
-                    is_sender: s.is_sender,
-                    retransmits: None,
-                    jitter,
-                    lost,
-                    total_packets: total,
-                }
-            })
-            .collect();
+            let local = crate::reporter::StreamSummary {
+                stream_id: s.id,
+                start: 0.0,
+                end: test_duration,
+                bytes,
+                is_sender: s.is_sender,
+                // TCP sender lines carry the omit-adjusted retransmit total
+                // iperf3 prints (#184); receivers/UDP carry none.
+                retransmits: s.sender_retransmits(is_udp),
+                jitter,
+                lost,
+                total_packets: total,
+                role_tag,
+            };
+            // The peer half — the opposite role of the same stream — from the
+            // server's per-stream results entry. Tolerant of a missing entry
+            // (an odd peer): the pair just collapses to the local line. The
+            // peer's sender line shows its retransmits only when the peer
+            // reported having them (#156 sender_has_retransmits).
+            let peer_has_retr = server_results.is_some_and(|r| r.sender_has_retransmits == 1);
+            let peer = server_results
+                .and_then(|r| r.streams.iter().find(|x| x.id == s.id))
+                .map(|x| {
+                    peer_half_summary(
+                        x,
+                        s.is_sender,
+                        is_udp,
+                        peer_has_retr,
+                        test_duration,
+                        role_tag,
+                    )
+                });
 
-        // Forward: the server is the receiver, so its loss/throughput lives only
-        // in the results it returned — surface it as the receiver line iperf3
-        // prints, otherwise forward UDP looks loss-free even when the link drops
-        // packets (issue #25). Reverse already reports the receiver locally;
-        // bidir's server-receive half isn't split out of the aggregate results.
-        if !self.reverse && !self.bidir {
-            if let Some(server) = server_results {
-                let is_udp = matches!(self.protocol, TransportProtocol::Udp);
-                summaries.extend(server_receiver_summaries(server, test_duration, is_udp));
+            // iperf3 orders each pair sender-first.
+            match peer {
+                Some(peer) if s.is_sender => summaries.extend([local, peer]),
+                Some(peer) => summaries.extend([peer, local]),
+                None => summaries.push(local),
             }
         }
 
+        // iperf3 reprints the column header above the final summaries, with
+        // the Retr column only when a line actually carries a retransmit total.
+        let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
+        crate::reporter::print_final_header(self.protocol, self.bidir, with_retr);
         // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
         // (issue #4), via the shared path the server also uses.
         crate::reporter::print_final_summaries(&summaries, self.format_char);
@@ -2267,7 +2315,7 @@ mod tests {
             rcvbuf_actual: None,
             congestion_used: None,
         };
-        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1460, 1.0);
         assert_eq!(results.sender_has_retransmits, 1);
         assert!(
             results.streams[0].retransmits >= 0,
@@ -2353,7 +2401,7 @@ mod tests {
             congestion_used: None,
         };
         let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
-        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1460, 1.0);
         assert_eq!(
             results.streams[0].retransmits, 3,
             "#171: warm-up retransmits (5) must be subtracted from the \
@@ -2705,7 +2753,7 @@ mod tests {
             assert_eq!(c.build_params(1460).pacing_timer, Some(500));
         }
 
-        // -- forward UDP receiver-loss reporting (issue #25) --
+        // -- end-block peer halves (issue #25 generalized by #184) --
 
         #[test]
         fn forward_udp_surfaces_server_receiver_loss() {
@@ -2713,45 +2761,61 @@ mod tests {
             // only in the server's results. riperf3 must surface it as a receiver
             // line, like iperf3 — otherwise forward looks artificially loss-free
             // even when the link drops packets (issue #25).
-            let server = TestResultsJson {
-                cpu_util_total: 0.0,
-                cpu_util_user: 0.0,
-                cpu_util_system: 0.0,
-                sender_has_retransmits: -1,
-                congestion_used: None,
-                server_output_text: None,
-                server_output_json: None,
-                streams: vec![protocol::StreamResultJson {
-                    id: 1,
-                    bytes: 2_000_000,
-                    retransmits: -1,
-                    jitter: 0.000_03,
-                    errors: 4258,
-                    omitted_errors: 0,
-                    packets: 267_190,
-                    omitted_packets: 0,
-                    start_time: 0.0,
-                    end_time: 5.0,
-                }],
+            let x = protocol::StreamResultJson {
+                id: 1,
+                bytes: 2_000_000,
+                retransmits: -1,
+                jitter: 0.000_03,
+                errors: 4258,
+                omitted_errors: 0,
+                packets: 267_190,
+                omitted_packets: 0,
+                start_time: 0.0,
+                end_time: 5.0,
             };
 
-            let recv = server_receiver_summaries(&server, 5.0, true);
-            assert_eq!(recv.len(), 1);
-            assert!(!recv[0].is_sender, "server is the receiver in forward mode");
-            assert_eq!(recv[0].lost, Some(4258));
-            assert_eq!(recv[0].total_packets, Some(267_190));
-            assert_eq!(recv[0].jitter, Some(0.000_03));
+            let recv = peer_half_summary(&x, true, true, false, 5.0, None);
+            assert!(!recv.is_sender, "server is the receiver in forward mode");
+            assert_eq!(recv.lost, Some(4258));
+            assert_eq!(recv.total_packets, Some(267_190));
+            assert_eq!(recv.jitter, Some(0.000_03));
 
             // Renders as a receiver line carrying the loss iperf3 would print.
-            let line = crate::reporter::format_summary_line(&recv[0], 'a');
+            let line = crate::reporter::format_summary_line(&recv, 'a');
             assert!(line.contains("receiver"), "{line}");
             assert!(line.contains("4258/267190"), "{line}");
 
             // TCP forward: no datagram-loss columns, just a receiver byte line.
-            let tcp = server_receiver_summaries(&server, 5.0, false);
-            assert_eq!(tcp[0].lost, None);
-            assert_eq!(tcp[0].total_packets, None);
-            assert_eq!(tcp[0].jitter, None);
+            let tcp = peer_half_summary(&x, true, false, false, 5.0, None);
+            assert_eq!(tcp.lost, None);
+            assert_eq!(tcp.total_packets, None);
+            assert_eq!(tcp.jitter, None);
+        }
+
+        #[test]
+        fn peer_sender_half_carries_sent_total_not_measured_stats() {
+            // Reverse/bidir: the peer SENT this stream — its pair line is a
+            // sender line with zero jitter/loss over the sent count (#184),
+            // exactly iperf3's sender-line convention.
+            let x = protocol::StreamResultJson {
+                id: 3,
+                bytes: 250_000,
+                retransmits: -1,
+                jitter: 0.5, // a peer sender reports no meaningful jitter
+                errors: 0,
+                omitted_errors: 0,
+                packets: 30,
+                omitted_packets: 5,
+                start_time: 0.0,
+                end_time: 5.0,
+            };
+            let snd = peer_half_summary(&x, false, true, false, 5.0, Some("RX-C"));
+            assert!(snd.is_sender, "peer half of a local receiver is the sender");
+            assert_eq!(snd.jitter, Some(0.0), "sender line shows zero jitter");
+            assert_eq!(snd.lost, Some(0), "sender line shows zero loss");
+            assert_eq!(snd.total_packets, Some(25), "post-omit sent count (#31)");
+            let line = crate::reporter::format_summary_line(&snd, 'a');
+            assert!(line.contains("sender") && line.contains("RX-C"), "{line}");
         }
 
         // -- client -B vs -4/-6 build-time validation (issue #15) --
