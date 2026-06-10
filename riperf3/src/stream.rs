@@ -30,6 +30,22 @@ pub struct StreamCounters {
     bytes_received: AtomicU64,
     bytes_sent_interval: AtomicU64,
     bytes_received_interval: AtomicU64,
+    // `-O/--omit` warm-up baselines (#31): cumulative counts at the omit
+    // boundary. The net getters subtract them so summaries cover only the
+    // post-omit window, like iperf3's stats reset in iperf_reset_stats.
+    bytes_sent_omit: AtomicU64,
+    bytes_received_omit: AtomicU64,
+    /// #156: the sender's end-of-test retransmit total, snapshotted by the
+    /// sender task while its socket is still open. The results exchange runs
+    /// after the task has dropped (closed) the socket, so an exchange-time
+    /// TCP_INFO read hits a dead fd. -1 = not captured (receiver, UDP, or no
+    /// platform support).
+    final_retransmits: AtomicI64,
+    /// #171: the cumulative retransmit count at the omit boundary, stored by
+    /// the reporter's boundary block — iperf3's iperf_reset_stats records
+    /// stream_prev_total_retrans the same way, so the exchanged total covers
+    /// the post-omit window only. -1 = no boundary crossed.
+    omit_retransmits: AtomicI64,
 }
 
 impl Default for StreamCounters {
@@ -45,6 +61,64 @@ impl StreamCounters {
             bytes_received: AtomicU64::new(0),
             bytes_sent_interval: AtomicU64::new(0),
             bytes_received_interval: AtomicU64::new(0),
+            bytes_sent_omit: AtomicU64::new(0),
+            bytes_received_omit: AtomicU64::new(0),
+            final_retransmits: AtomicI64::new(-1),
+            omit_retransmits: AtomicI64::new(-1),
+        }
+    }
+
+    /// Record the omit boundary (#31): cumulative counts so far become the
+    /// warm-up baseline the net getters subtract.
+    pub fn snapshot_omit(&self) {
+        self.bytes_sent_omit
+            .store(self.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.bytes_received_omit.store(
+            self.bytes_received.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Bytes sent since the omit boundary (the whole run when `-O` is unused).
+    pub fn bytes_sent_net(&self) -> u64 {
+        self.bytes_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_sent_omit.load(Ordering::Relaxed))
+    }
+
+    /// Bytes received since the omit boundary (see [`Self::bytes_sent_net`]).
+    pub fn bytes_received_net(&self) -> u64 {
+        self.bytes_received
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_received_omit.load(Ordering::Relaxed))
+    }
+
+    /// Store the end-of-test retransmit total (#156; sender task only, while
+    /// the socket is still open).
+    pub fn set_final_retransmits(&self, n: i64) {
+        self.final_retransmits.store(n, Ordering::Relaxed);
+    }
+
+    /// The snapshotted end-of-test retransmit total, or -1 if never captured.
+    pub fn final_retransmits(&self) -> i64 {
+        self.final_retransmits.load(Ordering::Relaxed)
+    }
+
+    /// Record the omit-boundary retransmit baseline (#171; reporter boundary
+    /// block only).
+    pub fn set_omit_retransmits(&self, n: i64) {
+        self.omit_retransmits.store(n, Ordering::Relaxed);
+    }
+
+    /// Adjust a connection-lifetime retransmit total to the post-omit window
+    /// (#171): subtract the boundary baseline when one was recorded, exactly
+    /// iperf3's stream_retrans accounting after iperf_reset_stats.
+    pub fn omit_adjusted_retransmits(&self, lifetime: i64) -> i64 {
+        let base = self.omit_retransmits.load(Ordering::Relaxed);
+        if base >= 0 {
+            (lifetime - base).max(0)
+        } else {
+            lifetime
         }
     }
 
@@ -172,15 +246,11 @@ pub struct UdpRecvStats {
     /// Previous one-way transit time for jitter calculation.
     prev_transit: f64,
 
-    // Snapshots taken at the end of the omit period so we can subtract them.
-    // Test-only today: only `snapshot_omit` (now `#[cfg(test)]`) writes non-zero
-    // values here; in production these stay at their 0 init until `-O/--omit` is
-    // wired into the UDP receive path (#31).
-    #[allow(dead_code)]
+    // Snapshots taken at the omit boundary (#31): the results exchange carries
+    // gross packets/errors plus these omitted_* baselines, and the reading side
+    // subtracts — exactly iperf3's accounting.
     pub omitted_packet_count: i64,
-    #[allow(dead_code)]
     pub omitted_cnt_error: i64,
-    #[allow(dead_code)]
     pub omitted_outoforder_packets: i64,
 }
 
@@ -232,72 +302,79 @@ impl UdpRecvStats {
     }
 
     /// Snapshot current values as the omit-period baseline.
-    /// Call this at the end of the omit period.
-    ///
-    /// Test-only today: `-O/--omit` is not yet wired into the UDP receive path
-    /// (#31), so production never calls this; the unit tests exercise it so the
-    /// omit-accounting fields stay correct for when #31 lands.
-    #[cfg(test)]
+    /// Called by the reporter at the omit boundary (#31).
     pub fn snapshot_omit(&mut self) {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;
         self.omitted_outoforder_packets = self.outoforder_packets;
+        // iperf3's iperf_reset_stats also zeroes the jitter EWMA at the
+        // boundary so warm-up influence doesn't bleed into the measurement.
+        self.jitter = 0.0;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiter (token bucket for UDP pacing)
+// Rate limiter (cumulative-average throttle for `-b` pacing, TCP path)
 // ---------------------------------------------------------------------------
 
-/// Token-bucket rate limiter for application-level send pacing.
+/// Cumulative-average rate limiter for application-level send pacing.
 pub struct RateLimiter {
     rate_bytes_per_sec: f64,
-    burst_bytes: f64,
-    tokens: f64,
-    last_refill: Instant,
+    /// Wakeup quantum when behind schedule (`--pacing-timer`, iperf3 default
+    /// 1000 µs).
+    pacing: Duration,
+    start: tokio::time::Instant,
+    sent: u64,
 }
 
 impl RateLimiter {
-    /// Create a rate limiter.
+    /// Create a rate limiter using iperf3's cumulative-average throttle
+    /// (`iperf_check_throttle`): a send is green-lit whenever the cumulative
+    /// bytes are at or below `elapsed * rate`, so total overshoot is bounded
+    /// by ONE in-flight block at any rate — the old token bucket's burst floor
+    /// (max(rate*0.1, 4*blksize), granted up front) overshot a low `-b` by 2x
+    /// with TCP's 128 KiB default block (#116). High rates self-correct the
+    /// other way: after an oversleep the average is behind, so blocks go out
+    /// back-to-back with no sleep — burstiness ≈ rate × pacing quantum,
+    /// matching the documented `--pacing-timer` semantics (iperf3 <= 3.17's
+    /// timer-driven throttle; 3.18+ deprecated the quantum and sleeps exactly
+    /// to the green-light instant — same long-run average either way).
     ///
     /// - `rate_bits_per_sec`: target send rate
-    /// - `burst_packets`: how many packets to send per burst (0 = auto)
-    /// - `blksize`: datagram/block size in bytes
-    pub fn new(rate_bits_per_sec: u64, burst_packets: u32, blksize: usize) -> Self {
-        let rate_bytes = rate_bits_per_sec as f64 / 8.0;
-        // Default burst: ~100ms worth of data, minimum 4 packets.
-        // This avoids per-packet tokio::sleep overhead which has ~1ms granularity.
-        let burst = if burst_packets > 0 {
-            burst_packets as f64 * blksize as f64
+    /// - `pacing_timer_us`: wakeup quantum when behind (`--pacing-timer`,
+    ///   0 → iperf3's 1000 µs default)
+    pub fn new(rate_bits_per_sec: u64, pacing_timer_us: u32) -> Self {
+        let pacing_us = if pacing_timer_us == 0 {
+            crate::utils::DEFAULT_PACING_TIMER_US
         } else {
-            (rate_bytes * 0.1).max(4.0 * blksize as f64)
+            pacing_timer_us
         };
         Self {
-            rate_bytes_per_sec: rate_bytes,
-            burst_bytes: burst,
-            tokens: burst,
-            last_refill: Instant::now(),
+            rate_bytes_per_sec: rate_bits_per_sec as f64 / 8.0,
+            pacing: Duration::from_micros(pacing_us as u64),
+            // tokio's Instant so the accuracy tests can run under start_paused.
+            start: tokio::time::Instant::now(),
+            sent: 0,
         }
     }
 
-    /// Wait until enough tokens are available for `bytes`, then consume them.
+    /// Wait until the cumulative average is at or below the target rate, then
+    /// account `bytes` as sent.
     pub async fn acquire(&mut self, bytes: u64) {
-        self.refill();
-        let needed = bytes as f64;
-        while self.tokens < needed {
-            let deficit = needed - self.tokens;
-            let wait = Duration::from_secs_f64(deficit / self.rate_bytes_per_sec);
-            tokio::time::sleep(wait).await;
-            self.refill();
+        loop {
+            let allowed = self.start.elapsed().as_secs_f64() * self.rate_bytes_per_sec;
+            let behind = self.sent as f64 - allowed;
+            if behind <= 0.0 {
+                break;
+            }
+            // Sleep to the green-light instant, but never less than the pacing
+            // quantum — the documented --pacing-timer semantics (iperf3
+            // <= 3.17's minimum wakeup was one tick; 3.18+ deprecated the
+            // quantum). The cumulative math absorbs any oversleep.
+            let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
+            tokio::time::sleep(to_green.max(self.pacing)).await;
         }
-        self.tokens -= needed;
-    }
-
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate_bytes_per_sec).min(self.burst_bytes);
-        self.last_refill = now;
+        self.sent += bytes;
     }
 }
 
@@ -356,8 +433,27 @@ pub(crate) fn make_byte_budget(
 // TCP send / recv loops
 // ---------------------------------------------------------------------------
 
+/// #156: snapshot the sender's final retransmit total into its counters while
+/// the socket is still open. Called by every TCP sender just before it
+/// returns (and drops the socket): the results exchange runs after that drop,
+/// so an exchange-time TCP_INFO read would hit a closed fd and ship the -1
+/// sentinel beside `sender_has_retransmits=1` — which an iperf3 peer renders
+/// as a bogus Retr count (u64::MAX on 3.12).
+fn snapshot_final_retransmits(stream: &TcpStream, counters: &StreamCounters) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Some(info) = crate::tcp_info::get_tcp_info(stream.as_raw_fd()) {
+            counters.set_final_retransmits(info.total_retransmits as i64);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (stream, counters);
+}
+
 /// TCP sender: writes full blocks as fast as the kernel will accept them.
 /// If `file_path` is set, reads from the file into the buffer each iteration.
+#[allow(clippy::too_many_arguments)] // hot-path sender; knobs map 1:1 to CLI flags
 pub async fn run_tcp_sender(
     mut stream: TcpStream,
     counters: Arc<StreamCounters>,
@@ -365,25 +461,46 @@ pub async fn run_tcp_sender(
     done: Arc<AtomicBool>,
     file_path: Option<std::path::PathBuf>,
     rate: u64,
+    pacing_timer_us: u32,
     byte_budget: Option<Arc<AtomicI64>>,
 ) -> Result<()> {
     use std::io::Read;
     let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
-    // `-b` pacing: a token bucket caps the application send rate, matching
-    // iperf3's TCP throttle. 0 = unlimited → no limiter, so the default TCP
-    // path is unchanged (#102; mirrors UDP's `-b 0` per #17).
-    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, 0, buf.len().max(1)));
+    // `-b` pacing: iperf3's cumulative-average throttle caps the application
+    // send rate, waking on the `--pacing-timer` quantum (#32/#116). 0 =
+    // unlimited → no limiter, so the default TCP path is unchanged (#102;
+    // mirrors UDP's `-b 0` per #17).
+    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, pacing_timer_us));
 
     while !done.load(Ordering::Relaxed) {
         // `-n`/`-k` byte/block limit: claim this block from the shared budget and
         // stop when it is exhausted, so the sender stops at ~N instead of
         // free-running until the controller's next 100ms poll. The budget is
         // shared across the sending streams — iperf3's `-n` is the test-wide
-        // total, consumed across streams as each sends — so the overshoot is
-        // bounded to ~one block per stream rather than ~100ms of line rate.
+        // total, consumed across streams as each sends. The claim has NO undo:
+        // a fetch_sub + compensating fetch_add could interleave with the omit
+        // boundary's refill store and land the undo on the fresh budget,
+        // leaking a block past the target (review r3). fetch_update claims
+        // only from a positive budget, so only one claim can drive it
+        // non-positive — BUDGET overshoot is bounded to less than one block.
+        // The recorded post-omit net can additionally exceed N by one
+        // in-flight block per sending stream (claimed pre-refill, recorded
+        // post-snapshot), so a paced `-P k` run can land at N + k blocks —
+        // don't pin the 1-block figure in tests (review r4).
         if let Some(b) = &byte_budget {
-            if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
-                break;
+            let len = buf.len() as i64;
+            if b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v > 0).then_some(v - len)
+            })
+            .is_err()
+            {
+                // iperf3's sender IDLES at the limit instead of exiting (its
+                // mt sender checks bytes_sent >= N per burst, including during
+                // an -O warm-up, and resumes when the boundary resets the
+                // counter). Wait for a refill (#31) or the driver's `done`
+                // (the normal end, set once the post-omit target is reached).
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             }
         }
 
@@ -413,6 +530,7 @@ pub async fn run_tcp_sender(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -460,6 +578,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -518,6 +637,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -578,6 +698,7 @@ pub async fn run_tcp_sender_zerocopy(
             Err(e) => return Err(e.into()),
         }
     }
+    snapshot_final_retransmits(&stream, &counters);
     Ok(())
 }
 
@@ -1729,24 +1850,47 @@ mod tests {
 
     // -- RateLimiter --
 
+    // #116: with TCP's 128 KiB default block, the old token bucket's burst
+    // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
+    // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
+    // total sent to elapsed*rate + one in-flight block at any rate/blksize.
     #[tokio::test]
-    async fn rate_limiter_allows_burst() {
-        let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbit/s, 1000-byte blocks
+    async fn rate_limiter_total_accuracy_low_rate_large_blocks() {
+        let rate_bits: u64 = 1_000_000; // 1 Mbit/s
+        let blk: u64 = 128 * 1024; // TCP default block
+        let mut limiter = RateLimiter::new(rate_bits, 0);
         let start = Instant::now();
-        // First acquire should be instant (burst tokens available)
+        let mut sent: u64 = 0;
+        while start.elapsed() < Duration::from_millis(1000) {
+            limiter.acquire(blk).await;
+            sent += blk;
+        }
+        let budget = (rate_bits as f64 / 8.0) * start.elapsed().as_secs_f64();
+        let bound = budget * 1.25 + blk as f64;
+        assert!(
+            (sent as f64) <= bound,
+            "sent {sent} bytes in {:?}; budget {budget:.0} (+25% + one block = {bound:.0}) — \
+             initial burst overshoots the target rate (#116)",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_first_acquire_is_instant() {
+        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbit/s
+        let start = Instant::now();
+        // Cumulative average: nothing sent yet → always green-lit.
         limiter.acquire(1000).await;
         assert!(start.elapsed() < Duration::from_millis(10));
     }
 
     #[tokio::test]
-    async fn rate_limiter_paces() {
-        // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks
-        // burst = max(10000*0.1, 4*1000) = 4000 bytes
-        let mut limiter = RateLimiter::new(80_000, 0, 1000);
-        // Drain the burst (4 packets)
-        for _ in 0..4 {
-            limiter.acquire(1000).await;
-        }
+    async fn rate_limiter_paces_from_the_second_block() {
+        // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks: after block 1
+        // the average is 1000 bytes ahead of schedule, so block 2 waits ~100ms
+        // — there is no up-front burst grant (#116).
+        let mut limiter = RateLimiter::new(80_000, 0);
+        limiter.acquire(1000).await; // instant
         let start = Instant::now();
         limiter.acquire(1000).await; // must wait ~100ms
         let elapsed = start.elapsed();
@@ -1756,60 +1900,42 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_high_rate_precision() {
-        // At 10 Gbps with 1460-byte packets, drain the burst first,
-        // then verify paced throughput is within 50% of target.
-        // Before fix: tokio::time::sleep caps at ~1 Gbps after burst.
-        // After fix: clock_nanosleep should approach 10 Gbps.
+        // At 10 Gbps the cumulative average is almost always at-or-behind
+        // schedule, so acquires release back-to-back with no sleep; catch-up
+        // after any oversleep keeps throughput within 50% of target.
         let rate = 10_000_000_000u64; // 10 Gbps
-        let blksize = 1460usize;
-        let mut limiter = RateLimiter::new(rate, 0, blksize);
+        let blksize = 1460u64;
+        let mut limiter = RateLimiter::new(rate, 0);
 
-        // Drain the burst completely
-        let burst_bytes = (rate as f64 / 8.0 * 0.1).max(4.0 * blksize as f64) as u64;
-        let burst_packets = burst_bytes / blksize as u64 + 1;
-        for _ in 0..burst_packets {
-            limiter.acquire(blksize as u64).await;
-        }
-
-        // Now measure paced throughput (no burst tokens left)
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
-        let target_duration = Duration::from_millis(100);
-
-        while start.elapsed() < target_duration {
-            limiter.acquire(blksize as u64).await;
-            total_bytes += blksize as u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            limiter.acquire(blksize).await;
+            total_bytes += blksize;
         }
 
         let elapsed = start.elapsed().as_secs_f64();
         let achieved_bps = total_bytes as f64 * 8.0 / elapsed;
-        let target_bps = rate as f64;
-
-        // Should achieve at least 50% of target rate
         assert!(
-            achieved_bps > target_bps * 0.5,
-            "high-rate pacing too slow: {:.1} Gbps achieved, {:.1} Gbps target",
+            achieved_bps > rate as f64 * 0.5,
+            "high-rate pacing too slow: {:.1} Gbps achieved, 10.0 Gbps target",
             achieved_bps / 1e9,
-            target_bps / 1e9,
         );
     }
 
     #[tokio::test]
     async fn rate_limiter_low_rate_still_works() {
-        // Verify that the clock_nanosleep path doesn't break low-rate pacing
-        let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbps
+        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbps
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
 
-        // Send 10 packets at 1 Mbps = ~10ms
+        // 10 × 1000-byte blocks at 125 KB/s ≈ 72ms of pacing after block 1.
         for _ in 0..10 {
             limiter.acquire(1000).await;
             total_bytes += 1000;
         }
 
         let elapsed = start.elapsed();
-        // Should take at least some time (not instant)
-        // Burst covers first ~4 packets, remaining 6 need pacing
         assert!(total_bytes == 10_000);
         // Should complete in under 1 second (generously)
         assert!(elapsed < Duration::from_secs(1));
@@ -1833,7 +1959,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None, 0, None).await
+            run_tcp_sender(stream, sc, buf, d, None, 0, 1000, None).await
         });
 
         let rc = recv_counters.clone();

@@ -561,6 +561,44 @@ async fn tcp_bitrate_is_paced() {
     let _ = server_task.await;
 }
 
+/// #116: at a LOW -b with TCP's 128 KiB default block, the old token bucket's
+/// 512 KiB burst floor doubled the achieved rate (verified ~2.10 Mbit/s for
+/// -b 1M against iperf3's 1.05M). iperf3's cumulative-average throttle keeps
+/// the total within one block of elapsed*rate; allow +25% + one block.
+#[tokio::test]
+async fn tcp_low_bitrate_no_overshoot() {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .one_off(true)
+        .build()
+        .unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let target: u64 = 1_000_000; // 1 Mbit/s — far below the old burst floor
+    let secs: u64 = 2;
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(secs as u32)
+        .bandwidth(target)
+        .build()
+        .unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let budget = (target / 8 * secs) as f64; // 250 KB
+    let bound = budget * 1.25 + (128 * 1024) as f64;
+    assert!(
+        (bytes as f64) <= bound,
+        "low -b overshoot (#116): sent {bytes} bytes, budget {budget:.0} (bound {bound:.0})"
+    );
+    let _ = server_task.await;
+}
+
 #[tokio::test]
 async fn tcp_unlimited_is_not_paced() {
     // Regression guard: default TCP (no -b ⇒ rate 0) must stay unthrottled.
