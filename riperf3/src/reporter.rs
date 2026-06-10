@@ -58,11 +58,11 @@ fn fmt_id(id: i32) -> String {
 /// prefix matches iperf3 without changing the public printer signatures.
 fn titled(line: std::fmt::Arguments) {
     let rendered = format!("{}{}", crate::macros::output_title_prefix(), line);
-    // --get-server-output (#33): a capturing server diverts its report lines
-    // into the results exchange instead of stdout, like iperf3's tmpfile.
-    if !crate::macros::capture_line(&rendered) {
-        println!("{rendered}");
-    }
+    // --get-server-output (#33): a capturing server TEES its report lines
+    // into the exchange buffer while still printing — iperf3's iperf_printf
+    // dual-writes (console + server_output_list).
+    crate::macros::capture_line(&rendered);
+    println!("{rendered}");
 }
 
 /// Print the header line for interval reports.

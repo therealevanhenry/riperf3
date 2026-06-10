@@ -213,10 +213,14 @@ impl Server {
         params.normalize_unlimited();
         let cfg = TestConfig::from_params(&params);
         // --get-server-output (#33): when the client asks and this server is
-        // in text mode, divert the console report into the exchange (iperf3's
-        // tmpfile diversion). JSON-mode servers attach their full report
-        // instead (built pre-exchange below).
+        // in text mode, TEE the console report into the exchange buffer
+        // (iperf3's iperf_printf dual-write — the console stays live).
+        // JSON-mode servers attach their full report instead (built
+        // pre-exchange below).
         let want_server_output = params.get_server_output == Some(1);
+        // --json-stream x get-server-output divergences are tracked in #168
+        // (iperf3's streaming server DOES attach; its streaming client emits a
+        // server_output event).
         let capture = (want_server_output && !self.json_output && !self.json_stream)
             .then(crate::macros::OutputCaptureGuard::start);
 
@@ -726,9 +730,10 @@ impl Server {
         } else if !was_captured {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
-            // Skipped when --get-server-output diverted the report into the
-            // exchange (#33): the summaries were rendered into the capture
-            // pre-exchange, and the console stays silent like iperf3's.
+            // Skipped when --get-server-output already rendered them (#33):
+            // the pre-exchange render TEE'd to console + capture (iperf3 also
+            // prints at TEST_END, before its exchange), so printing here again
+            // would duplicate the lines.
             let summaries = Self::text_summaries(&streams, test_duration);
             crate::reporter::print_final_summaries(&summaries, 'a');
         }
@@ -1099,12 +1104,8 @@ impl Server {
         Ok(())
     }
 
-    /// Assemble and print the server's iperf3-schema `-J` report (#50). Mirrors
-    /// the client's `print_results_json`, with the server's perspective baked in
-    /// via `is_server: true`: `accepted_connection` instead of `connecting_to`,
-    /// no peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
     /// Per-stream final summaries for the text report (shared by the normal
-    /// print path and the --get-server-output capture, #33).
+    /// print path and the --get-server-output pre-exchange render, #33).
     fn text_summaries(
         streams: &[DataStream],
         test_duration: f64,
@@ -1142,10 +1143,13 @@ impl Server {
             .collect()
     }
 
+    /// Assemble the server's typed iperf3-schema report input (#50). Shared by
+    /// `-J` (build + pretty-print, see `build_report`/`print_results_json`),
+    /// `--json-stream` (the `start`/`end` events), and `--get-server-output`'s
+    /// pre-exchange attachment (#33). The server's perspective is baked in via
+    /// `is_server: true`: `accepted_connection` instead of `connecting_to`, no
+    /// peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
     /// (iperf3's server never reads its control-socket MSS).
-    /// Assemble the server's typed iperf3-schema report input. Shared by `-J`
-    /// (build + pretty-print) and `--json-stream` (build + emit the `start`/`end`
-    /// events). The server's perspective is baked in via `is_server: true`.
     #[allow(clippy::too_many_arguments)]
     fn build_report_input(
         &self,

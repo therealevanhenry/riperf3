@@ -1,8 +1,8 @@
 //! CLI integration tests: `--get-server-output` must work like iperf3 (#33) —
 //! the server returns its console output (text mode) or its full `-J` report
-//! (JSON mode) in the results exchange, and the client prints/attaches it.
-//! Pre-#33 the flag was a silent no-op: the param was never sent and nothing
-//! was fetched or printed.
+//! (JSON mode) in the results exchange, and the client prints/attaches it —
+//! while the server console stays live (iperf3 dual-writes; it never
+//! diverted). Pre-#33 the flag was a silent no-op.
 #![cfg(unix)]
 
 use std::io::Read;
@@ -125,8 +125,10 @@ fn text_client_gets_text_server_output() {
         "server's report (receiver summary) must appear in the client output: {out}"
     );
     assert!(
-        !server_out.contains("receiver"),
-        "the server's console is diverted into the exchange, like iperf3's tmpfile: {server_out}"
+        server_out.contains("receiver"),
+        "iperf3 dual-writes: the server console stays LIVE while the output \
+         also rides the exchange (iperf_printf appends to server_output_list \
+         AND fprintfs) — review r1: {server_out}"
     );
 }
 

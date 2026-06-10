@@ -14,23 +14,22 @@ use std::sync::RwLock;
 static OUTPUT_TITLE: RwLock<Option<String>> = RwLock::new(None);
 
 /// `--get-server-output` capture sink (#33): when active, the server's report
-/// lines (vprintln! + the reporter's `titled` printers) append here instead of
-/// stdout — faithful to iperf3's tmpfile diversion, whose text-mode server
-/// console is silent for the test while its output rides the results exchange.
+/// lines (vprintln! + the reporter's `titled` printers) are TEE'd here in
+/// addition to stdout — iperf3's `iperf_printf` dual-writes (fprintf + the
+/// server_output_list linebuffer; it has never diverted via tmpfile), so the
+/// server console stays live while the output also rides the exchange.
 /// Shares the OUTPUT_TITLE process-global caveat (one server run at a time).
 static OUTPUT_CAPTURE: RwLock<Option<String>> = RwLock::new(None);
 
-/// Append `line` to the active capture; returns false when no capture is
-/// active (caller prints normally).
-pub(crate) fn capture_line(line: &str) -> bool {
+/// Tee `line` into the active capture (no-op when none is active); the caller
+/// always prints to stdout as well, like iperf3's dual-write.
+pub(crate) fn capture_line(line: &str) {
     if let Ok(mut g) = OUTPUT_CAPTURE.write() {
         if let Some(buf) = g.as_mut() {
             buf.push_str(line);
             buf.push('\n');
-            return true;
         }
     }
-    false
 }
 
 /// RAII capture for the server's `--get-server-output` diversion (#33). Drop
@@ -108,9 +107,8 @@ macro_rules! vprintln {
                 $crate::macros::output_title_prefix(),
                 format_args!($($arg)*)
             );
-            if !$crate::macros::capture_line(&line) {
-                println!("{line}");
-            }
+            $crate::macros::capture_line(&line);
+            println!("{line}");
         }
     };
 }
