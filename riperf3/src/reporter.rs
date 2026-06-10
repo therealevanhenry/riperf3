@@ -485,12 +485,14 @@ fn direction_interval_sum(
 /// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
 /// interval and stop the task; `done` is the fallback stop signal for error/early
 /// teardown paths. The handle should be awaited after `finish`/`done`.
+#[allow(clippy::too_many_arguments)] // reporter wiring, 1:1 with the drivers
 pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
     done: Arc<AtomicBool>,
     reporter_end: Arc<ReporterEnd>,
     collector: Option<Arc<Mutex<CollectedIntervals>>>,
+    byte_budget: Option<(Arc<std::sync::atomic::AtomicI64>, i64)>,
 ) -> Option<JoinHandle<()>> {
     if config.interval_secs < 0.0 {
         return None;
@@ -872,6 +874,14 @@ pub fn spawn_interval_reporter(
             // be stale), and the end-block extremes restart. Lives inside
             // this closure because prev_*/acc_extremes are its captures.
             if omit_boundary {
+                // -n/-k + -O (#31): refill the shared sender budget HERE,
+                // where the byte baselines are snapshotted, so the limit and
+                // the net accounting share one boundary instant — refilling
+                // from the driver's 100ms poll overshot by up to a poll's
+                // worth of line rate (review r2).
+                if let Some((b, target)) = &byte_budget {
+                    b.store(*target, std::sync::atomic::Ordering::Relaxed);
+                }
                 for (i, s) in streams.iter().enumerate() {
                     let _ = s.counters.take_sent_interval();
                     let _ = s.counters.take_received_interval();
@@ -1333,7 +1343,7 @@ mod interval_reporter_tests {
             blksize: 128 * 1024,
         };
         assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
+            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None, None)
                 .is_some()
         );
     }
@@ -1354,7 +1364,7 @@ mod interval_reporter_tests {
             blksize: 128 * 1024,
         };
         assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
+            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None, None)
                 .is_none()
         );
     }
@@ -1379,6 +1389,7 @@ mod interval_reporter_tests {
             vec![],
             done.clone(),
             Arc::new(ReporterEnd::new()),
+            None,
             None,
         );
         assert!(handle.is_some());
@@ -1434,6 +1445,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
         )
         .expect("reporter spawns for a positive interval");
 
@@ -1515,6 +1527,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
         )
         .expect("reporter spawns for -i 0 (#107)");
 
@@ -1590,6 +1603,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
         )
         .expect("reporter spawns for a positive interval");
 
@@ -1662,6 +1676,7 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
         )
         .expect("reporter spawns for a positive interval");
 

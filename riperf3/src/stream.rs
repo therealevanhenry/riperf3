@@ -409,7 +409,15 @@ pub async fn run_tcp_sender(
         // bounded to ~one block per stream rather than ~100ms of line rate.
         if let Some(b) = &byte_budget {
             if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
-                break;
+                // iperf3's sender IDLES at the limit instead of exiting (its
+                // mt sender checks bytes_sent >= N per burst, including during
+                // an -O warm-up, and resumes when the boundary resets the
+                // counter). Undo the claim and wait for a refill (#31) or the
+                // driver's `done` (the normal end, set once the post-omit net
+                // target is reached).
+                b.fetch_add(buf.len() as i64, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             }
         }
 

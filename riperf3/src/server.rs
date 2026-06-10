@@ -288,6 +288,8 @@ impl Server {
         // build it only for a TCP run that has senders. See `make_byte_budget`
         // for the 0-is-unlimited (iperf3 sends `num`/`blocks` = 0 for a plain
         // `-t` run) and overflow-clamp rules.
+        // -O + -n/-k on the SERVER's senders (reverse/bidir, #31 review r2):
+        // same pause-at-limit + reporter-boundary-refill design as the client.
         let byte_budget: Option<Arc<AtomicI64>> = (matches!(cfg.protocol, TransportProtocol::Tcp)
             && send_count > 0)
             .then(|| stream::make_byte_budget(params.num, params.blockcount, cfg.blksize))
@@ -509,6 +511,9 @@ impl Server {
                 done.clone(),
                 reporter_end.clone(),
                 want_collector.then(|| interval_data.clone()),
+                byte_budget
+                    .as_ref()
+                    .map(|b| (b.clone(), b.load(Ordering::Relaxed))),
             )
         };
 
@@ -711,7 +716,16 @@ impl Server {
                     let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
                         udp_stats
                             .lock()
-                            .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                            .map(|st| {
+                                // Post-omit stats (#31, review r2 — this was
+                                // the missed third site): gross minus the
+                                // boundary baselines.
+                                (
+                                    Some(st.jitter),
+                                    Some(st.cnt_error - st.omitted_cnt_error),
+                                    Some(st.packet_count - st.omitted_packet_count),
+                                )
+                            })
                             .unwrap_or((None, None, None))
                     } else {
                         (None, None, None)

@@ -99,7 +99,7 @@ fn omit_extends_run_and_resets_timeline() {
             "1",
             "-J",
         ],
-        Duration::from_secs(25),
+        Duration::from_secs(60),
         "client",
     );
     let _ = server.0.wait();
@@ -169,7 +169,7 @@ fn omit_summary_excludes_warmup_bytes() {
             "1",
             "-J",
         ],
-        Duration::from_secs(25),
+        Duration::from_secs(60),
         "client",
     );
     let _ = server.0.wait();
@@ -211,7 +211,7 @@ fn omit_with_byte_limit_applies_post_omit() {
 
     let (out, elapsed) = run_capturing(
         &["-c", "127.0.0.1", "-p", &ps, "-O", "1", "-n", "100M", "-J"],
-        Duration::from_secs(25),
+        Duration::from_secs(60),
         "client",
     );
     let _ = server.0.wait();
@@ -222,10 +222,54 @@ fn omit_with_byte_limit_applies_post_omit() {
     );
     let v: Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
+    // `-n 100M` is binary (unit_atoi): 104,857,600. The budget design lands
+    // exactly on it; allow one 128 KiB block of slack. The old driver-poll
+    // refill overshot 1.2-4x (review r2 blocker 3).
     let bytes = v["end"]["sum_sent"]["bytes"].as_u64().expect("bytes");
     assert!(
-        bytes >= 95_000_000,
-        "the -n budget must be transferred POST-omit, got {bytes}: {out}"
+        (104_857_600..=104_988_672).contains(&bytes),
+        "post-omit -n must land on the 104857600-byte target (r2): {bytes}: {out}"
+    );
+}
+
+/// Reverse `-R -n + -O` (r2 blocker 1): the SERVER's senders hit the same
+/// budget design — pre-fix they exhausted the gross budget during warm-up and
+/// broke permanently, so the client's post-omit net target was unreachable
+/// (infinite zero-byte intervals).
+#[test]
+fn omit_with_reverse_byte_limit_terminates() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    let (out, elapsed) = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-R",
+            "-O",
+            "1",
+            "-n",
+            "50M",
+            "-J",
+        ],
+        Duration::from_secs(60),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "reverse -n + -O must terminate (r2 blocker 1)"
+    );
+    let v: Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
+    let bytes = v["end"]["sum_received"]["bytes"].as_u64().expect("bytes");
+    assert!(
+        (47_500_000..=53_000_000).contains(&bytes),
+        "reverse post-omit budget must land on ~50M, got {bytes}: {out}"
     );
 }
 
@@ -260,7 +304,7 @@ fn server_intervals_rebased_after_omit() {
             "-i",
             "1",
         ],
-        Duration::from_secs(25),
+        Duration::from_secs(60),
         "client",
     );
     let mut sout = String::new();

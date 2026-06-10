@@ -419,17 +419,13 @@ impl Client {
             && send_count > 0)
             .then(|| stream::make_byte_budget(self.bytes_to_send, self.blocks_to_send, blksize))
             .flatten();
-        // -O + -n/-k (#31): the limit applies to the POST-omit window (iperf3
-        // gates end checks on !omitting and resets byte progress at the
-        // boundary). Senders break permanently when the budget exhausts, so
-        // during warm-up it must be effectively unlimited; the boundary then
-        // stores the real target.
+        // -O + -n/-k (#31): the limit applies to the POST-omit window. The
+        // budget holds gross N from the start — senders PAUSE at it (iperf3's
+        // mt sender idles at the limit, including during warm-up, then
+        // resumes when the boundary resets the counter) — and the REPORTER
+        // refills it at its omit boundary, the same instant the byte
+        // baselines snapshot, so limit and accounting can't skew (review r2).
         let budget_target = byte_budget.as_ref().map(|b| b.load(Ordering::Relaxed));
-        if self.omit > 0 {
-            if let Some(b) = &byte_budget {
-                b.store(i64::MAX, Ordering::Relaxed);
-            }
-        }
 
         match self.protocol {
             TransportProtocol::Tcp => {
@@ -689,32 +685,23 @@ impl Client {
         Ok((streams, byte_budget.zip(budget_target)))
     }
 
-    /// Wait out a `-n`/`-k` run (#31): iperf3 gates the end-condition check on
-    /// !omitting and resets byte progress at the boundary, so the warm-up
-    /// never consumes the limit. The shared sender budget is refilled to its
-    /// initial value at the boundary (the warm-up drained it), and the
-    /// returned summary window is rebased to exclude the warm-up.
+    /// Wait out a `-n`/`-k` run (#31): iperf3 gates the end-condition check
+    /// on !omitting, so the warm-up never satisfies the limit. The budget
+    /// refill happens in the REPORTER's boundary block (same instant as the
+    /// byte baselines); this poll only waits out the warm-up and then watches
+    /// the net (post-omit) progress. The returned summary window excludes the
+    /// warm-up.
     async fn wait_byte_limit(
         &self,
         streams: &[DataStream],
-        byte_budget: Option<&(Arc<AtomicI64>, i64)>,
         target: u64,
         report_start: &std::time::Instant,
     ) -> f64 {
         let omit = Duration::from_secs(self.omit as u64);
-        let mut boundary_done = self.omit == 0;
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if !boundary_done {
-                if report_start.elapsed() < omit {
-                    continue; // still warming up — the limit doesn't apply yet
-                }
-                // Boundary: restore the senders' shared budget (the reporter
-                // snapshots the counters on its own omit deadline).
-                if let Some((b, initial)) = byte_budget {
-                    b.store(*initial, Ordering::Relaxed);
-                }
-                boundary_done = true;
+            if report_start.elapsed() < omit {
+                continue; // still warming up — the limit doesn't apply yet
             }
             if transferred_bytes(streams) >= target {
                 break;
@@ -779,6 +766,7 @@ impl Client {
                 done.clone(),
                 reporter_end.clone(),
                 want_collector.then(|| collector.clone()),
+                byte_budget.cloned(),
             )
         } else {
             None
@@ -826,14 +814,12 @@ impl Client {
                 dur.as_secs_f64()
             }
             EndCondition::Bytes(target) => {
-                self.wait_byte_limit(streams, byte_budget, target, &report_start)
-                    .await
+                self.wait_byte_limit(streams, target, &report_start).await
             }
             EndCondition::Blocks(target) => {
                 // Block-based: approximate by dividing transferred bytes by blksize.
                 self.wait_byte_limit(
                     streams,
-                    byte_budget,
                     target.saturating_mul(blksize as u64),
                     &report_start,
                 )
