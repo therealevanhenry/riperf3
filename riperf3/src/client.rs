@@ -1357,66 +1357,85 @@ impl ClientBuilder {
         Self::default().host(host)
     }
 
+    /// `-c/--client <host>`: the server to connect to (hostname or IP literal).
     pub fn host(mut self, host: &str) -> Self {
         self.host = Some(host.to_string());
         self
     }
 
+    /// `-p/--port`: server control port to connect to (default 5201); `None`
+    /// resolves back to the default at `build()`.
     pub fn port(mut self, port: Option<u16>) -> Self {
         self.port = port;
         self
     }
 
+    /// `-u/--udp`: transport protocol for the data streams (default TCP).
     pub fn protocol(mut self, protocol: TransportProtocol) -> Self {
         self.protocol = protocol;
         self
     }
 
+    /// `-t/--time`: time in seconds to transmit for (default 10).
     pub fn duration(mut self, secs: u32) -> Self {
         self.duration = secs;
         self
     }
 
+    /// `-P/--parallel`: number of parallel data streams (default 1).
     pub fn num_streams(mut self, n: u32) -> Self {
         self.num_streams = n;
         self
     }
 
+    /// `-l/--length`: length of the read/write buffer in bytes (default 128 KB
+    /// for TCP; unset UDP derives the datagram size from the control-socket MSS).
     pub fn blksize(mut self, size: usize) -> Self {
         self.blksize = Some(size);
         self
     }
 
+    /// `-R/--reverse`: reverse mode — the server sends, the client receives.
     pub fn reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
         self
     }
 
+    /// `--bidir`: bidirectional mode — client and server send and receive
+    /// simultaneously.
     pub fn bidir(mut self, bidir: bool) -> Self {
         self.bidir = bidir;
         self
     }
 
+    /// `-O/--omit`: omit the first `secs` seconds of the test (e.g. TCP
+    /// slow-start) from the results (default 0).
     pub fn omit(mut self, secs: u32) -> Self {
         self.omit = secs;
         self
     }
 
+    /// `-N/--no-delay`: set `TCP_NODELAY`, disabling Nagle's algorithm.
     pub fn no_delay(mut self, no_delay: bool) -> Self {
         self.no_delay = no_delay;
         self
     }
 
+    /// `-M/--set-mss`: TCP maximum segment size (MTU - 40 bytes).
     pub fn mss(mut self, mss: i32) -> Self {
         self.mss = Some(mss);
         self
     }
 
+    /// `-w/--window`: socket buffer size in bytes (indirectly sets the TCP
+    /// window size).
     pub fn window(mut self, window: i32) -> Self {
         self.window = Some(window);
         self
     }
 
+    /// `-b/--bitrate`: target bitrate in bits/sec; 0 = unlimited. Unset resolves
+    /// at `build()` to the iperf3 default: unlimited for TCP, 1 Mbit/sec for UDP.
     pub fn bandwidth(mut self, bps: u64) -> Self {
         // `Some` even for 0: an explicit `-b 0` means unlimited and must be
         // distinguishable from "unset" (which resolves to the UDP default) (#17).
@@ -1424,21 +1443,28 @@ impl ClientBuilder {
         self
     }
 
+    /// `-S/--tos`: IP type-of-service value (0-255). Symbolic DSCP names go
+    /// through [`Self::dscp`] instead.
     pub fn tos(mut self, tos: i32) -> Self {
         self.tos = tos;
         self
     }
 
+    /// `-C/--congestion`: TCP congestion control algorithm (e.g. `cubic`,
+    /// `bbr`); rejected at `build()` on platforms without support.
     pub fn congestion(mut self, algo: &str) -> Self {
         self.congestion = Some(algo.to_string());
         self
     }
 
+    /// `--udp-counters-64bit`: use 64-bit sequence counters in UDP test packets.
     pub fn udp_counters_64bit(mut self, enabled: bool) -> Self {
         self.udp_counters_64bit = enabled;
         self
     }
 
+    /// `--connect-timeout`: timeout for establishing the control connection
+    /// (the CLI flag takes milliseconds).
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
@@ -1456,101 +1482,134 @@ impl ClientBuilder {
         self
     }
 
+    /// `--extra-data`: extra data string to include in the JSON output.
     pub fn extra_data(mut self, data: &str) -> Self {
         self.extra_data = Some(data.to_string());
         self
     }
 
+    /// `-V/--verbose`: enable verbose output.
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
     }
 
+    /// `-J/--json`: emit the results as iperf3-schema JSON on stdout instead
+    /// of text.
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
         self
     }
 
+    /// `-n/--bytes`: number of bytes to transmit, instead of running for a set
+    /// time (`-t`).
     pub fn bytes(mut self, bytes: u64) -> Self {
         self.bytes_to_send = Some(bytes);
         self
     }
 
+    /// `-k/--blockcount`: number of blocks (packets) to transmit, instead of
+    /// `-t` or `-n`.
     pub fn blocks(mut self, blocks: u64) -> Self {
         self.blocks_to_send = Some(blocks);
         self
     }
 
+    /// `--json-stream`: stream line-delimited interval JSON during the test.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
         self
     }
 
+    /// `--repeating-payload`: use a repeating pattern in the payload instead
+    /// of zeros.
     pub fn repeating_payload(mut self, enabled: bool) -> Self {
         self.repeating_payload = enabled;
         self
     }
 
+    /// `-Z/--zerocopy`: use a zero-copy (`sendfile`) method of sending data;
+    /// rejected at `build()` on platforms without support.
     pub fn zerocopy(mut self, enabled: bool) -> Self {
         self.zerocopy = enabled;
         self
     }
 
+    /// `--gsro`: enable UDP GSO/GRO (generic segmentation/receive offload);
+    /// rejected at `build()` on platforms without support.
     pub fn gsro(mut self, enabled: bool) -> Self {
         self.gsro = enabled;
         self
     }
 
+    /// `--sendmmsg`: batched UDP sends via `sendmmsg(2)` (experimental,
+    /// Linux/FreeBSD/NetBSD). riperf3 extension with no iperf3 equivalent.
     pub fn sendmmsg(mut self, enabled: bool) -> Self {
         self.sendmmsg = enabled;
         self
     }
 
+    /// `--dont-fragment`: set the IPv4 Don't Fragment flag on UDP packets.
     pub fn dont_fragment(mut self, enabled: bool) -> Self {
         self.dont_fragment = enabled;
         self
     }
 
+    /// `--cport`: bind to a specific local client port (default: ephemeral).
     pub fn cport(mut self, port: u16) -> Self {
         self.cport = Some(port);
         self
     }
 
+    /// `--get-server-output`: retrieve the server-side output and include it
+    /// in the client's results.
     pub fn get_server_output(mut self, enabled: bool) -> Self {
         self.get_server_output = enabled;
         self
     }
 
+    /// `--forceflush`: force flushing output at every interval.
     pub fn forceflush(mut self, enabled: bool) -> Self {
         self.forceflush = enabled;
         self
     }
 
+    /// `--timestamps`: prefix each output line with a timestamp in the given
+    /// `strftime` format (the CLI defaults to `"%c "` when no format is given).
     pub fn timestamps(mut self, fmt: &str) -> Self {
         self.timestamps = Some(fmt.to_string());
         self
     }
 
+    /// `-B/--bind`: bind to a specific local source address (interface binding
+    /// is [`Self::bind_dev`]).
     pub fn bind_address(mut self, addr: &str) -> Self {
         self.bind_address = Some(addr.to_string());
         self
     }
 
+    /// `--bind-dev`: bind to a network interface with `SO_BINDTODEVICE`;
+    /// rejected at `build()` on platforms without support.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
     }
 
+    /// `--fq-rate`: fair-queuing based socket pacing rate in bits/sec
+    /// (Linux only).
     pub fn fq_rate(mut self, rate: u64) -> Self {
         self.fq_rate = Some(rate);
         self
     }
 
+    /// `-L/--flowlabel`: IPv6 flow label (Linux only).
     pub fn flowlabel(mut self, label: i32) -> Self {
         self.flowlabel = Some(label);
         self
     }
 
+    /// `-4`/`-6`: only use IPv4 (`4`) or IPv6 (`6`) when connecting. Leave
+    /// unset to use whichever family the host resolves to.
     pub fn ip_version(mut self, version: u8) -> Self {
         debug_assert!(
             matches!(version, 4 | 6),
@@ -1560,66 +1619,91 @@ impl ClientBuilder {
         self
     }
 
+    /// `-m/--mptcp`: use MPTCP rather than plain TCP.
     pub fn mptcp(mut self, enabled: bool) -> Self {
         self.mptcp = enabled;
         self
     }
 
+    /// `--skip-rx-copy`: discard received data in the kernel with `MSG_TRUNC`,
+    /// skipping the copy to userspace.
     pub fn skip_rx_copy(mut self, enabled: bool) -> Self {
         self.skip_rx_copy = enabled;
         self
     }
 
+    /// `--rcv-timeout`: idle timeout for receiving data, in milliseconds
+    /// (`SO_RCVTIMEO`).
     pub fn rcv_timeout(mut self, ms: u64) -> Self {
         self.rcv_timeout = Some(ms);
         self
     }
 
+    /// `--snd-timeout`: timeout for unacknowledged TCP data, in milliseconds
+    /// (`TCP_USER_TIMEOUT`).
     pub fn snd_timeout(mut self, ms: u64) -> Self {
         self.snd_timeout = Some(ms);
         self
     }
 
+    /// `-F/--file`: sending streams read the payload from this file instead of
+    /// generated data; receiving streams write received data to it.
     pub fn file(mut self, path: &str) -> Self {
         self.file = Some(path.to_string());
         self
     }
 
+    /// `--dscp`: IP DSCP value, numeric (0-63) or symbolic (e.g. `CS5`);
+    /// overrides [`Self::tos`] at `build()`.
     pub fn dscp(mut self, val: &str) -> Self {
         self.dscp = Some(val.to_string());
         self
     }
 
+    /// `-f/--format`: report units — `k`/`m`/`g`/`t` for bits, uppercase for
+    /// bytes; the default `'a'` picks adaptively.
     pub fn format_char(mut self, c: char) -> Self {
         self.format_char = c;
         self
     }
 
+    /// `-i/--interval`: seconds between periodic throughput reports (default 1).
     pub fn interval(mut self, secs: f64) -> Self {
         self.interval = Some(secs);
         self
     }
 
+    /// `--cntl-ka`: enable TCP keepalive on the control connection; `spec` is
+    /// `idle/intv/cnt`.
     pub fn cntl_ka(mut self, spec: &str) -> Self {
         self.cntl_ka = Some(spec.to_string());
         self
     }
 
+    /// `--username`: username for authentication (used with a password and
+    /// [`Self::rsa_public_key_path`]).
     pub fn username(mut self, name: &str) -> Self {
         self.username = Some(name.to_string());
         self
     }
 
+    /// Password for authentication. iperf3 has no flag for this; the CLI reads
+    /// the `RIPERF3_PASSWORD`/`IPERF3_PASSWORD` environment variables or prompts.
     pub fn password(mut self, pass: &str) -> Self {
         self.password = Some(pass.to_string());
         self
     }
 
+    /// `--rsa-public-key-path`: path to the RSA public key used to encrypt the
+    /// authentication credentials.
     pub fn rsa_public_key_path(mut self, path: &str) -> Self {
         self.rsa_public_key_path = Some(path.to_string());
         self
     }
 
+    /// `--use-pkcs1-padding`: encrypt credentials with PKCS#1 v1.5 padding
+    /// instead of OAEP (for pre-3.17 iperf3 servers). The CLI rejects this flag
+    /// for clients, matching iperf3 (#100); only embedders can set it here.
     pub fn use_pkcs1_padding(mut self, enabled: bool) -> Self {
         self.use_pkcs1_padding = enabled;
         self
@@ -1628,27 +1712,39 @@ impl ClientBuilder {
     // String-accepting variants — parse KMG suffixes (e.g., "1M", "512K", "10G")
     // so callers don't need to import parse_kmg/parse_bitrate.
 
+    /// Like [`Self::bytes`], accepting a KMG-suffixed size string
+    /// (`-n 100M`; binary, 1024-based).
     pub fn bytes_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.bytes(parse_kmg(s)?))
     }
 
+    /// Like [`Self::blocks`], accepting a KMG-suffixed count string
+    /// (`-k 10K`; binary, 1024-based).
     pub fn blocks_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.blocks(parse_kmg(s)?))
     }
 
+    /// Like [`Self::blksize`], accepting a KMG-suffixed size string
+    /// (`-l 128K`; binary, 1024-based).
     pub fn blksize_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.blksize(parse_kmg(s)? as usize))
     }
 
+    /// Like [`Self::window`], accepting a KMG-suffixed size string
+    /// (`-w 4M`; binary, 1024-based).
     pub fn window_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.window(parse_kmg(s)? as i32))
     }
 
+    /// Like [`Self::bandwidth`], accepting an iperf3 rate string (`-b 10M`;
+    /// decimal, 1000-based). A `/burst` suffix is parsed but not applied.
     pub fn bandwidth_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         let (rate, _burst) = parse_bitrate(s)?;
         Ok(self.bandwidth(rate))
     }
 
+    /// Like [`Self::fq_rate`], accepting an iperf3 rate string
+    /// (`--fq-rate 1G`; decimal, 1000-based).
     pub fn fq_rate_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         // --fq-rate is a rate: decimal (1000-based) suffixes, like iperf3 (#56).
         Ok(self.fq_rate(crate::utils::parse_rate(s)?))
