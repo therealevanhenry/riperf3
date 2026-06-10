@@ -20,6 +20,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod common;
+
 /// Best-effort cleanup: kill the reparented daemon and remove its pidfile when
 /// the test ends (success or panic), so a failure can't leak a server holding
 /// the port.
@@ -45,11 +47,8 @@ impl Drop for Reaper {
 /// releasing it and the daemon binding it, but it avoids the real flakiness of a
 /// hardcoded port (a leaked or concurrent server sitting on it).
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
 }
 
 /// Poll for the pidfile to appear and contain a parseable pid.

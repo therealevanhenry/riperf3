@@ -21,11 +21,8 @@ use serde_json::Value;
 mod common;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
 }
 
 /// Assert `stdout` is a valid `--json-stream` document: every non-empty line is a
@@ -118,36 +115,9 @@ fn wait_bounded(
     }
 }
 
-/// Spawn `riperf3`, bound its run, and return captured stdout.
+/// Run the client to completion (with refused-retry) and return its stdout.
 fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
-
-    let status = wait_bounded(&mut child, timeout, who);
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    assert!(
-        status.success(),
-        "{who}: exited unsuccessfully ({status}); stderr: {err}"
-    );
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    out
+    common::run_client_ok(args, timeout, who).stdout
 }
 
 /// Client `--json-stream` against a plain one-off server.
@@ -164,7 +134,6 @@ fn client_json_stream_tcp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    common::wait_port_listening(port);
 
     let out = run_capturing(
         &[
@@ -199,7 +168,6 @@ fn client_json_stream_udp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    common::wait_port_listening(port);
 
     let out = run_capturing(
         &[
@@ -238,17 +206,14 @@ fn server_json_stream_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    common::wait_port_listening(port);
 
-    // Drive one test, bounded so a non-serving server can't hang the suite.
-    let mut client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn client");
-    let status = wait_bounded(&mut client, Duration::from_secs(20), "client");
-    assert!(status.success(), "client failed: {status:?}");
+    // Drive one test, bounded so a non-serving server can't hang the suite;
+    // its stdout is irrelevant here — only the server's NDJSON is asserted.
+    let _ = common::run_client_ok(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"],
+        Duration::from_secs(20),
+        "client",
+    );
 
     // The one-off server now finishes and closes stdout; bound that wait too.
     // (Output is a handful of small lines, well under the pipe buffer, so

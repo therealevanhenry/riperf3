@@ -6,18 +6,15 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
 mod common;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+    // Sub-ephemeral, PID-windowed allocation — see common::free_port.
+    common::free_port()
 }
 
 /// Kills the wrapped child on drop so a spawned server is reaped on panic.
@@ -29,61 +26,21 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Spawn `riperf3` with `args`, bound its run, and return captured stdout.
+/// Run the client to completion (with refused-retry) and return its stdout.
 fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_riperf3");
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{who}: timed out");
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    };
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    assert!(
-        status.success(),
-        "{who}: exited unsuccessfully ({status}); stderr: {err}"
-    );
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    out
+    common::run_client_ok(args, timeout, who).stdout
 }
 
 fn spawn_server(port_str: &str) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_riperf3");
-    let g = ChildGuard(
+    ChildGuard(
         Command::new(bin)
             .args(["-s", "-1", "-p", port_str])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn server"),
-    );
-    common::wait_port_listening(port_str.parse().unwrap());
-    g
+    )
 }
 
 /// `-n` (byte-limited) `-J` summary must use the measured elapsed, not the
@@ -158,7 +115,6 @@ fn server_json_byte_limited_summary_uses_measured_elapsed() {
             .spawn()
             .expect("spawn server"),
     );
-    common::wait_port_listening(port);
 
     // Forward byte-limited transfer: the server is the receiver.
     let _client = run_capturing(
