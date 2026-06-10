@@ -669,6 +669,9 @@ impl Client {
                         // Effective rate is resolved at build time (UDP unset →
                         // 1 Mbit/s); 0 means unlimited — no pacing (#17).
                         let rate = self.bandwidth;
+                        // #185: honor --pacing-timer on the UDP send batch too,
+                        // so a low -b over a large datagram paces smoothly.
+                        let pt = self.pacing_timer;
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -676,11 +679,11 @@ impl Client {
                         thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
                                 )
                             } else {
                                 stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
                                 )
                             }
                         })
