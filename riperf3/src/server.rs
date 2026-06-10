@@ -307,10 +307,17 @@ impl Server {
         // build it only for a TCP run that has senders. See `make_byte_budget`
         // for the 0-is-unlimited (iperf3 sends `num`/`blocks` = 0 for a plain
         // `-t` run) and overflow-clamp rules.
+        // -O + -n/-k on the SERVER's senders (reverse/bidir, #31 review r2):
+        // same pause-at-limit + reporter-boundary-refill design as the client.
         let byte_budget: Option<Arc<AtomicI64>> = (matches!(cfg.protocol, TransportProtocol::Tcp)
             && send_count > 0)
             .then(|| stream::make_byte_budget(params.num, params.blockcount, cfg.blksize))
             .flatten();
+        // The boundary-refill target, captured BEFORE any sender can consume:
+        // loading it at reporter-spawn time read `N − early_consumed` on fast
+        // links (senders start in the TestStart→spawn gap), silently
+        // shrinking the refill (review r4).
+        let budget_target = byte_budget.as_ref().map(|b| b.load(Ordering::Relaxed));
 
         // Single-socket UDP server demux (#80): one demux receiver thread serves
         // every receiving stream, so its handle lives outside the per-stream
@@ -412,7 +419,7 @@ impl Server {
                 // runtime so it never processes the client's TestEnd. Only in
                 // duration mode; byte/block-limited tests stop on `done`.
                 let max_duration = (params.num.is_none() && params.blockcount.is_none())
-                    .then(|| std::time::Duration::from_secs(cfg.duration as u64));
+                    .then(|| std::time::Duration::from_secs((cfg.duration + cfg.omit) as u64));
 
                 // Two server UDP designs, same wire protocol. The default Unix
                 // path mirrors iperf3: one connected data socket per stream, all
@@ -533,6 +540,10 @@ impl Server {
                 done.clone(),
                 reporter_end.clone(),
                 want_collector.then(|| interval_data.clone()),
+                byte_budget.clone().zip(budget_target),
+                // The server has no -n/-k end-check driver — the client ends
+                // the test — so it never waits on the boundary signal.
+                None,
             )
         };
 
@@ -590,7 +601,10 @@ impl Server {
         // interval (#55). The reporter prioritises `finish` over `done`, so the
         // final interval still flushes; wait for it before tearing streams down.
         let measured_elapsed = report_start.elapsed().as_secs_f64();
-        reporter_end.finish(measured_elapsed);
+        // The reporter's timeline restarted at the omit boundary (#31), so its
+        // authoritative end time is post-omit; clamp for runs that died inside
+        // the warm-up.
+        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
         done.store(true, Ordering::Relaxed);
         if let Some(handle) = interval_handle {
             let _ = handle.await;
@@ -605,27 +619,38 @@ impl Server {
         // run, exactly `-t` otherwise (#103, mirrors the client). The requested
         // `-t` is reported separately as the test_start `duration` parameter.
         let test_duration = if params.num.is_some() || params.blockcount.is_some() {
-            measured_elapsed
+            // Rebase to the post-omit window (#31): the measured elapsed
+            // includes the warm-up the summary must exclude.
+            (measured_elapsed - cfg.omit as f64).max(0.0)
         } else {
             cfg.duration as f64
         };
 
         for s in &streams {
+            // Net (post-omit) bytes; packets/errors stay GROSS with the
+            // omitted_* baselines alongside, like iperf3's exchange (#31).
             let bytes = if s.is_sender {
-                s.counters.bytes_sent()
+                s.counters.bytes_sent_net()
             } else {
-                s.counters.bytes_received()
+                s.counters.bytes_received_net()
             };
 
-            let (jitter, errors, packets) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                if let Ok(stats) = udp_stats.lock() {
-                    (stats.jitter, stats.cnt_error, stats.packet_count)
+            let (jitter, errors, packets, omitted_errors, omitted_packets) =
+                if let Some(ref udp_stats) = s.udp_recv_stats {
+                    if let Ok(st) = udp_stats.lock() {
+                        (
+                            st.jitter,
+                            st.cnt_error,
+                            st.packet_count,
+                            st.omitted_cnt_error,
+                            st.omitted_packet_count,
+                        )
+                    } else {
+                        (0.0, 0, 0, 0, 0)
+                    }
                 } else {
-                    (0.0, 0, 0)
-                }
-            } else {
-                (0.0, 0, 0)
-            };
+                    (0.0, 0, 0, 0, 0)
+                };
 
             let is_udp_stream = matches!(cfg.protocol, TransportProtocol::Udp);
 
@@ -635,17 +660,21 @@ impl Server {
             // total. The sender task snapshots it into the counters while
             // its socket is still open; by exchange time the socket is
             // closed, so a live fd read here only serves as a fallback for
-            // paths that never reached the snapshot.
+            // paths that never reached the snapshot. With -O the boundary
+            // baseline is subtracted (#171), like iperf3's stream_retrans
+            // after iperf_reset_stats.
             let retransmits =
                 if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                    match s.counters.final_retransmits() {
-                        n if n >= 0 => n,
+                    let lifetime = match s.counters.final_retransmits() {
+                        n if n >= 0 => Some(n),
                         _ => s
                             .raw_fd
                             .and_then(crate::tcp_info::get_tcp_info)
-                            .map(|i| i.total_retransmits as i64)
-                            .unwrap_or(-1),
-                    }
+                            .map(|i| i.total_retransmits as i64),
+                    };
+                    lifetime
+                        .map(|t| s.counters.omit_adjusted_retransmits(t))
+                        .unwrap_or(-1)
                 } else {
                     -1
                 };
@@ -656,9 +685,9 @@ impl Server {
                 retransmits,
                 jitter,
                 errors,
-                omitted_errors: 0,
+                omitted_errors,
                 packets,
-                omitted_packets: 0,
+                omitted_packets,
                 start_time: 0.0,
                 end_time: test_duration,
             });
@@ -1155,15 +1184,24 @@ impl Server {
             .iter()
             .map(|s| {
                 let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
                 let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
                     udp_stats
                         .lock()
-                        .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                        .map(|st| {
+                            // Post-omit stats (#31, review r2 — this was the
+                            // missed third site): gross minus the boundary
+                            // baselines.
+                            (
+                                Some(st.jitter),
+                                Some(st.cnt_error - st.omitted_cnt_error),
+                                Some(st.packet_count - st.omitted_packet_count),
+                            )
+                        })
                         .unwrap_or((None, None, None))
                 } else {
                     (None, None, None)
@@ -1225,18 +1263,19 @@ impl Server {
             .iter()
             .map(|s| {
                 let local_bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
-                // The server measures UDP loss/jitter on the streams it receives.
+                // The server measures UDP loss/jitter on the streams it
+                // receives — post-omit stats (#31): gross minus baselines.
                 let udp = s.udp_recv_stats.as_ref().and_then(|lock| {
                     lock.lock().ok().map(|st| UdpStreamStats {
                         jitter_secs: st.jitter,
-                        lost_packets: st.cnt_error,
-                        packets: st.packet_count,
-                        out_of_order: st.outoforder_packets,
+                        lost_packets: st.cnt_error - st.omitted_cnt_error,
+                        packets: st.packet_count - st.omitted_packet_count,
+                        out_of_order: st.outoforder_packets - st.omitted_outoforder_packets,
                     })
                 });
 

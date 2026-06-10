@@ -414,6 +414,56 @@ impl Default for ReporterEnd {
     }
 }
 
+/// Omit-boundary-crossed signal for the `-n`/`-k` driver (#31, review r3):
+/// the reporter sets it at the END of its boundary block — after the byte
+/// baselines are snapshotted and the budget refilled — so the driver's first
+/// post-warm-up end check runs against consistent net accounting. Gating that
+/// check on a parallel wall clock instead provably opened before the
+/// boundary's re-baselining (race C) and read gross-as-net.
+pub struct OmitBoundary {
+    passed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl OmitBoundary {
+    pub fn new() -> Self {
+        Self {
+            passed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Reporter side: mark the boundary crossed and wake the waiting driver.
+    /// `notify_one` stores a permit, so a driver that starts waiting after
+    /// the boundary fired still wakes immediately. Release pairs with the
+    /// fast path's Acquire so the boundary block's baseline/refill stores are
+    /// visible to a driver that skips the Notify (which synchronizes on its
+    /// own) — review r4.
+    fn cross(&self) {
+        self.passed.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    /// Driver side: wait until the boundary has been crossed. `fallback`
+    /// bounds the wait for liveness if the reporter died before its boundary
+    /// (error paths); the caller then degrades to wall-clock gating.
+    pub async fn crossed(&self, fallback: Duration) {
+        if self.passed.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            _ = self.notify.notified() => {}
+            _ = tokio::time::sleep(fallback) => {}
+        }
+    }
+}
+
+impl Default for OmitBoundary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-direction interval aggregates (#54). In bidir both directions run
 /// concurrently; iperf3 sums each separately (`sum` + `sum_bidir_reverse`).
 #[derive(Default)]
@@ -495,12 +545,15 @@ fn direction_interval_sum(
 /// normal run the driver calls [`ReporterEnd::finish`] to flush the final partial
 /// interval and stop the task; `done` is the fallback stop signal for error/early
 /// teardown paths. The handle should be awaited after `finish`/`done`.
+#[allow(clippy::too_many_arguments)] // reporter wiring, 1:1 with the drivers
 pub fn spawn_interval_reporter(
     config: IntervalReporterConfig,
     streams: Vec<IntervalStreamRef>,
     done: Arc<AtomicBool>,
     reporter_end: Arc<ReporterEnd>,
     collector: Option<Arc<Mutex<CollectedIntervals>>>,
+    byte_budget: Option<(Arc<std::sync::atomic::AtomicI64>, i64)>,
+    boundary_signal: Option<Arc<OmitBoundary>>,
 ) -> Option<JoinHandle<()>> {
     if config.interval_secs < 0.0 {
         return None;
@@ -529,11 +582,17 @@ pub fn spawn_interval_reporter(
 
         let mut interval_num: u64 = 0;
         let mut header_printed = false;
-        let omit_intervals = if config.interval_secs > 0.0 {
-            (config.omit_secs as f64 / config.interval_secs).ceil() as u64
-        } else {
-            0
-        };
+        // `-O/--omit` (#31): a real warm-up phase, like iperf3 — ticks during
+        // it emit `omitted` intervals on a 0..omit timeline, then the boundary
+        // snapshots every counter, the interval timeline restarts at 0, and
+        // the summary covers only the post-omit window.
+        let mut in_warmup = config.omit_secs > 0;
+        let omit_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(config.omit_secs as u64);
+        // Post-omit retransmit baselines: cumulative kernel counts at the
+        // boundary, subtracted from the end-block extremes (iperf3 resets
+        // stream retransmit stats at the omit boundary).
+        let mut omit_retransmits: Vec<u32> = vec![0; streams.len()];
 
         // Per-stream previous values for computing deltas
         let mut prev_retransmits: Vec<u32> = vec![0; streams.len()];
@@ -565,301 +624,366 @@ pub fn spawn_interval_reporter(
         // render and collect identically. Each call drains the per-stream
         // interval counters, reporting exactly the bytes/stats accrued since the
         // previous call.
-        let mut emit_interval = |start: f64, end: f64, omitted: bool| {
-            let seconds = end - start;
+        let mut emit_interval = |start: f64,
+                                 end: f64,
+                                 omitted: bool,
+                                 omit_boundary: bool,
+                                 do_emit: bool| {
+            if do_emit {
+                let seconds = end - start;
 
-            // Timestamp prefix for this tick (text decoration; never on --json-stream)
-            if config.print && !config.json_stream && config.timestamp_format.is_some() {
-                // Use libc strftime for iperf3-compatible timestamp formatting
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let secs = now.as_secs();
-                // Simple ISO-ish format without pulling in chrono
-                let hours = (secs % 86400) / 3600;
-                let mins = (secs % 3600) / 60;
-                let s = secs % 60;
-                print!("{hours:02}:{mins:02}:{s:02} ");
-            }
+                // Timestamp prefix for this tick (text decoration; never on --json-stream)
+                if config.print && !config.json_stream && config.timestamp_format.is_some() {
+                    // Use libc strftime for iperf3-compatible timestamp formatting
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let secs = now.as_secs();
+                    // Simple ISO-ish format without pulling in chrono
+                    let hours = (secs % 86400) / 3600;
+                    let mins = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    print!("{hours:02}:{mins:02}:{s:02} ");
+                }
 
-            // The text header banner is suppressed under --json-stream (pure NDJSON).
-            if config.print && !config.json_stream && !header_printed {
-                print_header(config.protocol, has_retransmits);
-                header_printed = true;
-            }
+                // The text header banner is suppressed under --json-stream (pure NDJSON).
+                if config.print && !config.json_stream && !header_printed {
+                    print_header(config.protocol, has_retransmits);
+                    header_printed = true;
+                }
 
-            // Per-direction aggregates (#54): `fwd` covers streams flowing the
-            // same way as the first stream — the forward (client→server) flow
-            // on both roles, since the client lists its senders first and the
-            // server its receivers — `rev` the opposite. Non-bidir runs leave
-            // `rev` empty.
-            let fwd_is_sender = streams.first().is_none_or(|s| s.is_sender);
-            let mut fwd = DirAcc::default();
-            let mut rev = DirAcc::default();
-            let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
+                // Per-direction aggregates (#54): `fwd` covers streams flowing the
+                // same way as the first stream — the forward (client→server) flow
+                // on both roles, since the client lists its senders first and the
+                // server its receivers — `rev` the opposite. Non-bidir runs leave
+                // `rev` empty.
+                let fwd_is_sender = streams.first().is_none_or(|s| s.is_sender);
+                let mut fwd = DirAcc::default();
+                let mut rev = DirAcc::default();
+                let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
 
-            for (i, stream) in streams.iter().enumerate() {
-                let bytes = if stream.is_sender {
-                    stream.counters.take_sent_interval()
-                } else {
-                    stream.counters.take_received_interval()
-                };
+                for (i, stream) in streams.iter().enumerate() {
+                    let bytes = if stream.is_sender {
+                        stream.counters.take_sent_interval()
+                    } else {
+                        stream.counters.take_received_interval()
+                    };
 
-                // TCP_INFO for the interval detail and the end extremes.
-                let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) = if has_retransmits
-                    && stream.is_sender
-                {
-                    if let Some(fd) = stream.raw_fd {
-                        if let Some(info) = tcp_info::get_tcp_info(fd) {
-                            let delta = info.total_retransmits.saturating_sub(prev_retransmits[i]);
-                            prev_retransmits[i] = info.total_retransmits;
-                            // Accumulate sender-side extremes for the end report.
-                            let e = &mut acc_extremes[i];
-                            e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
-                            e.reorder = e.reorder.max(info.reorder);
-                            if info.rtt > 0 {
-                                e.max_rtt = e.max_rtt.max(info.rtt);
-                                e.min_rtt = e.min_rtt.min(info.rtt);
-                                e.rtt_sum += info.rtt as u64;
-                                e.rtt_samples += 1;
+                    // TCP_INFO for the interval detail and the end extremes.
+                    let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) =
+                        if has_retransmits && stream.is_sender {
+                            if let Some(fd) = stream.raw_fd {
+                                if let Some(info) = tcp_info::get_tcp_info(fd) {
+                                    let delta =
+                                        info.total_retransmits.saturating_sub(prev_retransmits[i]);
+                                    prev_retransmits[i] = info.total_retransmits;
+                                    // Accumulate sender-side extremes for the end report.
+                                    let e = &mut acc_extremes[i];
+                                    e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
+                                    e.reorder = e.reorder.max(info.reorder);
+                                    if info.rtt > 0 {
+                                        e.max_rtt = e.max_rtt.max(info.rtt);
+                                        e.min_rtt = e.min_rtt.min(info.rtt);
+                                        e.rtt_sum += info.rtt as u64;
+                                        e.rtt_samples += 1;
+                                    }
+                                    e.total_retransmits = Some(info.total_retransmits);
+                                    last_tcp[i] = Some(TcpSample {
+                                        snd_cwnd: info.snd_cwnd,
+                                        rtt: info.rtt,
+                                        rttvar: info.rttvar,
+                                        pmtu: info.pmtu,
+                                        reorder: info.reorder,
+                                    });
+                                    (
+                                        Some(delta as i64),
+                                        Some(info.snd_cwnd),
+                                        Some(info.rtt),
+                                        Some(info.rttvar),
+                                        Some(info.pmtu),
+                                        Some(info.reorder),
+                                    )
+                                } else if let Some(s) = last_tcp[i] {
+                                    // Final-interval fallback (#55): the socket closed as
+                                    // the run ended, so a fresh read failed. Reuse the
+                                    // last sample's cwnd/rtt; no new retransmit count is
+                                    // measurable for the sub-interval, so report 0.
+                                    (
+                                        Some(0),
+                                        Some(s.snd_cwnd),
+                                        Some(s.rtt),
+                                        Some(s.rttvar),
+                                        Some(s.pmtu),
+                                        Some(s.reorder),
+                                    )
+                                } else {
+                                    (None, None, None, None, None, None)
+                                }
+                            } else {
+                                (None, None, None, None, None, None)
                             }
-                            e.total_retransmits = Some(info.total_retransmits);
-                            last_tcp[i] = Some(TcpSample {
-                                snd_cwnd: info.snd_cwnd,
-                                rtt: info.rtt,
-                                rttvar: info.rttvar,
-                                pmtu: info.pmtu,
-                                reorder: info.reorder,
-                            });
-                            (
-                                Some(delta as i64),
-                                Some(info.snd_cwnd),
-                                Some(info.rtt),
-                                Some(info.rttvar),
-                                Some(info.pmtu),
-                                Some(info.reorder),
-                            )
-                        } else if let Some(s) = last_tcp[i] {
-                            // Final-interval fallback (#55): the socket closed as
-                            // the run ended, so a fresh read failed. Reuse the
-                            // last sample's cwnd/rtt; no new retransmit count is
-                            // measurable for the sub-interval, so report 0.
-                            (
-                                Some(0),
-                                Some(s.snd_cwnd),
-                                Some(s.rtt),
-                                Some(s.rttvar),
-                                Some(s.pmtu),
-                                Some(s.reorder),
-                            )
                         } else {
                             (None, None, None, None, None, None)
+                        };
+
+                    // UDP stats (compute deltas for loss/packets)
+                    let (jitter, lost, total) = if let Some(ref udp_stats) = stream.udp_recv_stats {
+                        if let Ok(st) = udp_stats.lock() {
+                            let delta_error = st.cnt_error - prev_cnt_error[i];
+                            let delta_packets = st.packet_count - prev_packet_count[i];
+                            prev_cnt_error[i] = st.cnt_error;
+                            prev_packet_count[i] = st.packet_count;
+                            (Some(st.jitter), Some(delta_error), Some(delta_packets))
+                        } else {
+                            (None, None, None)
                         }
                     } else {
-                        (None, None, None, None, None, None)
-                    }
-                } else {
-                    (None, None, None, None, None, None)
-                };
-
-                // UDP stats (compute deltas for loss/packets)
-                let (jitter, lost, total) = if let Some(ref udp_stats) = stream.udp_recv_stats {
-                    if let Ok(st) = udp_stats.lock() {
-                        let delta_error = st.cnt_error - prev_cnt_error[i];
-                        let delta_packets = st.packet_count - prev_packet_count[i];
-                        prev_cnt_error[i] = st.cnt_error;
-                        prev_packet_count[i] = st.packet_count;
-                        (Some(st.jitter), Some(delta_error), Some(delta_packets))
-                    } else {
                         (None, None, None)
+                    };
+
+                    let bps_val = if seconds > 0.0 {
+                        bytes as f64 * 8.0 / seconds
+                    } else {
+                        0.0
+                    };
+
+                    // Text mode prints a per-stream line here. `--json-stream` emits
+                    // one typed `interval` event per tick (assembled after the loop
+                    // from the same typed streams the `-J` collector builds), so it
+                    // has nothing to print per stream.
+                    if config.print && !config.json_stream {
+                        let interval = StreamInterval {
+                            stream_id: stream.id,
+                            start,
+                            end,
+                            bytes,
+                            retransmits,
+                            snd_cwnd,
+                            jitter,
+                            lost,
+                            total_packets: total,
+                            omitted,
+                        };
+                        print_interval(&interval, config.format_char);
                     }
-                } else {
-                    (None, None, None)
-                };
 
-                let bps_val = if seconds > 0.0 {
-                    bytes as f64 * 8.0 / seconds
-                } else {
-                    0.0
-                };
+                    if collecting {
+                        // UDP datagram detail: a receiver stream reports measured
+                        // loss/jitter; a sender stream reports only the sent packet
+                        // count (bytes / datagram size), like iperf3.
+                        let (j_ms, lost_p, pkts, lost_pct) = if stream.udp_recv_stats.is_some() {
+                            (
+                                jitter.map(|j| j * 1000.0),
+                                lost,
+                                total,
+                                match (lost, total) {
+                                    (Some(l), Some(t)) => Some(lost_percent(l, t)),
+                                    _ => None,
+                                },
+                            )
+                        } else if is_udp {
+                            (None, None, Some((bytes / blk) as i64), None)
+                        } else {
+                            (None, None, None, None)
+                        };
+                        collected_streams.push(crate::json_report::IntervalStream {
+                            socket: stream.id,
+                            start,
+                            end,
+                            seconds,
+                            bytes,
+                            bits_per_second: bps_val,
+                            retransmits,
+                            snd_cwnd,
+                            // snd_wnd is unavailable via libc (see TcpStreamSide); emit
+                            // 0 alongside the other TCP detail, like iperf3.
+                            snd_wnd: snd_cwnd.map(|_| 0u64),
+                            rtt,
+                            rttvar,
+                            pmtu,
+                            reorder: reorder_iv,
+                            jitter_ms: j_ms,
+                            lost_packets: lost_p,
+                            packets: pkts,
+                            lost_percent: lost_pct,
+                            omitted,
+                            sender: stream.is_sender,
+                        });
+                    }
 
-                // Text mode prints a per-stream line here. `--json-stream` emits
-                // one typed `interval` event per tick (assembled after the loop
-                // from the same typed streams the `-J` collector builds), so it
-                // has nothing to print per stream.
-                if config.print && !config.json_stream {
-                    let interval = StreamInterval {
-                        stream_id: stream.id,
+                    let acc = if stream.is_sender == fwd_is_sender {
+                        &mut fwd
+                    } else {
+                        &mut rev
+                    };
+                    acc.count += 1;
+                    acc.bytes += bytes;
+                    if let Some(r) = retransmits {
+                        acc.retransmits += r;
+                    }
+                    if stream.udp_recv_stats.is_some() {
+                        acc.udp_recv_count += 1;
+                        if let Some(j) = jitter {
+                            acc.jitter_sum += j;
+                        }
+                    }
+                    if let Some(l) = lost {
+                        acc.lost += l;
+                    }
+                    if let Some(p) = total {
+                        acc.packets += p;
+                    }
+                }
+
+                // Print [SUM] line for parallel streams (text only; the json-stream
+                // `interval` event below carries the typed `sum` instead).
+                if config.print && !config.json_stream && config.num_streams > 1 {
+                    // The text [SUM] stays one combined line (both directions in
+                    // bidir); only the typed -J/json-stream sums split per direction.
+                    // Jitter is the mean across receiving streams (#142).
+                    let sum_jitter = if rev.udp_recv_count > 0 {
+                        rev.jitter_sum / rev.udp_recv_count.max(1) as f64
+                    } else {
+                        fwd.jitter_sum / fwd.udp_recv_count.max(1) as f64
+                    };
+                    let sum_interval = StreamInterval {
+                        stream_id: -1, // renders as "SUM"
                         start,
                         end,
-                        bytes,
-                        retransmits,
-                        snd_cwnd,
-                        jitter,
-                        lost,
-                        total_packets: total,
+                        bytes: fwd.bytes + rev.bytes,
+                        retransmits: if has_retransmits {
+                            Some(fwd.retransmits + rev.retransmits)
+                        } else {
+                            None
+                        },
+                        snd_cwnd: None,
+                        jitter: if is_udp { Some(sum_jitter) } else { None },
+                        lost: if is_udp {
+                            Some(fwd.lost + rev.lost)
+                        } else {
+                            None
+                        },
+                        total_packets: if is_udp {
+                            Some(fwd.packets + rev.packets)
+                        } else {
+                            None
+                        },
                         omitted,
                     };
-                    print_interval(&interval, config.format_char);
+                    print_interval(&sum_interval, config.format_char);
                 }
 
                 if collecting {
-                    // UDP datagram detail: a receiver stream reports measured
-                    // loss/jitter; a sender stream reports only the sent packet
-                    // count (bytes / datagram size), like iperf3.
-                    let (j_ms, lost_p, pkts, lost_pct) = if stream.udp_recv_stats.is_some() {
-                        (
-                            jitter.map(|j| j * 1000.0),
-                            lost,
-                            total,
-                            match (lost, total) {
-                                (Some(l), Some(t)) => Some(lost_percent(l, t)),
-                                _ => None,
-                            },
-                        )
-                    } else if is_udp {
-                        (None, None, Some((bytes / blk) as i64), None)
-                    } else {
-                        (None, None, None, None)
-                    };
-                    collected_streams.push(crate::json_report::IntervalStream {
-                        socket: stream.id,
+                    // #54: iperf3 emits per-direction interval sums in bidir — `sum`
+                    // for the forward flow, `sum_bidir_reverse` for the reverse —
+                    // mirroring the end block's sum_*_bidir_reverse split.
+                    let sum = direction_interval_sum(
                         start,
                         end,
                         seconds,
-                        bytes,
-                        bits_per_second: bps_val,
-                        retransmits,
-                        snd_cwnd,
-                        // snd_wnd is unavailable via libc (see TcpStreamSide); emit
-                        // 0 alongside the other TCP detail, like iperf3.
-                        snd_wnd: snd_cwnd.map(|_| 0u64),
-                        rtt,
-                        rttvar,
-                        pmtu,
-                        reorder: reorder_iv,
-                        jitter_ms: j_ms,
-                        lost_packets: lost_p,
-                        packets: pkts,
-                        lost_percent: lost_pct,
-                        omitted,
-                        sender: stream.is_sender,
-                    });
-                }
-
-                let acc = if stream.is_sender == fwd_is_sender {
-                    &mut fwd
-                } else {
-                    &mut rev
-                };
-                acc.count += 1;
-                acc.bytes += bytes;
-                if let Some(r) = retransmits {
-                    acc.retransmits += r;
-                }
-                if stream.udp_recv_stats.is_some() {
-                    acc.udp_recv_count += 1;
-                    if let Some(j) = jitter {
-                        acc.jitter_sum += j;
-                    }
-                }
-                if let Some(l) = lost {
-                    acc.lost += l;
-                }
-                if let Some(p) = total {
-                    acc.packets += p;
-                }
-            }
-
-            // Print [SUM] line for parallel streams (text only; the json-stream
-            // `interval` event below carries the typed `sum` instead).
-            if config.print && !config.json_stream && config.num_streams > 1 {
-                // The text [SUM] stays one combined line (both directions in
-                // bidir); only the typed -J/json-stream sums split per direction.
-                // Jitter is the mean across receiving streams (#142).
-                let sum_jitter = if rev.udp_recv_count > 0 {
-                    rev.jitter_sum / rev.udp_recv_count.max(1) as f64
-                } else {
-                    fwd.jitter_sum / fwd.udp_recv_count.max(1) as f64
-                };
-                let sum_interval = StreamInterval {
-                    stream_id: -1, // renders as "SUM"
-                    start,
-                    end,
-                    bytes: fwd.bytes + rev.bytes,
-                    retransmits: if has_retransmits {
-                        Some(fwd.retransmits + rev.retransmits)
-                    } else {
-                        None
-                    },
-                    snd_cwnd: None,
-                    jitter: if is_udp { Some(sum_jitter) } else { None },
-                    lost: if is_udp {
-                        Some(fwd.lost + rev.lost)
-                    } else {
-                        None
-                    },
-                    total_packets: if is_udp {
-                        Some(fwd.packets + rev.packets)
-                    } else {
-                        None
-                    },
-                    omitted,
-                };
-                print_interval(&sum_interval, config.format_char);
-            }
-
-            if collecting {
-                // #54: iperf3 emits per-direction interval sums in bidir — `sum`
-                // for the forward flow, `sum_bidir_reverse` for the reverse —
-                // mirroring the end block's sum_*_bidir_reverse split.
-                let sum = direction_interval_sum(
-                    start,
-                    end,
-                    seconds,
-                    &fwd,
-                    fwd_is_sender,
-                    has_retransmits,
-                    is_udp,
-                    blk,
-                    omitted,
-                );
-                let sum_bidir_reverse = (rev.count > 0).then(|| {
-                    direction_interval_sum(
-                        start,
-                        end,
-                        seconds,
-                        &rev,
-                        !fwd_is_sender,
+                        &fwd,
+                        fwd_is_sender,
                         has_retransmits,
                         is_udp,
                         blk,
                         omitted,
-                    )
-                });
-                let interval = crate::json_report::Interval {
-                    streams: collected_streams,
-                    sum,
-                    sum_bidir_reverse,
-                };
-                // `-J` collects intervals for the final batched blob; `--json-stream`
-                // emits each one live as `{"event":"interval","data":{...}}`.
-                if config.json_stream {
-                    println!(
-                        "{}",
-                        crate::json_report::json_stream_event("interval", &interval)
                     );
-                } else {
-                    collected.push(interval);
+                    let sum_bidir_reverse = (rev.count > 0).then(|| {
+                        direction_interval_sum(
+                            start,
+                            end,
+                            seconds,
+                            &rev,
+                            !fwd_is_sender,
+                            has_retransmits,
+                            is_udp,
+                            blk,
+                            omitted,
+                        )
+                    });
+                    let interval = crate::json_report::Interval {
+                        streams: collected_streams,
+                        sum,
+                        sum_bidir_reverse,
+                    };
+                    // `-J` collects intervals for the final batched blob; `--json-stream`
+                    // emits each one live as `{"event":"interval","data":{...}}`.
+                    if config.json_stream {
+                        println!(
+                            "{}",
+                            crate::json_report::json_stream_event("interval", &interval)
+                        );
+                    } else {
+                        collected.push(interval);
+                    }
                 }
-            }
 
-            // Flush after each interval if requested. --json-stream always flushes
-            // so a piped consumer sees each event as it happens (the point of the
-            // streaming format), regardless of --forceflush.
-            if config.print && (config.forceflush || config.json_stream) {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
+                // Flush after each interval if requested. --json-stream always flushes
+                // so a piped consumer sees each event as it happens (the point of the
+                // streaming format), regardless of --forceflush.
+                if config.print && (config.forceflush || config.json_stream) {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            } // do_emit
+
+            // Omit boundary (#31): statistics reset, like iperf3's
+            // iperf_reset_stats — interval counters drained (iperf3 zeroes the
+            // per-interval bytes; the un-tick-aligned warm-up tail is
+            // discarded, not emitted), byte baselines, UDP omitted_* counters
+            // + delta prevs re-synced, a FRESH retransmit sample taken
+            // (iperf3 does save_tcpinfo at reset — the last tick's value may
+            // be stale), and the end-block extremes restart. Lives inside
+            // this closure because prev_*/acc_extremes are its captures.
+            if omit_boundary {
+                // Order is load-bearing (review r3 blocker 3): baselines
+                // FIRST, budget refill second. Refill-first let a sender wake
+                // in the store→snapshot gap, claim post-refill budget, and
+                // record bytes BEFORE the baseline — consumed budget excluded
+                // from net, so net topped out below target and the forward
+                // run hung. Baselines-first is safe: paused senders cannot
+                // record new bytes until the refill lands.
+                for (i, s) in streams.iter().enumerate() {
+                    let _ = s.counters.take_sent_interval();
+                    let _ = s.counters.take_received_interval();
+                    s.counters.snapshot_omit();
+                    if let Some(u) = &s.udp_recv_stats {
+                        if let Ok(mut st) = u.lock() {
+                            st.snapshot_omit();
+                            prev_cnt_error[i] = st.cnt_error;
+                            prev_packet_count[i] = st.packet_count;
+                        }
+                    }
+                    if has_retransmits && s.is_sender {
+                        if let Some(fd) = s.raw_fd {
+                            if let Some(info) = tcp_info::get_tcp_info(fd) {
+                                prev_retransmits[i] = info.total_retransmits;
+                            }
+                        }
+                        // #171: the exchange subtracts this baseline from the
+                        // sender's lifetime total, like iperf3's
+                        // stream_prev_total_retrans at iperf_reset_stats.
+                        s.counters.set_omit_retransmits(prev_retransmits[i] as i64);
+                    }
+                    omit_retransmits[i] = prev_retransmits[i];
+                    acc_extremes[i] = StreamExtremes {
+                        stream_id: s.id,
+                        min_rtt: u32::MAX,
+                        ..Default::default()
+                    };
+                }
+                // -n/-k + -O (#31): refill the shared sender budget at the
+                // boundary, where the byte baselines were just snapshotted,
+                // so the limit and the net accounting share one boundary
+                // instant (review r2).
+                if let Some((b, target)) = &byte_budget {
+                    b.store(*target, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Wake the -n/-k driver LAST: its first post-warm-up check
+                // must observe the baselines and the refill (review r3).
+                if let Some(ob) = &boundary_signal {
+                    ob.cross();
+                }
             }
         };
 
@@ -897,8 +1021,10 @@ pub fn spawn_interval_reporter(
                         })
                         .sum();
                     if end_secs > last_end + 1e-3 && residual_bytes > 0 {
-                        let omitted = (interval_num + 1) <= omit_intervals;
-                        emit_interval(last_end, end_secs, omitted);
+                        // Normal final partial flush; `in_warmup` is only true
+                        // here when the run died before the boundary
+                        // (error/abort path), tagging the flush omitted.
+                        emit_interval(last_end, end_secs, in_warmup, false, true);
                     }
                     break;
                 }
@@ -909,10 +1035,27 @@ pub fn spawn_interval_reporter(
                         break;
                     }
                     interval_num += 1;
-                    let omitted = interval_num <= omit_intervals;
                     let start = (interval_num - 1) as f64 * config.interval_secs;
                     let end = interval_num as f64 * config.interval_secs;
-                    emit_interval(start, end, omitted);
+                    emit_interval(start, end, in_warmup, false, true);
+                }
+                // Omit boundary (#31): ordered AFTER the ticker, matching
+                // iperf3's coincident-timer behavior (its stats timer fires
+                // before the omit timer, so -O 1 -i 1 emits the [0,1] omitted
+                // line from the tick, then resets). iperf3 DISCARDS a warm-up
+                // tail that isn't tick-aligned (stats are zeroed at reset, no
+                // partial emission), so the closure's boundary block drains
+                // and re-baselines without emitting. Its own sleep, so `-i 0`
+                // (year-long ticker) still hits it.
+                _ = tokio::time::sleep_until(omit_deadline), if in_warmup => {
+                    emit_interval(0.0, 0.0, true, true, false);
+                    // The interval timeline restarts at 0 and the ticker is
+                    // re-phased (omit need not be a multiple of -i).
+                    in_warmup = false;
+                    interval_num = 0;
+                    ticker = tokio::time::interval(interval_dur);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ticker.tick().await; // skip the immediate first tick
                 }
             }
         }
@@ -920,9 +1063,14 @@ pub fn spawn_interval_reporter(
         // Hand the collected samples + extremes to the client (#36 PR2).
         if let Some(c) = collector {
             if let Ok(mut g) = c.lock() {
-                for e in acc_extremes.iter_mut() {
+                for (i, e) in acc_extremes.iter_mut().enumerate() {
                     if e.min_rtt == u32::MAX {
                         e.min_rtt = 0;
+                    }
+                    // End-block retransmit totals cover the post-omit window
+                    // only (#31), like iperf3's boundary stats reset.
+                    if let Some(t) = e.total_retransmits {
+                        e.total_retransmits = Some(t.saturating_sub(omit_retransmits[i]));
                     }
                 }
                 g.intervals = collected;
@@ -1289,10 +1437,16 @@ mod interval_reporter_tests {
             print: true,
             blksize: 128 * 1024,
         };
-        assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
-                .is_some()
-        );
+        assert!(spawn_interval_reporter(
+            config,
+            vec![],
+            done,
+            Arc::new(ReporterEnd::new()),
+            None,
+            None,
+            None
+        )
+        .is_some());
     }
 
     #[tokio::test]
@@ -1310,10 +1464,16 @@ mod interval_reporter_tests {
             print: true,
             blksize: 128 * 1024,
         };
-        assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None)
-                .is_none()
-        );
+        assert!(spawn_interval_reporter(
+            config,
+            vec![],
+            done,
+            Arc::new(ReporterEnd::new()),
+            None,
+            None,
+            None
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -1336,6 +1496,8 @@ mod interval_reporter_tests {
             vec![],
             done.clone(),
             Arc::new(ReporterEnd::new()),
+            None,
+            None,
             None,
         );
         assert!(handle.is_some());
@@ -1391,6 +1553,8 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
+            None,
         )
         .expect("reporter spawns for a positive interval");
 
@@ -1472,6 +1636,8 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
+            None,
         )
         .expect("reporter spawns for -i 0 (#107)");
 
@@ -1547,6 +1713,8 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
+            None,
         )
         .expect("reporter spawns for a positive interval");
 
@@ -1619,6 +1787,8 @@ mod interval_reporter_tests {
             done.clone(),
             reporter_end.clone(),
             Some(collector.clone()),
+            None,
+            None,
         )
         .expect("reporter spawns for a positive interval");
 

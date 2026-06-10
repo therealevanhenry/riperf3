@@ -30,12 +30,22 @@ pub struct StreamCounters {
     bytes_received: AtomicU64,
     bytes_sent_interval: AtomicU64,
     bytes_received_interval: AtomicU64,
+    // `-O/--omit` warm-up baselines (#31): cumulative counts at the omit
+    // boundary. The net getters subtract them so summaries cover only the
+    // post-omit window, like iperf3's stats reset in iperf_reset_stats.
+    bytes_sent_omit: AtomicU64,
+    bytes_received_omit: AtomicU64,
     /// #156: the sender's end-of-test retransmit total, snapshotted by the
     /// sender task while its socket is still open. The results exchange runs
     /// after the task has dropped (closed) the socket, so an exchange-time
     /// TCP_INFO read hits a dead fd. -1 = not captured (receiver, UDP, or no
     /// platform support).
     final_retransmits: AtomicI64,
+    /// #171: the cumulative retransmit count at the omit boundary, stored by
+    /// the reporter's boundary block — iperf3's iperf_reset_stats records
+    /// stream_prev_total_retrans the same way, so the exchanged total covers
+    /// the post-omit window only. -1 = no boundary crossed.
+    omit_retransmits: AtomicI64,
 }
 
 impl Default for StreamCounters {
@@ -51,8 +61,36 @@ impl StreamCounters {
             bytes_received: AtomicU64::new(0),
             bytes_sent_interval: AtomicU64::new(0),
             bytes_received_interval: AtomicU64::new(0),
+            bytes_sent_omit: AtomicU64::new(0),
+            bytes_received_omit: AtomicU64::new(0),
             final_retransmits: AtomicI64::new(-1),
+            omit_retransmits: AtomicI64::new(-1),
         }
+    }
+
+    /// Record the omit boundary (#31): cumulative counts so far become the
+    /// warm-up baseline the net getters subtract.
+    pub fn snapshot_omit(&self) {
+        self.bytes_sent_omit
+            .store(self.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.bytes_received_omit.store(
+            self.bytes_received.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Bytes sent since the omit boundary (the whole run when `-O` is unused).
+    pub fn bytes_sent_net(&self) -> u64 {
+        self.bytes_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_sent_omit.load(Ordering::Relaxed))
+    }
+
+    /// Bytes received since the omit boundary (see [`Self::bytes_sent_net`]).
+    pub fn bytes_received_net(&self) -> u64 {
+        self.bytes_received
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.bytes_received_omit.load(Ordering::Relaxed))
     }
 
     /// Store the end-of-test retransmit total (#156; sender task only, while
@@ -64,6 +102,24 @@ impl StreamCounters {
     /// The snapshotted end-of-test retransmit total, or -1 if never captured.
     pub fn final_retransmits(&self) -> i64 {
         self.final_retransmits.load(Ordering::Relaxed)
+    }
+
+    /// Record the omit-boundary retransmit baseline (#171; reporter boundary
+    /// block only).
+    pub fn set_omit_retransmits(&self, n: i64) {
+        self.omit_retransmits.store(n, Ordering::Relaxed);
+    }
+
+    /// Adjust a connection-lifetime retransmit total to the post-omit window
+    /// (#171): subtract the boundary baseline when one was recorded, exactly
+    /// iperf3's stream_retrans accounting after iperf_reset_stats.
+    pub fn omit_adjusted_retransmits(&self, lifetime: i64) -> i64 {
+        let base = self.omit_retransmits.load(Ordering::Relaxed);
+        if base >= 0 {
+            (lifetime - base).max(0)
+        } else {
+            lifetime
+        }
     }
 
     /// Record bytes sent (called from the send loop hot path).
@@ -190,15 +246,11 @@ pub struct UdpRecvStats {
     /// Previous one-way transit time for jitter calculation.
     prev_transit: f64,
 
-    // Snapshots taken at the end of the omit period so we can subtract them.
-    // Test-only today: only `snapshot_omit` (now `#[cfg(test)]`) writes non-zero
-    // values here; in production these stay at their 0 init until `-O/--omit` is
-    // wired into the UDP receive path (#31).
-    #[allow(dead_code)]
+    // Snapshots taken at the omit boundary (#31): the results exchange carries
+    // gross packets/errors plus these omitted_* baselines, and the reading side
+    // subtracts — exactly iperf3's accounting.
     pub omitted_packet_count: i64,
-    #[allow(dead_code)]
     pub omitted_cnt_error: i64,
-    #[allow(dead_code)]
     pub omitted_outoforder_packets: i64,
 }
 
@@ -250,16 +302,14 @@ impl UdpRecvStats {
     }
 
     /// Snapshot current values as the omit-period baseline.
-    /// Call this at the end of the omit period.
-    ///
-    /// Test-only today: `-O/--omit` is not yet wired into the UDP receive path
-    /// (#31), so production never calls this; the unit tests exercise it so the
-    /// omit-accounting fields stay correct for when #31 lands.
-    #[cfg(test)]
+    /// Called by the reporter at the omit boundary (#31).
     pub fn snapshot_omit(&mut self) {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;
         self.omitted_outoforder_packets = self.outoforder_packets;
+        // iperf3's iperf_reset_stats also zeroes the jitter EWMA at the
+        // boundary so warm-up influence doesn't bleed into the measurement.
+        self.jitter = 0.0;
     }
 }
 
@@ -427,11 +477,30 @@ pub async fn run_tcp_sender(
         // stop when it is exhausted, so the sender stops at ~N instead of
         // free-running until the controller's next 100ms poll. The budget is
         // shared across the sending streams — iperf3's `-n` is the test-wide
-        // total, consumed across streams as each sends — so the overshoot is
-        // bounded to ~one block per stream rather than ~100ms of line rate.
+        // total, consumed across streams as each sends. The claim has NO undo:
+        // a fetch_sub + compensating fetch_add could interleave with the omit
+        // boundary's refill store and land the undo on the fresh budget,
+        // leaking a block past the target (review r3). fetch_update claims
+        // only from a positive budget, so only one claim can drive it
+        // non-positive — BUDGET overshoot is bounded to less than one block.
+        // The recorded post-omit net can additionally exceed N by one
+        // in-flight block per sending stream (claimed pre-refill, recorded
+        // post-snapshot), so a paced `-P k` run can land at N + k blocks —
+        // don't pin the 1-block figure in tests (review r4).
         if let Some(b) = &byte_budget {
-            if b.fetch_sub(buf.len() as i64, Ordering::Relaxed) <= 0 {
-                break;
+            let len = buf.len() as i64;
+            if b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v > 0).then_some(v - len)
+            })
+            .is_err()
+            {
+                // iperf3's sender IDLES at the limit instead of exiting (its
+                // mt sender checks bytes_sent >= N per burst, including during
+                // an -O warm-up, and resumes when the boundary resets the
+                // counter). Wait for a refill (#31) or the driver's `done`
+                // (the normal end, set once the post-omit target is reached).
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             }
         }
 

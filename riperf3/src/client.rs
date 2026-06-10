@@ -97,8 +97,11 @@ fn server_receiver_summaries(
             is_sender: false,
             retransmits: None,
             jitter: is_udp.then_some(s.jitter),
-            lost: is_udp.then_some(s.errors),
-            total_packets: is_udp.then_some(s.packets),
+            // The exchange carries GROSS packets/errors plus omitted_*
+            // baselines; subtract for the post-omit summary (#31). This also
+            // reads a real iperf3 server's omit results correctly.
+            lost: is_udp.then_some(s.errors - s.omitted_errors),
+            total_packets: is_udp.then_some(s.packets - s.omitted_packets),
         })
         .collect()
 }
@@ -109,10 +112,19 @@ fn server_receiver_summaries(
 /// bidir whichever direction reaches the limit first ends the test. Counting
 /// only sent bytes leaves a reverse `-n`/`-k` test spinning forever (#60).
 fn transferred_bytes(streams: &[DataStream]) -> u64 {
+    // The two sides are deliberately asymmetric, copying iperf3's test-level
+    // counters (#31, review r3): iperf_reset_stats zeroes test->bytes_sent at
+    // the omit boundary (iperf_api.c:3675) so the SEND side counts post-omit
+    // NET — but it never touches test->bytes_received, so the RECEIVE side
+    // counts GROSS, warm-up included (end check, iperf_client_api.c:771-772).
+    // The asymmetry is load-bearing: gross received is monotonic, so a
+    // reverse/bidir limit cannot race either reporter's boundary baselines
+    // (the pre-r3 net-received check hung when a mistimed baseline swallowed
+    // warm-up bytes).
     let sent: u64 = streams
         .iter()
         .filter(|s| s.is_sender)
-        .map(|s| s.counters.bytes_sent())
+        .map(|s| s.counters.bytes_sent_net())
         .sum();
     let received: u64 = streams
         .iter()
@@ -186,6 +198,7 @@ impl Client {
         // run, read back at DisplayResults for the `-J` blob (#36 PR2).
         let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
         let mut streams: Vec<DataStream> = Vec::new();
+        let mut byte_budget: Option<(Arc<AtomicI64>, i64)> = None;
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
         // Authoritative test duration captured from run_test: `-t` for a duration
@@ -205,7 +218,8 @@ impl Client {
                 }
 
                 TestState::CreateStreams => {
-                    streams = self.create_streams(&cookie, &done, &start, blksize).await?;
+                    (streams, byte_budget) =
+                        self.create_streams(&cookie, &done, &start, blksize).await?;
                 }
 
                 TestState::TestStart => {
@@ -239,7 +253,14 @@ impl Client {
 
                 TestState::TestRunning => {
                     measured_secs = self
-                        .run_test(&mut ctrl, &streams, &done, blksize, interval_data.clone())
+                        .run_test(
+                            &mut ctrl,
+                            &streams,
+                            &done,
+                            blksize,
+                            interval_data.clone(),
+                            byte_budget.as_ref(),
+                        )
                         .await?;
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
@@ -379,7 +400,7 @@ impl Client {
         done: &Arc<AtomicBool>,
         start: &Arc<AtomicBool>,
         blksize: usize,
-    ) -> Result<Vec<DataStream>> {
+    ) -> Result<(Vec<DataStream>, Option<(Arc<AtomicI64>, i64)>)> {
         let mut streams = Vec::new();
 
         // In normal mode: client sends. Reverse: client receives. Bidir: both.
@@ -400,7 +421,7 @@ impl Client {
         // being set by a CPU-starved runtime. Only in duration mode;
         // byte/block-limited tests stop on `done`.
         let max_duration = (self.bytes_to_send.is_none() && self.blocks_to_send.is_none())
-            .then(|| Duration::from_secs(self.duration as u64));
+            .then(|| Duration::from_secs((self.duration + self.omit) as u64));
 
         // `-n`/`-k` shared byte budget for the sending streams: they collectively
         // stop at ~N bytes (iperf3's `-n` is the test-wide total), bounding the
@@ -411,6 +432,13 @@ impl Client {
             && send_count > 0)
             .then(|| stream::make_byte_budget(self.bytes_to_send, self.blocks_to_send, blksize))
             .flatten();
+        // -O + -n/-k (#31): the limit applies to the POST-omit window. The
+        // budget holds gross N from the start — senders PAUSE at it (iperf3's
+        // mt sender idles at the limit, including during warm-up, then
+        // resumes when the boundary resets the counter) — and the REPORTER
+        // refills it at its omit boundary, the same instant the byte
+        // baselines snapshot, so limit and accounting can't skew (review r2).
+        let budget_target = byte_budget.as_ref().map(|b| b.load(Ordering::Relaxed));
 
         match self.protocol {
             TransportProtocol::Tcp => {
@@ -676,9 +704,47 @@ impl Client {
             }
         }
 
-        Ok(streams)
+        Ok((streams, byte_budget.zip(budget_target)))
     }
 
+    /// Wait out a `-n`/`-k` run (#31): iperf3 gates the end-condition check
+    /// on !omitting, so the warm-up never satisfies the limit. The budget
+    /// refill happens in the REPORTER's boundary block (same instant as the
+    /// byte baselines); this poll only waits out the warm-up and then watches
+    /// the net (post-omit) progress. The returned summary window excludes the
+    /// warm-up.
+    async fn wait_byte_limit(
+        &self,
+        streams: &[DataStream],
+        target: u64,
+        report_start: &std::time::Instant,
+        boundary: Option<&Arc<crate::reporter::OmitBoundary>>,
+    ) -> f64 {
+        // With -O the limit applies from the boundary on — iperf3 gates its
+        // end check on `!test->omitting`. Wait on the reporter's boundary
+        // signal, not a parallel wall clock: the wall gate provably opened
+        // before the boundary's re-baselining and read gross-as-net (review
+        // r3, race C). The fallback bounds the wait for liveness if the
+        // reporter died before its boundary fired.
+        if let Some(b) = boundary {
+            let fallback = Duration::from_secs(self.omit as u64 + 2);
+            b.crossed(fallback).await;
+        }
+        // First check BEFORE any sleep: a warm-up that already covered the
+        // gross receive target ends the test AT the boundary, like iperf3
+        // (its select loop re-checks per wake, stopping within ~1 ms of the
+        // omit flip — a 100 ms first poll would leak a poll's worth of line
+        // rate into the post-omit window).
+        loop {
+            if transferred_bytes(streams) >= target {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        (report_start.elapsed().as_secs_f64() - self.omit as f64).max(0.0)
+    }
+
+    #[allow(clippy::too_many_arguments)] // test-drive knobs, 1:1 with run()'s state
     async fn run_test(
         &self,
         ctrl: &mut TcpStream,
@@ -686,6 +752,7 @@ impl Client {
         done: &Arc<AtomicBool>,
         blksize: usize,
         collector: Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        byte_budget: Option<&(Arc<AtomicI64>, i64)>,
     ) -> Result<f64> {
         // Run the interval reporter whenever intervals are enabled. It prints
         // live for text / json-stream; for plain -J it runs silently to collect
@@ -702,6 +769,10 @@ impl Client {
         // before spawning it, so `report_start.elapsed()` at end-of-test is the
         // authoritative final-interval boundary (#55).
         let reporter_end = Arc::new(crate::reporter::ReporterEnd::new());
+        // -O + -n/-k: the reporter signals here when its omit boundary has
+        // fully crossed (baselines snapshotted, budget refilled), gating the
+        // byte-limit driver's first end check (#31, review r3).
+        let omit_boundary = (self.omit > 0).then(|| Arc::new(crate::reporter::OmitBoundary::new()));
         let report_start = std::time::Instant::now();
         // `>= 0.0`: `-i 0` still spawns the reporter, which emits a single
         // whole-test interval rather than none (#107).
@@ -733,6 +804,8 @@ impl Client {
                 done.clone(),
                 reporter_end.clone(),
                 want_collector.then(|| collector.clone()),
+                byte_budget.cloned(),
+                omit_boundary.clone(),
             )
         } else {
             None
@@ -763,9 +836,14 @@ impl Client {
                 // and starve this async timer, so they must not depend on it to
                 // stop (issue #5). Once they self-terminate, CPU frees and this
                 // timer fires normally to drive the rest of the shutdown.
+                // The wall clock runs omit + time (#31): iperf3 extends the
+                // run by the warm-up so the measured window is a full `-t`.
+                // The authoritative end time handed to the reporter stays the
+                // post-omit `-t` (its timeline restarts at the boundary).
+                let wall = dur + Duration::from_secs(self.omit as u64);
                 let mut aborted = false;
                 tokio::select! {
-                    _ = tokio::time::sleep(dur) => {}
+                    _ = tokio::time::sleep(wall) => {}
                     state = protocol::recv_state(ctrl) => {
                         // Server sent something unexpected during the test
                         if let Ok(TestState::ServerTerminate) = state {
@@ -788,23 +866,18 @@ impl Client {
                 dur.as_secs_f64()
             }
             EndCondition::Bytes(target) => {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if transferred_bytes(streams) >= target {
-                        break;
-                    }
-                }
-                report_start.elapsed().as_secs_f64()
+                self.wait_byte_limit(streams, target, &report_start, omit_boundary.as_ref())
+                    .await
             }
             EndCondition::Blocks(target) => {
                 // Block-based: approximate by dividing transferred bytes by blksize.
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if transferred_bytes(streams) / blksize as u64 >= target {
-                        break;
-                    }
-                }
-                report_start.elapsed().as_secs_f64()
+                self.wait_byte_limit(
+                    streams,
+                    target.saturating_mul(blksize as u64),
+                    &report_start,
+                    omit_boundary.as_ref(),
+                )
+                .await
             }
         };
 
@@ -839,20 +912,32 @@ impl Client {
         let stream_results: Vec<_> = streams
             .iter()
             .map(|s| {
+                // Net (post-omit) bytes; packets/errors stay GROSS with the
+                // omitted_* baselines alongside — the reading side subtracts,
+                // exactly iperf3's exchange accounting (#31).
                 let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
-                let (jitter, errors, packets) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                    udp_stats
-                        .lock()
-                        .map(|stats| (stats.jitter, stats.cnt_error, stats.packet_count))
-                        .unwrap_or((0.0, 0, 0))
-                } else {
-                    (0.0, 0, 0)
-                };
+                let (jitter, errors, packets, omitted_errors, omitted_packets) =
+                    if let Some(ref udp_stats) = s.udp_recv_stats {
+                        udp_stats
+                            .lock()
+                            .map(|st| {
+                                (
+                                    st.jitter,
+                                    st.cnt_error,
+                                    st.packet_count,
+                                    st.omitted_cnt_error,
+                                    st.omitted_packet_count,
+                                )
+                            })
+                            .unwrap_or((0.0, 0, 0, 0, 0))
+                    } else {
+                        (0.0, 0, 0, 0, 0)
+                    };
                 let is_udp_stream = self.protocol == TransportProtocol::Udp;
 
                 // #156: when sender_has_retransmits=1, the peer prints this
@@ -861,17 +946,21 @@ impl Client {
                 // total. The sender task snapshots it into the counters while
                 // its socket is still open; by exchange time the socket is
                 // closed, so a live fd read here only serves as a fallback
-                // for paths that never reached the snapshot.
+                // for paths that never reached the snapshot. With -O the
+                // boundary baseline is subtracted (#171), like iperf3's
+                // stream_retrans after iperf_reset_stats.
                 let retransmits =
                     if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                        match s.counters.final_retransmits() {
-                            n if n >= 0 => n,
+                        let lifetime = match s.counters.final_retransmits() {
+                            n if n >= 0 => Some(n),
                             _ => s
                                 .raw_fd
                                 .and_then(crate::tcp_info::get_tcp_info)
-                                .map(|i| i.total_retransmits as i64)
-                                .unwrap_or(-1),
-                        }
+                                .map(|i| i.total_retransmits as i64),
+                        };
+                        lifetime
+                            .map(|t| s.counters.omit_adjusted_retransmits(t))
+                            .unwrap_or(-1)
                     } else {
                         -1
                     };
@@ -882,9 +971,9 @@ impl Client {
                     retransmits,
                     jitter,
                     errors,
-                    omitted_errors: 0,
+                    omitted_errors,
                     packets,
-                    omitted_packets: 0,
+                    omitted_packets,
                     start_time: 0.0,
                     end_time: test_duration,
                 }
@@ -989,15 +1078,22 @@ impl Client {
             .iter()
             .map(|s| {
                 let bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
 
                 let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
                     udp_stats
                         .lock()
-                        .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                        .map(|st| {
+                            // Post-omit stats (#31): gross minus baselines.
+                            (
+                                Some(st.jitter),
+                                Some(st.cnt_error - st.omitted_cnt_error),
+                                Some(st.packet_count - st.omitted_packet_count),
+                            )
+                        })
                         .unwrap_or((None, None, None))
                 } else {
                     (None, None, None)
@@ -1081,9 +1177,9 @@ impl Client {
             .iter()
             .map(|s| {
                 let local_bytes = if s.is_sender {
-                    s.counters.bytes_sent()
+                    s.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received()
+                    s.counters.bytes_received_net()
                 };
                 // The peer's per-stream result is the opposite side of this stream.
                 let server_stream =
@@ -1092,17 +1188,20 @@ impl Client {
                 // UDP datagram stats: from our local receiver if we measured them,
                 // else (forward UDP) from the server's results for this stream (#25).
                 let udp = if let Some(ref lock) = s.udp_recv_stats {
+                    // Local receiver: post-omit stats (#31) — gross counters
+                    // minus the boundary baselines.
                     lock.lock().ok().map(|st| UdpStreamStats {
                         jitter_secs: st.jitter,
-                        lost_packets: st.cnt_error,
-                        packets: st.packet_count,
-                        out_of_order: st.outoforder_packets,
+                        lost_packets: st.cnt_error - st.omitted_cnt_error,
+                        packets: st.packet_count - st.omitted_packet_count,
+                        out_of_order: st.outoforder_packets - st.omitted_outoforder_packets,
                     })
                 } else if is_forward_udp && s.is_sender {
+                    // Peer's gross counts minus its omitted_* baselines (#31).
                     server_stream.map(|x| UdpStreamStats {
                         jitter_secs: x.jitter,
-                        lost_packets: x.errors,
-                        packets: x.packets,
+                        lost_packets: x.errors - x.omitted_errors,
+                        packets: x.packets - x.omitted_packets,
                         out_of_order: 0,
                     })
                 } else {
@@ -1779,6 +1878,32 @@ impl ClientBuilder {
             }
         }
 
+        // iperf3 caps the warm-up at MAX_OMIT_TIME (600 s, iperf.h) with
+        // IEOMIT (#31; review r1 — the cap is 600, not 60).
+        if self.omit > 600 {
+            return Err(ConfigError::InvalidValue(
+                "omit",
+                format!(
+                    "bogus value for --omit (maximum = 600 seconds): {}",
+                    self.omit
+                ),
+            ));
+        }
+
+        // iperf3 rejects -i outside {0} ∪ [MIN_INTERVAL, MAX_INTERVAL] with
+        // IEINTERVAL (iperf_api.c:1261; 0.1/60 in iperf.h). Load-bearing for
+        // -O: the reporter owns the omit boundary, so an out-of-range
+        // interval silently disabling it would silently disable omit
+        // semantics too (#31, review r3).
+        if let Some(i) = self.interval {
+            if i != 0.0 && !(0.1..=60.0).contains(&i) {
+                return Err(ConfigError::InvalidValue(
+                    "interval",
+                    format!("invalid report interval (min = 0.1, max = 60 seconds): {i}"),
+                ));
+            }
+        }
+
         // Reject flags that require OS support not available on this platform.
         // Matches iperf3 behavior: error at build/parse time, not at runtime.
         #[cfg(not(unix))]
@@ -1942,7 +2067,7 @@ mod tests {
         let collector = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
 
         let res = client
-            .run_test(&mut ctrl, &[], &done, 131072, collector.clone())
+            .run_test(&mut ctrl, &[], &done, 131072, collector.clone(), None)
             .await;
         assert!(res.is_err(), "ServerTerminate must abort the test");
         assert_eq!(
@@ -1985,21 +2110,27 @@ mod tests {
         let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         let counters = Arc::new(crate::stream::StreamCounters::new());
         let done = Arc::new(AtomicBool::new(false));
-        // 1 MiB budget: the sender finishes on its own and drops the socket,
-        // exactly like a real run reaching ExchangeResults.
+        // 1 MiB budget. A sender at budget exhaustion IDLES waiting for a
+        // refill or `done` (#31) — it no longer self-terminates — so drive it
+        // like the real run does: wait for the budget to be consumed, then
+        // set `done`. The exit path still snapshots the retransmit total
+        // before the socket drops.
         let budget = Arc::new(AtomicI64::new(1 << 20));
-        crate::stream::run_tcp_sender(
+        let sender = tokio::spawn(crate::stream::run_tcp_sender(
             sock,
             counters.clone(),
             vec![0u8; 131072],
-            done,
+            done.clone(),
             None,
             0,
             1000,
-            Some(budget),
-        )
-        .await
-        .unwrap();
+            Some(budget.clone()),
+        ));
+        while budget.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.await.unwrap().unwrap();
         drain.await.unwrap();
 
         let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
@@ -2028,6 +2159,108 @@ mod tests {
     }
 
     use super::*;
+
+    // #31 (review r3 blocker 1): iperf3's -n/-k end check uses test-level
+    // counters (iperf_client_api.c:771-772) — bytes_sent is zeroed at the
+    // omit boundary by iperf_reset_stats (iperf_api.c:3675) but
+    // test->bytes_received never is, so the receive side counts GROSS,
+    // warm-up included. Counting net on the receive side hangs a reverse
+    // -n -O run whenever a mistimed boundary baseline swallows warm-up bytes.
+    #[tokio::test]
+    async fn byte_limit_counts_received_gross_and_sent_net() {
+        use crate::stream::{DataStream, StreamCounters};
+
+        let sender = Arc::new(StreamCounters::new());
+        sender.record_sent(1_000);
+        sender.snapshot_omit();
+        sender.record_sent(300); // post-omit net: 300
+        let receiver = Arc::new(StreamCounters::new());
+        receiver.record_received(1_000);
+        receiver.snapshot_omit(); // the boundary must NOT hide warm-up receive
+        receiver.record_received(300);
+
+        let mk = |is_sender: bool, counters: Arc<StreamCounters>| DataStream {
+            id: 1,
+            is_sender,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let streams = [mk(true, sender), mk(false, receiver)];
+        assert_eq!(
+            transferred_bytes(&streams),
+            1_300,
+            "received counts gross (1300), sent counts net (300)"
+        );
+        for s in &streams {
+            s.task.abort();
+        }
+    }
+
+    // #171: with -O, the exchanged per-stream retransmit total must cover
+    // the post-omit window only — iperf3's iperf_reset_stats records
+    // stream_prev_total_retrans at the boundary (iperf_api.c:3687-3692) and
+    // stream_retrans accumulates from there. The reporter's boundary block
+    // stores the same baseline into StreamCounters; the exchange subtracts.
+    #[tokio::test]
+    async fn exchange_retransmits_subtract_the_omit_baseline() {
+        use crate::stream::{DataStream, StreamCounters};
+
+        if !crate::tcp_info::has_retransmit_info() {
+            return;
+        }
+
+        let counters = Arc::new(StreamCounters::new());
+        counters.set_omit_retransmits(5); // boundary baseline (warm-up retransmits)
+        counters.set_final_retransmits(8); // connection-lifetime total at exit
+        let ds = DataStream {
+            id: 1,
+            is_sender: true,
+            counters,
+            udp_recv_stats: None,
+            task: tokio::spawn(async { Ok(()) }),
+            raw_fd: None,
+            local_addr: None,
+            peer_addr: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            congestion_used: None,
+        };
+        let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
+        assert_eq!(
+            results.streams[0].retransmits, 3,
+            "#171: warm-up retransmits (5) must be subtracted from the \
+             lifetime total (8)"
+        );
+        ds.task.abort();
+    }
+
+    // iperf3 rejects -i outside {0} ∪ [0.1, 60] with IEINTERVAL
+    // (iperf_api.c:1261, MIN_INTERVAL/MAX_INTERVAL in iperf.h). With -O the
+    // reporter is load-bearing (it owns the omit boundary), so an invalid
+    // interval silently disabling it must be impossible (review r3 nit).
+    #[test]
+    fn client_builder_rejects_out_of_range_interval() {
+        for bad in [-1.0, 0.05, 60.1] {
+            assert!(
+                ClientBuilder::new("h").interval(bad).build().is_err(),
+                "interval {bad} must be rejected"
+            );
+        }
+        for ok in [0.0, 0.1, 1.0, 60.0] {
+            assert!(
+                ClientBuilder::new("h").interval(ok).build().is_ok(),
+                "interval {ok} must be accepted"
+            );
+        }
+    }
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
     // when `Client`'s fields became `pub(crate)` (#43): an external test crate
@@ -2079,6 +2312,18 @@ mod tests {
         fn client_builder_reverse() {
             let c = ClientBuilder::new("h").reverse(true).build().unwrap();
             assert!(c.reverse);
+        }
+
+        #[test]
+        fn omit_cap_matches_iperf3_max_omit_time() {
+            // iperf3's MAX_OMIT_TIME is 600 (iperf.h); -O 600 accepted, 601
+            // rejected with IEOMIT's wording (r1 blocker 4: was capped at 60).
+            assert!(ClientBuilder::new("h").omit(600).build().is_ok());
+            let err = ClientBuilder::new("h").omit(601).build().unwrap_err();
+            assert!(
+                format!("{err}").contains("maximum = 600 seconds"),
+                "IEOMIT wording expected: {err}"
+            );
         }
 
         #[test]
