@@ -4,9 +4,8 @@ pub struct TcpInfoSnapshot {
     /// Cumulative retransmissions over the connection lifetime.
     pub total_retransmits: u32,
     /// Send congestion window in bytes. Linux reports segments, so that
-    /// reader multiplies by mss; macOS reports bytes and is used raw, like
-    /// iperf3. (FreeBSD also reports bytes but its reader still multiplies —
-    /// pre-existing unit bug, #155.)
+    /// reader multiplies by mss; macOS and FreeBSD report bytes and are used
+    /// raw, like iperf3 (#155).
     pub snd_cwnd: u64,
     /// Send window advertised by the receiver, in bytes.
     #[allow(dead_code)]
@@ -188,7 +187,9 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
 
     Some(TcpInfoSnapshot {
         total_retransmits: info.tcpi_snd_rexmitpack,
-        snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,
+        // FreeBSD's tcpi_snd_cwnd is BYTES (tcp_usrreq.c) and iperf3 uses it
+        // raw — the old ×mss inflated the Cwnd column ~mss-fold (#155).
+        snd_cwnd: info.tcpi_snd_cwnd as u64,
         snd_wnd: info.tcpi_snd_wnd as u64,
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,

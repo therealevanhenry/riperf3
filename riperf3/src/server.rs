@@ -649,10 +649,33 @@ impl Server {
                     (0.0, 0, 0, 0, 0)
                 };
 
+            let is_udp_stream = matches!(cfg.protocol, TransportProtocol::Udp);
+
+            // #156: when sender_has_retransmits=1, the peer prints this
+            // value (iperf3 get_results stores it into stream_retrans and
+            // the summary renders it) — it must be the REAL end-of-test
+            // total. The sender task snapshots it into the counters while
+            // its socket is still open; by exchange time the socket is
+            // closed, so a live fd read here only serves as a fallback for
+            // paths that never reached the snapshot.
+            let retransmits =
+                if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
+                    match s.counters.final_retransmits() {
+                        n if n >= 0 => n,
+                        _ => s
+                            .raw_fd
+                            .and_then(crate::tcp_info::get_tcp_info)
+                            .map(|i| i.total_retransmits as i64)
+                            .unwrap_or(-1),
+                    }
+                } else {
+                    -1
+                };
+
             result_streams.push(protocol::StreamResultJson {
                 id: s.id,
                 bytes,
-                retransmits: -1,
+                retransmits,
                 jitter,
                 errors,
                 omitted_errors,
@@ -697,8 +720,13 @@ impl Server {
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
+            // #156: 1 when this side is a retransmit-capable TCP sender
+            // (reverse/bidir), like iperf3's check_sender_has_retransmits.
             sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
-                0
+                i64::from(
+                    matches!(cfg.protocol, TransportProtocol::Tcp)
+                        && crate::tcp_info::has_retransmit_info(),
+                )
             } else {
                 -1
             },
