@@ -633,8 +633,13 @@ impl Server {
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
+            // #156: 1 when this side is a retransmit-capable TCP sender
+            // (reverse/bidir), like iperf3's check_sender_has_retransmits.
             sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
-                0
+                i64::from(
+                    matches!(cfg.protocol, TransportProtocol::Tcp)
+                        && crate::tcp_info::has_retransmit_info(),
+                )
             } else {
                 -1
             },

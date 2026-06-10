@@ -188,7 +188,9 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
 
     Some(TcpInfoSnapshot {
         total_retransmits: info.tcpi_snd_rexmitpack,
-        snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,
+        // FreeBSD's tcpi_snd_cwnd is BYTES (tcp_usrreq.c) and iperf3 uses it
+        // raw — the old ×mss inflated the Cwnd column ~mss-fold (#155).
+        snd_cwnd: info.tcpi_snd_cwnd as u64,
         snd_wnd: info.tcpi_snd_wnd as u64,
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,

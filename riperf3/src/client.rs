@@ -754,14 +754,27 @@ impl Client {
                 // and starve this async timer, so they must not depend on it to
                 // stop (issue #5). Once they self-terminate, CPU frees and this
                 // timer fires normally to drive the rest of the shutdown.
+                let mut aborted = false;
                 tokio::select! {
                     _ = tokio::time::sleep(dur) => {}
                     state = protocol::recv_state(ctrl) => {
                         // Server sent something unexpected during the test
                         if let Ok(TestState::ServerTerminate) = state {
-                            return Err(RiperfError::Aborted("server terminated".into()));
+                            aborted = true;
                         }
                     }
+                }
+                if aborted {
+                    // #147: stop the senders and the reporter BEFORE
+                    // propagating — the early return leaked a forever-ticking
+                    // reporter task (and running senders) into a library
+                    // consumer's runtime.
+                    reporter_end.finish(report_start.elapsed().as_secs_f64());
+                    done.store(true, Ordering::Relaxed);
+                    if let Some(handle) = interval_handle {
+                        let _ = handle.await;
+                    }
+                    return Err(RiperfError::Aborted("server terminated".into()));
                 }
                 dur.as_secs_f64()
             }
@@ -851,8 +864,15 @@ impl Client {
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
+            // #156: iperf3 sends 1 when this side is a retransmit-capable TCP
+            // sender (check_sender_has_retransmits) — the PEER gates display
+            // of our Retr column on it; 0 suppressed it cross-tool even where
+            // riperf3 measures retransmits.
             sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
-                0
+                i64::from(
+                    self.protocol == TransportProtocol::Tcp
+                        && crate::tcp_info::has_retransmit_info(),
+                )
             } else {
                 -1
             },
@@ -2245,5 +2265,86 @@ mod client_run_return_value {
         }
 
         let _ = server_task.await;
+    }
+
+    /// #147: a mid-test `ServerTerminate` made `run_test` return without
+    /// stopping the reporter or the senders (`done` was never set on that
+    /// early-return path) — for a library consumer the run's tasks leaked and
+    /// kept sending. Drive a mock through the full handshake, terminate
+    /// mid-test, and assert the data flow STOPS once `run()` has returned.
+    #[tokio::test]
+    async fn server_terminate_stops_senders_and_reporter() {
+        use crate::protocol::{self, TestState};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let drained = Arc::new(AtomicU64::new(0));
+        let drained_srv = drained.clone();
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            let (mut ctrl, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            ctrl.read_exact(&mut cookie).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::ParamExchange)
+                .await
+                .unwrap();
+            let _params = protocol::recv_params(&mut ctrl).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::CreateStreams)
+                .await
+                .unwrap();
+            let (mut data, _) = listener.accept().await.unwrap();
+            let mut dcookie = [0u8; 37];
+            data.read_exact(&mut dcookie).await.unwrap();
+            protocol::send_state(&mut ctrl, TestState::TestStart)
+                .await
+                .unwrap();
+            protocol::send_state(&mut ctrl, TestState::TestRunning)
+                .await
+                .unwrap();
+            // Let the test run briefly, then terminate mid-test.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            protocol::send_state(&mut ctrl, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Wait until run() has returned, then measure post-abort flow.
+            let _ = err_rx.await;
+            let mut buf = vec![0u8; 64 * 1024];
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+            loop {
+                tokio::select! {
+                    r = data.read(&mut buf) => match r {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { drained_srv.fetch_add(n as u64, Ordering::Relaxed); }
+                    },
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        });
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(10)
+            .build()
+            .unwrap();
+        let err = client.run().await.expect_err("expected Aborted");
+        assert!(
+            matches!(err, RiperfError::Aborted(_)),
+            "expected Aborted, got {err:?}"
+        );
+        // Kernel socket buffers legitimately hold a few MB in flight on
+        // loopback; the LEAK signature is continued line-rate production
+        // (hundreds of MB over the 800 ms drain window). 64 MB cleanly
+        // separates the two: pre-fix this reads GBs, post-fix single-digit MB.
+        let _ = err_tx.send(());
+        let _ = server_task.await;
+        let post = drained.load(Ordering::Relaxed);
+        assert!(
+            post <= 64 * 1024 * 1024,
+            "senders still producing after run() returned (#147 leak): {post} bytes post-abort"
+        );
     }
 }
