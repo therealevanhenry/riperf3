@@ -322,13 +322,16 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
 /// Print the column header iperf3 reprints above the final (end-block)
 /// summaries (#184) — like the interval header, but TCP drops the `Cwnd`
 /// column (per-stream cwnd is an interval-only figure) and bidir adds the
-/// `[Role]` column.
-pub fn print_final_header(protocol: TransportProtocol, with_role: bool) {
+/// `[Role]` column. `with_retr` gates the TCP `Retr` column on retransmit info
+/// actually being available (iperf3 omits it on Windows / for a peer without
+/// it), mirroring the interval header's `has_retransmits`.
+pub fn print_final_header(protocol: TransportProtocol, with_role: bool, with_retr: bool) {
     let role = if with_role { "[Role]" } else { "" };
     match protocol {
         TransportProtocol::Tcp => {
+            let retr = if with_retr { "         Retr" } else { "" };
             titled(format_args!(
-                "[ ID]{role} Interval           Transfer     Bitrate         Retr"
+                "[ ID]{role} Interval           Transfer     Bitrate{retr}"
             ));
         }
         TransportProtocol::Udp => {

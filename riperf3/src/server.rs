@@ -656,39 +656,16 @@ impl Server {
                     // sent bytes, keeping the gross+baseline convention (#184
                     // — a zero here made an iperf3 client print `0/0` for a
                     // riperf3 server's reverse stream).
-                    let gross = (s.counters.bytes_sent() / cfg.blksize as u64) as i64;
-                    let net = (bytes / cfg.blksize as u64) as i64;
+                    let blk = cfg.blksize.max(1) as u64;
+                    let gross = (s.counters.bytes_sent() / blk) as i64;
+                    let net = (bytes / blk) as i64;
                     (0.0, 0, gross, 0, gross - net)
                 } else {
                     (0.0, 0, 0, 0, 0)
                 };
 
             let is_udp_stream = matches!(cfg.protocol, TransportProtocol::Udp);
-
-            // #156: when sender_has_retransmits=1, the peer prints this
-            // value (iperf3 get_results stores it into stream_retrans and
-            // the summary renders it) — it must be the REAL end-of-test
-            // total. The sender task snapshots it into the counters while
-            // its socket is still open; by exchange time the socket is
-            // closed, so a live fd read here only serves as a fallback for
-            // paths that never reached the snapshot. With -O the boundary
-            // baseline is subtracted (#171), like iperf3's stream_retrans
-            // after iperf_reset_stats.
-            let retransmits =
-                if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
-                    let lifetime = match s.counters.final_retransmits() {
-                        n if n >= 0 => Some(n),
-                        _ => s
-                            .raw_fd
-                            .and_then(crate::tcp_info::get_tcp_info)
-                            .map(|i| i.total_retransmits as i64),
-                    };
-                    lifetime
-                        .map(|t| s.counters.omit_adjusted_retransmits(t))
-                        .unwrap_or(-1)
-                } else {
-                    -1
-                };
+            let retransmits = s.sender_retransmits(is_udp_stream).unwrap_or(-1);
 
             result_streams.push(protocol::StreamResultJson {
                 id: s.id,
@@ -712,8 +689,9 @@ impl Server {
         let mut prebuilt_report: Option<crate::json_report::Report> = None;
         let (server_output_text, server_output_json) = if let Some(capture) = capture {
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
+            let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
-            crate::reporter::print_final_header(cfg.protocol, cfg.bidir);
+            crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
             (Some(capture.take()), None)
         } else if want_server_output && self.json_output {
@@ -818,8 +796,9 @@ impl Server {
             // prints at TEST_END, before its exchange), so printing here again
             // would duplicate the lines.
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
+            let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
-            crate::reporter::print_final_header(cfg.protocol, cfg.bidir);
+            crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
         }
 
@@ -1245,7 +1224,7 @@ impl Server {
                     (
                         Some(0.0),
                         Some(0),
-                        Some((bytes / cfg.blksize as u64) as i64),
+                        Some((bytes / cfg.blksize.max(1) as u64) as i64),
                     )
                 } else {
                     (None, None, None)
@@ -1257,7 +1236,8 @@ impl Server {
                     end: test_duration,
                     bytes,
                     is_sender: s.is_sender,
-                    retransmits: None,
+                    // TCP sender lines carry the retransmit total (#184).
+                    retransmits: s.sender_retransmits(is_udp),
                     jitter,
                     lost,
                     total_packets: total,

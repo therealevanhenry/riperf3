@@ -137,6 +137,52 @@ fn udp_forward_sender_line_carries_sent_total() {
     );
 }
 
+/// TCP reverse: the client's lone receiving stream pairs with the server's
+/// sender line (its bytes + Retr from the exchange), exercising the `!is_udp`
+/// peer-sender branch that UDP reverse does not.
+#[test]
+fn tcp_reverse_end_block_pairs_with_server_sender() {
+    let port = common::free_port().to_string();
+    let mut server = spawn_server(&port);
+    let out = run(&port, &["-R", "-t", "1"]);
+    let _ = server.0.wait();
+
+    let end = end_block(&out);
+    assert!(
+        end.iter().any(|l| l.ends_with("sender")),
+        "TCP reverse end block must include the server's sender line: {out}"
+    );
+    assert!(
+        end.iter().any(|l| l.ends_with("receiver")),
+        "and the local receiver line: {out}"
+    );
+}
+
+/// `-P 2 -u --bidir`: four streams, four pairs, and exactly four direction-pure
+/// `[SUM]` rows — one per (role, line-direction) group — never a SUM mixing the
+/// two directions (the sum_summaries role grouping, #184).
+#[test]
+fn udp_parallel_bidir_sums_are_direction_pure() {
+    let port = common::free_port().to_string();
+    let mut server = spawn_server(&port);
+    let out = run(&port, &["-u", "--bidir", "-P", "2", "-t", "1"]);
+    let _ = server.0.wait();
+
+    let end = end_block(&out);
+    let sums: Vec<&&str> = end.iter().filter(|l| l.contains("SUM")).collect();
+    assert_eq!(
+        sums.len(),
+        4,
+        "P=2 bidir yields 4 SUM rows (TX-C sender+receiver, RX-C sender+receiver): {out}"
+    );
+    for s in &sums {
+        assert!(
+            s.contains("TX-C") || s.contains("RX-C"),
+            "every bidir SUM carries one direction's role tag: {s}"
+        );
+    }
+}
+
 /// TCP bidir: pairs too — Retr on sender lines only, no [SUM] at P=1, role tags.
 #[test]
 fn tcp_bidir_end_block_pairs_each_stream() {
