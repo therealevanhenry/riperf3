@@ -68,12 +68,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Err("daemon mode is not supported on this platform".into());
     }
 
-    // Write the PID file (after daemonizing, so it records the daemon child's
-    // pid — the long-lived server — not the foreground process that forked away).
-    if let Some(ref path) = cli.pidfile {
-        std::fs::write(path, format!("{}\n", std::process::id()))?;
-    }
-
     // Redirect stdout to logfile if requested. Must run after daemonizing so the
     // redirect isn't clobbered by daemon()'s stdout->/dev/null.
     if let Some(ref path) = cli.logfile {
@@ -109,10 +103,97 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async_main(cli))
+    // Install the termination-signal handlers BEFORE writing the pidfile,
+    // matching iperf3's run() order (iperf_catch_sigend first, create_pidfile
+    // after): once the pidfile exists, a SIGTERM is guaranteed to take the
+    // clean unlink path — there is no startup window where it gets default
+    // disposition and strands a fresh pidfile (#105 review). Stream creation
+    // registers the OS sigactions immediately; it needs the runtime context.
+    #[cfg(unix)]
+    let mut sigend = Sigend::install(&rt).map_err(|e| format!("signal handler setup: {e}"))?;
+
+    // Write the PID file LAST before entering the runtime: after daemonizing
+    // (it must record the daemon child's pid), after the logfile/affinity
+    // fallible setup (their `?` exits can no longer leak a fresh pidfile),
+    // and after the signal handlers above.
+    if let Some(ref path) = cli.pidfile {
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+    }
+
+    // The pidfile must be unlinked on EVERY exit path — normal completion,
+    // error, or termination signal — like iperf3, which deletes it after the
+    // server/client loop and in its sigend path (#105). One cleanup point,
+    // after the runtime returns.
+    let pidfile = cli.pidfile.clone();
+    let is_server = cli.server;
+    #[cfg(unix)]
+    let outcome = rt.block_on(async {
+        tokio::select! {
+            r = async_main(cli) => r,
+            sig = sigend.recv() => Ok(Exit::Signal(sig)),
+        }
+    });
+    #[cfg(not(unix))]
+    let outcome = rt.block_on(async_main(cli));
+    if let Some(ref path) = pidfile {
+        let _ = std::fs::remove_file(path);
+    }
+    match outcome {
+        // iperf3 treats SIGTERM/SIGINT/SIGHUP as a NORMAL exit
+        // (iperf_got_sigend → iperf_signormalexit → exit 0), printing an
+        // interrupt notice first.
+        Ok(Exit::Signal(sig)) => {
+            let role = if is_server { "server" } else { "client" };
+            eprintln!("riperf3: interrupt - the {role} has terminated by signal {sig}");
+            Ok(())
+        }
+        Ok(Exit::Normal) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
-async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
+/// How the async role future ended: normally, or cut short by a termination
+/// signal (which iperf3 reports and treats as a clean exit — see `main`).
+enum Exit {
+    Normal,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Signal(&'static str),
+}
+
+/// The termination-signal set iperf3 catches in `iperf_catch_sigend`
+/// (SIGTERM/SIGINT/SIGHUP). The streams are created — and the OS sigactions
+/// registered — in `install`, so handler installation can be ordered before
+/// pidfile creation; `recv` resolves with iperf3's `strsignal(sig)(num)`
+/// rendering for the interrupt notice.
+#[cfg(unix)]
+struct Sigend {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Sigend {
+    fn install(rt: &tokio::runtime::Runtime) -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        let _guard = rt.enter();
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "Terminated(15)",
+            _ = self.int.recv() => "Interrupt(2)",
+            _ = self.hup.recv() => "Hangup(1)",
+        }
+    }
+}
+
+async fn async_main(cli: Cli) -> std::result::Result<Exit, Box<dyn std::error::Error>> {
     if cli.client.is_some() {
         // Client mode. Client-only options on a server and server-only options
         // on a client are both rejected up front in `main` (#65/#100), before
@@ -126,8 +207,7 @@ async fn async_main(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Err
     } else {
         eprintln!("No mode specified. Use -s for server or -c <host> for client.");
     }
-
-    Ok(())
+    Ok(Exit::Normal)
 }
 
 fn configure_log4rs(verbosity: u8) {

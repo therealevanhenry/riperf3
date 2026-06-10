@@ -202,7 +202,9 @@ pub struct Cli {
     pub cport: Option<u16>,
 
     /// Set the server timing for pacing in microseconds (deprecated)
-    #[arg(long, value_name = "usec")]
+    // Capped at i32::MAX: the wire TestParams field is i32 (a larger u32
+    // would wrap negative on the wire — review r1).
+    #[arg(long, value_name = "usec", value_parser = clap::value_parser!(u32).range(..=i32::MAX as i64))]
     pub pacing_timer: Option<u32>,
 
     /// Only use IPv4
@@ -484,6 +486,9 @@ impl Cli {
         }
         if let Some(t) = self.time {
             builder = builder.duration(t);
+        }
+        if let Some(us) = self.pacing_timer {
+            builder = builder.pacing_timer(us);
         }
         if let Some(ref s) = self.bytes {
             builder = builder.bytes_str(s)?;
@@ -1628,6 +1633,14 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-n", "0"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").build().unwrap());
+        }
+
+        // #32: --pacing-timer was parsed but never wired — a silent no-op.
+        #[test]
+        fn pacing_timer_wired() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "500"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").pacing_timer(500).build().unwrap());
         }
 
         #[test]
