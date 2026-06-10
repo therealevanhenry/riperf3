@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod common;
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -25,16 +27,6 @@ fn free_port() -> u16 {
         .expect("local_addr")
         .port()
 }
-
-/// How long to wait for a freshly spawned `-s` server to bind its control
-/// listener before connecting a client. 300 ms intermittently lost the race on a
-/// loaded Windows CI runner — these three tests each spawn a server concurrently,
-/// and a client that connected first got an empty stream ("no events", a #62 test
-/// flake). The server normally binds in well under this; 2 s is ample headroom.
-/// (A connect poll would be tighter, but a probe connection consumes the `-1`
-/// one-off server, and a bind probe is unreliable under the listener's
-/// `SO_REUSEADDR` on Windows — so a generous fixed margin is the robust choice.)
-const SERVER_BIND_WAIT: Duration = Duration::from_secs(2);
 
 /// Assert `stdout` is a valid `--json-stream` document: every non-empty line is a
 /// JSON object with `event` + `data`, and the events run `start`, one or more
@@ -132,11 +124,22 @@ fn run_capturing(args: &[&str], timeout: Duration, who: &str) -> String {
     let mut child = Command::new(bin)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
 
-    wait_bounded(&mut child, timeout, who);
+    let status = wait_bounded(&mut child, timeout, who);
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(
+        status.success(),
+        "{who}: exited unsuccessfully ({status}); stderr: {err}"
+    );
     let mut out = String::new();
     child
         .stdout
@@ -161,7 +164,7 @@ fn client_json_stream_tcp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
+    common::wait_port_listening(port);
 
     let out = run_capturing(
         &[
@@ -196,7 +199,7 @@ fn client_json_stream_udp_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
+    common::wait_port_listening(port);
 
     let out = run_capturing(
         &[
@@ -235,7 +238,7 @@ fn server_json_stream_is_valid_ndjson() {
             .spawn()
             .expect("spawn server"),
     );
-    std::thread::sleep(SERVER_BIND_WAIT);
+    common::wait_port_listening(port);
 
     // Drive one test, bounded so a non-serving server can't hang the suite.
     let mut client = Command::new(bin)
