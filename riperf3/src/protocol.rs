@@ -359,6 +359,14 @@ pub struct TestResultsJson {
     pub sender_has_retransmits: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub congestion_used: Option<String>,
+    // --get-server-output (#33): the server's console output (text mode) or
+    // its full -J report (JSON mode), attached to the exchange exactly like
+    // iperf3's server_output_text / server_output_json. `default` keeps blobs
+    // from peers without the keys (incl. iperf3 without the flag) decoding.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub server_output_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub server_output_json: Option<serde_json::Value>,
     pub streams: Vec<StreamResultJson>,
 }
 
@@ -639,6 +647,8 @@ mod tests {
             cpu_util_system: 0.5,
             sender_has_retransmits: -1,
             congestion_used: Some("cubic".to_string()),
+            server_output_text: None,
+            server_output_json: None,
             streams: vec![StreamResultJson {
                 id: 5,
                 bytes: 1_000_000,
@@ -689,6 +699,8 @@ mod tests {
             cpu_util_system: 0.0,
             sender_has_retransmits: -1,
             congestion_used: None,
+            server_output_text: None,
+            server_output_json: None,
             streams: vec![StreamResultJson {
                 id: 1,
                 bytes: 0,
@@ -1034,6 +1046,8 @@ mod protocol_tests {
         let addr = listener.local_addr().unwrap();
 
         let results = TestResultsJson {
+            server_output_text: None,
+            server_output_json: None,
             cpu_util_total: 42.5,
             cpu_util_user: 30.0,
             cpu_util_system: 12.5,
@@ -1177,6 +1191,8 @@ mod protocol_tests {
     #[test]
     fn test_results_json_structure() {
         let r = TestResultsJson {
+            server_output_text: None,
+            server_output_json: None,
             cpu_util_total: 50.0,
             cpu_util_user: 40.0,
             cpu_util_system: 10.0,

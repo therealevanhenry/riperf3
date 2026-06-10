@@ -23,6 +23,7 @@ pub(crate) struct TestConfig {
     pub mss: Option<i32>,
     pub window: Option<i32>,
     pub bandwidth: u64,
+    pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
     pub udp_counters_64bit: bool,
@@ -63,6 +64,13 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
+            // The client's --pacing-timer quantum (#32); iperf3 always sends
+            // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
+            pacing_timer: params
+                .pacing_timer
+                .filter(|&us| us > 0)
+                .map(|us| us as u32)
+                .unwrap_or(crate::utils::DEFAULT_PACING_TIMER_US),
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
@@ -212,6 +220,17 @@ impl Server {
         // as byte-limited (#119).
         params.normalize_unlimited();
         let cfg = TestConfig::from_params(&params);
+        // --get-server-output (#33): when the client asks and this server is
+        // in text mode, TEE the console report into the exchange buffer
+        // (iperf3's iperf_printf dual-write — the console stays live).
+        // JSON-mode servers attach their full report instead (built
+        // pre-exchange below).
+        let want_server_output = params.get_server_output == Some(1);
+        // --json-stream x get-server-output divergences are tracked in #168
+        // (iperf3's streaming server DOES attach; its streaming client emits a
+        // server_output event).
+        let capture = (want_server_output && !self.json_output && !self.json_stream)
+            .then(crate::macros::OutputCaptureGuard::start);
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -320,7 +339,10 @@ impl Server {
                         cfg.congestion.as_deref(),
                     )?;
                     if cfg.tos != 0 {
-                        let _ = net::set_tos(&data_stream, cfg.tos as u32);
+                        // Fatal like every other set_tos site (#45): iperf3's
+                        // iperf_common_sockopts errors (IESETTOS) when IP_TOS
+                        // can't be applied, on both roles and both protocols.
+                        net::set_tos(&data_stream, cfg.tos as u32)?;
                     }
 
                     let stream_id = iperf3_stream_id(i);
@@ -353,11 +375,13 @@ impl Server {
                         let c = counters.clone();
                         let d = done.clone();
                         // `-b` paces the sender in reverse/bidir too (negotiated
-                        // rate; 0 = unlimited). #102
+                        // rate; 0 = unlimited), on the client's pacing-timer
+                        // quantum. #102/#32
                         let rate = cfg.bandwidth;
+                        let pt = cfg.pacing_timer;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, bb).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb).await
                         })
                     } else {
                         let c = counters.clone();
@@ -638,6 +662,34 @@ impl Server {
 
         // ---- ExchangeResults ----
         let cpu_util = cpu_end.utilization_since(&cpu_start);
+        // --get-server-output (#33): finish the diverted text (render the final
+        // summaries into the capture first, so the client sees the complete
+        // report), or attach the full -J report for a JSON-mode server.
+        let mut prebuilt_report: Option<crate::json_report::Report> = None;
+        let (server_output_text, server_output_json) = if let Some(capture) = capture {
+            let summaries = Self::text_summaries(&streams, test_duration);
+            crate::reporter::print_final_summaries(&summaries, 'a');
+            (Some(capture.take()), None)
+        } else if want_server_output && self.json_output {
+            let report = self.build_report(
+                &streams,
+                &cfg,
+                &params,
+                &cpu_util,
+                test_duration,
+                &cookie,
+                &accepted_host,
+                accepted_port,
+                test_start_millis,
+                &interval_data,
+            );
+            let value = serde_json::to_value(&report).ok();
+            prebuilt_report = Some(report);
+            (None, value)
+        } else {
+            (None, None)
+        };
+        let was_captured = server_output_text.is_some();
         let server_results = TestResultsJson {
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
@@ -650,6 +702,8 @@ impl Server {
             // #37: the congestion algorithm actually in effect (read back at stream
             // creation); None for UDP / unsupported platforms.
             congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
+            server_output_text,
+            server_output_json,
             streams: result_streams,
         };
 
@@ -674,19 +728,23 @@ impl Server {
         }
 
         if self.json_output {
-            // Emit the iperf3-schema JSON report on stdout (#50).
-            self.print_results_json(
-                &streams,
-                &cfg,
-                &params,
-                &cpu_util,
-                test_duration,
-                &cookie,
-                &accepted_host,
-                accepted_port,
-                test_start_millis,
-                &interval_data,
-            );
+            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
+            // pre-exchange build when --get-server-output attached it (#33).
+            let report = prebuilt_report.unwrap_or_else(|| {
+                self.build_report(
+                    &streams,
+                    &cfg,
+                    &params,
+                    &cpu_util,
+                    test_duration,
+                    &cookie,
+                    &accepted_host,
+                    accepted_port,
+                    test_start_millis,
+                    &interval_data,
+                )
+            });
+            self.print_results_json(&report);
         } else if self.json_stream {
             // --json-stream: emit the `end` event (intervals already streamed; #62).
             self.emit_json_stream_end(
@@ -701,49 +759,14 @@ impl Server {
                 test_start_millis,
                 &interval_data,
             );
-        } else {
+        } else if !was_captured {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
-            let summaries: Vec<crate::reporter::StreamSummary> = streams
-                .iter()
-                .map(|s| {
-                    let bytes = if s.is_sender {
-                        s.counters.bytes_sent_net()
-                    } else {
-                        s.counters.bytes_received_net()
-                    };
-
-                    let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
-                        udp_stats
-                            .lock()
-                            .map(|st| {
-                                // Post-omit stats (#31, review r2 — this was
-                                // the missed third site): gross minus the
-                                // boundary baselines.
-                                (
-                                    Some(st.jitter),
-                                    Some(st.cnt_error - st.omitted_cnt_error),
-                                    Some(st.packet_count - st.omitted_packet_count),
-                                )
-                            })
-                            .unwrap_or((None, None, None))
-                    } else {
-                        (None, None, None)
-                    };
-
-                    crate::reporter::StreamSummary {
-                        stream_id: s.id,
-                        start: 0.0,
-                        end: test_duration,
-                        bytes,
-                        is_sender: s.is_sender,
-                        retransmits: None,
-                        jitter,
-                        lost,
-                        total_packets: total,
-                    }
-                })
-                .collect();
+            // Skipped when --get-server-output already rendered them (#33):
+            // the pre-exchange render TEE'd to console + capture (iperf3 also
+            // prints at TEST_END, before its exchange), so printing here again
+            // would duplicate the lines.
+            let summaries = Self::text_summaries(&streams, test_duration);
             crate::reporter::print_final_summaries(&summaries, 'a');
         }
 
@@ -1113,14 +1136,61 @@ impl Server {
         Ok(())
     }
 
-    /// Assemble and print the server's iperf3-schema `-J` report (#50). Mirrors
-    /// the client's `print_results_json`, with the server's perspective baked in
-    /// via `is_server: true`: `accepted_connection` instead of `connecting_to`,
-    /// no peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
+    /// Per-stream final summaries for the text report (shared by the normal
+    /// print path and the --get-server-output pre-exchange render, #33).
+    fn text_summaries(
+        streams: &[DataStream],
+        test_duration: f64,
+    ) -> Vec<crate::reporter::StreamSummary> {
+        streams
+            .iter()
+            .map(|s| {
+                let bytes = if s.is_sender {
+                    s.counters.bytes_sent_net()
+                } else {
+                    s.counters.bytes_received_net()
+                };
+
+                let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
+                    udp_stats
+                        .lock()
+                        .map(|st| {
+                            // Post-omit stats (#31, review r2 — this was the
+                            // missed third site): gross minus the boundary
+                            // baselines.
+                            (
+                                Some(st.jitter),
+                                Some(st.cnt_error - st.omitted_cnt_error),
+                                Some(st.packet_count - st.omitted_packet_count),
+                            )
+                        })
+                        .unwrap_or((None, None, None))
+                } else {
+                    (None, None, None)
+                };
+
+                crate::reporter::StreamSummary {
+                    stream_id: s.id,
+                    start: 0.0,
+                    end: test_duration,
+                    bytes,
+                    is_sender: s.is_sender,
+                    retransmits: None,
+                    jitter,
+                    lost,
+                    total_packets: total,
+                }
+            })
+            .collect()
+    }
+
+    /// Assemble the server's typed iperf3-schema report input (#50). Shared by
+    /// `-J` (build + pretty-print, see `build_report`/`print_results_json`),
+    /// `--json-stream` (the `start`/`end` events), and `--get-server-output`'s
+    /// pre-exchange attachment (#33). The server's perspective is baked in via
+    /// `is_server: true`: `accepted_connection` instead of `connecting_to`, no
+    /// peer-byte graft (the un-measured side is 0), and `tcp_mss_default` of 0
     /// (iperf3's server never reads its control-socket MSS).
-    /// Assemble the server's typed iperf3-schema report input. Shared by `-J`
-    /// (build + pretty-print) and `--json-stream` (build + emit the `start`/`end`
-    /// events). The server's perspective is baked in via `is_server: true`.
     #[allow(clippy::too_many_arguments)]
     fn build_report_input(
         &self,
@@ -1281,6 +1351,8 @@ impl Server {
             // The client sends --extra-data via the parameter exchange; echo it
             // into the server's -J output too, like iperf3 (#35).
             extra_data: params.extra_data.clone(),
+            server_output_text: None,
+            server_output_json: None,
             intervals: collected_intervals,
             streams: stream_reports,
         };
@@ -1288,9 +1360,12 @@ impl Server {
         input
     }
 
-    /// `-J`: build and pretty-print the server's single batched report blob (#50).
+    /// Build the server's full `-J` report. Split from the printer so
+    /// `--get-server-output` (#33) can build it ONCE pre-exchange (attaching it
+    /// to the results) and reuse it at print time — `build_report_input`
+    /// drains the interval collector destructively, so it must run once.
     #[allow(clippy::too_many_arguments)]
-    fn print_results_json(
+    fn build_report(
         &self,
         streams: &[DataStream],
         cfg: &TestConfig,
@@ -1302,8 +1377,8 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
-    ) {
-        let input = self.build_report_input(
+    ) -> crate::json_report::Report {
+        self.build_report_input(
             streams,
             cfg,
             params,
@@ -1314,8 +1389,14 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
-        );
-        match serde_json::to_string_pretty(&input.build()) {
+        )
+        .build()
+    }
+
+    /// `-J`: pretty-print the server's single batched report blob (#50), or a
+    /// prebuilt one (#33).
+    fn print_results_json(&self, report: &crate::json_report::Report) {
+        match serde_json::to_string_pretty(report) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
         }
@@ -1756,6 +1837,25 @@ mod test_config_tests {
         assert_eq!(cfg.tos, 0x10);
         assert_eq!(cfg.congestion, Some("bbr".to_string()));
         assert!(cfg.udp_counters_64bit);
+    }
+
+    // #32: the server's reverse/bidir sender must pace on the CLIENT's
+    // pacing-timer quantum — iperf3 always sends it and the server honors it.
+    // Absent/zero (older peers) falls back to iperf3's 1000 µs default.
+    #[test]
+    fn from_params_honors_peer_pacing_timer() {
+        let p = TestParams {
+            pacing_timer: Some(250),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 250);
+        let p = TestParams::default();
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
+        let p = TestParams {
+            pacing_timer: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
     }
 
     // -- server mirrors the client's rate resolution (#17) --

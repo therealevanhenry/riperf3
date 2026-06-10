@@ -272,58 +272,67 @@ impl UdpRecvStats {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiter (token bucket for UDP pacing)
+// Rate limiter (cumulative-average throttle for `-b` pacing, TCP path)
 // ---------------------------------------------------------------------------
 
-/// Token-bucket rate limiter for application-level send pacing.
+/// Cumulative-average rate limiter for application-level send pacing.
 pub struct RateLimiter {
     rate_bytes_per_sec: f64,
-    burst_bytes: f64,
-    tokens: f64,
-    last_refill: Instant,
+    /// Wakeup quantum when behind schedule (`--pacing-timer`, iperf3 default
+    /// 1000 µs).
+    pacing: Duration,
+    start: tokio::time::Instant,
+    sent: u64,
 }
 
 impl RateLimiter {
-    /// Create a rate limiter.
+    /// Create a rate limiter using iperf3's cumulative-average throttle
+    /// (`iperf_check_throttle`): a send is green-lit whenever the cumulative
+    /// bytes are at or below `elapsed * rate`, so total overshoot is bounded
+    /// by ONE in-flight block at any rate — the old token bucket's burst floor
+    /// (max(rate*0.1, 4*blksize), granted up front) overshot a low `-b` by 2x
+    /// with TCP's 128 KiB default block (#116). High rates self-correct the
+    /// other way: after an oversleep the average is behind, so blocks go out
+    /// back-to-back with no sleep — burstiness ≈ rate × pacing quantum,
+    /// matching the documented `--pacing-timer` semantics (iperf3 <= 3.17's
+    /// timer-driven throttle; 3.18+ deprecated the quantum and sleeps exactly
+    /// to the green-light instant — same long-run average either way).
     ///
     /// - `rate_bits_per_sec`: target send rate
-    /// - `burst_packets`: how many packets to send per burst (0 = auto)
-    /// - `blksize`: datagram/block size in bytes
-    pub fn new(rate_bits_per_sec: u64, burst_packets: u32, blksize: usize) -> Self {
-        let rate_bytes = rate_bits_per_sec as f64 / 8.0;
-        // Default burst: ~100ms worth of data, minimum 4 packets.
-        // This avoids per-packet tokio::sleep overhead which has ~1ms granularity.
-        let burst = if burst_packets > 0 {
-            burst_packets as f64 * blksize as f64
+    /// - `pacing_timer_us`: wakeup quantum when behind (`--pacing-timer`,
+    ///   0 → iperf3's 1000 µs default)
+    pub fn new(rate_bits_per_sec: u64, pacing_timer_us: u32) -> Self {
+        let pacing_us = if pacing_timer_us == 0 {
+            crate::utils::DEFAULT_PACING_TIMER_US
         } else {
-            (rate_bytes * 0.1).max(4.0 * blksize as f64)
+            pacing_timer_us
         };
         Self {
-            rate_bytes_per_sec: rate_bytes,
-            burst_bytes: burst,
-            tokens: burst,
-            last_refill: Instant::now(),
+            rate_bytes_per_sec: rate_bits_per_sec as f64 / 8.0,
+            pacing: Duration::from_micros(pacing_us as u64),
+            // tokio's Instant so the accuracy tests can run under start_paused.
+            start: tokio::time::Instant::now(),
+            sent: 0,
         }
     }
 
-    /// Wait until enough tokens are available for `bytes`, then consume them.
+    /// Wait until the cumulative average is at or below the target rate, then
+    /// account `bytes` as sent.
     pub async fn acquire(&mut self, bytes: u64) {
-        self.refill();
-        let needed = bytes as f64;
-        while self.tokens < needed {
-            let deficit = needed - self.tokens;
-            let wait = Duration::from_secs_f64(deficit / self.rate_bytes_per_sec);
-            tokio::time::sleep(wait).await;
-            self.refill();
+        loop {
+            let allowed = self.start.elapsed().as_secs_f64() * self.rate_bytes_per_sec;
+            let behind = self.sent as f64 - allowed;
+            if behind <= 0.0 {
+                break;
+            }
+            // Sleep to the green-light instant, but never less than the pacing
+            // quantum — the documented --pacing-timer semantics (iperf3
+            // <= 3.17's minimum wakeup was one tick; 3.18+ deprecated the
+            // quantum). The cumulative math absorbs any oversleep.
+            let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
+            tokio::time::sleep(to_green.max(self.pacing)).await;
         }
-        self.tokens -= needed;
-    }
-
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate_bytes_per_sec).min(self.burst_bytes);
-        self.last_refill = now;
+        self.sent += bytes;
     }
 }
 
@@ -384,6 +393,7 @@ pub(crate) fn make_byte_budget(
 
 /// TCP sender: writes full blocks as fast as the kernel will accept them.
 /// If `file_path` is set, reads from the file into the buffer each iteration.
+#[allow(clippy::too_many_arguments)] // hot-path sender; knobs map 1:1 to CLI flags
 pub async fn run_tcp_sender(
     mut stream: TcpStream,
     counters: Arc<StreamCounters>,
@@ -391,14 +401,16 @@ pub async fn run_tcp_sender(
     done: Arc<AtomicBool>,
     file_path: Option<std::path::PathBuf>,
     rate: u64,
+    pacing_timer_us: u32,
     byte_budget: Option<Arc<AtomicI64>>,
 ) -> Result<()> {
     use std::io::Read;
     let mut file = file_path.as_ref().map(std::fs::File::open).transpose()?;
-    // `-b` pacing: a token bucket caps the application send rate, matching
-    // iperf3's TCP throttle. 0 = unlimited → no limiter, so the default TCP
-    // path is unchanged (#102; mirrors UDP's `-b 0` per #17).
-    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, 0, buf.len().max(1)));
+    // `-b` pacing: iperf3's cumulative-average throttle caps the application
+    // send rate, waking on the `--pacing-timer` quantum (#32/#116). 0 =
+    // unlimited → no limiter, so the default TCP path is unchanged (#102;
+    // mirrors UDP's `-b 0` per #17).
+    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, pacing_timer_us));
 
     while !done.load(Ordering::Relaxed) {
         // `-n`/`-k` byte/block limit: claim this block from the shared budget and
@@ -1763,24 +1775,47 @@ mod tests {
 
     // -- RateLimiter --
 
+    // #116: with TCP's 128 KiB default block, the old token bucket's burst
+    // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
+    // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
+    // total sent to elapsed*rate + one in-flight block at any rate/blksize.
     #[tokio::test]
-    async fn rate_limiter_allows_burst() {
-        let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbit/s, 1000-byte blocks
+    async fn rate_limiter_total_accuracy_low_rate_large_blocks() {
+        let rate_bits: u64 = 1_000_000; // 1 Mbit/s
+        let blk: u64 = 128 * 1024; // TCP default block
+        let mut limiter = RateLimiter::new(rate_bits, 0);
         let start = Instant::now();
-        // First acquire should be instant (burst tokens available)
+        let mut sent: u64 = 0;
+        while start.elapsed() < Duration::from_millis(1000) {
+            limiter.acquire(blk).await;
+            sent += blk;
+        }
+        let budget = (rate_bits as f64 / 8.0) * start.elapsed().as_secs_f64();
+        let bound = budget * 1.25 + blk as f64;
+        assert!(
+            (sent as f64) <= bound,
+            "sent {sent} bytes in {:?}; budget {budget:.0} (+25% + one block = {bound:.0}) — \
+             initial burst overshoots the target rate (#116)",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_first_acquire_is_instant() {
+        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbit/s
+        let start = Instant::now();
+        // Cumulative average: nothing sent yet → always green-lit.
         limiter.acquire(1000).await;
         assert!(start.elapsed() < Duration::from_millis(10));
     }
 
     #[tokio::test]
-    async fn rate_limiter_paces() {
-        // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks
-        // burst = max(10000*0.1, 4*1000) = 4000 bytes
-        let mut limiter = RateLimiter::new(80_000, 0, 1000);
-        // Drain the burst (4 packets)
-        for _ in 0..4 {
-            limiter.acquire(1000).await;
-        }
+    async fn rate_limiter_paces_from_the_second_block() {
+        // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks: after block 1
+        // the average is 1000 bytes ahead of schedule, so block 2 waits ~100ms
+        // — there is no up-front burst grant (#116).
+        let mut limiter = RateLimiter::new(80_000, 0);
+        limiter.acquire(1000).await; // instant
         let start = Instant::now();
         limiter.acquire(1000).await; // must wait ~100ms
         let elapsed = start.elapsed();
@@ -1790,60 +1825,42 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_high_rate_precision() {
-        // At 10 Gbps with 1460-byte packets, drain the burst first,
-        // then verify paced throughput is within 50% of target.
-        // Before fix: tokio::time::sleep caps at ~1 Gbps after burst.
-        // After fix: clock_nanosleep should approach 10 Gbps.
+        // At 10 Gbps the cumulative average is almost always at-or-behind
+        // schedule, so acquires release back-to-back with no sleep; catch-up
+        // after any oversleep keeps throughput within 50% of target.
         let rate = 10_000_000_000u64; // 10 Gbps
-        let blksize = 1460usize;
-        let mut limiter = RateLimiter::new(rate, 0, blksize);
+        let blksize = 1460u64;
+        let mut limiter = RateLimiter::new(rate, 0);
 
-        // Drain the burst completely
-        let burst_bytes = (rate as f64 / 8.0 * 0.1).max(4.0 * blksize as f64) as u64;
-        let burst_packets = burst_bytes / blksize as u64 + 1;
-        for _ in 0..burst_packets {
-            limiter.acquire(blksize as u64).await;
-        }
-
-        // Now measure paced throughput (no burst tokens left)
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
-        let target_duration = Duration::from_millis(100);
-
-        while start.elapsed() < target_duration {
-            limiter.acquire(blksize as u64).await;
-            total_bytes += blksize as u64;
+        while start.elapsed() < Duration::from_millis(100) {
+            limiter.acquire(blksize).await;
+            total_bytes += blksize;
         }
 
         let elapsed = start.elapsed().as_secs_f64();
         let achieved_bps = total_bytes as f64 * 8.0 / elapsed;
-        let target_bps = rate as f64;
-
-        // Should achieve at least 50% of target rate
         assert!(
-            achieved_bps > target_bps * 0.5,
-            "high-rate pacing too slow: {:.1} Gbps achieved, {:.1} Gbps target",
+            achieved_bps > rate as f64 * 0.5,
+            "high-rate pacing too slow: {:.1} Gbps achieved, 10.0 Gbps target",
             achieved_bps / 1e9,
-            target_bps / 1e9,
         );
     }
 
     #[tokio::test]
     async fn rate_limiter_low_rate_still_works() {
-        // Verify that the clock_nanosleep path doesn't break low-rate pacing
-        let mut limiter = RateLimiter::new(1_000_000, 0, 1000); // 1 Mbps
+        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbps
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
 
-        // Send 10 packets at 1 Mbps = ~10ms
+        // 10 × 1000-byte blocks at 125 KB/s ≈ 72ms of pacing after block 1.
         for _ in 0..10 {
             limiter.acquire(1000).await;
             total_bytes += 1000;
         }
 
         let elapsed = start.elapsed();
-        // Should take at least some time (not instant)
-        // Burst covers first ~4 packets, remaining 6 need pacing
         assert!(total_bytes == 10_000);
         // Should complete in under 1 second (generously)
         assert!(elapsed < Duration::from_secs(1));
@@ -1867,7 +1884,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None, 0, None).await
+            run_tcp_sender(stream, sc, buf, d, None, 0, 1000, None).await
         });
 
         let rc = recv_counters.clone();
