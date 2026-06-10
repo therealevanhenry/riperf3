@@ -313,6 +313,11 @@ impl Server {
             && send_count > 0)
             .then(|| stream::make_byte_budget(params.num, params.blockcount, cfg.blksize))
             .flatten();
+        // The boundary-refill target, captured BEFORE any sender can consume:
+        // loading it at reporter-spawn time read `N − early_consumed` on fast
+        // links (senders start in the TestStart→spawn gap), silently
+        // shrinking the refill (review r4).
+        let budget_target = byte_budget.as_ref().map(|b| b.load(Ordering::Relaxed));
 
         // Single-socket UDP server demux (#80): one demux receiver thread serves
         // every receiving stream, so its handle lives outside the per-stream
@@ -535,9 +540,7 @@ impl Server {
                 done.clone(),
                 reporter_end.clone(),
                 want_collector.then(|| interval_data.clone()),
-                byte_budget
-                    .as_ref()
-                    .map(|b| (b.clone(), b.load(Ordering::Relaxed))),
+                byte_budget.clone().zip(budget_target),
                 // The server has no -n/-k end-check driver — the client ends
                 // the test — so it never waits on the boundary signal.
                 None,

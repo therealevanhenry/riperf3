@@ -482,7 +482,11 @@ pub async fn run_tcp_sender(
         // boundary's refill store and land the undo on the fresh budget,
         // leaking a block past the target (review r3). fetch_update claims
         // only from a positive budget, so only one claim can drive it
-        // non-positive — total overshoot is bounded to less than one block.
+        // non-positive — BUDGET overshoot is bounded to less than one block.
+        // The recorded post-omit net can additionally exceed N by one
+        // in-flight block per sending stream (claimed pre-refill, recorded
+        // post-snapshot), so a paced `-P k` run can land at N + k blocks —
+        // don't pin the 1-block figure in tests (review r4).
         if let Some(b) = &byte_budget {
             let len = buf.len() as i64;
             if b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {

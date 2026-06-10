@@ -435,9 +435,12 @@ impl OmitBoundary {
 
     /// Reporter side: mark the boundary crossed and wake the waiting driver.
     /// `notify_one` stores a permit, so a driver that starts waiting after
-    /// the boundary fired still wakes immediately.
+    /// the boundary fired still wakes immediately. Release pairs with the
+    /// fast path's Acquire so the boundary block's baseline/refill stores are
+    /// visible to a driver that skips the Notify (which synchronizes on its
+    /// own) — review r4.
     fn cross(&self) {
-        self.passed.store(true, Ordering::Relaxed);
+        self.passed.store(true, Ordering::Release);
         self.notify.notify_one();
     }
 
@@ -445,7 +448,7 @@ impl OmitBoundary {
     /// bounds the wait for liveness if the reporter died before its boundary
     /// (error paths); the caller then degrades to wall-clock gating.
     pub async fn crossed(&self, fallback: Duration) {
-        if self.passed.load(Ordering::Relaxed) {
+        if self.passed.load(Ordering::Acquire) {
             return;
         }
         tokio::select! {
