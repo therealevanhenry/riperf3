@@ -1436,6 +1436,20 @@ pub(crate) fn run_udp_server_demux_receiver(
             {
                 continue
             }
+            // #178: ConnectionReset on a UDP socket is ICMP port-unreachable
+            // noise from something WE sent (Windows surfaces it as
+            // WSAECONNRESET/ConnectionReset; Linux connected-UDP as
+            // ECONNREFUSED/ConnectionRefused) — not EOF. On this
+            // SHARED demux socket a break here would silently end reception
+            // for every stream at once.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                continue
+            }
             Err(_) => break,
         }
     }
@@ -1551,6 +1565,21 @@ pub fn run_udp_receiver_blocking(
             {
                 continue
             }
+            // #178: ConnectionReset on a UDP socket is ICMP port-unreachable
+            // noise from something WE sent (Windows: WSAECONNRESET after a
+            // connect-magic retransmit hit a closed port; Linux: ECONNREFUSED
+            // for the same class) — not EOF. Breaking
+            // here silently ended the reverse flow: a bidir run completed
+            // "normally" with sum_bidir_reverse 0 throughout (windows-latest
+            // CI signature).
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                continue
+            }
             Err(_) => break,
         }
     }
@@ -1570,6 +1599,66 @@ pub fn run_udp_receiver_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #178: a connection-reset-class error on a UDP socket is ICMP
+    // port-unreachable noise from something WE sent — Windows surfaces it as
+    // WSAECONNRESET/ConnectionReset on a connected socket (e.g. after a
+    // connect-magic retransmit hits a closed port); Linux connected UDP
+    // surfaces the same class as ECONNREFUSED/ConnectionRefused, which is
+    // what makes this test portable. It is NOT EOF, and the receiver must
+    // keep receiving. Pre-fix, the blocking receiver's `Err(_) => break`
+    // silently ended reception on the first such event: a complete bidir run
+    // with `sum_bidir_reverse: 0` throughout, the windows-latest CI
+    // signature.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore)] // poison injection relies on Linux loopback ICMP
+    fn udp_receiver_survives_connection_reset() {
+        use std::net::UdpSocket as StdUdp;
+        use std::sync::atomic::AtomicBool;
+
+        // Receiver socket, connected to a peer that immediately vanishes.
+        let receiver = StdUdp::bind("127.0.0.1:0").expect("bind receiver");
+        let doomed = StdUdp::bind("127.0.0.1:0").expect("bind doomed peer");
+        let peer_addr = doomed.local_addr().unwrap();
+        receiver.connect(peer_addr).expect("connect");
+        drop(doomed);
+
+        // Poison: send to the now-closed port → ICMP unreachable → the next
+        // recv on this connected socket reports ConnectionReset.
+        receiver.send(b"poison").expect("send to dead port");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The peer "comes back" on the same port (as a still-sending peer
+        // would simply keep existing) and delivers real datagrams.
+        let revived = StdUdp::bind(peer_addr).expect("rebind peer port");
+        let dest = receiver.local_addr().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(StreamCounters::new());
+        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+
+        let sender = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let _ = revived.send_to(&[0u8; 64], dest);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let recv_counters = counters.clone();
+        let recv_done = done.clone();
+        let receiver_thread = std::thread::spawn(move || {
+            run_udp_receiver_blocking(receiver, recv_counters, stats, 1024, recv_done, false)
+        });
+
+        sender.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        receiver_thread.join().unwrap().unwrap();
+
+        assert!(
+            counters.bytes_received() > 0,
+            "#178: the receiver must survive a ConnectionReset (ICMP noise) \
+             and keep counting datagrams; it received nothing"
+        );
+    }
 
     #[test]
     fn byte_budget_zero_is_unlimited() {
