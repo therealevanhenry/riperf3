@@ -136,6 +136,12 @@ pub struct Report {
     /// server (the server receives it via the parameter exchange).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_data: Option<String>,
+    /// `--get-server-output` (#33): the server's diverted text report or its
+    /// full `-J` report, appended at the end of the top level like iperf3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_output_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_output_json: Option<serde_json::Value>,
 }
 
 /// Serialize one `--json-stream` NDJSON line: `{"event":<event>,"data":<data>}`,
@@ -581,6 +587,10 @@ pub struct ReportInput {
     pub start_time_millis: u64,
     /// `--extra-data` string, emitted at the top level when present (#35).
     pub extra_data: Option<String>,
+    /// `--get-server-output` (#33), client side: the server's returned output
+    /// for the -J report tail.
+    pub server_output_text: Option<String>,
+    pub server_output_json: Option<serde_json::Value>,
     /// Per-interval samples collected during the run (PR2). Empty if interval
     /// reporting was disabled (`-i 0`).
     pub intervals: Vec<Interval>,
@@ -932,6 +942,8 @@ impl ReportInput {
             intervals: self.intervals.clone(),
             end,
             extra_data: self.extra_data.clone(),
+            server_output_text: self.server_output_text.clone(),
+            server_output_json: self.server_output_json.clone(),
         }
     }
 
@@ -1193,6 +1205,8 @@ mod tests {
 
     fn base_input() -> ReportInput {
         ReportInput {
+            server_output_text: None,
+            server_output_json: None,
             protocol: TransportProtocol::Tcp,
             reverse: false,
             bidir: false,

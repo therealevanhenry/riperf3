@@ -53,9 +53,6 @@ pub struct Client {
     pub(crate) sendmmsg: bool,
     pub(crate) dont_fragment: bool,
     pub(crate) cport: Option<u16>,
-    // Set by the builder but not yet consumed by `run()`; to be wired into the
-    // library as non-breaking 0.7.x work (#33).
-    #[allow(dead_code)]
     pub(crate) get_server_output: bool,
     pub(crate) forceflush: bool,
     pub(crate) timestamps: Option<String>,
@@ -331,6 +328,11 @@ impl Client {
         // Always sent, like iperf3 (default 1000 µs): the server's
         // reverse/bidir sender paces on the client's quantum (#32).
         p.pacing_timer = Some(self.pacing_timer as i32);
+        // --get-server-output (#33): ask the server to return its output in
+        // the results exchange, exactly like iperf3's param.
+        if self.get_server_output {
+            p.get_server_output = Some(1);
+        }
         if self.tos != 0 {
             p.tos = Some(self.tos);
         }
@@ -572,13 +574,20 @@ impl Client {
                     udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
 
-                    // Apply GSO/GRO if requested (no-ops on non-Linux)
+                    // GSO/GRO is deliberately best-effort (#45), matching
+                    // iperf3 3.20+'s --gsro: its iperf_udp_gso/iperf_udp_gro
+                    // disable the feature and continue when the setsockopt
+                    // fails, so a kernel lacking UDP_SEGMENT/UDP_GRO degrades
+                    // to plain sends rather than failing the test.
                     if self.gsro {
                         let _ = net::set_udp_gso(&udp_sock, blksize as u16);
                         let _ = net::set_udp_gro(&udp_sock);
                     }
                     if self.tos != 0 {
-                        let _ = net::set_tos(&udp_sock, self.tos as u32);
+                        // Fatal like the TCP path (#45): iperf3's
+                        // iperf_common_sockopts errors (IESETTOS) when IP_TOS
+                        // can't be applied, on both roles and both protocols.
+                        net::set_tos(&udp_sock, self.tos as u32)?;
                     }
 
                     let stream_id = iperf3_stream_id(i);
@@ -876,6 +885,9 @@ impl Client {
             .collect();
 
         TestResultsJson {
+            // Client → server payload never carries server output (#33).
+            server_output_text: None,
+            server_output_json: None,
             cpu_util_total: cpu_util.host_total,
             cpu_util_user: cpu_util.host_user,
             cpu_util_system: cpu_util.host_system,
@@ -936,6 +948,28 @@ impl Client {
         }
     }
 
+    /// `--get-server-output` (#33): print the server's returned output after
+    /// our own report, like iperf3 — "Server output:" for text, "Server JSON
+    /// output:" for a -J server's report (iperf_api.c); the text block ends
+    /// with a blank line, the JSON block with a single newline, matching
+    /// iperf3's format strings. Only consulted when WE requested it, like
+    /// test->get_server_output gate (a misbehaving server can't inject).
+    fn print_server_output(&self, server_results: Option<&TestResultsJson>) {
+        if !self.get_server_output {
+            return;
+        }
+        let Some(server) = server_results else { return };
+        if let Some(text) = &server.server_output_text {
+            crate::vprintln!("\nServer output:");
+            println!("{text}");
+        } else if let Some(json) = &server.server_output_json {
+            crate::vprintln!("\nServer JSON output:");
+            if let Ok(s) = serde_json::to_string_pretty(json) {
+                println!("{s}");
+            }
+        }
+    }
+
     fn print_results_text(
         &self,
         streams: &[DataStream],
@@ -991,6 +1025,7 @@ impl Client {
         // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
         // (issue #4), via the shared path the server also uses.
         crate::reporter::print_final_summaries(&summaries, self.format_char);
+        self.print_server_output(server_results);
     }
 
     /// Assemble the typed iperf3-schema report input from the finished test.
@@ -1174,6 +1209,17 @@ impl Client {
             gro: i32::from(self.gsro),
             start_time_millis: start_meta.start_time_millis,
             extra_data: self.extra_data.clone(),
+            // --get-server-output (#33): the server's returned output rides
+            // the -J report tail — only when WE requested it (iperf3 gates on
+            // test->get_server_output; an unrequested attachment is ignored).
+            server_output_text: self
+                .get_server_output
+                .then(|| remote_cpu.and_then(|r| r.server_output_text.clone()))
+                .flatten(),
+            server_output_json: self
+                .get_server_output
+                .then(|| remote_cpu.and_then(|r| r.server_output_json.clone()))
+                .flatten(),
             intervals: collected_intervals,
             streams: stream_reports,
         };
@@ -1521,11 +1567,15 @@ impl ClientBuilder {
         self
     }
 
+    /// `-n/--bytes`: end the test after this many bytes. 0 means "no byte
+    /// limit" (iperf3 semantics) and is normalized to unset at build().
     pub fn bytes(mut self, bytes: u64) -> Self {
         self.bytes_to_send = Some(bytes);
         self
     }
 
+    /// `-k/--blockcount`: end the test after this many blocks. 0 means "no
+    /// block limit" (iperf3 semantics) and is normalized to unset at build().
     pub fn blocks(mut self, blocks: u64) -> Self {
         self.blocks_to_send = Some(blocks);
         self
@@ -1807,8 +1857,11 @@ impl ClientBuilder {
             verbose: self.verbose,
             json_output: self.json_output,
             json_stream: self.json_stream,
-            bytes_to_send: self.bytes_to_send,
-            blocks_to_send: self.blocks_to_send,
+            // 0 means "no limit" in iperf3 (`-n 0`/`-k 0` run a plain duration
+            // test — its end-condition checks gate on the value), so normalize
+            // to unset here rather than ending the test instantly (#140).
+            bytes_to_send: self.bytes_to_send.filter(|&b| b != 0),
+            blocks_to_send: self.blocks_to_send.filter(|&b| b != 0),
             repeating_payload: self.repeating_payload,
             zerocopy: self.zerocopy,
             gsro: self.gsro,
@@ -2221,6 +2274,8 @@ mod tests {
                 cpu_util_system: 0.0,
                 sender_has_retransmits: -1,
                 congestion_used: None,
+                server_output_text: None,
+                server_output_json: None,
                 streams: vec![protocol::StreamResultJson {
                     id: 1,
                     bytes: 2_000_000,
