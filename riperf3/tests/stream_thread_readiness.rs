@@ -12,33 +12,14 @@
 //! This reproduces that deterministically on any platform: cap the runtime's
 //! blocking pool and saturate it with hogs that outlive the test duration, so
 //! the stream threads queue behind them exactly like the loaded runner. The
-//! readiness barrier must hold the test window open until the data threads
-//! have checked in; without it both directions report zero bytes.
+//! readiness gate must hold the test window open until the data threads have
+//! checked in; without it both directions report zero bytes.
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use riperf3::{ClientBuilder, RiperfError, ServerBuilder, TransportProtocol};
 
-/// Sub-ephemeral, PID-windowed port allocation — same scheme as the CLI test
-/// harness (`riperf3-cli/tests/common`): ephemeral-range picks collide with
-/// concurrent test binaries' connect() source ports under the parallel
-/// harness (#176).
-fn free_port() -> u16 {
-    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
-
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let window = 7000 + (std::process::id() % 250) as u16 * 100;
-    for _ in 0..100 {
-        let port = window + NEXT.fetch_add(1, Ordering::Relaxed) % 100;
-        if TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).is_ok()
-            && TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok()
-        {
-            return port;
-        }
-    }
-    panic!("no free port in test window {window}-{}", window + 99);
-}
+mod common;
 
 #[test]
 fn udp_bidir_window_waits_for_stream_threads() {
@@ -55,7 +36,7 @@ fn udp_bidir_window_waits_for_stream_threads() {
         .unwrap();
 
     rt.block_on(async {
-        let port = free_port();
+        let port = common::free_port();
         let server = ServerBuilder::new()
             .port(Some(port))
             .one_off(true)
@@ -63,16 +44,26 @@ fn udp_bidir_window_waits_for_stream_threads() {
             .unwrap();
         let srv = tokio::spawn(async move { server.run().await });
 
-        // The server binds inside run(); retry the control connect briefly.
-        // IMPORTANT: spawn the hogs only once the server is accepting, so
-        // they stall stream-thread creation, not the control-plane setup.
+        // 100 Mbit/s keeps the run light but shrinks the sender's pacing
+        // batch interval from ~8 s (loopback blksize at the 1 Mbit/s default)
+        // to ~80 ms, so teardown joins promptly instead of parking in the
+        // pacing sleep for most of 10 s of wall time.
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
             .protocol(TransportProtocol::Udp)
             .bidir(true)
             .duration(1)
+            .bandwidth(100_000_000)
             .build()
             .unwrap();
+
+        // The server binds inside run(), so the control connect can race it;
+        // retry on refusal. Each attempt saturates the pool with a FRESH hog
+        // wave so the stall covers the successful attempt's CreateStreams —
+        // and a refused attempt first waits out the previous wave, so waves
+        // never stack up FIFO-ahead of the stream threads (stacked waves
+        // would serialize at 1.5 s each and could blow the 10 s gate budget,
+        // failing the test in exactly the loaded environment it targets).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let results = loop {
             for _ in 0..HOGS {
@@ -84,7 +75,7 @@ fn udp_bidir_window_waits_for_stream_threads() {
                     if e.kind() == std::io::ErrorKind::ConnectionRefused
                         && tokio::time::Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(HOG_LIFETIME).await;
                 }
                 Err(e) => panic!("client run failed: {e}"),
             }

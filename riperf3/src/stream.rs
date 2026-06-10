@@ -1015,37 +1015,77 @@ fn await_start(start: &AtomicBool, done: &AtomicBool) -> bool {
 /// in before opening the test window anyway (#178). Generous: the worst stall
 /// observed on loaded windows-latest runners was ~3.5 s; a barrier timeout
 /// only recreates the pre-fix behavior, so erring long costs nothing in the
-/// normal case (the wait ends the moment the threads are up).
+/// normal case (the wait ends the moment the threads are up). Note a blocking
+/// pool persistently sized below the stream count (an embedder's custom
+/// runtime) burns this in full on every setup — the queued threads cannot
+/// enter until earlier streams finish, which is the whole test.
 pub(crate) const STREAM_THREAD_START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wait (bounded) until `expected` stream data threads have checked in (#178).
+/// Readiness gate for stream data threads (#178).
 ///
 /// The UDP data plane runs on `spawn_blocking` OS threads while the `-t` test
 /// clock is driven by the async control plane. On a loaded host (2-core CI
 /// runners), OS-thread creation can stall for seconds — the whole test window
 /// can elapse before a single data thread runs, completing a run "normally"
 /// with zero bytes (the late receiver goes straight to its post-test drain and
-/// discards everything the peer sent). Each blocking task bumps `entered` as
-/// its first action; the control plane calls this before letting the test
-/// window open, so the duration clock cannot start ahead of the data plane.
+/// discards everything the peer sent). Spawning through the gate makes each
+/// task release a permit as its first action; the control plane awaits the
+/// full permit count before letting the test window open, so the duration
+/// clock cannot start ahead of the data plane. The gate owns both the check-in
+/// and the expected count, so a future spawn site cannot desynchronize them.
 ///
-/// Returns whether all threads checked in. On timeout the caller proceeds
-/// anyway — a degraded run (today's behavior) beats failing a test that would
-/// have moved most of its bytes.
-pub(crate) async fn await_stream_threads_entered(
-    entered: &std::sync::atomic::AtomicU32,
+/// UDP-only by design: TCP data tasks are `tokio::spawn` async tasks (no
+/// OS-thread creation to stall), and a late TCP reader still gets its bytes
+/// from the kernel buffer instead of discarding them like the late UDP drain.
+pub(crate) struct StreamThreadGate {
+    sem: Arc<tokio::sync::Semaphore>,
     expected: u32,
-    timeout: Duration,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while entered.load(Ordering::Acquire) < expected {
-        if tokio::time::Instant::now() >= deadline {
-            log::debug!("stream data threads not all started within {timeout:?} (#178)");
-            return false;
+}
+
+impl StreamThreadGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(0)),
+            expected: 0,
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    true
+
+    /// `tokio::task::spawn_blocking` with a check-in: the spawned closure
+    /// releases its gate permit the moment its OS thread actually runs.
+    pub(crate) fn spawn<T, F>(&mut self, f: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.expected += 1;
+        let sem = self.sem.clone();
+        tokio::task::spawn_blocking(move || {
+            sem.add_permits(1);
+            f()
+        })
+    }
+
+    /// Wait (bounded) until every gate-spawned thread has checked in.
+    ///
+    /// Returns whether all threads checked in. On timeout the caller proceeds
+    /// anyway — a degraded run (pre-#178 behavior) beats failing a test that
+    /// would have moved most of its bytes.
+    pub(crate) async fn wait(&self, timeout: Duration) -> bool {
+        if self.expected == 0 {
+            return true;
+        }
+        match tokio::time::timeout(timeout, self.sem.acquire_many(self.expected)).await {
+            Ok(Ok(_permits)) => true,
+            _ => {
+                log::warn!(
+                    "{} stream data thread(s) not started within {timeout:?}; \
+                     proceeding degraded (#178)",
+                    self.expected as usize - self.sem.available_permits()
+                );
+                false
+            }
+        }
+    }
 }
 
 /// Sets `done` when dropped, so every exit path of a test handler — including
@@ -1637,33 +1677,36 @@ pub fn run_udp_receiver_blocking(
 mod tests {
     use super::*;
 
-    // #178 readiness barrier: returns true immediately when the threads are
-    // already in, true once they arrive late, false only past the deadline.
+    // #178 readiness barrier: wait() is trivially true with nothing spawned,
+    // true once every gate-spawned thread checks in (even when the threads
+    // start slowly), and false — without hanging — when a thread can't start.
     #[tokio::test]
-    async fn await_stream_threads_entered_counts_and_times_out() {
-        use std::sync::atomic::AtomicU32;
-
-        let entered = Arc::new(AtomicU32::new(2));
+    async fn stream_thread_gate_waits_and_times_out() {
+        let gate = StreamThreadGate::new();
         assert!(
-            await_stream_threads_entered(&entered, 2, Duration::from_millis(50)).await,
-            "already-entered threads must satisfy the barrier instantly"
+            gate.wait(Duration::from_millis(50)).await,
+            "an empty gate must not wait"
         );
 
-        let entered = Arc::new(AtomicU32::new(0));
-        let e = entered.clone();
-        let bumper = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            e.fetch_add(2, Ordering::Release);
-        });
+        let mut gate = StreamThreadGate::new();
+        let h1 = gate.spawn(|| std::thread::sleep(Duration::from_millis(20)));
+        let h2 = gate.spawn(|| ());
         assert!(
-            await_stream_threads_entered(&entered, 2, Duration::from_secs(5)).await,
-            "late arrivals within the deadline must satisfy the barrier"
+            gate.wait(Duration::from_secs(5)).await,
+            "gate-spawned threads must satisfy the barrier once running"
         );
-        bumper.await.unwrap();
+        h1.await.unwrap();
+        h2.await.unwrap();
 
-        let entered = Arc::new(AtomicU32::new(1));
+        // A check-in that never comes (in real life: a spawn whose thread is
+        // queued behind a saturated blocking pool): an expectation with no
+        // permit ever released.
+        let starved = StreamThreadGate {
+            sem: Arc::new(tokio::sync::Semaphore::new(0)),
+            expected: 1,
+        };
         assert!(
-            !await_stream_threads_entered(&entered, 2, Duration::from_millis(40)).await,
+            !starved.wait(Duration::from_millis(40)).await,
             "missing threads must time out, not hang"
         );
     }

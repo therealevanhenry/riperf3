@@ -847,9 +847,10 @@ impl Server {
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
-        // #178: each stream's spawn_blocking data thread checks in here; the
-        // barrier below holds TestStart until the data plane actually exists.
-        let threads_entered = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // #178: each stream's spawn_blocking data thread is spawned through
+        // the gate; the barrier below holds TestStart until the data plane
+        // actually exists.
+        let mut thread_gate = stream::StreamThreadGate::new();
         for i in 0..total {
             // Accept: recv magic, connect() to client, send reply.
             // Bounded so a client that never connects fails the test
@@ -908,9 +909,7 @@ impl Server {
                 let u64bit = cfg.udp_counters_64bit;
                 let st = start.clone();
                 let md = max_duration;
-                let te = threads_entered.clone();
-                let task = tokio::task::spawn_blocking(move || {
-                    te.fetch_add(1, std::sync::atomic::Ordering::Release);
+                let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit, st, md)
                 });
                 streams.push(DataStream {
@@ -933,9 +932,7 @@ impl Server {
                 let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                 let stats_clone = stats.clone();
                 let u64bit = cfg.udp_counters_64bit;
-                let te = threads_entered.clone();
-                let task = tokio::task::spawn_blocking(move || {
-                    te.fetch_add(1, std::sync::atomic::Ordering::Release);
+                let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
                 streams.push(DataStream {
@@ -957,12 +954,7 @@ impl Server {
         // until every data thread is running — the test clock must not outrun
         // OS-thread creation, which stalls for seconds on loaded hosts. On
         // timeout proceed anyway (degraded = pre-fix behavior).
-        stream::await_stream_threads_entered(
-            &threads_entered,
-            total,
-            stream::STREAM_THREAD_START_TIMEOUT,
-        )
-        .await;
+        thread_gate.wait(stream::STREAM_THREAD_START_TIMEOUT).await;
         Ok(())
     }
 
@@ -1108,10 +1100,9 @@ impl Server {
         let rate = cfg.bandwidth;
         let u64bit = cfg.udp_counters_64bit;
         // #178: every spawn_blocking data thread (each sender + the one demux
-        // receiver) checks in here; the barrier below holds TestStart until
-        // the data plane actually exists.
-        let threads_entered = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let mut threads_expected: u32 = 0;
+        // receiver) is spawned through the gate; the barrier below holds
+        // TestStart until the data plane actually exists.
+        let mut thread_gate = stream::StreamThreadGate::new();
         for i in 0..total {
             let stream_id = iperf3_stream_id(i);
             let is_sender = i >= recv_count;
@@ -1129,10 +1120,7 @@ impl Server {
                 let d = done.clone();
                 let st = start.clone();
                 let md = max_duration;
-                let te = threads_entered.clone();
-                threads_expected += 1;
-                let task = tokio::task::spawn_blocking(move || {
-                    te.fetch_add(1, std::sync::atomic::Ordering::Release);
+                let task = thread_gate.spawn(move || {
                     stream::run_udp_server_demux_sender(
                         s,
                         client_addr,
@@ -1192,23 +1180,16 @@ impl Server {
         if !routes.is_empty() {
             let s = shared.clone();
             let d = done.clone();
-            let te = threads_entered.clone();
-            threads_expected += 1;
-            *demux_handle = Some(tokio::task::spawn_blocking(move || {
-                te.fetch_add(1, std::sync::atomic::Ordering::Release);
-                stream::run_udp_server_demux_receiver(s, routes, d, u64bit)
-            }));
+            *demux_handle = Some(
+                thread_gate
+                    .spawn(move || stream::run_udp_server_demux_receiver(s, routes, d, u64bit)),
+            );
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun
         // OS-thread creation, which stalls for seconds on loaded hosts. On
         // timeout proceed anyway (degraded = pre-fix behavior).
-        stream::await_stream_threads_entered(
-            &threads_entered,
-            threads_expected,
-            stream::STREAM_THREAD_START_TIMEOUT,
-        )
-        .await;
+        thread_gate.wait(stream::STREAM_THREAD_START_TIMEOUT).await;
         Ok(())
     }
 

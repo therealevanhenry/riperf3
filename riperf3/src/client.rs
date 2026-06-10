@@ -595,10 +595,9 @@ impl Client {
                     None => None,
                 };
                 // #178: every UDP stream gets a dedicated spawn_blocking OS
-                // thread; each checks in here as its first action so the
-                // barrier below can hold the test window until the data plane
-                // actually exists.
-                let threads_entered = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                // thread, spawned through the gate so the barrier below can
+                // hold this side's test window until the data plane exists.
+                let mut thread_gate = stream::StreamThreadGate::new();
                 for i in 0..total {
                     let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
@@ -655,9 +654,7 @@ impl Client {
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
                         let md = max_duration;
-                        let te = threads_entered.clone();
-                        tokio::task::spawn_blocking(move || {
-                            te.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
                                     std_sock, c, bs, d, rate, u64bit, st, md,
@@ -675,9 +672,7 @@ impl Client {
                         let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                         let sc = stats.clone();
                         let u64bit = self.udp_counters_64bit;
-                        let te = threads_entered.clone();
-                        let task = tokio::task::spawn_blocking(move || {
-                            te.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        let task = thread_gate.spawn(move || {
                             stream::run_udp_receiver_blocking(std_sock, c, sc, bs, d, u64bit)
                         });
                         streams.push(DataStream {
@@ -711,16 +706,18 @@ impl Client {
                     });
                 }
                 // #178: hold CreateStreams until every data thread is running
-                // (parked at its start gate). The server's TestStart — and with
-                // it this side's test clock — must not outrun OS-thread
-                // creation, which stalls for seconds on loaded hosts. On
-                // timeout proceed anyway (degraded = pre-fix behavior).
-                stream::await_stream_threads_entered(
-                    &threads_entered,
-                    total,
-                    stream::STREAM_THREAD_START_TIMEOUT,
-                )
-                .await;
+                // (parked at its start gate). This gates the CLIENT's side
+                // only — TestStart isn't read (so this side's clock doesn't
+                // start and its senders stay parked) until the data plane
+                // exists. The server sends TestStart on its own schedule once
+                // the last UDP handshake arrives; the wire protocol has no
+                // post-handshake signal to hold it back, so a *cross-host*
+                // stall confined to the client can still cost the start of
+                // the window (bounded by SO_RCVBUF for receivers — and iperf3
+                // has the identical exposure). Same-host, both gates release
+                // together. On timeout proceed anyway (degraded = pre-fix
+                // behavior).
+                thread_gate.wait(stream::STREAM_THREAD_START_TIMEOUT).await;
             }
         }
 
