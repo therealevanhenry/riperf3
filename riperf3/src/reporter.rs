@@ -294,10 +294,9 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
         } else {
             (None, None, None)
         };
-        // Aggregate per-stream retransmits when present. The final per-stream
-        // summaries don't yet carry retransmits (the producers pass `None`, so
-        // this is dormant today), but the math is kept correct and tested so
-        // the SUM stays right if/when end-of-test TCP_INFO is plumbed in.
+        // Aggregate per-stream retransmits when present — live since #184 wired
+        // the TCP sender lines' omit-adjusted totals into the producers; a SUM
+        // over a TCP sender group carries the summed Retr iperf3 prints.
         let retransmits = if group.iter().any(|s| s.retransmits.is_some()) {
             Some(group.iter().filter_map(|s| s.retransmits).sum())
         } else {

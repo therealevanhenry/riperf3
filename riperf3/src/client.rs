@@ -986,16 +986,9 @@ impl Client {
                         (0.0, 0, 0, 0, 0)
                     };
                 let is_udp_stream = self.protocol == TransportProtocol::Udp;
-
-                // #156: when sender_has_retransmits=1, the peer prints this
-                // value (iperf3 get_results stores it into stream_retrans and
-                // the summary renders it) — it must be the REAL end-of-test
-                // total. The sender task snapshots it into the counters while
-                // its socket is still open; by exchange time the socket is
-                // closed, so a live fd read here only serves as a fallback
-                // for paths that never reached the snapshot. With -O the
-                // boundary baseline is subtracted (#171), like iperf3's
-                // stream_retrans after iperf_reset_stats.
+                // #156 sentinel: -1 = "no retransmit total" (receiver/UDP/no
+                // TCP_INFO); the wire carries it, the peer renders it (#171
+                // omit-adjustment and the fd fallback live in the method).
                 let retransmits = s.sender_retransmits(is_udp_stream).unwrap_or(-1);
 
                 protocol::StreamResultJson {
