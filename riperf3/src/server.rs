@@ -613,10 +613,26 @@ impl Server {
                 (0.0, 0, 0)
             };
 
+            let is_udp_stream = matches!(cfg.protocol, TransportProtocol::Udp);
+
+            // #156: when sender_has_retransmits=1, the peer prints this
+            // value (iperf3 get_results stores it into stream_retrans and
+            // the summary renders it) — it must be the REAL end-of-test
+            // total, read directly from the kernel, not a sentinel.
+            let retransmits =
+                if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
+                    s.raw_fd
+                        .and_then(crate::tcp_info::get_tcp_info)
+                        .map(|i| i.total_retransmits as i64)
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+
             result_streams.push(protocol::StreamResultJson {
                 id: s.id,
                 bytes,
-                retransmits: -1,
+                retransmits,
                 jitter,
                 errors,
                 omitted_errors: 0,

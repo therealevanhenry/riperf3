@@ -844,11 +844,26 @@ impl Client {
                 } else {
                     (0.0, 0, 0)
                 };
+                let is_udp_stream = self.protocol == TransportProtocol::Udp;
+
+                // #156: when sender_has_retransmits=1, the peer prints this
+                // value (iperf3 get_results stores it into stream_retrans and
+                // the summary renders it) — it must be the REAL end-of-test
+                // total, read directly from the kernel, not a sentinel.
+                let retransmits =
+                    if s.is_sender && crate::tcp_info::has_retransmit_info() && !is_udp_stream {
+                        s.raw_fd
+                            .and_then(crate::tcp_info::get_tcp_info)
+                            .map(|i| i.total_retransmits as i64)
+                            .unwrap_or(-1)
+                    } else {
+                        -1
+                    };
 
                 protocol::StreamResultJson {
                     id: s.id,
                     bytes,
-                    retransmits: -1,
+                    retransmits,
                     jitter,
                     errors,
                     omitted_errors: 0,
@@ -1830,6 +1845,55 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    // #147 (review r1): the discriminating leak test. The e2e mock below can't
+    // pin the fix — run()'s DoneOnDrop guard already stops the SENDERS on any
+    // exit, pre-fix included. The real pre-fix leak was the REPORTER task:
+    // `done` was never set on the ServerTerminate early-return, so it stayed
+    // parked holding the collector Arc (forever under -i 0's year-long
+    // ticker). Calling run_test directly bypasses DoneOnDrop, and the
+    // collector's strong count observes the reporter's clone: pre-fix this
+    // asserts 2 (parked reporter), post-fix 1 (joined before propagating).
+    #[tokio::test]
+    async fn abort_path_joins_the_reporter() {
+        use crate::protocol::{self, TestState};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut ctrl, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            protocol::send_state(&mut ctrl, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Keep the control socket open past the client's assertions.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        });
+
+        // json_output(true) makes the reporter take the collector clone.
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .duration(10)
+            .json_output(true)
+            .build()
+            .unwrap();
+        let mut ctrl = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
+
+        let res = client
+            .run_test(&mut ctrl, &[], &done, 131072, collector.clone())
+            .await;
+        assert!(res.is_err(), "ServerTerminate must abort the test");
+        assert_eq!(
+            Arc::strong_count(&collector),
+            1,
+            "#147: the reporter must be JOINED before the abort propagates \
+             (a parked reporter still holds the collector Arc)"
+        );
+        srv.abort();
+    }
+
     use super::*;
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
@@ -2267,11 +2331,11 @@ mod client_run_return_value {
         let _ = server_task.await;
     }
 
-    /// #147: a mid-test `ServerTerminate` made `run_test` return without
-    /// stopping the reporter or the senders (`done` was never set on that
-    /// early-return path) — for a library consumer the run's tasks leaked and
-    /// kept sending. Drive a mock through the full handshake, terminate
-    /// mid-test, and assert the data flow STOPS once `run()` has returned.
+    /// End-to-end abort sanity: a mid-test `ServerTerminate` aborts `run()`
+    /// and the data flow stops promptly. NOTE this does NOT discriminate the
+    /// #147 fix — run()'s DoneOnDrop guard stops the senders on any exit; the
+    /// real pre-fix leak (a parked reporter task) is pinned by
+    /// `abort_path_joins_the_reporter` in the in-module tests.
     #[tokio::test]
     async fn server_terminate_stops_senders_and_reporter() {
         use crate::protocol::{self, TestState};
