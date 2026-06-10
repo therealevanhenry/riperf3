@@ -566,7 +566,10 @@ impl Server {
         // interval (#55). The reporter prioritises `finish` over `done`, so the
         // final interval still flushes; wait for it before tearing streams down.
         let measured_elapsed = report_start.elapsed().as_secs_f64();
-        reporter_end.finish(measured_elapsed);
+        // The reporter's timeline restarted at the omit boundary (#31), so its
+        // authoritative end time is post-omit; clamp for runs that died inside
+        // the warm-up.
+        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
         done.store(true, Ordering::Relaxed);
         if let Some(handle) = interval_handle {
             let _ = handle.await;
@@ -581,7 +584,9 @@ impl Server {
         // run, exactly `-t` otherwise (#103, mirrors the client). The requested
         // `-t` is reported separately as the test_start `duration` parameter.
         let test_duration = if params.num.is_some() || params.blockcount.is_some() {
-            measured_elapsed
+            // Rebase to the post-omit window (#31): the measured elapsed
+            // includes the warm-up the summary must exclude.
+            (measured_elapsed - cfg.omit as f64).max(0.0)
         } else {
             cfg.duration as f64
         };
@@ -1141,13 +1146,14 @@ impl Server {
                     s.counters.bytes_received_net()
                 };
 
-                // The server measures UDP loss/jitter on the streams it receives.
+                // The server measures UDP loss/jitter on the streams it
+                // receives — post-omit stats (#31): gross minus baselines.
                 let udp = s.udp_recv_stats.as_ref().and_then(|lock| {
                     lock.lock().ok().map(|st| UdpStreamStats {
                         jitter_secs: st.jitter,
-                        lost_packets: st.cnt_error,
-                        packets: st.packet_count,
-                        out_of_order: st.outoforder_packets,
+                        lost_packets: st.cnt_error - st.omitted_cnt_error,
+                        packets: st.packet_count - st.omitted_packet_count,
+                        out_of_order: st.outoforder_packets - st.omitted_outoforder_packets,
                     })
                 });
 

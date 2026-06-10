@@ -193,6 +193,7 @@ impl Client {
         // run, read back at DisplayResults for the `-J` blob (#36 PR2).
         let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
         let mut streams: Vec<DataStream> = Vec::new();
+        let mut byte_budget: Option<(Arc<AtomicI64>, i64)> = None;
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
         // Authoritative test duration captured from run_test: `-t` for a duration
@@ -212,7 +213,8 @@ impl Client {
                 }
 
                 TestState::CreateStreams => {
-                    streams = self.create_streams(&cookie, &done, &start, blksize).await?;
+                    (streams, byte_budget) =
+                        self.create_streams(&cookie, &done, &start, blksize).await?;
                 }
 
                 TestState::TestStart => {
@@ -246,7 +248,14 @@ impl Client {
 
                 TestState::TestRunning => {
                     measured_secs = self
-                        .run_test(&mut ctrl, &streams, &done, blksize, interval_data.clone())
+                        .run_test(
+                            &mut ctrl,
+                            &streams,
+                            &done,
+                            blksize,
+                            interval_data.clone(),
+                            byte_budget.as_ref(),
+                        )
                         .await?;
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
@@ -378,7 +387,7 @@ impl Client {
         done: &Arc<AtomicBool>,
         start: &Arc<AtomicBool>,
         blksize: usize,
-    ) -> Result<Vec<DataStream>> {
+    ) -> Result<(Vec<DataStream>, Option<(Arc<AtomicI64>, i64)>)> {
         let mut streams = Vec::new();
 
         // In normal mode: client sends. Reverse: client receives. Bidir: both.
@@ -410,6 +419,17 @@ impl Client {
             && send_count > 0)
             .then(|| stream::make_byte_budget(self.bytes_to_send, self.blocks_to_send, blksize))
             .flatten();
+        // -O + -n/-k (#31): the limit applies to the POST-omit window (iperf3
+        // gates end checks on !omitting and resets byte progress at the
+        // boundary). Senders break permanently when the budget exhausts, so
+        // during warm-up it must be effectively unlimited; the boundary then
+        // stores the real target.
+        let budget_target = byte_budget.as_ref().map(|b| b.load(Ordering::Relaxed));
+        if self.omit > 0 {
+            if let Some(b) = &byte_budget {
+                b.store(i64::MAX, Ordering::Relaxed);
+            }
+        }
 
         match self.protocol {
             TransportProtocol::Tcp => {
@@ -666,9 +686,44 @@ impl Client {
             }
         }
 
-        Ok(streams)
+        Ok((streams, byte_budget.zip(budget_target)))
     }
 
+    /// Wait out a `-n`/`-k` run (#31): iperf3 gates the end-condition check on
+    /// !omitting and resets byte progress at the boundary, so the warm-up
+    /// never consumes the limit. The shared sender budget is refilled to its
+    /// initial value at the boundary (the warm-up drained it), and the
+    /// returned summary window is rebased to exclude the warm-up.
+    async fn wait_byte_limit(
+        &self,
+        streams: &[DataStream],
+        byte_budget: Option<&(Arc<AtomicI64>, i64)>,
+        target: u64,
+        report_start: &std::time::Instant,
+    ) -> f64 {
+        let omit = Duration::from_secs(self.omit as u64);
+        let mut boundary_done = self.omit == 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !boundary_done {
+                if report_start.elapsed() < omit {
+                    continue; // still warming up — the limit doesn't apply yet
+                }
+                // Boundary: restore the senders' shared budget (the reporter
+                // snapshots the counters on its own omit deadline).
+                if let Some((b, initial)) = byte_budget {
+                    b.store(*initial, Ordering::Relaxed);
+                }
+                boundary_done = true;
+            }
+            if transferred_bytes(streams) >= target {
+                break;
+            }
+        }
+        (report_start.elapsed().as_secs_f64() - self.omit as f64).max(0.0)
+    }
+
+    #[allow(clippy::too_many_arguments)] // test-drive knobs, 1:1 with run()'s state
     async fn run_test(
         &self,
         ctrl: &mut TcpStream,
@@ -676,6 +731,7 @@ impl Client {
         done: &Arc<AtomicBool>,
         blksize: usize,
         collector: Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        byte_budget: Option<&(Arc<AtomicI64>, i64)>,
     ) -> Result<f64> {
         // Run the interval reporter whenever intervals are enabled. It prints
         // live for text / json-stream; for plain -J it runs silently to collect
@@ -770,23 +826,18 @@ impl Client {
                 dur.as_secs_f64()
             }
             EndCondition::Bytes(target) => {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if transferred_bytes(streams) >= target {
-                        break;
-                    }
-                }
-                report_start.elapsed().as_secs_f64()
+                self.wait_byte_limit(streams, byte_budget, target, &report_start)
+                    .await
             }
             EndCondition::Blocks(target) => {
                 // Block-based: approximate by dividing transferred bytes by blksize.
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if transferred_bytes(streams) / blksize as u64 >= target {
-                        break;
-                    }
-                }
-                report_start.elapsed().as_secs_f64()
+                self.wait_byte_limit(
+                    streams,
+                    byte_budget,
+                    target.saturating_mul(blksize as u64),
+                    &report_start,
+                )
+                .await
             }
         };
 
@@ -937,7 +988,14 @@ impl Client {
                 let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
                     udp_stats
                         .lock()
-                        .map(|st| (Some(st.jitter), Some(st.cnt_error), Some(st.packet_count)))
+                        .map(|st| {
+                            // Post-omit stats (#31): gross minus baselines.
+                            (
+                                Some(st.jitter),
+                                Some(st.cnt_error - st.omitted_cnt_error),
+                                Some(st.packet_count - st.omitted_packet_count),
+                            )
+                        })
                         .unwrap_or((None, None, None))
                 } else {
                     (None, None, None)
@@ -1697,12 +1755,13 @@ impl ClientBuilder {
             }
         }
 
-        // iperf3 caps the warm-up at MAX_OMIT_TIME (60 s) with IEOMIT (#31).
-        if self.omit > 60 {
+        // iperf3 caps the warm-up at MAX_OMIT_TIME (600 s, iperf.h) with
+        // IEOMIT (#31; review r1 — the cap is 600, not 60).
+        if self.omit > 600 {
             return Err(ConfigError::InvalidValue(
                 "omit",
                 format!(
-                    "bogus value for --omit (maximum = 60 seconds): {}",
+                    "bogus value for --omit (maximum = 600 seconds): {}",
                     self.omit
                 ),
             ));
@@ -1876,6 +1935,18 @@ mod tests {
         fn client_builder_reverse() {
             let c = ClientBuilder::new("h").reverse(true).build().unwrap();
             assert!(c.reverse);
+        }
+
+        #[test]
+        fn omit_cap_matches_iperf3_max_omit_time() {
+            // iperf3's MAX_OMIT_TIME is 600 (iperf.h); -O 600 accepted, 601
+            // rejected with IEOMIT's wording (r1 blocker 4: was capped at 60).
+            assert!(ClientBuilder::new("h").omit(600).build().is_ok());
+            let err = ClientBuilder::new("h").omit(601).build().unwrap_err();
+            assert!(
+                format!("{err}").contains("maximum = 600 seconds"),
+                "IEOMIT wording expected: {err}"
+            );
         }
 
         #[test]

@@ -864,16 +864,30 @@ pub fn spawn_interval_reporter(
             } // do_emit
 
             // Omit boundary (#31): statistics reset, like iperf3's
-            // iperf_reset_stats — byte baselines, UDP omitted_* counters,
-            // retransmit baselines, and the end-block extremes restart here.
-            // Lives inside this closure because prev_retransmits/acc_extremes
-            // are its captures.
+            // iperf_reset_stats — interval counters drained (iperf3 zeroes the
+            // per-interval bytes; the un-tick-aligned warm-up tail is
+            // discarded, not emitted), byte baselines, UDP omitted_* counters
+            // + delta prevs re-synced, a FRESH retransmit sample taken
+            // (iperf3 does save_tcpinfo at reset — the last tick's value may
+            // be stale), and the end-block extremes restart. Lives inside
+            // this closure because prev_*/acc_extremes are its captures.
             if omit_boundary {
                 for (i, s) in streams.iter().enumerate() {
+                    let _ = s.counters.take_sent_interval();
+                    let _ = s.counters.take_received_interval();
                     s.counters.snapshot_omit();
                     if let Some(u) = &s.udp_recv_stats {
                         if let Ok(mut st) = u.lock() {
                             st.snapshot_omit();
+                            prev_cnt_error[i] = st.cnt_error;
+                            prev_packet_count[i] = st.packet_count;
+                        }
+                    }
+                    if has_retransmits && s.is_sender {
+                        if let Some(fd) = s.raw_fd {
+                            if let Some(info) = tcp_info::get_tcp_info(fd) {
+                                prev_retransmits[i] = info.total_retransmits;
+                            }
                         }
                     }
                     omit_retransmits[i] = prev_retransmits[i];
@@ -896,36 +910,6 @@ pub fn spawn_interval_reporter(
             // boundary's data is folded into the recovered final interval below.
             tokio::select! {
                 biased;
-                // Omit boundary (#31): placed before the ticker so a
-                // tick-coincident boundary (e.g. -O 1 -i 1) resolves as the
-                // final warm-up interval, not a phantom first real one. Its
-                // own sleep, so `-i 0` (year-long ticker) still hits it.
-                _ = tokio::time::sleep_until(omit_deadline), if in_warmup => {
-                    // Flush the warm-up tail [last tick, omit] if it carries
-                    // anything (0..omit timeline), then reset statistics — the
-                    // closure runs the reset (its captures own the baselines).
-                    let last_end = interval_num as f64 * config.interval_secs;
-                    let end = config.omit_secs as f64;
-                    let residual: u64 = streams
-                        .iter()
-                        .map(|s| {
-                            if s.is_sender {
-                                s.counters.peek_sent_interval()
-                            } else {
-                                s.counters.peek_received_interval()
-                            }
-                        })
-                        .sum();
-                    let do_emit = end > last_end + 1e-3 && residual > 0;
-                    emit_interval(last_end, end, true, true, do_emit);
-                    // The interval timeline restarts at 0 and the ticker is
-                    // re-phased (omit need not be a multiple of -i).
-                    in_warmup = false;
-                    interval_num = 0;
-                    ticker = tokio::time::interval(interval_dur);
-                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    ticker.tick().await; // skip the immediate first tick
-                }
                 _ = reporter_end.notify.notified() => {
                     // #55: the run ended part-way through an interval. Flush one
                     // final interval `[last_boundary, end_secs]` using the
@@ -950,8 +934,9 @@ pub fn spawn_interval_reporter(
                         })
                         .sum();
                     if end_secs > last_end + 1e-3 && residual_bytes > 0 {
-                        // Only reachable in warm-up when the run dies before
-                        // the boundary (error/abort path).
+                        // Normal final partial flush; `in_warmup` is only true
+                        // here when the run died before the boundary
+                        // (error/abort path), tagging the flush omitted.
                         emit_interval(last_end, end_secs, in_warmup, false, true);
                     }
                     break;
@@ -966,6 +951,24 @@ pub fn spawn_interval_reporter(
                     let start = (interval_num - 1) as f64 * config.interval_secs;
                     let end = interval_num as f64 * config.interval_secs;
                     emit_interval(start, end, in_warmup, false, true);
+                }
+                // Omit boundary (#31): ordered AFTER the ticker, matching
+                // iperf3's coincident-timer behavior (its stats timer fires
+                // before the omit timer, so -O 1 -i 1 emits the [0,1] omitted
+                // line from the tick, then resets). iperf3 DISCARDS a warm-up
+                // tail that isn't tick-aligned (stats are zeroed at reset, no
+                // partial emission), so the closure's boundary block drains
+                // and re-baselines without emitting. Its own sleep, so `-i 0`
+                // (year-long ticker) still hits it.
+                _ = tokio::time::sleep_until(omit_deadline), if in_warmup => {
+                    emit_interval(0.0, 0.0, true, true, false);
+                    // The interval timeline restarts at 0 and the ticker is
+                    // re-phased (omit need not be a multiple of -i).
+                    in_warmup = false;
+                    interval_num = 0;
+                    ticker = tokio::time::interval(interval_dur);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ticker.tick().await; // skip the immediate first tick
                 }
             }
         }

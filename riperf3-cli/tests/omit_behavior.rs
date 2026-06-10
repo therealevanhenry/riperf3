@@ -198,3 +198,97 @@ fn omit_summary_excludes_warmup_bytes() {
         "summary bytes {bytes} exceed post-omit interval bytes {interval_bytes} — warm-up leaked into the summary: {out}"
     );
 }
+
+/// #31 r1 blocker 1: `-n` + `-O` — the byte limit applies to the POST-omit
+/// window (iperf3 gates end conditions on !omitting and resets byte progress
+/// at the boundary). Pre-fix the whole budget was consumed during warm-up:
+/// the run ended in ~0.3 s with warm-up bytes in the summary.
+#[test]
+fn omit_with_byte_limit_applies_post_omit() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = spawn_server(&ps);
+
+    let (out, elapsed) = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-O", "1", "-n", "100M", "-J"],
+        Duration::from_secs(25),
+        "client",
+    );
+    let _ = server.0.wait();
+
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "the warm-up second must elapse before the -n window: took {elapsed:?}"
+    );
+    let v: Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
+    let bytes = v["end"]["sum_sent"]["bytes"].as_u64().expect("bytes");
+    assert!(
+        bytes >= 95_000_000,
+        "the -n budget must be transferred POST-omit, got {bytes}: {out}"
+    );
+}
+
+/// #31 r1 blocker 2: the server's reporter end time must be rebased to the
+/// post-omit timeline — pre-fix the final server interval spanned
+/// [last_tick, omit+t] (a 2 s window holding ~1 s of data, halving its rate).
+#[test]
+fn server_intervals_rebased_after_omit() {
+    let port = free_port();
+    let ps = port.to_string();
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let mut server = ChildGuard(
+        Command::new(bin)
+            .args(["-s", "-1", "-J", "-p", &ps])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(SERVER_BIND_WAIT);
+
+    let (_out, _) = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-O",
+            "1",
+            "-t",
+            "2",
+            "-i",
+            "1",
+        ],
+        Duration::from_secs(25),
+        "client",
+    );
+    let mut sout = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.0.try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < deadline, "server did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut sout)
+        .unwrap();
+
+    let v: Value =
+        serde_json::from_str(&sout).unwrap_or_else(|e| panic!("server -J invalid ({e}): {sout}"));
+    for i in v["intervals"].as_array().expect("intervals") {
+        let s = i["sum"]["start"].as_f64().unwrap();
+        let e = i["sum"]["end"].as_f64().unwrap();
+        assert!(
+            e - s <= 1.6,
+            "server interval [{s},{e}] spans the un-rebased warm-up (r1 blocker 2): {sout}"
+        );
+        assert!(
+            e <= 2.6,
+            "server timeline must end near the post-omit -t: {sout}"
+        );
+    }
+}

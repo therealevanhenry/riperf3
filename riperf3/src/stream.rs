@@ -265,6 +265,9 @@ impl UdpRecvStats {
         self.omitted_packet_count = self.packet_count;
         self.omitted_cnt_error = self.cnt_error;
         self.omitted_outoforder_packets = self.outoforder_packets;
+        // iperf3's iperf_reset_stats also zeroes the jitter EWMA at the
+        // boundary so warm-up influence doesn't bleed into the measurement.
+        self.jitter = 0.0;
     }
 }
 
