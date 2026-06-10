@@ -1347,10 +1347,15 @@ mod interval_reporter_tests {
             print: true,
             blksize: 128 * 1024,
         };
-        assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None, None)
-                .is_some()
-        );
+        assert!(spawn_interval_reporter(
+            config,
+            vec![],
+            done,
+            Arc::new(ReporterEnd::new()),
+            None,
+            None
+        )
+        .is_some());
     }
 
     #[tokio::test]
@@ -1368,10 +1373,15 @@ mod interval_reporter_tests {
             print: true,
             blksize: 128 * 1024,
         };
-        assert!(
-            spawn_interval_reporter(config, vec![], done, Arc::new(ReporterEnd::new()), None, None)
-                .is_none()
-        );
+        assert!(spawn_interval_reporter(
+            config,
+            vec![],
+            done,
+            Arc::new(ReporterEnd::new()),
+            None,
+            None
+        )
+        .is_none());
     }
 
     #[tokio::test]
