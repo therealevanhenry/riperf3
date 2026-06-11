@@ -968,26 +968,11 @@ impl Server {
             }
         }
 
-        if self.json_output {
-            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
-            // pre-exchange build when --get-server-output attached it (#33).
-            let report = prebuilt_report.unwrap_or_else(|| {
-                self.build_report(
-                    &streams,
-                    &cfg,
-                    &params,
-                    &cpu_util,
-                    test_duration,
-                    &cookie,
-                    &accepted_host,
-                    accepted_port,
-                    test_start_millis,
-                    &interval_data,
-                    report_error.as_deref(),
-                )
-            });
-            self.print_results_json(&report);
-        } else if self.json_stream {
+        // #220: stream mode WINS when both flags are set — iperf3's
+        // OPT_JSON_STREAM implies -J, so `-s -J --json-stream` IS stream
+        // mode (the client-side dispatch and the CLI error sinks already
+        // follow this rule).
+        if self.json_stream {
             // A terminated/interrupted run emits the discrete `error` event
             // BEFORE `end`, like iperf_json_finish on both roles
             // (iperf_api.c:5310-5323) — without this the r1 stderr gating
@@ -1012,6 +997,25 @@ impl Server {
                 &interval_data,
                 report_error.as_deref(),
             );
+        } else if self.json_output {
+            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
+            // pre-exchange build when --get-server-output attached it (#33).
+            let report = prebuilt_report.unwrap_or_else(|| {
+                self.build_report(
+                    &streams,
+                    &cfg,
+                    &params,
+                    &cpu_util,
+                    test_duration,
+                    &cookie,
+                    &accepted_host,
+                    accepted_port,
+                    test_start_millis,
+                    &interval_data,
+                    report_error.as_deref(),
+                )
+            });
+            self.print_results_json(&report);
         } else if !was_captured && server_error.is_none() {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
@@ -1903,12 +1907,15 @@ impl ServerBuilder {
     }
 
     /// Emit the results as iperf3-schema JSON on stdout instead of text (`-J`).
+    /// When combined with [`Self::json_stream`], stream mode wins (#220).
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
         self
     }
 
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
+    /// Combined with [`Self::json_output`], stream mode WINS — iperf3's
+    /// OPT_JSON_STREAM implies -J (#220), same rule as the client builder.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
         self
