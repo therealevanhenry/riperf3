@@ -208,6 +208,13 @@ fn max_duration_timer_survives_rate_ticks() {
         "rate ticks must not reset the duration timer (#237) — a 1 s max \
          duration left this -t 10 run running for {elapsed:?}"
     );
+    // Lower bound (r2): tokio timers never fire early, so this is
+    // structurally flake-safe — and it catches an instant-fire deadline
+    // (e.g. an unguarded already-past sleep_until) the upper bound can't.
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the timer must not fire BEFORE the 1 s max duration: {elapsed:?}"
+    );
     assert_eq!(client.status.code(), Some(1));
     assert!(
         client
