@@ -7,3 +7,5 @@ publish = false
 description = "Dev-only shared test helpers for the riperf3 workspace (#192)"
 
 [dependencies]
+# The JSON-aware pre-data classifier (#195) parses -J error docs.
+serde_json = { workspace = true }
