@@ -63,6 +63,57 @@ impl Drop for OutputCaptureGuard {
     }
 }
 
+/// `--timestamps` prefix state (#168): set run-scoped like OUTPUT_TITLE; when
+/// active, `titled` prepends the rendered prefix to EVERY report line, so the
+/// console and the --get-server-output capture both carry it — iperf3 buffers
+/// the PREFIXED linebuffer. (Same one-run-at-a-time process-global caveat.)
+static OUTPUT_TIMESTAMPS: RwLock<bool> = RwLock::new(false);
+
+pub(crate) struct OutputTimestampGuard;
+
+impl OutputTimestampGuard {
+    /// Construct ONLY when timestamps are active (callers use
+    /// `cond.then(OutputTimestampGuard::set)`): an unconditional `set(false)`
+    /// from a concurrent in-process run would clobber another run's `true` —
+    /// the exact server-clobbers-client topology of the lib's
+    /// `timestamps_runs` test (#168 review r1 n3). Mirrors OutputTitleGuard,
+    /// whose construct-only-when-titled shape has no such mode.
+    pub(crate) fn set() -> Self {
+        if let Ok(mut g) = OUTPUT_TIMESTAMPS.write() {
+            *g = true;
+        }
+        OutputTimestampGuard
+    }
+}
+
+impl Drop for OutputTimestampGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = OUTPUT_TIMESTAMPS.write() {
+            *g = false;
+        }
+    }
+}
+
+/// The rendered `--timestamps` prefix for the current line, or "" when off.
+/// HH:MM:SS (UTC) — the custom strftime FORMAT argument is a recorded
+/// fidelity gap, tracked separately from #168.
+pub(crate) fn output_timestamp_prefix() -> String {
+    let on = OUTPUT_TIMESTAMPS.read().map(|g| *g).unwrap_or(false);
+    if !on {
+        return String::new();
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!(
+        "{:02}:{:02}:{:02} ",
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 pub(crate) fn set_output_title(title: Option<String>) {
     if let Ok(mut g) = OUTPUT_TITLE.write() {
         *g = title;

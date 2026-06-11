@@ -187,3 +187,149 @@ fn no_flag_no_server_output() {
     assert!(v.get("server_output_text").is_none());
     assert!(v.get("server_output_json").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// #168: --get-server-output x --json-stream divergences (both roles) + the
+// timestamps-in-capture gap. Ground truth iperf3 3.20 (iperf_api.c:3900,
+// 5310-5323): a --json-stream SERVER keeps its JSON alive when the client
+// requests output and attaches server_output_json; a --json-stream CLIENT
+// emits server_output_text/_json NDJSON events BEFORE `end`; a capturing
+// --timestamps server's returned text carries the prefixes.
+// ---------------------------------------------------------------------------
+
+/// A `--json-stream` server attaches its JSON report for a requesting client.
+#[test]
+fn json_stream_server_attaches_json_output() {
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn_server_capturing(&["--json-stream"], &ps);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "-J",
+            "--get-server-output",
+        ],
+        Duration::from_secs(20),
+        "json client vs json-stream server",
+    );
+    drop(server);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("client -J output");
+    assert!(
+        v.get("server_output_json").is_some(),
+        "a --json-stream server must attach server_output_json (iperf3 keeps \
+         json_top alive for get_server_output): {out}"
+    );
+    let n_intervals = v["server_output_json"]["intervals"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(
+        n_intervals >= 1,
+        "the attached report carries populated intervals — discard_json's \
+         whole purpose (review r1 n2): {out}"
+    );
+}
+
+/// A `--json-stream` client emits the returned server output as an NDJSON
+/// event before `end` (iperf3 event order: start, interval*, server_output_*,
+/// end).
+#[test]
+fn json_stream_client_emits_server_output_event_before_end() {
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn_server_capturing(&[], &ps);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "--json-stream",
+            "--get-server-output",
+        ],
+        Duration::from_secs(20),
+        "json-stream client",
+    );
+    drop(server);
+    let mut saw_server_output_at = None;
+    let mut saw_end_at = None;
+    for (i, line) in out.lines().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("non-JSON NDJSON line ({e}): {line}"));
+        match v.get("event").and_then(|e| e.as_str()) {
+            Some("server_output_text") | Some("server_output_json") => {
+                saw_server_output_at.get_or_insert(i);
+            }
+            Some("end") => {
+                saw_end_at.get_or_insert(i);
+            }
+            _ => {}
+        }
+    }
+    let so = saw_server_output_at
+        .unwrap_or_else(|| panic!("no server_output_* event in the NDJSON: {out}"));
+    let end = saw_end_at.unwrap_or_else(|| panic!("no end event: {out}"));
+    assert!(
+        so < end,
+        "server_output_* must precede end (iperf3 order): {out}"
+    );
+}
+
+/// `--timestamps` on a capturing server: the returned text carries the
+/// prefixes (iperf3 buffers the PREFIXED linebuffer).
+#[test]
+fn timestamped_server_capture_carries_prefixes() {
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn_server_capturing(&["--timestamps"], &ps);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "--get-server-output",
+        ],
+        Duration::from_secs(20),
+        "client vs timestamped server",
+    );
+    drop(server);
+    let server_block: Vec<&str> = out
+        .lines()
+        .skip_while(|l| !l.contains("Server output:"))
+        .skip(1)
+        .filter(|l| l.contains("Mbits/sec") || l.contains("bits/sec"))
+        .collect();
+    assert!(
+        !server_block.is_empty(),
+        "no server report lines in the capture: {out}"
+    );
+    let ts = regex_lite_timestamp(server_block[0]);
+    assert!(
+        ts,
+        "captured server report lines must carry the --timestamps prefix \
+         (iperf3 tees the prefixed line): {:?}",
+        server_block[0]
+    );
+}
+
+/// HH:MM:SS-ish prefix check without a regex dependency.
+fn regex_lite_timestamp(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 9
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2] == b':'
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+        && b[5] == b':'
+}

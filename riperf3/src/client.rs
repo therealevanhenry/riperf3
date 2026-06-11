@@ -163,6 +163,10 @@ impl Client {
         // both see it.
         let _title_guard = (!self.json_output && !self.json_stream)
             .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
+        // --timestamps prefixes every text report line, run-scoped like the
+        // title; never in the machine-JSON modes (#168).
+        let _ts_guard = (self.timestamps.is_some() && !self.json_output && !self.json_stream)
+            .then(crate::macros::OutputTimestampGuard::set);
 
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
@@ -887,10 +891,10 @@ impl Client {
                     format_char: self.format_char,
                     omit_secs: self.omit,
                     forceflush: self.forceflush,
-                    timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
+                    keep_intervals: false,
                     bidir: self.bidir,
                     is_server: false,
                 },
@@ -1112,6 +1116,27 @@ impl Client {
                 test_duration,
             );
         } else if self.json_stream {
+            // iperf3's NDJSON order is start, interval*, server_output_*, end
+            // (iperf_api.c:5310-5323): the returned server output is emitted
+            // as its own event(s) BEFORE `end`; riperf3 used to drop it (#168).
+            if self.get_server_output {
+                if let Some(server) = remote_cpu {
+                    // Through the shared envelope helper — a hand-built
+                    // serde_json::json! map serializes alphabetically
+                    // ("data" before "event"), breaking the {"event":..,
+                    // "data":..} contract every other event keeps (r1 n1).
+                    if let Some(json) = &server.server_output_json {
+                        crate::reporter::emit_json_stream_line(
+                            &crate::json_report::json_stream_event("server_output_json", json),
+                        );
+                    }
+                    if let Some(text) = &server.server_output_text {
+                        crate::reporter::emit_json_stream_line(
+                            &crate::json_report::json_stream_event("server_output_text", text),
+                        );
+                    }
+                }
+            }
             // --json-stream: emit the `end` event. (Previously this fell through
             // to print_results_text, printing text banners into the NDJSON — #62.)
             self.emit_json_stream_end(
