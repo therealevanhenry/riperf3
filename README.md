@@ -86,7 +86,7 @@ riperf3 builds on Linux, macOS, FreeBSD, and Windows. Linux is the reference pla
 | `-Z` zerocopy (sendfile) | yes | yes | yes | |
 | `-C` congestion control | yes | | yes | |
 | `-D` daemon | yes | | yes | |
-| `--bind-dev` | yes | yes | | |
+| `--bind-dev` | yes | yes (client) | | |
 | `--rcv-timeout` | yes | yes | yes | |
 | `--cntl-ka` keepalive | yes | yes | yes | |
 | TCP_INFO stats | yes | yes | yes | |
