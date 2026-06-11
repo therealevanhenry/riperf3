@@ -26,6 +26,93 @@ pub struct TcpInfoSnapshot {
     pub reorder: u32,
 }
 
+/// Linux UAPI `struct tcp_info` (`linux/tcp.h`), hand-rolled through
+/// `tcpi_rcv_wnd` because libc 0.2.x mirrors glibc's `netinet/tcp.h`, which
+/// truncates after `tcpi_total_retrans` — losing `tcpi_reord_seen` and
+/// `tcpi_snd_wnd`, both of which iperf3 reads on Linux (its configure probes
+/// prefer `linux/tcp.h`): `get_reorder` → `tcpi_reord_seen` (4.19+),
+/// `get_snd_wnd` → `tcpi_snd_wnd` (5.4+) (#161). The kernel copies
+/// `min(optlen, sizeof(kernel struct))` and returns the copied length, so a
+/// larger-than-kernel buffer is safe and old kernels simply leave the tail
+/// fields unfilled — gate every tail read on the returned length. Layout
+/// pinned by the offset asserts below (the UAPI struct is append-only).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[allow(dead_code)] // kernel ABI mirror — every field is required for layout
+#[derive(Clone, Copy)]
+struct LinuxTcpInfo {
+    tcpi_state: u8,
+    tcpi_ca_state: u8,
+    tcpi_retransmits: u8,
+    tcpi_probes: u8,
+    tcpi_backoff: u8,
+    tcpi_options: u8,
+    /// `tcpi_snd_wscale:4, tcpi_rcv_wscale:4`, packed in one byte.
+    tcpi_wscale_bits: u8,
+    /// `tcpi_delivery_rate_app_limited:1, tcpi_fastopen_client_fail:2` + pad.
+    tcpi_rate_limit_bits: u8,
+    tcpi_rto: u32,
+    tcpi_ato: u32,
+    tcpi_snd_mss: u32,
+    tcpi_rcv_mss: u32,
+    tcpi_unacked: u32,
+    tcpi_sacked: u32,
+    tcpi_lost: u32,
+    tcpi_retrans: u32,
+    tcpi_fackets: u32,
+    tcpi_last_data_sent: u32,
+    tcpi_last_ack_sent: u32,
+    tcpi_last_data_recv: u32,
+    tcpi_last_ack_recv: u32,
+    tcpi_pmtu: u32,
+    tcpi_rcv_ssthresh: u32,
+    tcpi_rtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_advmss: u32,
+    tcpi_reordering: u32,
+    tcpi_rcv_rtt: u32,
+    tcpi_rcv_space: u32,
+    tcpi_total_retrans: u32,
+    tcpi_pacing_rate: u64,
+    tcpi_max_pacing_rate: u64,
+    tcpi_bytes_acked: u64,
+    tcpi_bytes_received: u64,
+    tcpi_segs_out: u32,
+    tcpi_segs_in: u32,
+    tcpi_notsent_bytes: u32,
+    tcpi_min_rtt: u32,
+    tcpi_data_segs_in: u32,
+    tcpi_data_segs_out: u32,
+    tcpi_delivery_rate: u64,
+    tcpi_busy_time: u64,
+    tcpi_rwnd_limited: u64,
+    tcpi_sndbuf_limited: u64,
+    tcpi_delivered: u32,
+    tcpi_delivered_ce: u32,
+    tcpi_bytes_sent: u64,
+    tcpi_bytes_retrans: u64,
+    tcpi_dsack_dups: u32,
+    tcpi_reord_seen: u32,
+    tcpi_rcv_ooopack: u32,
+    tcpi_snd_wnd: u32,
+    tcpi_rcv_wnd: u32,
+}
+
+// Pin the ABI-critical offsets against the kernel header. The shared prefix
+// must also agree with libc's glibc-shaped struct (same kernel layout).
+#[cfg(target_os = "linux")]
+const _: () = {
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_rto) == 8);
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_pmtu) == 60);
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_total_retrans) == 100);
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_pacing_rate) == 104);
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_reord_seen) == 220);
+    assert!(std::mem::offset_of!(LinuxTcpInfo, tcpi_snd_wnd) == 228);
+    assert!(std::mem::size_of::<LinuxTcpInfo>() == 240); // 236 rounded to the u64 align
+};
+
 /// Query TCP_INFO for a connected TCP socket.
 ///
 /// Returns `None` if the query fails or the platform does not support TCP_INFO.
@@ -34,11 +121,12 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
     use std::mem::{self, MaybeUninit};
 
     // SAFETY: getsockopt(TCP_INFO) is a read-only kernel query on a valid fd.
-    // MaybeUninit is fully initialized by getsockopt on success (ret >= 0).
+    // The kernel fills min(len, its struct size) bytes and writes that length
+    // back; zero-init so tail fields an older kernel doesn't fill read as 0.
     // No nix wrapper exists for TCP_INFO — this is the minimal unsafe surface.
-    let info = unsafe {
-        let mut info = MaybeUninit::<libc::tcp_info>::uninit();
-        let mut len = mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let (info, filled) = unsafe {
+        let mut info = MaybeUninit::<LinuxTcpInfo>::zeroed();
+        let mut len = mem::size_of::<LinuxTcpInfo>() as libc::socklen_t;
         let ret = libc::getsockopt(
             fd,
             libc::IPPROTO_TCP,
@@ -49,22 +137,36 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         if ret < 0 {
             return None;
         }
-        info.assume_init()
+        (info.assume_init(), len as usize)
     };
 
+    // Tail fields exist only on newer kernels: tcpi_reord_seen 4.19+,
+    // tcpi_snd_wnd 5.4+. The zeroed init already leaves them 0 on short
+    // copies; the explicit length gates make the contract visible.
+    let field_filled = |offset: usize| filled >= offset + std::mem::size_of::<u32>();
     Some(TcpInfoSnapshot {
         total_retransmits: info.tcpi_total_retrans,
         snd_cwnd: info.tcpi_snd_cwnd as u64 * info.tcpi_snd_mss as u64,
-        snd_wnd: 0, // tcpi_snd_wnd is not exposed by libc's tcp_info on Linux
+        // The REAL peer-advertised send window, like iperf3 (its
+        // HAVE_TCP_INFO_SND_WND probe prefers linux/tcp.h, so Linux builds
+        // emit the live value) (#161).
+        snd_wnd: if field_filled(std::mem::offset_of!(LinuxTcpInfo, tcpi_snd_wnd)) {
+            info.tcpi_snd_wnd as u64
+        } else {
+            0
+        },
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_snd_mss,
         pmtu: info.tcpi_pmtu,
-        // iperf3's `reorder` is `tcpi_reord_seen` (count of reordering events),
-        // NOT `tcpi_reordering` (the kernel's reordering-degree estimate). libc's
-        // `tcp_info` truncates before `tcpi_reord_seen`, so it's unreachable here;
-        // report 0, as iperf3 does when the field is unavailable.
-        reorder: 0,
+        // iperf3's `reorder` is `tcpi_reord_seen` (count of reordering events,
+        // 4.19+), NOT `tcpi_reordering` (the kernel's reordering-degree
+        // estimate) — now reachable through the UAPI mirror (#161).
+        reorder: if field_filled(std::mem::offset_of!(LinuxTcpInfo, tcpi_reord_seen)) {
+            info.tcpi_reord_seen
+        } else {
+            0
+        },
     })
 }
 
@@ -153,7 +255,12 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         // iperf3 uses it raw — multiplying by maxseg here would inflate the
         // Cwnd column ~1500x (#96).
         snd_cwnd: info.tcpi_snd_cwnd as u64,
-        snd_wnd: info.tcpi_snd_wnd as u64,
+        // xnu has the live value, but iperf3's HAVE_TCP_INFO_SND_WND probe
+        // checks struct tcp_info — absent on macOS — so its APPLE snd_wnd
+        // branch is dead and get_snd_wnd returns -1. Emitting the real value
+        // here would diverge from every macOS iperf3 build; the faithful -1
+        // needs the 0.8.0 i64 report fields, so pin 0 until then (#161).
+        snd_wnd: 0,
         rtt: info.tcpi_srtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_maxseg,
@@ -252,6 +359,35 @@ mod tests {
             let info = get_tcp_info(client_stream.as_raw_fd()).unwrap();
             assert!(info.snd_mss > 0);
         }
+    }
+
+    // #161: on Linux iperf3 reads tcpi_snd_wnd through linux/tcp.h (its
+    // HAVE_TCP_INFO_SND_WND probe prefers that header) and emits the REAL
+    // peer-advertised window; libc's glibc-shaped tcp_info truncates before
+    // the field, so the old reader pinned 0. Right after the handshake the
+    // peer's advertised window on loopback is always nonzero (a zero window
+    // needs a FULL receive buffer). Test prerequisite: kernel >= 5.4
+    // (tcpi_snd_wnd's introduction; older kernels return a short TCP_INFO
+    // and the gated read correctly yields 0, failing this test) — every CI
+    // runner and the fleet are 5.15+.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_snapshot_reads_real_snd_wnd() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap();
+
+        let info = get_tcp_info(server_stream.as_raw_fd()).unwrap();
+        assert!(
+            info.snd_wnd > 0,
+            "tcpi_snd_wnd must be the real advertised window, got {}",
+            info.snd_wnd
+        );
     }
 
     // #40/#96: only platforms with a real sender retransmit *packet* count

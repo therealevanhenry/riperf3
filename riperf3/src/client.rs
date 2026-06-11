@@ -180,7 +180,43 @@ impl Client {
             self.mptcp,
             self.ip_version,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            // iperf3 raises IECONNECT for ANY netdial failure
+            // (iperf_client_api.c:441) — refused, timed out (netdial sets
+            // ETIMEDOUT), and bind-local failures alike — so wrap every
+            // error from the control connect. The io kind is preserved so
+            // callers (and the test harness's refused-retry) can still
+            // classify it (#151). The `(os error N)` suffix std's io::Error
+            // appends is a deliberate, recorded deviation from iperf3's bare
+            // strerror text: substring matchers survive, and strerror text
+            // varies by platform/locale anyway (review r1 n4).
+            let (kind, detail) = match e {
+                RiperfError::Io(io) => (io.kind(), io.to_string()),
+                // iperf3's suffix is strerror(ETIMEDOUT) — glibc's text;
+                // macOS/BSD say "Operation timed out" (recorded, like the
+                // os-error suffix above).
+                RiperfError::ConnectionTimeout => (
+                    std::io::ErrorKind::TimedOut,
+                    "Connection timed out".to_string(),
+                ),
+                // Not dial failures: the family-conflict validation (#15)
+                // keeps its Protocol classification (pinned by the lib
+                // tests). Recorded deviations sharing that variant (a
+                // net.rs error split would be needed to reclassify): a
+                // failed `-B` local bind (review r1 n3) and resolve_host's
+                // "no IPvX address found" (r2 n2) — both fold into
+                // IECONNECT in iperf3's netdial.
+                other => return other,
+            };
+            RiperfError::Io(std::io::Error::new(
+                kind,
+                format!(
+                    "unable to connect to server - server may have stopped running \
+                     or use a different port, firewall issue, etc.: {detail}"
+                ),
+            ))
+        })?;
         net::configure_tcp_stream(&ctrl, true)?;
 
         // The control connection's MSS sizes UDP datagrams (issue #6) and feeds
@@ -853,12 +889,13 @@ impl Client {
                     protocol: self.protocol,
                     format_char: self.format_char,
                     omit_secs: self.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
                     keep_intervals: false,
+                    bidir: self.bidir,
+                    is_server: false,
                 },
                 stream_refs,
                 done.clone(),
@@ -1159,7 +1196,7 @@ impl Client {
             // Bidir tags every line with the STREAM's direction (#184).
             let role_tag = self
                 .bidir
-                .then_some(if s.is_sender { "TX-C" } else { "RX-C" });
+                .then_some(crate::reporter::bidir_role_tag(false, s.is_sender));
             let bytes = if s.is_sender {
                 s.counters.bytes_sent_net()
             } else {
@@ -1339,6 +1376,7 @@ impl Client {
                     .find(|e| e.stream_id == s.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
+                    max_snd_wnd: e.max_snd_wnd,
                     max_rtt: e.max_rtt,
                     min_rtt: e.min_rtt,
                     mean_rtt: e.mean_rtt(),
@@ -1918,9 +1956,10 @@ impl ClientBuilder {
         self
     }
 
-    /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
-    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere on
-    /// unix, rejected at `build()` on non-unix.
+    /// `--bind-dev`: bind data sockets to a network device. Linux
+    /// (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`/`IPV6_BOUND_IF`) only;
+    /// rejected at `build()` everywhere else (#149) — matching iperf3, whose
+    /// client-side IP_BOUND_IF fallback covers exactly these two.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
@@ -2154,11 +2193,6 @@ impl ClientBuilder {
                     "this OS does not support sendfile".into(),
                 ));
             }
-            if self.bind_dev.is_some() {
-                return Err(ConfigError::Unsupported(
-                    "SO_BINDTODEVICE is not supported on this platform".into(),
-                ));
-            }
             if self.congestion.is_some() {
                 return Err(ConfigError::Unsupported(
                     "TCP congestion control is not supported on this platform".into(),
@@ -2169,6 +2203,17 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
+        }
+
+        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS). The
+        // old gate only covered not(unix), so FreeBSD/NetBSD silently
+        // no-opped through net.rs's fallback — no binding, no error (#149).
+        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev is not supported on this platform".into(),
+            ));
         }
 
         // sendmmsg's real implementation is Linux/FreeBSD/NetBSD only; elsewhere

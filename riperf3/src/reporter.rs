@@ -22,6 +22,11 @@ pub struct StreamInterval {
     pub jitter: Option<f64>,
     pub lost: Option<i64>,
     pub total_packets: Option<i64>,
+    /// UDP *sender* rows: datagrams sent this interval — iperf3 prints them
+    /// with a blank jitter/loss region (report_bw_udp_sender_format) (#187).
+    pub sent_packets: Option<i64>,
+    /// Bidir role tag, rendered as iperf3's `[TX-C]`-style column (#143/#187).
+    pub role_tag: Option<&'static str>,
     pub omitted: bool,
 }
 
@@ -85,23 +90,58 @@ fn titled(line: std::fmt::Arguments) {
 }
 
 /// Print the header line for interval reports.
-pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
+/// iperf3's bidir role tag (its `mbuf`): TX/RX by sender-ness, C/S by role.
+/// One table for the four call sites (interval rows, interval SUMs, and the
+/// client/server end blocks) so they can't drift (#143 review r1 n6).
+pub(crate) fn bidir_role_tag(is_server: bool, is_sender: bool) -> &'static str {
+    match (is_server, is_sender) {
+        (false, true) => "TX-C",
+        (false, false) => "RX-C",
+        (true, true) => "TX-S",
+        (true, false) => "RX-S",
+    }
+}
+
+/// The UDP header variant: iperf3 picks by test mode (print_interval_results)
+/// — the sender header has "Total Datagrams" and no Jitter/Lost columns.
+#[derive(Clone, Copy, PartialEq)]
+pub enum UdpHeaderMode {
+    Sender,
+    Receiver,
+}
+
+pub fn print_header(
+    protocol: TransportProtocol,
+    has_retransmits: bool,
+    bidir: bool,
+    udp_mode: UdpHeaderMode,
+) {
+    // iperf3's bidir headers add the [Role] column (report_bw_*_header_bidir).
+    let role = if bidir { "[Role]" } else { "" };
     match protocol {
         TransportProtocol::Tcp => {
             if has_retransmits {
                 titled(format_args!(
-                    "[ ID] Interval           Transfer     Bitrate         Retr  Cwnd"
+                    "[ ID]{role} Interval           Transfer     Bitrate         Retr  Cwnd"
                 ));
             } else {
                 titled(format_args!(
-                    "[ ID] Interval           Transfer     Bitrate"
+                    "[ ID]{role} Interval           Transfer     Bitrate"
                 ));
             }
         }
         TransportProtocol::Udp => {
-            titled(format_args!(
-                "[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
-            ));
+            // Bidir mixes both directions under the receiver-shaped header,
+            // exactly like report_bw_udp_header_bidir.
+            if udp_mode == UdpHeaderMode::Sender && !bidir {
+                titled(format_args!(
+                    "[ ID]{role} Interval           Transfer     Bitrate         Total Datagrams"
+                ));
+            } else {
+                titled(format_args!(
+                    "[ ID]{role} Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
+                ));
+            }
         }
     }
 }
@@ -117,7 +157,7 @@ pub(crate) fn emit_json_stream_line(line: &str) {
 
 /// Print one interval line.
 pub fn print_interval(interval: &StreamInterval, format_char: char) {
-    let id = fmt_id(interval.stream_id);
+    let id = fmt_id_role(interval.stream_id, interval.role_tag);
     let transfer = units::format_bytes(interval.bytes as f64, format_char.to_ascii_uppercase());
     let seconds = interval.end - interval.start;
     let bits_per_sec = if seconds > 0.0 {
@@ -144,6 +184,28 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
             total,
             pct,
             omit_tag,
+        ));
+    } else if let Some(sent) = interval.sent_packets {
+        // UDP sender row: the sent-datagram count, with the blank jitter/loss
+        // pad ONLY in bidir — iperf3's zbuf is 10 spaces in bidir and empty
+        // otherwise (report_bw_udp_sender_format; #187 review r1 n4).
+        let pad = if interval.role_tag.is_some() {
+            "          " // iperf3's zbuf: exactly 10 spaces
+        } else {
+            ""
+        };
+        titled(format_args!(
+            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {pad}{sent}  {}",
+            interval.start, interval.end, transfer, rate, omit_tag,
+        ));
+    } else if let (Some(retr), None) = (interval.retransmits, interval.snd_cwnd) {
+        // TCP [SUM] with retransmits: iperf3's report_sum_bw_retrans_format
+        // carries Retr but no Cwnd (a SUM has no single congestion window) —
+        // without this branch the populated Retr fell through to the bare
+        // format and vanished (#143 review r1 n3).
+        titled(format_args!(
+            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}            {}",
+            interval.start, interval.end, transfer, rate, retr, omit_tag,
         ));
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
@@ -370,7 +432,6 @@ pub struct IntervalReporterConfig {
     pub protocol: TransportProtocol,
     pub format_char: char,
     pub omit_secs: u32,
-    pub num_streams: usize,
     pub forceflush: bool,
     pub json_stream: bool,
     /// Print interval lines live (text or json-stream). When false the reporter
@@ -384,6 +445,11 @@ pub struct IntervalReporterConfig {
     /// attached server_output_json carries populated intervals like iperf3's
     /// json_top under discard_json (#168).
     pub keep_intervals: bool,
+    /// Bidir run: interval rows and SUMs carry iperf3's role tags
+    /// (`[TX-C]`/`[RX-C]` client side, `[TX-S]`/`[RX-S]` server side) (#143/#187).
+    pub bidir: bool,
+    /// Which side this reporter prints for (selects the C/S half of the tag).
+    pub is_server: bool,
 }
 
 /// A single TCP_INFO sample reused for the final interval (#55) when the socket
@@ -391,6 +457,7 @@ pub struct IntervalReporterConfig {
 #[derive(Clone, Copy)]
 struct TcpSample {
     snd_cwnd: u64,
+    snd_wnd: u64,
     rtt: u32,
     rttvar: u32,
     pmtu: u32,
@@ -403,6 +470,7 @@ struct TcpSample {
 pub struct StreamExtremes {
     pub stream_id: i32,
     pub max_snd_cwnd: u64,
+    pub max_snd_wnd: u64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub reorder: u32,
@@ -699,7 +767,15 @@ pub fn spawn_interval_reporter(
 
                 // The text header banner is suppressed under --json-stream (pure NDJSON).
                 if config.print && !config.json_stream && !header_printed {
-                    print_header(config.protocol, has_retransmits);
+                    // iperf3's UDP header is mode-selected: all-sender (a
+                    // forward client / reverse server) gets the sender
+                    // variant; bidir gets the receiver-shaped bidir header.
+                    let udp_mode = if streams.iter().all(|s| s.udp_recv_stats.is_none()) {
+                        UdpHeaderMode::Sender
+                    } else {
+                        UdpHeaderMode::Receiver
+                    };
+                    print_header(config.protocol, has_retransmits, config.bidir, udp_mode);
                     header_printed = true;
                 }
 
@@ -709,6 +785,7 @@ pub fn spawn_interval_reporter(
                 // server its receivers — `rev` the opposite. Non-bidir runs leave
                 // `rev` empty.
                 let fwd_is_sender = streams.first().is_none_or(|s| s.is_sender);
+                let mut tick_rows: Vec<(bool, StreamInterval)> = Vec::new();
                 let mut fwd = DirAcc::default();
                 let mut rev = DirAcc::default();
                 let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
@@ -721,7 +798,7 @@ pub fn spawn_interval_reporter(
                     };
 
                     // TCP_INFO for the interval detail and the end extremes.
-                    let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) =
+                    let (retransmits, snd_cwnd, snd_wnd, rtt, rttvar, pmtu, reorder_iv) =
                         if has_retransmits && stream.is_sender {
                             if let Some(fd) = stream.raw_fd {
                                 if let Some(info) = tcp_info::get_tcp_info(fd) {
@@ -731,6 +808,7 @@ pub fn spawn_interval_reporter(
                                     // Accumulate sender-side extremes for the end report.
                                     let e = &mut acc_extremes[i];
                                     e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
+                                    e.max_snd_wnd = e.max_snd_wnd.max(info.snd_wnd);
                                     e.reorder = e.reorder.max(info.reorder);
                                     if info.rtt > 0 {
                                         e.max_rtt = e.max_rtt.max(info.rtt);
@@ -741,6 +819,7 @@ pub fn spawn_interval_reporter(
                                     e.total_retransmits = Some(info.total_retransmits);
                                     last_tcp[i] = Some(TcpSample {
                                         snd_cwnd: info.snd_cwnd,
+                                        snd_wnd: info.snd_wnd,
                                         rtt: info.rtt,
                                         rttvar: info.rttvar,
                                         pmtu: info.pmtu,
@@ -749,6 +828,7 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(delta as i64),
                                         Some(info.snd_cwnd),
+                                        Some(info.snd_wnd),
                                         Some(info.rtt),
                                         Some(info.rttvar),
                                         Some(info.pmtu),
@@ -762,19 +842,20 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(0),
                                         Some(s.snd_cwnd),
+                                        Some(s.snd_wnd),
                                         Some(s.rtt),
                                         Some(s.rttvar),
                                         Some(s.pmtu),
                                         Some(s.reorder),
                                     )
                                 } else {
-                                    (None, None, None, None, None, None)
+                                    (None, None, None, None, None, None, None)
                                 }
                             } else {
-                                (None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None)
                             }
                         } else {
-                            (None, None, None, None, None, None)
+                            (None, None, None, None, None, None, None)
                         };
 
                     // UDP stats (compute deltas for loss/packets)
@@ -798,24 +879,44 @@ pub fn spawn_interval_reporter(
                         0.0
                     };
 
+                    // Bidir role tag for this stream's rows, iperf3's mbuf
+                    // (`[TX-C]`-style; the S half on the server) (#143/#187).
+                    let role_tag = config
+                        .bidir
+                        .then_some(bidir_role_tag(config.is_server, stream.is_sender));
+                    // UDP sender rows carry the sent-datagram count with a
+                    // blank jitter/loss region (iperf3's
+                    // report_bw_udp_sender_format) — senders measure no
+                    // loss/jitter (#187).
+                    let sent_pkts =
+                        (is_udp && stream.udp_recv_stats.is_none()).then(|| (bytes / blk) as i64);
+
                     // Text mode prints a per-stream line here. `--json-stream` emits
                     // one typed `interval` event per tick (assembled after the loop
                     // from the same typed streams the `-J` collector builds), so it
                     // has nothing to print per stream.
                     if config.print && !config.json_stream {
-                        let interval = StreamInterval {
-                            stream_id: stream.id,
-                            start,
-                            end,
-                            bytes,
-                            retransmits,
-                            snd_cwnd,
-                            jitter,
-                            lost,
-                            total_packets: total,
-                            omitted,
-                        };
-                        print_interval(&interval, config.format_char);
+                        // Buffered, not printed: iperf3 emits each DIRECTION's
+                        // rows followed by that direction's [SUM] (its
+                        // per-mode pass), so printing waits until the whole
+                        // tick is gathered (#143 review r1 n1).
+                        tick_rows.push((
+                            stream.is_sender,
+                            StreamInterval {
+                                stream_id: stream.id,
+                                start,
+                                end,
+                                bytes,
+                                retransmits,
+                                snd_cwnd,
+                                jitter,
+                                lost,
+                                total_packets: total,
+                                sent_packets: sent_pkts,
+                                role_tag,
+                                omitted,
+                            },
+                        ));
                     }
 
                     if collecting {
@@ -833,7 +934,7 @@ pub fn spawn_interval_reporter(
                                 },
                             )
                         } else if is_udp {
-                            (None, None, Some((bytes / blk) as i64), None)
+                            (None, None, sent_pkts, None)
                         } else {
                             (None, None, None, None)
                         };
@@ -846,9 +947,10 @@ pub fn spawn_interval_reporter(
                             bits_per_second: bps_val,
                             retransmits,
                             snd_cwnd,
-                            // snd_wnd is unavailable via libc (see TcpStreamSide); emit
-                            // 0 alongside the other TCP detail, like iperf3.
-                            snd_wnd: snd_cwnd.map(|_| 0u64),
+                            // The live tcpi_snd_wnd where the platform reader
+                            // captures it (Linux UAPI mirror / FreeBSD), like
+                            // iperf3's get_snd_wnd (#161).
+                            snd_wnd,
                             rtt,
                             rttvar,
                             pmtu,
@@ -886,42 +988,47 @@ pub fn spawn_interval_reporter(
                     }
                 }
 
-                // Print [SUM] line for parallel streams (text only; the json-stream
-                // `interval` event below carries the typed `sum` instead).
-                if config.print && !config.json_stream && config.num_streams > 1 {
-                    // The text [SUM] stays one combined line (both directions in
-                    // bidir); only the typed -J/json-stream sums split per direction.
-                    // Jitter is the mean across receiving streams (#142).
-                    let sum_jitter = if rev.udp_recv_count > 0 {
-                        rev.jitter_sum / rev.udp_recv_count.max(1) as f64
-                    } else {
-                        fwd.jitter_sum / fwd.udp_recv_count.max(1) as f64
-                    };
-                    let sum_interval = StreamInterval {
-                        stream_id: -1, // renders as "SUM"
-                        start,
-                        end,
-                        bytes: fwd.bytes + rev.bytes,
-                        retransmits: if has_retransmits {
-                            Some(fwd.retransmits + rev.retransmits)
-                        } else {
-                            None
-                        },
-                        snd_cwnd: None,
-                        jitter: if is_udp { Some(sum_jitter) } else { None },
-                        lost: if is_udp {
-                            Some(fwd.lost + rev.lost)
-                        } else {
-                            None
-                        },
-                        total_packets: if is_udp {
-                            Some(fwd.packets + rev.packets)
-                        } else {
-                            None
-                        },
-                        omitted,
-                    };
-                    print_interval(&sum_interval, config.format_char);
+                // Text emission, iperf3's iperf_print_intermediate: one pass
+                // per DIRECTION — that direction's stream rows, then ITS OWN
+                // [SUM] (tagged in bidir), the SUM only when the direction
+                // has more than one stream. The old code printed all rows
+                // then a combined SUM mixing both directions, even at bidir
+                // P=1 (#143/#187 + review r1 n1).
+                if config.print && !config.json_stream {
+                    for (acc, dir_is_sender) in [(&fwd, fwd_is_sender), (&rev, !fwd_is_sender)] {
+                        for (row_is_sender, row) in &tick_rows {
+                            if *row_is_sender == dir_is_sender {
+                                print_interval(row, config.format_char);
+                            }
+                        }
+                        if acc.count <= 1 {
+                            continue;
+                        }
+                        let role_tag = config
+                            .bidir
+                            .then_some(bidir_role_tag(config.is_server, dir_is_sender));
+                        // A receiving direction reports loss + mean jitter
+                        // (#142); a sending direction reports only the sent
+                        // count, like the per-stream sender rows.
+                        let receiving = acc.udp_recv_count > 0;
+                        let sum_interval = StreamInterval {
+                            stream_id: -1, // renders as "SUM"
+                            start,
+                            end,
+                            bytes: acc.bytes,
+                            retransmits: (has_retransmits && dir_is_sender)
+                                .then_some(acc.retransmits),
+                            snd_cwnd: None,
+                            jitter: (is_udp && receiving)
+                                .then(|| acc.jitter_sum / acc.udp_recv_count.max(1) as f64),
+                            lost: (is_udp && receiving).then_some(acc.lost),
+                            total_packets: (is_udp && receiving).then_some(acc.packets),
+                            sent_packets: (is_udp && !receiving).then(|| (acc.bytes / blk) as i64),
+                            role_tag,
+                            omitted,
+                        };
+                        print_interval(&sum_interval, config.format_char);
+                    }
                 }
 
                 if collecting {
@@ -1159,6 +1266,8 @@ mod tests {
             jitter: None,
             lost: None,
             total_packets: None,
+            sent_packets: None,
+            role_tag: None,
             omitted: false,
         };
         print_interval(&interval, 'm');
@@ -1193,6 +1302,8 @@ mod tests {
             jitter: None,
             lost: None,
             total_packets: None,
+            sent_packets: None,
+            role_tag: None,
             omitted: false,
         };
         // Should print [SUM] instead of a number
@@ -1500,12 +1611,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         assert!(spawn_interval_reporter(
             config,
@@ -1527,12 +1639,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         assert!(spawn_interval_reporter(
             config,
@@ -1554,12 +1667,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 0,
             forceflush: false,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         let handle = spawn_interval_reporter(
             config,
@@ -1608,12 +1722,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let report_start = std::time::Instant::now();
@@ -1691,12 +1806,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let report_start = std::time::Instant::now();
@@ -1769,12 +1885,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let handle = spawn_interval_reporter(
@@ -1843,12 +1960,13 @@ mod interval_reporter_tests {
             protocol: TransportProtocol::Tcp,
             format_char: 'a',
             omit_secs: 0,
-            num_streams: 1,
             forceflush: false,
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
             keep_intervals: false,
+            bidir: false,
+            is_server: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let handle = spawn_interval_reporter(

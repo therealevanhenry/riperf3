@@ -17,14 +17,8 @@ fn free_port() -> u16 {
     common::free_port()
 }
 
-/// Kills the wrapped child on drop so a spawned server is reaped on panic.
-struct ChildGuard(std::process::Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+// Reaper guard shared via riperf3-test-support (#192).
+use common::ChildGuard;
 
 fn wait_for(cond: impl Fn() -> bool, timeout: Duration, what: &str) {
     let deadline = Instant::now() + timeout;
