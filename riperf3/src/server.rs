@@ -212,11 +212,6 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
-        // -V opens with the version and uname lines, like iperf3 (#222).
-        if self.verbose && !self.json_output && !self.json_stream {
-            vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
-            vprintln!("{}", crate::utils::system_info());
-        }
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
@@ -242,6 +237,12 @@ impl Server {
             .map(crate::macros::OutputTimestampGuard::set);
         let sep = "-----------------------------------------------------------";
         if !json {
+            // -V reprints version/uname EVERY accept round, like GT's
+            // iperf_run_server loop (r1 item 12; #222).
+            if self.verbose && !self.json_output && !self.json_stream {
+                vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+                vprintln!("{}", crate::utils::system_info());
+            }
             Self::banner_line(sep);
             Self::banner_line(&format!("Server listening on {}", self.port));
             Self::banner_line(sep);
@@ -284,6 +285,10 @@ impl Server {
                 break;
             }
             if !json {
+                if self.verbose && !self.json_output && !self.json_stream {
+                    vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+                    vprintln!("{}", crate::utils::system_info());
+                }
                 Self::banner_line(sep);
                 Self::banner_line(&format!("Server listening on {}", self.port));
                 Self::banner_line(sep);
@@ -325,28 +330,9 @@ impl Server {
             Some(r) => r?,
             None => return Ok(()),
         };
-        // #222: Time (-V) then the UNCONDITIONAL accept banner
-        // (iperf_on_connect's server half, iperf_api.c:1017) — text only.
-        if !self.json_output && !self.json_stream {
-            if self.verbose {
-                vprintln!(
-                    "Time: {}",
-                    crate::json_report::http_date(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    )
-                );
-            }
-            // iperf3's shape: "host, port N", with v4-mapped v6 addresses
-            // unmapped for display (mapped_v4_to_regular_v4).
-            vprintln!(
-                "Accepted connection from {}, port {}",
-                peer_addr.ip().to_canonical(),
-                peer_addr.port()
-            );
-        }
+        // (#222 r1 item 6: the Time/banner/Cookie/MSS block prints AFTER the
+        // param exchange — GT's iperf_on_connect fires there — so a
+        // --get-server-output capture relays it; see below.)
         net::configure_tcp_stream(&ctrl, true)?;
 
         let json = self.json_output || self.json_stream;
@@ -361,12 +347,6 @@ impl Server {
 
         // ---- Cookie ----
         let cookie = protocol::recv_cookie(&mut ctrl).await?;
-        if self.verbose && !self.json_output && !self.json_stream {
-            vprintln!(
-                "      Cookie: {}",
-                String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
-            );
-        }
 
         // ---- ParamExchange ----
         protocol::send_state(&mut ctrl, TestState::ParamExchange).await?;
@@ -395,6 +375,41 @@ impl Server {
         // The timestamp guard is run-scoped — set in `run()` before the
         // banner (#216) — so the capture above tees PREFIXED lines like
         // iperf3's linebuffer (#168) with nothing to do per test.
+
+        // #222: the connect text block, in GT's order and GT's TIMING —
+        // iperf_on_connect fires post-param-exchange, which also puts these
+        // lines inside the --get-server-output capture (r1 item 6). The
+        // banner is unconditional in text mode; the rest is -V. The server's
+        // control MSS is 0 "(default)" (ctrl_sck_mss, r1 item 2).
+        if !self.json_output && !self.json_stream {
+            if self.verbose {
+                vprintln!(
+                    "Time: {}",
+                    crate::json_report::http_date(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                );
+            }
+            // iperf3's shape: "host, port N", with v4-mapped v6 addresses
+            // unmapped for display (mapped_v4_to_regular_v4).
+            vprintln!(
+                "Accepted connection from {}, port {}",
+                peer_addr.ip().to_canonical(),
+                peer_addr.port()
+            );
+            if self.verbose {
+                vprintln!(
+                    "      Cookie: {}",
+                    String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                );
+                if matches!(cfg.protocol, TransportProtocol::Tcp) {
+                    vprintln!("      TCP MSS: 0 (default)");
+                }
+            }
+        }
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -429,15 +444,8 @@ impl Server {
             }
         }
 
-        if self.verbose {
-            vprintln!(
-                "Test: {:?} {} stream(s) blksize={} duration={}s",
-                cfg.protocol,
-                cfg.num_streams,
-                cfg.blksize,
-                cfg.duration
-            );
-        }
+        // (The legacy "Test: Tcp N stream(s)..." -V line is gone — its GT
+        // replacement is the Starting Test line below; r1 item 14.)
 
         // ---- CreateStreams ----
         let done = Arc::new(AtomicBool::new(false));
@@ -660,7 +668,7 @@ impl Server {
                         TransportProtocol::Tcp => "TCP",
                         TransportProtocol::Udp => "UDP",
                     },
-                    streams.len(),
+                    cfg.num_streams,
                     cfg.blksize,
                     cfg.omit,
                     cfg.duration,
@@ -952,8 +960,22 @@ impl Server {
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
+            // The -V additions render here too (r1 item 7): the captured
+            // pre-exchange path is the console output AND the relay.
+            if self.verbose {
+                vprintln!("Test Complete. Summary Results:");
+            }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
+                if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
+                    if streams.iter().any(|s| s.is_sender) {
+                        vprintln!("snd_tcp_congestion {c}");
+                    } else {
+                        vprintln!("rcv_tcp_congestion {c}");
+                    }
+                }
+            }
             (Some(capture.take()), None)
         } else if want_server_output && (self.json_output || self.json_stream) {
             // A --json-stream server attaches its JSON report too: iperf3

@@ -162,9 +162,16 @@ fn text_is_setup_only(stdout: &str) -> bool {
             || t.starts_with("Cookie: ")
             || t.starts_with("TCP MSS: ")
             || t.starts_with("Starting Test: ")
+            || t.starts_with("Reverse mode, remote host ")
+            || t.starts_with("Target Bitrate: ")
+            || t.starts_with("Setting UDP block size to ")
             || (t.starts_with('[') && t.contains("] local ") && t.contains(" connected to "))
     })
 }
+// KNOWN HOLES (r1 review, documented not closed): the -V uname line has no
+// recognizable shape (any test relying on the retry should not use -V), and
+// a --timestamps/-T prefix defeats every starts_with above (no current test
+// combines those flags with the retry; revisit if one does).
 
 /// Did this JSON-mode run die during SETUP — streams never connected, no
 /// interval ever ticked? Both sinks are checked: a monolithic `-J` document

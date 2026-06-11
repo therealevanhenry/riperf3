@@ -86,7 +86,7 @@ fn banners_preamble_and_done_print_unconditionally() {
         out = client.stdout
     );
     assert!(
-        client.stdout.ends_with("\niperf Done.\n"),
+        client.stdout.ends_with("\n\niperf Done.\n"),
         "the run closes with a blank line + 'iperf Done.': {tail:?}",
         tail = &client.stdout[client.stdout.len().saturating_sub(40)..]
     );
@@ -94,6 +94,11 @@ fn banners_preamble_and_done_print_unconditionally() {
     assert!(
         sout.contains("Accepted connection from 127.0.0.1, port "),
         "the server banner is unconditional: {sout}"
+    );
+    assert!(
+        !client.stdout.contains("Reverse mode"),
+        "no reverse banner on a forward run: {out}",
+        out = client.stdout
     );
     assert!(preamble_re(&sout), "server per-stream preamble: {sout}");
     assert!(
@@ -207,4 +212,33 @@ fn json_mode_carries_no_text_lines() {
         )
     });
     assert!(doc["end"].is_object());
+}
+
+/// -R: the unconditional "Reverse mode, remote host … is sending" banner
+/// (iperf_api.c:995-998), and -V -R prints NO CPU line (GT gates it on the
+/// sending side, iperf_api.c:4563).
+#[test]
+fn reverse_mode_banner_and_no_cpu_line() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&[], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = common::run_client_ok(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "1", "-R", "-V"],
+        Duration::from_secs(40),
+        "client -R -V",
+    );
+    let _ = finish(server, "server");
+    assert!(
+        client
+            .stdout
+            .contains("Reverse mode, remote host 127.0.0.1 is sending"),
+        "{out}",
+        out = client.stdout
+    );
+    assert!(
+        !client.stdout.contains("CPU Utilization:"),
+        "GT prints no CPU line on the receiving side: {out}",
+        out = client.stdout
+    );
 }
