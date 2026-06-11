@@ -977,6 +977,38 @@ mod tests {
 
     /// #163: an explicit -w bump applied earlier (apply_socket_window runs
     /// before the data thread) must survive configure_udp_sender.
+    /// #163 review r2 nit: the None path (explicit -w given) must leave
+    /// SO_SNDBUF exactly untouched while still switching to blocking — the
+    /// regression guard against the buffer setup migrating inside the
+    /// Some-arm.
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_none_leaves_buffer_untouched() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let _ = sock.set_send_buffer_size(64 * 1024);
+        let before = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, None).unwrap();
+        assert_eq!(
+            sock.send_buffer_size().unwrap(),
+            before,
+            "None must not touch SO_SNDBUF"
+        );
+        // Blocking mode still applied: a recv on an empty socket with the
+        // SO_SNDTIMEO-class timeout... cheapest observable: nonblocking off
+        // means recv_from with a read timeout blocks ~that long, while a
+        // nonblocking socket returns WouldBlock instantly.
+        s.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 8];
+        let _ = s.recv_from(&mut buf);
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(30),
+            "socket must be in blocking mode after configure_udp_sender(None)"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn configure_udp_sender_preserves_window_bump() {
