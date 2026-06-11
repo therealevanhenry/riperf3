@@ -66,3 +66,53 @@ fn pre_data_reset_is_retried_until_a_real_server_arrives() {
         out = run.stdout
     );
 }
+
+/// The -J flavor: #198 routes the setup error INTO the document on stdout
+/// (stderr empty), so the pre-data classifier must read the doc — connected
+/// never populated, zero intervals — not just "stdout empty". This was the
+/// quiet-host residual: 4/20 two-core rounds died exactly here pre-fix.
+#[test]
+fn pre_data_reset_is_retried_in_json_mode() {
+    let port = common::free_port();
+
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind saboteur");
+    let saboteur = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut byte = [0u8; 1];
+            let _ = sock.read_exact(&mut byte);
+            drop(sock);
+        }
+    });
+    let server = std::thread::spawn(move || {
+        saboteur.join().expect("saboteur thread");
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn real server")
+    });
+
+    let ps = port.to_string();
+    let run = common::run_client_ok(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "1", "-J"],
+        Duration::from_secs(40),
+        "client -J",
+    );
+    let mut server = ChildGuard(server.join().expect("server thread"));
+    let _ = server.0.wait();
+
+    let doc: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("one clean doc after retries ({e}): {out}", out = run.stdout));
+    assert!(
+        doc["start"]["connected"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "the final run really connected: {doc}"
+    );
+    assert!(
+        doc.get("error").is_none(),
+        "no error key on the clean run: {doc}"
+    );
+}

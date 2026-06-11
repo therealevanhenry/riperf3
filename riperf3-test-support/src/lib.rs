@@ -108,11 +108,44 @@ pub fn refused(status: &ExitStatus, output: &str) -> bool {
 /// less precisely. Accepted: rare, bounded, and the alternative is the #195
 /// empty-output kill that destroys the diagnosis entirely.
 pub fn reset_pre_data(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
-    !status.success()
-        && stdout.is_empty()
-        && (stderr.contains("ConnectionReset")
-            || stderr.contains("Connection reset")
-            || stderr.contains("(os error 10054)"))
+    if status.success() {
+        return false;
+    }
+    if stdout.is_empty() {
+        return reset_tokens(stderr);
+    }
+    // -J/--json-stream render setup errors INTO stdout (#198) with stderr
+    // empty, so "empty stdout" cannot be the only pre-data proxy (the 2-core
+    // rounds proved it: every quiet-host residual failure was a -J doc whose
+    // connected list never populated). A rendered error whose run never
+    // built streams and never ticked an interval is pre-data by
+    // construction.
+    reset_tokens(stdout) && json_output_is_setup_only(stdout)
+}
+
+/// The three reset renderings, mirroring `refused`: Debug form, POSIX
+/// strerror, and Windows' WSAECONNRESET text (no "reset"-cased substring).
+fn reset_tokens(s: &str) -> bool {
+    s.contains("ConnectionReset")
+        || s.contains("Connection reset")
+        || s.contains("(os error 10054)")
+}
+
+/// Did this JSON-mode run die during SETUP — streams never connected, no
+/// interval ever ticked? Both sinks are checked: a monolithic `-J` document
+/// (start.connected empty + intervals empty) and a `--json-stream` event
+/// sequence (no interval events). Non-JSON stdout returns false: text-mode
+/// output means the run was past setup.
+fn json_output_is_setup_only(stdout: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        let connected_empty = v["start"]["connected"]
+            .as_array()
+            .is_none_or(|a| a.is_empty());
+        let no_intervals = v["intervals"].as_array().is_none_or(|a| a.is_empty());
+        return connected_empty && no_intervals;
+    }
+    // NDJSON stream: any interval event means data flowed.
+    stdout.contains("{\"event\":") && !stdout.contains("{\"event\":\"interval\"")
 }
 
 /// Run a riperf3 CLI binary to completion with a hard timeout, retrying while
@@ -288,6 +321,35 @@ mod tests {
                 "must classify as pre-data reset: {stderr}"
             );
         }
+    }
+
+    /// The -J shapes (#195 quiet-round residue): a setup-only error doc
+    /// (connected never populated, zero intervals) classifies; a doc whose
+    /// run carried data does not, whatever its error key says.
+    #[test]
+    fn json_mode_pre_data_reset_classifies() {
+        let failed = status(1);
+        let setup_doc = r#"{
+  "start": {"connected": [], "version": "riperf3 0.7.3"},
+  "intervals": [],
+  "end": {},
+  "error": "Connection reset by peer (os error 104)"
+}"#;
+        assert!(reset_pre_data(&failed, setup_doc, ""));
+
+        let mid_test_doc = r#"{
+  "start": {"connected": [{"socket": 1}]},
+  "intervals": [{"sum": {"bytes": 1}}],
+  "end": {},
+  "error": "Connection reset by peer (os error 104)"
+}"#;
+        assert!(!reset_pre_data(&failed, mid_test_doc, ""));
+
+        // json-stream: error+end only = setup; any interval event = data ran.
+        let stream_setup = "{\"event\":\"error\",\"data\":\"Connection reset by peer (os error 104)\"}\n{\"event\":\"end\",\"data\":{}}";
+        assert!(reset_pre_data(&failed, stream_setup, ""));
+        let stream_mid = "{\"event\":\"start\",\"data\":{}}\n{\"event\":\"interval\",\"data\":{}}\n{\"event\":\"error\",\"data\":\"Connection reset by peer (os error 104)\"}";
+        assert!(!reset_pre_data(&failed, stream_mid, ""));
     }
 
     /// The guards: output already produced (data phase, or a -J error doc),
