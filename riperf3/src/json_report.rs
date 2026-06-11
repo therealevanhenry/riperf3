@@ -1313,6 +1313,69 @@ mod tests {
         }
     }
 
+    /// #170 r3: the terminated-run shapes only existed in live matrices —
+    /// these pins keep a json_report refactor from silently regrowing the
+    /// fabrication family (it escaped two cold rounds for exactly this lack).
+    #[test]
+    fn terminated_bidir_sums_zero_the_absent_peer_halves() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.error = Some("the server has terminated".into());
+        let mut fwd = tcp_stream(1, true, 1_000_000, 0);
+        fwd.remote_bytes = None;
+        fwd.retransmits = None;
+        let mut rev = tcp_stream(3, false, 500_000, 0);
+        rev.remote_bytes = None;
+        rev.retransmits = None;
+        input.streams = vec![fwd, rev];
+        let v = serde_json::to_value(input.build()).unwrap();
+        // iperf3 (live-captured at #170 r2): locals kept, peer halves 0.
+        assert_eq!(v["end"]["sum_sent"]["bytes"], 1_000_000);
+        assert_eq!(v["end"]["sum_received"]["bytes"], 0);
+        assert_eq!(v["end"]["sum_sent_bidir_reverse"]["bytes"], 0);
+        assert_eq!(v["end"]["sum_received_bidir_reverse"]["bytes"], 500_000);
+    }
+
+    #[test]
+    fn terminated_reverse_udp_keeps_measured_packets_with_zero_bytes() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true;
+        input.blksize = 1460;
+        input.error = Some("the server has terminated".into());
+        let mut st = tcp_stream(1, false, 360_151, 0);
+        st.remote_bytes = None;
+        st.retransmits = None;
+        st.udp = Some(UdpStreamStats {
+            jitter_secs: 0.0001,
+            lost_packets: 1,
+            packets: 13,
+            out_of_order: 0,
+        });
+        input.streams = vec![st];
+        let v = serde_json::to_value(input.build()).unwrap();
+        // iperf3 (live-captured at #170 r2/r3): the sender-side bytes the
+        // dead peer never reported are 0; the locally measured packets stay;
+        // sum.packets falls back to the receiver count (iperf_api.c:4242).
+        assert_eq!(v["end"]["streams"][0]["udp"]["bytes"], 0);
+        assert_eq!(v["end"]["streams"][0]["udp"]["packets"], 13);
+        assert_eq!(v["end"]["sum"]["bytes"], 0);
+        assert_eq!(v["end"]["sum"]["packets"], 13);
+    }
+
+    /// The error=None peer-absent graft (legacy-peer tolerance) is unchanged:
+    /// locks the normal-path equivalence r3 verified by inspection.
+    #[test]
+    fn peer_absent_without_error_still_grafts() {
+        let mut input = base_input();
+        let mut st = tcp_stream(1, true, 1_000_000, 0);
+        st.remote_bytes = None;
+        input.streams = vec![st];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["streams"][0]["receiver"]["bytes"], 1_000_000);
+        assert_eq!(v["end"]["sum_received"]["bytes"], 1_000_000);
+    }
+
     #[test]
     fn tcp_forward_end_streams_are_nested_sender_receiver() {
         let mut input = base_input();
