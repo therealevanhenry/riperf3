@@ -417,6 +417,18 @@ pub const UDP_CONNECT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::
 /// How often the client resends the magic while waiting (recovers a lost magic).
 const UDP_CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Is this send/recv error the kernel relaying ICMP feedback for an earlier
+/// datagram on a connected UDP socket (reset/refused), rather than a real
+/// socket failure? Transient by definition: the peer state it reports is
+/// already in the past, and the handshake deadline bounds how long we keep
+/// trying past it.
+fn transient_udp_handshake_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 /// Client-side UDP connect handshake.
 /// Sends the magic word and waits for the server's reply.
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
@@ -448,7 +460,13 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     let mut next_send = tokio::time::Instant::now();
     while tokio::time::Instant::now() < deadline {
         if tokio::time::Instant::now() >= next_send {
-            socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await?;
+            // A queued ICMP error can surface on send too — same transient
+            // class as the recv side below; the interval still rate-limits.
+            match socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await {
+                Ok(_) => {}
+                Err(e) if transient_udp_handshake_error(&e) => {}
+                Err(e) => return Err(RiperfError::Io(e)),
+            }
             next_send = tokio::time::Instant::now() + UDP_CONNECT_RETRY_INTERVAL;
         }
         // Wait until the next resend is due (or the deadline), whichever first.
@@ -468,6 +486,23 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
             // (the real reply may be behind it). Don't resend here — the
             // interval floor gates the next send.
             Ok(Ok(_)) => {
+                saw_traffic = true;
+                continue;
+            }
+            // ECONNRESET/ECONNREFUSED here is the kernel relaying an ICMP
+            // port-unreachable for a PRIOR datagram — on a connected UDP
+            // socket it is transient feedback ("that one bounced"), not a
+            // terminal socket state. The live producer is the server's
+            // per-stream listener REBIND gap (accept → connect() → fresh
+            // bind leaves a window where the next stream's magic has no
+            // matching socket), torn wide open on loaded 2-core runners
+            // (#195: the udp_bidir empty-doc resets). The deadline still
+            // bounds the whole handshake; the next interval's resend
+            // recovers once the fresh listener is up. iperf3's
+            // single-send/long-read client dies here — but the retry loop
+            // is already a documented riperf3 robustness addition, and
+            // riding through transient ICMP feedback is its natural scope.
+            Ok(Err(e)) if transient_udp_handshake_error(&e) => {
                 saw_traffic = true;
                 continue;
             }
@@ -1233,6 +1268,42 @@ mod protocol_tests {
 #[cfg(test)]
 mod protocol_error_tests {
     use crate::protocol::{self, TestState};
+
+    /// #195 root cause: a transient ICMP-feedback error (ECONNRESET /
+    /// ECONNREFUSED on the connected socket — the server's per-stream
+    /// listener REBIND gap under load) must not kill the handshake while
+    /// budget remains. The loop resends the magic and succeeds once the
+    /// fresh listener is up. Sequence here: the client's first magic lands
+    /// on an unbound port (ICMP bounce queued), the real replier binds
+    /// ~600 ms later and answers the resend.
+    #[tokio::test]
+    async fn udp_connect_client_rides_through_transient_reset() {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe); // port now unbound: the first magic will ICMP-bounce
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(("127.0.0.1", port)).await.unwrap();
+
+        let replier = tokio::spawn(async move {
+            // Let the first magic bounce and the error queue on the client
+            // socket; then stand up the real listener and answer the resend.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let sock = tokio::net::UdpSocket::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 4];
+            let (_, from) = sock.recv_from(&mut buf).await.unwrap();
+            sock.send_to(&protocol::UDP_CONNECT_REPLY.to_ne_bytes(), from)
+                .await
+                .unwrap();
+        });
+
+        protocol::udp_connect_client(&client)
+            .await
+            .expect("the handshake must survive the transient reset and complete");
+        replier.await.unwrap();
+    }
 
     #[tokio::test]
     async fn client_handles_access_denied() {
