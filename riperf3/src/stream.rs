@@ -1171,6 +1171,7 @@ pub fn run_udp_sender_sendmmsg(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
+    burst: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1197,7 +1198,7 @@ pub fn run_udp_sender_sendmmsg(
     // doesn't stage one huge burst then sleep past a short test (#185); an
     // unlimited run (rate 0, -b 0) keeps the full 128.
     let batch_size: usize =
-        udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 128) as usize;
+        udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 128, burst) as usize;
 
     // Switch to blocking I/O — tokio's into_std() leaves the socket
     // non-blocking, which makes sendmmsg busy-spin on EAGAIN once SO_SNDBUF
@@ -1307,6 +1308,7 @@ pub fn run_udp_sender_sendmmsg(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
+    burst: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1318,6 +1320,7 @@ pub fn run_udp_sender_sendmmsg(
         done,
         rate_bits_per_sec,
         pacing_timer_us,
+        burst,
         use_64bit,
         start,
         max_duration,
@@ -1345,7 +1348,17 @@ fn udp_pacing_batch(
     blksize: usize,
     pacing_timer_us: u32,
     max_batch: u32,
+    burst: u32,
 ) -> u32 {
+    // `-b rate/burst` (#160): iperf3's multisend loop sends exactly `burst`
+    // blocks per throttle check, taking precedence over every other batch
+    // heuristic (iperf_send_mt: `if (burst) multisend = burst`). The absolute
+    // schedule below then spaces batches at burst-sized intervals — the same
+    // long-run shape as iperf3's burst-then-recheck. Not clamped to
+    // max_batch: iperf3 honors up to MAX_BURST (1000, enforced at parse).
+    if burst > 0 {
+        return burst;
+    }
     if rate_bits_per_sec == 0 {
         return max_batch;
     }
@@ -1379,6 +1392,7 @@ fn udp_send_loop(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
+    burst: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1397,7 +1411,7 @@ fn udp_send_loop(
     // atomic counters, but bounded so one batch is about a pacing quantum of
     // send budget, not a fixed count that becomes seconds at a low rate (#185).
     // 32 is the high-rate ceiling (the old fixed value).
-    let batch_size: u32 = udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 32);
+    let batch_size: u32 = udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 32, burst);
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
@@ -1490,6 +1504,7 @@ pub fn run_udp_sender_blocking(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
+    burst: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1502,6 +1517,7 @@ pub fn run_udp_sender_blocking(
         done,
         rate_bits_per_sec,
         pacing_timer_us,
+        burst,
         use_64bit,
         start,
         max_duration,
@@ -1522,6 +1538,7 @@ pub(crate) fn run_udp_server_demux_sender(
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
+    burst: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1534,6 +1551,7 @@ pub(crate) fn run_udp_server_demux_sender(
         done,
         rate_bits_per_sec,
         pacing_timer_us,
+        burst,
         use_64bit,
         start,
         max_duration,
@@ -1787,25 +1805,33 @@ mod tests {
         // Default 1 Mbit/s over a loopback-MSS datagram: one packet already
         // exceeds a 1 ms quantum's budget, so the batch floors at 1 (the bug
         // was a fixed 32 → an ~8 s batch interval).
-        assert_eq!(udp_pacing_batch(1_000_000, 32_741, 1000, 32), 1);
+        assert_eq!(udp_pacing_batch(1_000_000, 32_741, 1000, 32, 0), 1);
         // A high rate over a small datagram saturates at the ceiling.
-        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 32), 32);
-        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 128), 128);
+        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 32, 0), 32);
+        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 128, 0), 128);
         // Unlimited (-b 0) is unpaced and keeps the full ceiling.
-        assert_eq!(udp_pacing_batch(0, 32_741, 1000, 32), 32);
+        assert_eq!(udp_pacing_batch(0, 32_741, 1000, 32, 0), 32);
         // A larger --pacing-timer admits a larger batch at the same rate.
-        let small_q = udp_pacing_batch(100_000_000, 1448, 1000, 64);
-        let big_q = udp_pacing_batch(100_000_000, 1448, 10_000, 64);
+        let small_q = udp_pacing_batch(100_000_000, 1448, 1000, 64, 0);
+        let big_q = udp_pacing_batch(100_000_000, 1448, 10_000, 64, 0);
         assert!(big_q > small_q, "{big_q} should exceed {small_q}");
         // pacing_timer 0 resolves to iperf3's 1 ms default, not a div-by-zero.
         assert_eq!(
-            udp_pacing_batch(100_000_000, 1448, 0, 64),
-            udp_pacing_batch(100_000_000, 1448, 1000, 64),
+            udp_pacing_batch(100_000_000, 1448, 0, 64, 0),
+            udp_pacing_batch(100_000_000, 1448, 1000, 64, 0),
         );
         // A degenerate blksize cannot divide by zero — it yields a valid
         // clamped batch (here the max, since 1-byte packets are tiny), not a
         // panic or a garbage value.
-        assert_eq!(udp_pacing_batch(1_000_000, 0, 1000, 32), 32);
+        assert_eq!(udp_pacing_batch(1_000_000, 0, 1000, 32, 0), 32);
+
+        // `-b rate/burst` (#160): an explicit burst IS the batch — iperf3's
+        // multisend sends exactly `burst` blocks per green light, overriding
+        // the quantum heuristic and the max_batch ceiling (its own cap is
+        // MAX_BURST=1000, enforced at parse).
+        assert_eq!(udp_pacing_batch(100_000_000, 1448, 1000, 32, 5), 5);
+        assert_eq!(udp_pacing_batch(100_000_000, 1448, 1000, 128, 1000), 1000);
+        assert_eq!(udp_pacing_batch(0, 1448, 1000, 32, 50), 50);
     }
 
     // #178 readiness barrier: wait() is trivially true with nothing spawned,
@@ -2485,6 +2511,7 @@ mod tests {
             done.clone(),
             0,
             1000,
+            0,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2524,6 +2551,7 @@ mod tests {
             done.clone(),
             100_000_000, // 100 Mbps → rate>0 → batched + paced
             1000,
+            0,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2554,6 +2582,7 @@ mod tests {
             done.clone(),
             0,
             1000,
+            0,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2583,8 +2612,19 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        run_udp_sender_blocking(send, counters, 1400, done, 0, 1000, false, started(), None)
-            .unwrap();
+        run_udp_sender_blocking(
+            send,
+            counters,
+            1400,
+            done,
+            0,
+            1000,
+            0,
+            false,
+            started(),
+            None,
+        )
+        .unwrap();
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "should stop shortly after done is set"
@@ -2611,6 +2651,7 @@ mod tests {
                 d2,
                 0,
                 1000,
+                0,
                 false,
                 s2,
                 Some(Duration::from_secs(10)),
@@ -2652,6 +2693,7 @@ mod tests {
             done,
             0,
             1000,
+            0,
             false,
             start,
             Some(Duration::from_secs(10)),
@@ -2682,6 +2724,7 @@ mod tests {
                 d,
                 0,
                 1000,
+                0,
                 false,
                 s,
                 Some(Duration::from_secs(10)),

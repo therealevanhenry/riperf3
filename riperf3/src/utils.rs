@@ -76,14 +76,21 @@ fn parse_int_base0(s: &str) -> std::result::Result<i32, std::num::ParseIntError>
 /// Parse a `-S/--tos` value like iperf3: `strtol(optarg, &endptr, 0)` (decimal,
 /// `0x` hex, or leading-`0` octal) with the IEBADTOS range check (#167).
 pub fn parse_tos(s: &str) -> std::result::Result<i32, ConfigError> {
-    let val =
-        parse_int_base0(s.trim()).map_err(|_| ConfigError::InvalidValue("tos", s.to_string()))?;
-    if !(0..=255).contains(&val) {
-        // iperf3's IEBADTOS wording.
-        return Err(ConfigError::InvalidValue(
+    // Stricter than C strtol on purpose: iperf3 only checks endptr == optarg,
+    // so it ACCEPTS partial parses like `32abc` (→32), `08` (→0), `0x` (→0).
+    // Full-string parsing rejects those; recorded as a deliberate divergence
+    // (#167 review r1 n4).
+    let bad = || {
+        ConfigError::InvalidValue(
             "tos",
+            // iperf3's IEBADTOS wording, for the unparsable and the
+            // out-of-range case alike (iperf3 raises IEBADTOS for both).
             format!("bad TOS value (must be between 0 and 255 inclusive): {s}"),
-        ));
+        )
+    };
+    let val = parse_int_base0(s.trim()).map_err(|_| bad())?;
+    if !(0..=255).contains(&val) {
+        return Err(bad());
     }
     Ok(val)
 }

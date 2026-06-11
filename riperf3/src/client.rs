@@ -688,6 +688,7 @@ impl Client {
                         // #185: honor --pacing-timer on the UDP send batch too,
                         // so a low -b over a large datagram paces smoothly.
                         let pt = self.pacing_timer;
+                        let bu = self.burst;
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -695,11 +696,11 @@ impl Client {
                         thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
                                 )
                             } else {
                                 stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
                                 )
                             }
                         })
@@ -2694,6 +2695,19 @@ mod tests {
             assert_eq!(c.burst, 10);
             // IEBURST parity on the setter path too.
             assert!(ClientBuilder::new("h").burst(1001).build().is_err());
+        }
+
+        #[test]
+        fn pacing_timer_str_enforces_i32_wire_cap() {
+            // The wire TestParams field is i32; larger would wrap negative
+            // (review r1 of #32; coverage restored per #193 review r1 n2).
+            assert!(ClientBuilder::new("h").pacing_timer_str("3G").is_err());
+            assert!(ClientBuilder::new("h")
+                .pacing_timer_str("2147483647")
+                .is_ok());
+            assert!(ClientBuilder::new("h")
+                .pacing_timer_str("2147483648")
+                .is_err());
         }
 
         #[test]
