@@ -273,7 +273,8 @@ pub struct IntervalStream {
     #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     // TCP per-interval detail (sender side); omitted where TCP_INFO is
-    // unavailable. `snd_wnd` is absent — see TcpStreamSide.
+    // unavailable. `snd_wnd` carries the live tcpi_snd_wnd where the
+    // platform reader has it (#161).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1992,8 +1993,8 @@ mod tests {
         assert_eq!(snd["mean_rtt"], 15);
         assert_eq!(snd["reorder"], 0);
 
-        // snd_wnd / max_snd_wnd are emitted as 0 — libc can't read tcpi_snd_wnd,
-        // and iperf3 likewise emits 0 when the field is unavailable.
+        // This fixture feeds snd_wnd / max_snd_wnd as 0 — live runs carry the
+        // platform reader's real value since #161.
         assert_eq!(i0["snd_wnd"], 0);
         assert_eq!(snd["max_snd_wnd"], 0);
     }

@@ -21,8 +21,12 @@ fn connect_failure_prints_iperf3_error_shape_and_exits_1() {
         "stderr must start with the iperf3 error shape, got: {stderr}"
     );
     assert!(
-        stderr.contains("unable to connect to server"),
-        "connect failures carry iperf3's IECONNECT wording, got: {stderr}"
+        stderr.contains(
+            "unable to connect to server - server may have stopped running \
+             or use a different port, firewall issue, etc."
+        ),
+        "connect failures carry iperf3's FULL canonical IECONNECT sentence \
+         (review r1 found a line-join artifact the prefix check missed), got: {stderr}"
     );
     assert!(
         !stderr.contains("Error:"),

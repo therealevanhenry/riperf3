@@ -177,17 +177,39 @@ impl Client {
             self.ip_version,
         )
         .await
-        .map_err(|e| match e {
-            // iperf3's IECONNECT wording for a failed control connect; the
-            // io kind is preserved so callers (and the test harness's
-            // refused-retry) can still classify it (#151).
-            RiperfError::Io(io) => RiperfError::Io(std::io::Error::new(
-                io.kind(),
-                format!(
-                    "unable to connect to server - server may have stopped running                      or use a different port, firewall issue, etc.: {io}"
+        .map_err(|e| {
+            // iperf3 raises IECONNECT for ANY netdial failure
+            // (iperf_client_api.c:441) — refused, timed out (netdial sets
+            // ETIMEDOUT), and bind-local failures alike — so wrap every
+            // error from the control connect. The io kind is preserved so
+            // callers (and the test harness's refused-retry) can still
+            // classify it (#151). The `(os error N)` suffix std's io::Error
+            // appends is a deliberate, recorded deviation from iperf3's bare
+            // strerror text: substring matchers survive, and strerror text
+            // varies by platform/locale anyway (review r1 n4).
+            let (kind, detail) = match e {
+                RiperfError::Io(io) => (io.kind(), io.to_string()),
+                // iperf3's suffix is strerror(ETIMEDOUT).
+                RiperfError::ConnectionTimeout => (
+                    std::io::ErrorKind::TimedOut,
+                    "Connection timed out".to_string(),
                 ),
-            )),
-            other => other,
+                // Not dial failures: the family-conflict validation (#15)
+                // keeps its Protocol classification (pinned by the lib
+                // tests). Recorded deviation: a failed `-B` local bind is
+                // also Protocol here, where iperf3's netdial would fold it
+                // into IECONNECT (review r1 n3) — it shares the variant with
+                // the validations, so reclassifying needs a net.rs error
+                // split; ledgered.
+                other => return other,
+            };
+            RiperfError::Io(std::io::Error::new(
+                kind,
+                format!(
+                    "unable to connect to server - server may have stopped running \
+                     or use a different port, firewall issue, etc.: {detail}"
+                ),
+            ))
         })?;
         net::configure_tcp_stream(&ctrl, true)?;
 

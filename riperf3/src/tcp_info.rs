@@ -365,7 +365,11 @@ mod tests {
     // HAVE_TCP_INFO_SND_WND probe prefers that header) and emits the REAL
     // peer-advertised window; libc's glibc-shaped tcp_info truncates before
     // the field, so the old reader pinned 0. Right after the handshake the
-    // peer's advertised window on loopback is always nonzero.
+    // peer's advertised window on loopback is always nonzero (a zero window
+    // needs a FULL receive buffer). Test prerequisite: kernel >= 5.4
+    // (tcpi_snd_wnd's introduction; older kernels return a short TCP_INFO
+    // and the gated read correctly yields 0, failing this test) — every CI
+    // runner and the fleet are 5.15+.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_snapshot_reads_real_snd_wnd() {
