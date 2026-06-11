@@ -233,11 +233,15 @@ fn idle_server_exits_promptly_on_sigterm() {
         libc::kill(server.0.id() as i32, libc::SIGTERM);
     }
     let exited = common::wait_bounded(&mut server.0, Duration::from_secs(2));
-    assert!(
-        exited.is_some(),
-        "an idle server must exit well under the 5 s dump window; \
-         still alive after {:?}",
-        t0.elapsed()
-    );
+    let status = exited.unwrap_or_else(|| {
+        panic!(
+            "an idle server must exit well under the 5 s dump window; \
+             still alive after {:?}",
+            t0.elapsed()
+        )
+    });
+    // The prompt exit is the GRACEFUL path (exit 0), not an escape hatch
+    // (review r1 n1).
+    assert_eq!(status.code(), Some(0), "graceful signal-normal exit");
     wait_for(|| !pf.exists(), Duration::from_secs(2), "pidfile unlinked");
 }
