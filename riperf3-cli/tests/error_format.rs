@@ -143,6 +143,21 @@ fn usage_errors_exit_one() {
         stderr.contains("parameter error - must either be a client (-c) or server (-s)"),
         "iperf3's exact no-mode sentence: {stderr:?}"
     );
+    // -s -c h: iperf3's IESERVCLIENT sentence (review r1 n4).
+    let out = std::process::Command::new(bin)
+        .args(["-s", "-c", "h"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("parameter error - cannot be both server and client"),
+        "IESERVCLIENT sentence: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage: riperf3 [-s|-c host] [options]"),
+        "the usage trailer rides parameter errors: {stderr:?}"
+    );
     // --help / --version still exit 0.
     let out = std::process::Command::new(bin)
         .arg("--help")
@@ -154,4 +169,28 @@ fn usage_errors_exit_one() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// #198 review r1 f1: parse-class rejections (#65/#100/#140) print to STDERR
+/// in every mode — iperf3's iperf_exit only mode-sinks POST-parse errors
+/// (json_top exists / outfile open). Live: `iperf3 -s -t 5 -J` errors in
+/// plain text on stderr with empty stdout.
+#[test]
+fn parse_class_errors_stay_on_stderr_even_with_json() {
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let out = std::process::Command::new(bin)
+        .args(["-s", "-t", "5", "-J"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "no JSON document for a parse-class error: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("riperf3: error - ") && stderr.contains("client only"),
+        "the #65 rejection stays plain text on stderr: {stderr:?}"
+    );
 }
