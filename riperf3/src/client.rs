@@ -351,46 +351,9 @@ impl Client {
 
         protocol::send_cookie(&mut ctrl, &cookie).await?;
 
-        // #222: iperf3's connect-time text block. The banner is
-        // UNCONDITIONAL in text mode (iperf_on_connect, iperf_api.c:995 —
-        // it fires after the control connection is up, despite the name);
-        // the detail lines around it are -V. JSON modes print none of this.
-        if !self.json_output && !self.json_stream {
-            if self.verbose {
-                vprintln!("Control connection MSS {control_mss}");
-                vprintln!(
-                    "Time: {}",
-                    crate::json_report::http_date(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    )
-                );
-            }
-            vprintln!("Connecting to host {}, port {}", self.host, self.port);
-            if self.reverse {
-                // Unconditional like the banner (iperf_api.c:995-998).
-                vprintln!("Reverse mode, remote host {} is sending", self.host);
-            }
-            if self.verbose {
-                vprintln!(
-                    "      Cookie: {}",
-                    String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
-                );
-                if matches!(self.protocol, TransportProtocol::Tcp) {
-                    // -M prints the SET value with no suffix (iperf_api.c:
-                    // 1034-1037); only the unset case is "(default)".
-                    match self.mss {
-                        Some(m) => vprintln!("      TCP MSS: {m}"),
-                        None => vprintln!("      TCP MSS: {control_mss} (default)"),
-                    }
-                }
-                if self.bandwidth != 0 {
-                    vprintln!("      Target Bitrate: {}", self.bandwidth);
-                }
-            }
-        }
+        // (#222 r2 item 5: the connect text block prints after the param
+        // exchange — GT's client on_connect timing — see the ParamExchange
+        // arm; a failed exchange must not have printed the banner.)
 
         let done = Arc::new(AtomicBool::new(false));
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
@@ -420,19 +383,58 @@ impl Client {
                 TestState::ParamExchange => {
                     let params = self.build_params(blksize);
                     protocol::send_params(&mut ctrl, &params).await?;
+                    // #222: iperf3's connect text block — printed HERE,
+                    // after the param exchange (GT's on_connect timing, r2
+                    // item 5: a failed exchange prints no banner). The
+                    // banner is UNCONDITIONAL in text mode; the detail
+                    // lines are -V. JSON modes print none of this.
+                    if !self.json_output && !self.json_stream {
+                        if self.verbose {
+                            vprintln!("Control connection MSS {control_mss}");
+                            if matches!(self.protocol, TransportProtocol::Udp)
+                                && !self.blksize_explicit
+                            {
+                                // GT prints this only when it DEFAULTED the UDP
+                                // blocksize, right after the MSS line
+                                // (iperf_client_api.c:505-523; r2 item 4).
+                                vprintln!("Setting UDP block size to {blksize}");
+                            }
+                            vprintln!(
+                                "Time: {}",
+                                crate::json_report::http_date(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0)
+                                )
+                            );
+                        }
+                        vprintln!("Connecting to host {}, port {}", self.host, self.port);
+                        if self.reverse {
+                            // Unconditional like the banner (iperf_api.c:995-998).
+                            vprintln!("Reverse mode, remote host {} is sending", self.host);
+                        }
+                        if self.verbose {
+                            vprintln!(
+                                "      Cookie: {}",
+                                String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                            );
+                            if matches!(self.protocol, TransportProtocol::Tcp) {
+                                // -M prints the SET value with no suffix (iperf_api.c:
+                                // 1034-1037); only the unset case is "(default)".
+                                match self.mss {
+                                    Some(m) => vprintln!("      TCP MSS: {m}"),
+                                    None => vprintln!("      TCP MSS: {control_mss} (default)"),
+                                }
+                            }
+                            if self.bandwidth != 0 {
+                                vprintln!("      Target Bitrate: {}", self.bandwidth);
+                            }
+                        }
+                    }
                 }
 
                 TestState::CreateStreams => {
-                    // #222 (-V, UDP): GT announces the negotiated datagram
-                    // size before the streams come up
-                    // (iperf_client_api.c:520-522).
-                    if self.verbose
-                        && !self.json_output
-                        && !self.json_stream
-                        && matches!(self.protocol, TransportProtocol::Udp)
-                    {
-                        vprintln!("Setting UDP block size to {blksize}");
-                    }
                     (streams, byte_budget) =
                         self.create_streams(&cookie, &done, &start, blksize).await?;
                     // #222: the per-stream preamble, unconditional in text

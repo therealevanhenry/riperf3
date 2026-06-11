@@ -408,6 +408,13 @@ impl Server {
                 if matches!(cfg.protocol, TransportProtocol::Tcp) {
                     vprintln!("      TCP MSS: 0 (default)");
                 }
+                // GT's on_connect verbose tail is role-independent (r2
+                // item 3): the client's requested rate arrives in params.
+                if let Some(b) = params.bandwidth {
+                    if b != 0 {
+                        vprintln!("      Target Bitrate: {b}");
+                    }
+                }
             }
         }
 
@@ -661,19 +668,25 @@ impl Server {
                 }
             }
             if self.verbose {
-                vprintln!(
-                    "Starting Test: protocol: {}, {} streams, {} byte blocks, \
-                     omitting {} seconds, {} second test, tos {}",
-                    match cfg.protocol {
-                        TransportProtocol::Tcp => "TCP",
-                        TransportProtocol::Udp => "UDP",
-                    },
-                    cfg.num_streams,
-                    cfg.blksize,
-                    cfg.omit,
-                    cfg.duration,
-                    cfg.tos
+                // The bytes/blocks/time variants, like the client side (r2
+                // item 1): a -n/-k client's server printed a phantom
+                // duration before.
+                let proto = match cfg.protocol {
+                    TransportProtocol::Tcp => "TCP",
+                    TransportProtocol::Udp => "UDP",
+                };
+                let head = format!(
+                    "Starting Test: protocol: {proto}, {} streams, {} byte blocks, \
+                     omitting {} seconds",
+                    cfg.num_streams, cfg.blksize, cfg.omit
                 );
+                if let Some(bytes) = params.num.filter(|&n| n > 0) {
+                    vprintln!("{head}, {bytes} bytes to send, tos {}", cfg.tos);
+                } else if let Some(blocks) = params.blockcount.filter(|&n| n > 0) {
+                    vprintln!("{head}, {blocks} blocks to send, tos {}", cfg.tos);
+                } else {
+                    vprintln!("{head}, {} second test, tos {}", cfg.duration, cfg.tos);
+                }
             }
         }
         // All streams are set up — release the UDP senders.
@@ -967,6 +980,18 @@ impl Server {
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && streams.iter().any(|s| s.is_sender) {
+                // GT gates the CPU line on the SENDING side (iperf_api.c:
+                // 4563): a -R server prints it, with ZERO remote figures —
+                // the peer's CPU is never exchanged to the server (#50).
+                vprintln!(
+                    "CPU Utilization: local/sender {:.1}% ({:.1}%u/{:.1}%s), \
+                     remote/receiver 0.0% (0.0%u/0.0%s)",
+                    cpu_util.host_total,
+                    cpu_util.host_user,
+                    cpu_util.host_system
+                );
+            }
             if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
                 if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
                     if streams.iter().any(|s| s.is_sender) {
@@ -1119,6 +1144,18 @@ impl Server {
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && streams.iter().any(|s| s.is_sender) {
+                // GT gates the CPU line on the SENDING side (iperf_api.c:
+                // 4563): a -R server prints it, with ZERO remote figures —
+                // the peer's CPU is never exchanged to the server (#50).
+                vprintln!(
+                    "CPU Utilization: local/sender {:.1}% ({:.1}%u/{:.1}%s), \
+                     remote/receiver 0.0% (0.0%u/0.0%s)",
+                    cpu_util.host_total,
+                    cpu_util.host_user,
+                    cpu_util.host_system
+                );
+            }
             if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
                 if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
                     let is_sender = streams.iter().any(|s| s.is_sender);
