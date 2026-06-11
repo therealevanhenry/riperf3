@@ -1271,11 +1271,9 @@ impl Client {
             }
         };
 
-        // End of test: hand the reporter the authoritative end time, then stop
-        // the senders immediately (`done`) so no bytes leak past the deadline into
-        // the final interval or the summary (#55). The reporter prioritises this
-        // `finish` over `done` (see its select), so the final interval still
-        // flushes; we then wait for it before tearing the streams down.
+        // End of test (#55 window, #159 order): stop the senders, let the
+        // catch-up land, then hand the reporter the authoritative end time —
+        // the flush below reads settled counters.
         // #159: stop the senders FIRST and give their in-flight catch-up the
         // teardown grace to land in the counters, THEN signal the flush —
         // iperf3 reads its counters after the threads join, so the intervals

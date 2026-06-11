@@ -1192,12 +1192,11 @@ pub fn spawn_interval_reporter(
 
         loop {
             // Wait for either the next interval boundary or the driver's
-            // end-of-test signal. `biased` checks the end signal FIRST: the driver
-            // sets `done` immediately after `finish` (to stop the senders at the
-            // deadline), so the notify must win that race — otherwise the tick
-            // branch would observe `done` and exit without flushing the final
-            // interval. When `finish` and a boundary tick are both ready, that
-            // boundary's data is folded into the recovered final interval below.
+            // end-of-test signal. `biased` checks the end signal FIRST so a
+            // coincident boundary tick's data folds into the recovered final
+            // interval below rather than emitting twice. (The driver order is
+            // done → grace → finish since #159; the tick arm's own done
+            // handling waits for the finish signal.)
             tokio::select! {
                 biased;
                 _ = reporter_end.notify.notified() => {

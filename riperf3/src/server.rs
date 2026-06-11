@@ -765,10 +765,8 @@ impl Server {
         }
 
         // ---- Shut down streams ----
-        // Hand the reporter the authoritative end time, then stop the streams
-        // (`done`) so no received bytes leak past the deadline into the final
-        // interval (#55). The reporter prioritises `finish` over `done`, so the
-        // final interval still flushes; wait for it before tearing streams down.
+        // #55 window, #159 order: stop the streams, let the catch-up land,
+        // then hand the reporter the authoritative end time for the flush.
         let measured_elapsed = report_start.elapsed().as_secs_f64();
         // The reporter's timeline restarted at the omit boundary (#31), so its
         // authoritative end time is post-omit; clamp for runs that died inside
