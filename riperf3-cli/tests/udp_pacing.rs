@@ -61,12 +61,16 @@ fn default_rate_udp_paces_across_intervals() {
         .unwrap_or_else(|e| panic!("client -u -J is not valid JSON ({e}): {out}"));
     let intervals = v["intervals"].as_array().expect("intervals");
 
-    // The three full one-second intervals (a -t 3 run lands on its boundaries).
+    // Nominally three one-second intervals; a loaded Windows runner can
+    // coalesce one boundary and deliver two (#159, seen on three CI runs with
+    // consistent per-interval bytes). Two intervals still discriminate the
+    // #185 burst-then-starve signature below, so tolerate the coalesced run
+    // instead of flaking the required windows-latest check.
     let per: Vec<u64> = intervals
         .iter()
         .map(|i| i["sum"]["bytes"].as_u64().unwrap_or(0))
         .collect();
-    assert!(per.len() >= 3, "expected ~3 intervals: {out}");
+    assert!(per.len() >= 2, "expected >=2 intervals: {out}");
     let total: u64 = per.iter().sum();
     assert!(total > 0, "no bytes sent at all: {out}");
 
