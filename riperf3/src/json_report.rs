@@ -140,6 +140,10 @@ pub struct Report {
     /// full `-J` report, appended at the end of the top level like iperf3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_output_text: Option<String>,
+    /// Top-level `"error"` key, like iperf_json_finish: a -J run that ends in
+    /// IESERVERTERM still emits the partial blob, error attached (#170).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_output_json: Option<serde_json::Value>,
 }
@@ -541,6 +545,8 @@ pub struct UdpStreamStats {
 #[non_exhaustive]
 pub struct ReportInput {
     pub protocol: TransportProtocol,
+    /// iperf3's `"error"` blob key (e.g. "the server has terminated") (#170).
+    pub error: Option<String>,
     pub reverse: bool,
     pub bidir: bool,
     /// The requested `-t` duration parameter, reported under `test_start`. Stays
@@ -947,6 +953,7 @@ impl ReportInput {
             end,
             extra_data: self.extra_data.clone(),
             server_output_text: self.server_output_text.clone(),
+            error: self.error.clone(),
             server_output_json: self.server_output_json.clone(),
         }
     }
@@ -1209,6 +1216,7 @@ mod tests {
 
     fn base_input() -> ReportInput {
         ReportInput {
+            error: None,
             server_output_text: None,
             server_output_json: None,
             protocol: TransportProtocol::Tcp,
