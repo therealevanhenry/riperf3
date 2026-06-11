@@ -795,8 +795,18 @@ impl ReportInput {
             // (peer → this host) in the *_bidir_reverse pair, matching iperf3 —
             // rather than folding the reverse flow into sum_received (which would
             // make the two aggregates describe different directions).
-            let fwd_recv = if peer_recv > 0 { peer_recv } else { local_sent };
-            let rev_sent = if peer_sent > 0 { peer_sent } else { local_recv };
+            // No cross-graft on a terminated run (#170 review r2 f1): the
+            // peer halves never arrived — iperf3's bidir sums carry 0 there.
+            let fwd_recv = match (peer_recv, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_sent,
+            };
+            let rev_sent = match (peer_sent, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_recv,
+            };
             sum_sent_bidir_reverse = Some(self.tcp_sum(rev_sent, false, None));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
@@ -818,7 +828,16 @@ impl ReportInput {
                 peer_recv
             };
             let sent_packets = (sent_bytes / blk) as i64;
-            sum = Some(self.udp_sum(sent_bytes, fwd_sender, sent_packets, udp_lost, udp_jitter));
+            // iperf3's `sum` packet count falls back to the RECEIVER count
+            // when the sender count is absent (iperf_api.c:4242, the
+            // `packet_count = sender ? sender : receiver` running total) —
+            // reachable when a terminated -R run never exchanged (#170 r2 f2).
+            let sum_packets = if sent_packets > 0 {
+                sent_packets
+            } else {
+                udp_packets
+            };
+            sum = Some(self.udp_sum(sent_bytes, fwd_sender, sum_packets, udp_lost, udp_jitter));
             (
                 self.udp_sum(sent_bytes, true, sent_packets, 0, 0.0),
                 self.udp_sum(recv_bytes, false, udp_packets, udp_lost, udp_jitter),
@@ -990,6 +1009,11 @@ impl ReportInput {
                 // stats — iperf3 reports the sender's LOCAL packet count.
                 let blk = self.blksize.max(1) as u64;
                 (s.local_bytes, (s.local_bytes / blk) as i64)
+            } else if !s.is_sender && self.error.is_some() {
+                // Terminated receiver stream (-R): `bytes` is a SENDER-side
+                // count the dead peer never reported — iperf3 emits 0 while
+                // keeping the locally measured packets (#170 r2 f2).
+                (0, u.packets)
             } else {
                 (s.local_bytes, u.packets)
             };
