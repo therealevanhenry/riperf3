@@ -152,7 +152,7 @@ pub struct Server {
     pub(crate) forceflush: bool,
     pub(crate) bind_address: Option<String>,
     /// `--bind-dev`: bind the listener (and UDP server sockets) to a device,
-    /// like iperf3's netannounce (#149).
+    /// like iperf3's netannounce — Linux/SO_BINDTODEVICE only (#149).
     pub(crate) bind_dev: Option<String>,
     pub(crate) ip_version: Option<u8>,
     pub(crate) timestamps: Option<String>,
@@ -1737,17 +1737,17 @@ impl ServerBuilder {
         self
     }
 
-    /// `-B/--bind`: bind the listener to a specific local address.
     /// `--bind-dev`: bind the listening socket (and the UDP server sockets)
-    /// to a network device, like iperf3's netannounce (#149). Linux
-    /// (SO_BINDTODEVICE) and macOS (IP_BOUND_IF) only; rejected at `build()`
-    /// elsewhere, mirroring iperf3 (which compiles the option out without
-    /// CAN_BIND_TO_DEVICE).
+    /// to a network device, like iperf3's netannounce (#149). Linux only:
+    /// netannounce applies SO_BINDTODEVICE exclusively (iperf3's macOS
+    /// IP_BOUND_IF covers only the CLIENT path, so its macOS server fails
+    /// the listen); rejected at `build()` elsewhere.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
     }
 
+    /// `-B/--bind`: bind the listener to a specific local address.
     pub fn bind_address(mut self, addr: &str) -> Self {
         self.bind_address = Some(addr.to_string());
         self
@@ -1816,14 +1816,18 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
-        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS);
-        // everywhere else reject at config time like the client builder —
-        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option at
-        // all, so a silent no-op bind would be the worst behavior (#149).
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        // The SERVER honors --bind-dev only on Linux: iperf3's netannounce
+        // applies SO_BINDTODEVICE exclusively (its macOS IP_BOUND_IF support
+        // covers only the client's bind_to_device/create_socket path, so a
+        // macOS `iperf3 -s --bind-dev` FAILS at listener creation — review
+        // r1 ground truth). Rejecting at config time everywhere else matches
+        // both that and the no-CAN_BIND_TO_DEVICE unrecognized-option case;
+        // a silent no-op bind would be the worst behavior (#149).
+        #[cfg(not(target_os = "linux"))]
         if self.bind_dev.is_some() {
             return Err(ConfigError::Unsupported(
-                "--bind-dev is not supported on this platform".into(),
+                "--bind-dev on the server requires SO_BINDTODEVICE, which this platform lacks"
+                    .into(),
             ));
         }
 

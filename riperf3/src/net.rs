@@ -345,7 +345,8 @@ pub async fn tcp_listen(
         socket.set_only_v6(ip_version == Some(6))?;
     }
     // --bind-dev on the LISTENING socket, pre-bind, like iperf3's
-    // netannounce (#149); inherited by accepted data sockets on Linux.
+    // netannounce (#149) — which is SO_BINDTODEVICE-only, hence the server
+    // builder's Linux-only gate; inherited by accepted data sockets.
     if let Some(dev) = bind_dev {
         set_bind_dev(&socket, dev, addr.is_ipv6())?;
     }

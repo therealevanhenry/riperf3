@@ -1419,8 +1419,10 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").bind_dev("eth0").build().unwrap());
         }
 
-        // #149: the server applies --bind-dev too (iperf3's netannounce).
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // #149: the server applies --bind-dev too (iperf3's netannounce —
+        // SO_BINDTODEVICE-only, so the server side is Linux-only; iperf3's
+        // macOS IP_BOUND_IF covers only the client path).
+        #[cfg(target_os = "linux")]
         #[test]
         fn bind_dev_wired_server() {
             let cli = Cli::parse_from(["riperf3", "-s", "--bind-dev", "eth0"]);
@@ -1435,15 +1437,24 @@ mod cli_tests {
         }
 
         // #149: where it cannot be honored, --bind-dev is a config-time error
-        // on BOTH roles (iperf3 without CAN_BIND_TO_DEVICE doesn't recognize
-        // the option at all; the old behavior on FreeBSD/NetBSD was a silent
-        // no-op). Exercised by the FreeBSD/NetBSD/Windows CI jobs.
+        // (iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option at
+        // all; the old behavior on FreeBSD/NetBSD was a silent no-op).
+        // Exercised by the FreeBSD and Windows CI jobs (NetBSD is xcheck
+        // compile-only).
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         #[test]
         fn bind_dev_rejected_on_unsupported_platforms() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
             let err = cli.build_client().unwrap_err().to_string();
             assert!(err.contains("--bind-dev"), "got: {err}");
+        }
+
+        // #149 review r1: the SERVER rejects --bind-dev everywhere but Linux
+        // — including macOS, where real iperf3's netannounce (SO_BINDTODEVICE
+        // -only) fails the listen. The macOS native CI job exercises this.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn bind_dev_rejected_on_server_off_linux() {
             let cli = Cli::parse_from(["riperf3", "-s", "--bind-dev", "eth0"]);
             let err = cli.build_server().unwrap_err().to_string();
             assert!(err.contains("--bind-dev"), "got: {err}");
