@@ -194,6 +194,10 @@ impl Client {
         // both see it.
         let _title_guard = (!self.json_output && !self.json_stream)
             .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
+        // --timestamps prefixes every text report line, run-scoped like the
+        // title; never in the machine-JSON modes (#168).
+        let _ts_guard = (self.timestamps.is_some() && !self.json_output && !self.json_stream)
+            .then(crate::macros::OutputTimestampGuard::set);
 
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
@@ -784,6 +788,7 @@ impl Client {
                         // so a low -b over a large datagram paces smoothly.
                         let pt = self.pacing_timer;
                         let bu = self.burst;
+                        let uw = self.window.is_some();
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -791,11 +796,11 @@ impl Client {
                         thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                                 )
                             } else {
                                 stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                                 )
                             }
                         })
@@ -945,12 +950,13 @@ impl Client {
                     protocol: self.protocol,
                     format_char: self.format_char,
                     omit_secs: self.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
-                    timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
+                    keep_intervals: false,
+                    bidir: self.bidir,
+                    is_server: false,
                 },
                 stream_refs,
                 done.clone(),
@@ -1198,12 +1204,30 @@ impl Client {
                 error,
             );
         } else if self.json_stream {
-            // iperf3 emits an "error" NDJSON event before the end event when
-            // the run carries one (iperf_api.c:5310-5313) (#170).
+            // iperf3's NDJSON tail order is: error?, server_output_json,
+            // server_output_text, end (iperf_api.c:5310-5323) (#170 + #168).
             if let Some(e) = error {
                 crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
                     "error", &e,
                 ));
+            }
+            if self.get_server_output {
+                if let Some(server) = remote_cpu {
+                    // Through the shared envelope helper — a hand-built
+                    // serde_json::json! map serializes alphabetically
+                    // ("data" before "event"), breaking the {"event":..,
+                    // "data":..} contract every other event keeps (#168 r1 n1).
+                    if let Some(json) = &server.server_output_json {
+                        crate::reporter::emit_json_stream_line(
+                            &crate::json_report::json_stream_event("server_output_json", json),
+                        );
+                    }
+                    if let Some(text) = &server.server_output_text {
+                        crate::reporter::emit_json_stream_line(
+                            &crate::json_report::json_stream_event("server_output_text", text),
+                        );
+                    }
+                }
             }
             // --json-stream: emit the `end` event. (Previously this fell through
             // to print_results_text, printing text banners into the NDJSON — #62.)
@@ -1265,7 +1289,7 @@ impl Client {
             // Bidir tags every line with the STREAM's direction (#184).
             let role_tag = self
                 .bidir
-                .then_some(if s.is_sender { "TX-C" } else { "RX-C" });
+                .then_some(crate::reporter::bidir_role_tag(false, s.is_sender));
             let bytes = if s.is_sender {
                 s.counters.bytes_sent_net()
             } else {
@@ -2052,9 +2076,10 @@ impl ClientBuilder {
         self
     }
 
-    /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
-    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere on
-    /// unix, rejected at `build()` on non-unix.
+    /// `--bind-dev`: bind data sockets to a network device. Linux
+    /// (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`/`IPV6_BOUND_IF`) only;
+    /// rejected at `build()` everywhere else (#149) — matching iperf3, whose
+    /// client-side IP_BOUND_IF fallback covers exactly these two.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
@@ -2288,11 +2313,6 @@ impl ClientBuilder {
                     "this OS does not support sendfile".into(),
                 ));
             }
-            if self.bind_dev.is_some() {
-                return Err(ConfigError::Unsupported(
-                    "SO_BINDTODEVICE is not supported on this platform".into(),
-                ));
-            }
             if self.congestion.is_some() {
                 return Err(ConfigError::Unsupported(
                     "TCP congestion control is not supported on this platform".into(),
@@ -2303,6 +2323,17 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
+        }
+
+        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS). The
+        // old gate only covered not(unix), so FreeBSD/NetBSD silently
+        // no-opped through net.rs's fallback — no binding, no error (#149).
+        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev is not supported on this platform".into(),
+            ));
         }
 
         // sendmmsg's real implementation is Linux/FreeBSD/NetBSD only; elsewhere

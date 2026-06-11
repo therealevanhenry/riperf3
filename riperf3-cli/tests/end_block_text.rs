@@ -11,29 +11,10 @@ use std::time::Duration;
 
 mod common;
 
-/// Serializes the UDP tests in this binary. Several concurrent UDP runs on a
-/// 2-core CI runner starve the async UDP-connect handshake (the #178
-/// thread-contention family): loopback handshake datagrams sit undrained, the
-/// retry budget approaches the 30 s `UDP_CONNECT_TOTAL_TIMEOUT`, and the
-/// control connection resets (`ECONNRESET`). The data plane is fine once it
-/// runs — this is a setup-phase scheduling artifact under pathological test
-/// concurrency, not a production defect — so the cheapest robust fix is to run
-/// the UDP cases one at a time (cargo runs test *binaries* sequentially, so a
-/// per-binary lock suffices; TCP cases still parallelize). `into_inner`
-/// tolerates a poisoned lock so one failing UDP test doesn't cascade.
-static UDP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn udp_serial() -> std::sync::MutexGuard<'static, ()> {
-    UDP_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Kills the wrapped child on drop so a spawned server is reaped on panic.
-struct ChildGuard(std::process::Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+// The #191 per-binary UDP serialization lock and the child reaper now live in
+// riperf3-test-support (#192); semantics unchanged (statics are per linked
+// test binary).
+use common::{udp_serial, ChildGuard};
 
 fn spawn_server(port_str: &str) -> ChildGuard {
     let bin = env!("CARGO_BIN_EXE_riperf3");

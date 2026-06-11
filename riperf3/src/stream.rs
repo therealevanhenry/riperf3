@@ -1191,6 +1191,7 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1225,7 +1226,9 @@ pub fn run_udp_sender_sendmmsg(
     // whole batch and starving the async runtime. Blocking lets the kernel
     // backpressure this thread instead; best-effort enlarge the buffer to a
     // batch and bound a wedged link with SO_SNDTIMEO (issue #6).
-    crate::net::configure_udp_sender(&socket, batch_size * blksize)?;
+    // None under an explicit -w: iperf3 applies the user's window and never
+    // a batch-derived size (#163 review r1 n1).
+    crate::net::configure_udp_sender(&socket, (!user_window).then_some(batch_size * blksize))?;
 
     let fd = socket.as_raw_fd();
 
@@ -1322,6 +1325,7 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1334,6 +1338,7 @@ pub fn run_udp_sender_sendmmsg(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -1438,6 +1443,7 @@ fn udp_send_loop(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1460,7 +1466,10 @@ fn udp_send_loop(
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
-    crate::net::configure_udp_sender(socket, batch_size as usize * blksize)?;
+    crate::net::configure_udp_sender(
+        socket,
+        (!user_window).then_some(batch_size as usize * blksize),
+    )?;
 
     let pacing = if rate_bits_per_sec > 0 {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
@@ -1544,6 +1553,7 @@ pub fn run_udp_sender_blocking(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1557,6 +1567,7 @@ pub fn run_udp_sender_blocking(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -1578,6 +1589,7 @@ pub(crate) fn run_udp_server_demux_sender(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1591,6 +1603,7 @@ pub(crate) fn run_udp_server_demux_sender(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -1677,14 +1690,7 @@ pub(crate) fn run_udp_server_demux_receiver(
             // (that needs IP_RECVERR); the arm is live on Windows, where
             // winsock latches WSAECONNRESET per send_to target. A break here
             // would silently end reception for EVERY stream at once.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -1692,6 +1698,18 @@ pub(crate) fn run_udp_server_demux_receiver(
         drain_udp_demux_after_done(&socket, &mut buf);
     }
     Ok(())
+}
+
+/// Reset-class noise on a UDP socket (#178/#180): ICMP port-unreachable
+/// blowback from something WE sent to a port that just closed. Windows
+/// latches WSAECONNRESET per send_to target even on an unconnected socket;
+/// Linux surfaces ECONNREFUSED only on connected sockets. Neither is an EOF
+/// — receivers skip and keep going.
+pub(crate) fn is_reset_class(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// `recv_from` analogue of [`drain_udp_after_done`] for the single-socket demux:
@@ -1709,6 +1727,11 @@ fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
             {
                 break
             }
+            // One client's reset-class noise must not end the SHARED drain
+            // for every client — that reopens the #48 reset against a
+            // still-sending iperf3 <=3.12 peer. The deadline above bounds
+            // the loop, so continuing is safe (#180).
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -1807,14 +1830,7 @@ pub fn run_udp_receiver_blocking(
             // here silently ended the reverse flow: a bidir run completed
             // "normally" with sum_bidir_reverse 0 throughout (windows-latest
             // CI signature).
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -2250,6 +2266,17 @@ mod tests {
         // Effective (post-omit) packet count: 6 - 3 = 3
         assert_eq!(stats.packet_count - stats.omitted_packet_count, 3);
     }
+    #[test]
+    fn reset_class_covers_both_platform_shapes() {
+        // #180: WSAECONNRESET (Windows, unconnected send_to blowback) and
+        // ECONNREFUSED (Linux, connected sockets) — neither is an EOF.
+        use std::io::{Error, ErrorKind};
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionRefused)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::BrokenPipe)));
+    }
 
     // -- RateLimiter --
 
@@ -2448,6 +2475,7 @@ mod tests {
                 0,
                 1000,
                 false,
+                false,
                 started(),
                 None,
             )
@@ -2605,6 +2633,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2645,6 +2674,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2675,6 +2705,7 @@ mod tests {
             0,
             1000,
             0,
+            false,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2713,6 +2744,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             None,
         )
@@ -2744,6 +2776,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 s2,
                 Some(Duration::from_secs(10)),
@@ -2787,6 +2820,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             start,
             Some(Duration::from_secs(10)),
         )
@@ -2817,6 +2851,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 s,
                 Some(Duration::from_secs(10)),

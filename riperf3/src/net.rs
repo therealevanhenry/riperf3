@@ -322,6 +322,7 @@ pub async fn tcp_listen(
     bind_addr: Option<&str>,
     port: u16,
     ip_version: Option<u8>,
+    bind_dev: Option<&str>,
 ) -> Result<TcpListener> {
     let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
@@ -342,6 +343,12 @@ pub async fn tcp_listen(
         // can't rely on the platform default. For a non-wildcard IPv6 address
         // (e.g. `::1`) the flag is moot but harmless.
         socket.set_only_v6(ip_version == Some(6))?;
+    }
+    // --bind-dev on the LISTENING socket, pre-bind, like iperf3's
+    // netannounce (#149) — which is SO_BINDTODEVICE-only, hence the server
+    // builder's Linux-only gate; inherited by accepted data sockets.
+    if let Some(dev) = bind_dev {
+        set_bind_dev(&socket, dev, addr.is_ipv6())?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -526,16 +533,38 @@ const UDP_SEND_TIMEOUT_MS: u64 = 1000;
 /// send buffer fills, redundantly re-staging the whole batch and starving the
 /// async runtime. Switching to blocking lets the kernel backpressure the
 /// sender thread instead. The `SO_SNDBUF` bump is best-effort (clamped by
-/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link (see
+/// `net.core.wmem_max`) and GROW-ONLY (#163); `SO_SNDTIMEO` bounds a wedged link (see
 /// [`UDP_SEND_TIMEOUT_MS`]). Note: this is `SO_SNDTIMEO`, *not* the
 /// `TCP_USER_TIMEOUT` of [`set_snd_timeout`] (which is a no-op on UDP).
 #[cfg(unix)]
-pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) -> Result<()> {
+pub fn configure_udp_sender(
+    socket: &std::net::UdpSocket,
+    sndbuf_target: Option<usize>,
+) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
     socket.set_nonblocking(false)?;
     let sock = socket2::SockRef::from(socket);
-    let _ = sock.set_send_buffer_size(sndbuf_target);
+    // GROW-ONLY, and not at all under an explicit -w (#163; callers pass
+    // None then): iperf3 never sets UDP SO_SNDBUF except for -w. The
+    // old unconditional set shrank the buffer ~9-90x below the OS default
+    // whenever batch x blksize was small (a quantum batch at moderate -b, or
+    // -b rate/1's single datagram) and clobbered an earlier -w bump — on a
+    // completion-latency-bound path (real NIC/qdisc; virtio under light
+    // load) that serializes the blocking sender well below target. The
+    // readback compare only ever grows (Linux doubles the requested value;
+    // BSDs don't — comparing against the readback is correct on both).
+    if let Some(target) = sndbuf_target {
+        // A readback failure degrades to SKIP (the faithful direction), not
+        // to an unconditional set. Linux readback is doubled (BSDs aren't):
+        // a target inside (current/2, current] is a deliberate forgone grow
+        // — blocking-socket kernel backpressure is iperf3's own behavior, so
+        // don't "fix" this comparison to a pre-doubled value.
+        let current = sock.send_buffer_size().unwrap_or(usize::MAX);
+        if target > current {
+            let _ = sock.set_send_buffer_size(target);
+        }
+    }
     let tv = TimeVal::new(
         (UDP_SEND_TIMEOUT_MS / 1000) as libc::time_t,
         ((UDP_SEND_TIMEOUT_MS % 1000) * 1000) as libc::suseconds_t,
@@ -548,7 +577,10 @@ pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) 
 // wedged send can block until the link recovers; the per-batch deadline can't
 // fire mid-block. Acceptable given the sendmmsg fast path is Unix-only anyway.
 #[cfg(not(unix))]
-pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
+pub fn configure_udp_sender(
+    socket: &std::net::UdpSocket,
+    _sndbuf_target: Option<usize>,
+) -> Result<()> {
     socket.set_nonblocking(false)?;
     Ok(())
 }
@@ -714,9 +746,16 @@ pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str, is_ipv6: bool)
     Ok(())
 }
 
+// No SO_BINDTODEVICE / IP_BOUND_IF equivalent: error instead of silently
+// no-opping (#149) — iperf3 compiles --bind-dev out entirely on these
+// platforms (no CAN_BIND_TO_DEVICE), so a silent accept-and-ignore is the
+// worst of both. The builders reject at config time; this is defense in
+// depth for internal callers.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn set_bind_dev<F>(_fd: &F, _dev: &str, _is_ipv6: bool) -> Result<()> {
-    Ok(())
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "--bind-dev is not supported on this platform".into(),
+    )))
 }
 
 /// Set TCP keepalive options on a socket.
@@ -881,6 +920,7 @@ pub async fn udp_bind_reusable(
     bind_addr: Option<&str>,
     port: u16,
     ip_version: Option<u8>,
+    bind_dev: Option<&str>,
 ) -> Result<UdpSocket> {
     let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
@@ -898,6 +938,11 @@ pub async fn udp_bind_reusable(
         // Set V6ONLY on every IPv6 bind, explicit `-B` included — see tcp_listen.
         socket.set_only_v6(ip_version == Some(6))?;
     }
+    // --bind-dev pre-bind, like the TCP listener (#149); iperf3's UDP server
+    // socket goes through the same netannounce path.
+    if let Some(dev) = bind_dev {
+        set_bind_dev(&socket, dev, addr.is_ipv6())?;
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
 
@@ -912,6 +957,71 @@ pub async fn udp_bind_reusable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #163: configure_udp_sender must be GROW-ONLY. The old unconditional
+    /// set_send_buffer_size shrank SO_SNDBUF ~9-90x below the OS default at
+    /// moderate batch×blksize products (worst at -b rate/1: one datagram!) —
+    /// iperf3 never sets UDP SO_SNDBUF except for an explicit -w.
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_never_shrinks_sndbuf() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let default_buf = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, Some(4096)).unwrap();
+        assert!(
+            sock.send_buffer_size().unwrap() >= default_buf,
+            "a small batch target must not shrink the send buffer below the default"
+        );
+    }
+
+    /// #163: an explicit -w bump applied earlier (apply_socket_window runs
+    /// before the data thread) must survive configure_udp_sender.
+    /// #163 review r2 nit: the None path (explicit -w given) must leave
+    /// SO_SNDBUF exactly untouched while still switching to blocking — the
+    /// regression guard against the buffer setup migrating inside the
+    /// Some-arm.
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_none_leaves_buffer_untouched() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let _ = sock.set_send_buffer_size(64 * 1024);
+        let before = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, None).unwrap();
+        assert_eq!(
+            sock.send_buffer_size().unwrap(),
+            before,
+            "None must not touch SO_SNDBUF"
+        );
+        // Blocking mode still applied: a recv on an empty socket with the
+        // SO_SNDTIMEO-class timeout... cheapest observable: nonblocking off
+        // means recv_from with a read timeout blocks ~that long, while a
+        // nonblocking socket returns WouldBlock instantly.
+        s.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 8];
+        let _ = s.recv_from(&mut buf);
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(30),
+            "socket must be in blocking mode after configure_udp_sender(None)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_preserves_window_bump() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let _ = sock.set_send_buffer_size(1024 * 1024);
+        let bumped = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, Some(11_584)).unwrap();
+        assert!(
+            sock.send_buffer_size().unwrap() >= bumped,
+            "-w's bump must not be clobbered down to batch x blksize"
+        );
+    }
 
     // #59: -w/--window must be applied to UDP sockets, not just TCP. Requesting a
     // size *below* the default and asserting the read-back drops is robust across
@@ -945,9 +1055,35 @@ mod tests {
         assert_eq!(s2.send_buffer_size().unwrap(), before);
     }
 
+    // #149: the server's listener and UDP socket honor --bind-dev pre-bind
+    // (iperf3's netannounce). Loopback is always present, so bind to it and
+    // read SO_BINDTODEVICE back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_listen_binds_device() {
+        use nix::sys::socket::{self, sockopt};
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, Some("lo"))
+            .await
+            .unwrap();
+        let dev = socket::getsockopt(&listener, sockopt::BindToDevice).unwrap();
+        // The kernel readback is NUL-padded.
+        assert_eq!(dev.to_string_lossy().trim_end_matches('\0'), "lo");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_bind_reusable_binds_device() {
+        use nix::sys::socket::{self, sockopt};
+        let sock = udp_bind_reusable(Some("127.0.0.1"), 0, None, Some("lo"))
+            .await
+            .unwrap();
+        let dev = socket::getsockopt(&sock, sockopt::BindToDevice).unwrap();
+        assert_eq!(dev.to_string_lossy().trim_end_matches('\0'), "lo");
+    }
+
     #[tokio::test]
     async fn tcp_listen_and_connect() {
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {
@@ -988,7 +1124,7 @@ mod tests {
         // Bind the client source to 127.0.0.2 (loopback /8 on Linux). The OS
         // would otherwise pick 127.0.0.1, so observing 127.0.0.2 proves -B
         // actually took effect rather than being silently ignored (#15).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect(
@@ -1017,7 +1153,7 @@ mod tests {
     async fn tcp_connect_rejects_bind_family_mismatch() {
         // A -B with a v6 literal while connecting to a v4 target must error,
         // not silently ignore it (#15 family validation, mirroring #12).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let result = tcp_connect(
             "127.0.0.1",
@@ -1095,7 +1231,7 @@ mod tests {
     async fn tcp_connect_binds_local_address_and_port() {
         // -B and --cport together: the source IP is applied through the same
         // socket2 bind path that also handles the local port (#15).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             // local_port Some(0) = ephemeral, exercised alongside the -B bind.
@@ -1128,7 +1264,7 @@ mod tests {
         // was treated as fatal, so the connect failed on Windows (#79). Use an
         // OS-assigned source port (Some(0)) so this is portable and collision-
         // free while still exercising the explicit-local-port path on every OS.
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, Some(0), None, None, false, None).await
@@ -1252,7 +1388,7 @@ mod tests {
     /// clients on the same port — matches iperf3's dual-stack default.
     #[tokio::test]
     async fn tcp_listen_dual_stack_default() {
-        let listener = tcp_listen(None, 0, None).await.unwrap();
+        let listener = tcp_listen(None, 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         // IPv4 connect must succeed.
@@ -1281,7 +1417,7 @@ mod tests {
     /// `ip_version=Some(4)` restricts the listener to IPv4 only.
     #[tokio::test]
     async fn tcp_listen_ipv4_only() {
-        let listener = tcp_listen(None, 0, Some(4)).await.unwrap();
+        let listener = tcp_listen(None, 0, Some(4), None).await.unwrap();
         let local = listener.local_addr().unwrap();
         assert!(local.is_ipv4(), "expected IPv4 local_addr, got {local}");
         let port = local.port();
@@ -1308,7 +1444,7 @@ mod tests {
     /// addresses; the test guards against that regression.
     #[tokio::test]
     async fn tcp_listen_ipv6_only() {
-        let listener = tcp_listen(None, 0, Some(6)).await.unwrap();
+        let listener = tcp_listen(None, 0, Some(6), None).await.unwrap();
         let local = listener.local_addr().unwrap();
         assert!(local.is_ipv6(), "expected IPv6 local_addr, got {local}");
         let port = local.port();
@@ -1333,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_listen_explicit_bind_respects_ip_version() {
         // `-B :: -6`  → IPv6-only: an IPv4 client must be refused.
-        let v6only = tcp_listen(Some("::"), 0, Some(6)).await.unwrap();
+        let v6only = tcp_listen(Some("::"), 0, Some(6), None).await.unwrap();
         let port = v6only.local_addr().unwrap().port();
         let v4 = tcp_connect("127.0.0.1", port, None, None, None, None, false, None).await;
         assert!(
@@ -1343,7 +1479,7 @@ mod tests {
         drop(v6only);
 
         // `-B ::` alone → dual-stack: an IPv4 client connects via v4-mapped.
-        let dual = tcp_listen(Some("::"), 0, None).await.unwrap();
+        let dual = tcp_listen(Some("::"), 0, None, None).await.unwrap();
         let port = dual.local_addr().unwrap().port();
         let v4 = tcp_connect("127.0.0.1", port, None, None, None, None, false, None).await;
         match v4 {
@@ -1364,7 +1500,7 @@ mod tests {
     async fn tcp_maxseg_reports_mss_for_connected_stream() {
         // A connected TCP stream exposes a positive MSS via TCP_MAXSEG — this
         // is what the UDP datagram-size default is derived from (iperf3 parity).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, None, None, None, false, None)
@@ -1388,7 +1524,7 @@ mod tests {
         // #37: a connected TCP stream reports its in-effect congestion algorithm,
         // trimmed to a clean C-string (no nul padding / trailing whitespace) like
         // iperf3 — getsockopt(TCP_CONGESTION) returns a fixed-size padded buffer.
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, None, None, None, false, None)
@@ -1444,7 +1580,7 @@ mod tests {
             "precondition: socket starts non-blocking"
         );
 
-        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
         assert!(
             !is_nonblocking(socket.as_raw_fd()),
             "sender socket must be switched to blocking"
@@ -1459,7 +1595,7 @@ mod tests {
         // is a no-op on UDP and would leave the timeout unset (#6 review).
         use nix::sys::socket::{getsockopt, sockopt};
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
         let tv = getsockopt(&socket, sockopt::SendTimeout).unwrap();
         assert!(
             tv.tv_sec() > 0 || tv.tv_usec() > 0,

@@ -151,6 +151,9 @@ pub struct Server {
     pub(crate) server_max_duration: Option<u32>,
     pub(crate) forceflush: bool,
     pub(crate) bind_address: Option<String>,
+    /// `--bind-dev`: bind the listener (and UDP server sockets) to a device,
+    /// like iperf3's netannounce — Linux/SO_BINDTODEVICE only (#149).
+    pub(crate) bind_dev: Option<String>,
     pub(crate) ip_version: Option<u8>,
     pub(crate) timestamps: Option<String>,
     pub(crate) file: Option<String>,
@@ -194,8 +197,13 @@ impl Server {
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
         // threads (#81). The library must not fork here.
-        let listener =
-            net::tcp_listen(self.bind_address.as_deref(), self.port, self.ip_version).await?;
+        let listener = net::tcp_listen(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
         // Under -J / --json-stream iperf3's server stdout is pure JSON (the
         // "Server listening" banners are suppressed) so the document parses
         // cleanly; match that.
@@ -291,6 +299,11 @@ impl Server {
         // server_output event).
         let capture = (want_server_output && !self.json_output && !self.json_stream)
             .then(crate::macros::OutputCaptureGuard::start);
+        // --timestamps prefixes every text report line — through titled(), so
+        // the capture above tees the PREFIXED line like iperf3's linebuffer
+        // (#168). Run-scoped; never in the machine-JSON modes.
+        let _ts_guard = (self.timestamps.is_some() && !self.json_output && !self.json_stream)
+            .then(crate::macros::OutputTimestampGuard::set);
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -591,12 +604,15 @@ impl Server {
                     protocol: cfg.protocol,
                     format_char: 'a',
                     omit_secs: cfg.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
-                    timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
+                    // iperf3's discard_json: a json-stream server RETAINS the
+                    // interval objects when the client asked for output (#168).
+                    keep_intervals: want_server_output && self.json_stream,
+                    bidir: cfg.bidir,
+                    is_server: true,
                 },
                 stream_refs,
                 done.clone(),
@@ -756,7 +772,12 @@ impl Server {
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
             (Some(capture.take()), None)
-        } else if want_server_output && self.json_output {
+        } else if want_server_output && (self.json_output || self.json_stream) {
+            // A --json-stream server attaches its JSON report too: iperf3
+            // keeps json_top alive specifically for this flag
+            // (discard_json = json_stream && ... && !(server && get_server_output),
+            // iperf_api.c:3900) — without this a real iperf3 client
+            // requesting output silently got none (#168).
             let report = self.build_report(
                 &streams,
                 &cfg,
@@ -897,9 +918,13 @@ impl Server {
         start: &Arc<AtomicBool>,
         streams: &mut Vec<DataStream>,
     ) -> Result<()> {
-        let mut udp_listener =
-            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
-                .await?;
+        let mut udp_listener = net::udp_bind_reusable(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -925,6 +950,7 @@ impl Server {
                     self.bind_address.as_deref(),
                     self.port,
                     self.ip_version,
+                    self.bind_dev.as_deref(),
                 )
                 .await?;
             } else {
@@ -951,6 +977,14 @@ impl Server {
                     sock.recv_buffer_size().ok().map(|v| v as u64),
                 )
             };
+            // iperf3 runs iperf_common_sockopts (IP_TOS/IPV6_TCLASS) on UDP
+            // stream sockets on BOTH roles — it matters for reverse/bidir,
+            // where the server marks egress. Fatal like every other set_tos
+            // site (#45). The TCP accept loop has had this since #45; the
+            // UDP paths never did (#154).
+            if cfg.tos != 0 {
+                net::set_tos(&data_sock, cfg.tos as u32)?;
+            }
             // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
             net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
 
@@ -965,11 +999,12 @@ impl Server {
                 let pt = cfg.pacing_timer; // #185: pace the UDP batch too
                 let u64bit = cfg.udp_counters_64bit;
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(
-                        std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                        std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
                 streams.push(DataStream {
@@ -1050,9 +1085,13 @@ impl Server {
         // One unconnected dual-stack socket for the whole test. Never connect()'d
         // and never sharing its port with a second socket, so there is no
         // connected+wildcard pair for winsock to drop a new source against (#80).
-        let udp_sock =
-            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
-                .await?;
+        let udp_sock = net::udp_bind_reusable(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -1081,7 +1120,13 @@ impl Server {
             }
             let (n, src) =
                 match tokio::time::timeout(remaining, udp_sock.recv_from(&mut magic_buf)).await {
-                    Ok(r) => r?,
+                    Ok(Ok(r)) => r,
+                    // Reset-class noise: our own UDP_CONNECT_REPLY to a client
+                    // port that just closed (e.g. a retry on a fresh socket)
+                    // queues WSAECONNRESET on Windows — it must not abort setup
+                    // for EVERY stream; skip like the data-phase receivers (#180).
+                    Ok(Err(e)) if crate::stream::is_reset_class(&e) => continue,
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_) => {
                         return Err(RiperfError::Aborted(
                             "timed out waiting for UDP stream connect".into(),
@@ -1142,6 +1187,12 @@ impl Server {
         // single-socket demux path the recv buffer is sized to the aggregate, but a
         // genuine wmem/rmem_max clamp still drives the readback below the request.
         net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+        // iperf3 applies IP_TOS/IPV6_TCLASS per UDP stream socket on both
+        // roles; every stream here shares this one socket and one cfg.tos,
+        // so once-per-socket is semantically identical (#154). Fatal per #45.
+        if cfg.tos != 0 {
+            net::set_tos(&udp_std, cfg.tos as u32)?;
+        }
         // The connected recycling path reports each stream's local_host as the
         // kernel-selected source IP for that client. The demux socket is never
         // connect()'d, so its own local_addr is the wildcard bind — only on a
@@ -1180,6 +1231,7 @@ impl Server {
                 let c = counters.clone();
                 let d = done.clone();
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
@@ -1192,6 +1244,7 @@ impl Server {
                         rate,
                         pt,
                         bu,
+                        uw,
                         u64bit,
                         st,
                         md,
@@ -1314,7 +1367,7 @@ impl Server {
                     // Bidir tags every line with the stream's direction (#184).
                     role_tag: cfg
                         .bidir
-                        .then_some(if s.is_sender { "TX-S" } else { "RX-S" }),
+                        .then_some(crate::reporter::bidir_role_tag(true, s.is_sender)),
                 }
             })
             .collect()
@@ -1621,6 +1674,7 @@ pub struct ServerBuilder {
     server_max_duration: Option<u32>,
     forceflush: bool,
     bind_address: Option<String>,
+    bind_dev: Option<String>,
     ip_version: Option<u8>,
     timestamps: Option<String>,
     file: Option<String>,
@@ -1643,6 +1697,7 @@ impl Default for ServerBuilder {
             server_max_duration: None,
             forceflush: false,
             bind_address: None,
+            bind_dev: None,
             ip_version: None,
             timestamps: None,
             file: None,
@@ -1719,6 +1774,16 @@ impl ServerBuilder {
         self
     }
 
+    /// `--bind-dev`: bind the listening socket (and the UDP server sockets)
+    /// to a network device, like iperf3's netannounce (#149). Linux only:
+    /// netannounce applies SO_BINDTODEVICE exclusively (iperf3's macOS
+    /// IP_BOUND_IF covers only the CLIENT path, so its macOS server fails
+    /// the listen); rejected at `build()` elsewhere.
+    pub fn bind_dev(mut self, dev: &str) -> Self {
+        self.bind_dev = Some(dev.to_string());
+        self
+    }
+
     /// `-B/--bind`: bind the listener to a specific local address.
     pub fn bind_address(mut self, addr: &str) -> Self {
         self.bind_address = Some(addr.to_string());
@@ -1788,6 +1853,21 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
+        // The SERVER honors --bind-dev only on Linux: iperf3's netannounce
+        // applies SO_BINDTODEVICE exclusively (its macOS IP_BOUND_IF support
+        // covers only the client's bind_to_device/create_socket path, so a
+        // macOS `iperf3 -s --bind-dev` FAILS at listener creation — review
+        // r1 ground truth). Rejecting at config time everywhere else matches
+        // both that and the no-CAN_BIND_TO_DEVICE unrecognized-option case;
+        // a silent no-op bind would be the worst behavior (#149).
+        #[cfg(not(target_os = "linux"))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev on the server requires SO_BINDTODEVICE, which this platform lacks"
+                    .into(),
+            ));
+        }
+
         // Reject -4/-6 contradicting an explicit -B of the opposite family,
         // instead of silently letting the bind address win (issue #12).
         if let (Some(v), Some(addr)) = (self.ip_version, self.bind_address.as_deref()) {
@@ -1814,6 +1894,7 @@ impl ServerBuilder {
             server_max_duration: self.server_max_duration,
             forceflush: self.forceflush,
             bind_address: self.bind_address,
+            bind_dev: self.bind_dev,
             ip_version: self.ip_version,
             timestamps: self.timestamps,
             file: self.file,
@@ -1834,6 +1915,224 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Receive one datagram and return the IP_TOS control message byte, via
+    /// raw libc recvmsg (nix 0.29's UnknownCmsg fields are private). The
+    /// socket must have IP_RECVTOS enabled; with it on, the kernel delivers
+    /// the cmsg for every datagram (value 0 included), so asserting the byte
+    /// distinguishes "TOS applied" from "TOS defaulted" (#154).
+    #[cfg(target_os = "linux")]
+    fn recv_udp_tos(sock: &std::net::UdpSocket) -> Option<u8> {
+        use std::os::fd::AsRawFd;
+        let mut data = [0u8; 2048];
+        // u64-aligned backing store: CMSG_FIRSTHDR/NXTHDR deref cmsghdr
+        // fields, and a bare [u8] array has alignment 1 (review r1 n6).
+        let mut cmsg = [0u64; 8];
+        let mut iov = libc::iovec {
+            iov_base: data.as_mut_ptr() as *mut _,
+            iov_len: data.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        // `as _`: msg_iovlen/msg_controllen are usize on glibc but
+        // c_int/socklen_t on musl.
+        msg.msg_iovlen = 1 as _;
+        msg.msg_controllen = std::mem::size_of_val(&cmsg) as _;
+        msg.msg_control = cmsg.as_mut_ptr() as *mut _;
+        // SAFETY: valid fd, valid buffers sized above; CMSG_* walk the buffer
+        // the kernel just filled within msg_controllen.
+        unsafe {
+            if libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) < 0 {
+                return None;
+            }
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_TOS {
+                    return Some(*libc::CMSG_DATA(c));
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        None
+    }
+
+    /// Sub-ephemeral, PID-windowed UDP port pick for these in-module tests —
+    /// the lib unit tests can't reach tests/common's allocator, and a
+    /// bind-:0-then-drop probe hands back an ephemeral port a concurrent test
+    /// binary's client socket can land on (review r1 n5; the #176 scheme).
+    #[cfg(target_os = "linux")]
+    fn free_udp_port() -> u16 {
+        use std::sync::atomic::AtomicU16;
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let window = 7000 + (std::process::id() % 250) as u16 * 100;
+        for _ in 0..100 {
+            let port = window + NEXT.fetch_add(1, Ordering::Relaxed) % 100;
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("no free UDP port in test window {window}-{}", window + 99);
+    }
+
+    /// Test client half of the UDP connect handshake + first-data capture:
+    /// enables IP_RECVTOS, retries the connect magic until the reply lands,
+    /// then reads the first DATA datagram's TOS byte.
+    #[cfg(target_os = "linux")]
+    fn udp_tos_probe_client(server: std::net::SocketAddr) -> std::thread::JoinHandle<Option<u8>> {
+        use std::os::fd::AsRawFd;
+        std::thread::spawn(move || {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let on: libc::c_int = 1;
+            // SAFETY: plain setsockopt(IP_RECVTOS) on a valid fd.
+            let rc = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_RECVTOS,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            // A silent failure here would burn the recv window and fail with
+            // a misleading "left: None" (review r1 n7).
+            assert_eq!(rc, 0, "setsockopt(IP_RECVTOS)");
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(250)))
+                .unwrap();
+            let mut reply = [0u8; 4];
+            // Handshake: retry the magic until the reply arrives (the server
+            // task may bind after our first send).
+            for _ in 0..40 {
+                let _ = sock.send_to(&protocol::UDP_CONNECT_MSG.to_ne_bytes(), server);
+                match sock.recv_from(&mut reply) {
+                    Ok((4, _)) => break,
+                    _ => continue,
+                }
+            }
+            // First data datagram after TestStart carries the socket's TOS.
+            for _ in 0..40 {
+                if let Some(tos) = recv_udp_tos(&sock) {
+                    return Some(tos);
+                }
+            }
+            None
+        })
+    }
+
+    /// #154: the server's UDP data sockets must carry IP_TOS — iperf3 runs
+    /// iperf_common_sockopts on UDP stream sockets on both roles (matters
+    /// for reverse/bidir egress marking). Reverse, one stream: the server is
+    /// the sender. Recycling path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_recycling_server_sender_carries_tos() {
+        let port = free_udp_port();
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+
+        let srv = ServerBuilder::new()
+            .port(Some(port))
+            .bind_address("127.0.0.1")
+            .build()
+            .unwrap();
+        let params = TestParams {
+            udp: Some(true),
+            reverse: Some(true),
+            parallel: Some(1),
+            tos: Some(0x48),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false));
+        let mut streams = Vec::new();
+
+        let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
+
+        srv.setup_udp_recycling_streams(
+            &mut ctrl_srv,
+            &cfg,
+            0,
+            1,
+            None,
+            &done,
+            &start,
+            &mut streams,
+        )
+        .await
+        .unwrap();
+        start.store(true, Ordering::Relaxed);
+
+        let tos = client.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        for s in streams {
+            let _ = s.task.await;
+        }
+        assert_eq!(tos, Some(0x48), "server UDP egress must carry cfg.tos");
+    }
+
+    /// #154, demux flavor: one shared socket for every stream — TOS applied
+    /// once to it covers all (single cfg.tos). Calling the setup fn directly
+    /// avoids the RIPERF3_UDP_SERVER_DEMUX env-var gate (process-global).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_demux_server_sender_carries_tos() {
+        let port = free_udp_port();
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+
+        let srv = ServerBuilder::new()
+            .port(Some(port))
+            .bind_address("127.0.0.1")
+            .build()
+            .unwrap();
+        let params = TestParams {
+            udp: Some(true),
+            reverse: Some(true),
+            parallel: Some(1),
+            tos: Some(0x48),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false));
+        let mut streams = Vec::new();
+        let mut demux_handle = None;
+
+        let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
+
+        srv.setup_udp_demux_streams(
+            &mut ctrl_srv,
+            &cfg,
+            0,
+            1,
+            None,
+            &done,
+            &start,
+            &mut streams,
+            &mut demux_handle,
+        )
+        .await
+        .unwrap();
+        start.store(true, Ordering::Relaxed);
+
+        let tos = client.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        for s in streams {
+            let _ = s.task.await;
+        }
+        if let Some(h) = demux_handle {
+            h.abort();
+        }
+        assert_eq!(tos, Some(0x48), "demux UDP egress must carry cfg.tos");
+    }
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
     // when `Server`'s fields became `pub(crate)` (#43): an external test crate
