@@ -102,32 +102,21 @@ fn daemon_server_serves_a_client() {
         "daemon pid {pid} is not alive after fork"
     );
 
-    // Give the listener a moment to bind before connecting.
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Run a short byte-limited client against the daemon. Spawn it as a child
-    // and bound the wait: before the fix the daemon never serves and the client
-    // hangs, so a plain blocking call would hang the whole test suite.
-    let mut client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &port_s, "-n", "1M"])
-        .spawn()
-        .expect("failed to spawn client");
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let exit = loop {
-        match client.try_wait().expect("try_wait on client") {
-            Some(status) => break Some(status),
-            None if Instant::now() >= deadline => {
-                let _ = client.kill();
-                let _ = client.wait();
-                break None;
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
-    let exit = exit.expect("client hung against the daemon — server never served (#81)");
-    assert!(exit.success(), "client failed against the daemon: {exit:?}");
+    // No fixed bind sleep (#177): run_client retries a REFUSED connect for a
+    // bounded window (the #176 pattern), and its hard timeout bounds the
+    // pre-fix #81 hang (daemon forked but never serves) instead of stalling
+    // the suite.
+    let run = common::run_client(
+        &["-c", "127.0.0.1", "-p", &port_s, "-n", "1M"],
+        Duration::from_secs(15),
+        "client vs daemon (a timeout here = the #81 never-serves hang)",
+    );
+    assert!(
+        run.status.success(),
+        "client failed against the daemon: {status}; stderr: {stderr}",
+        status = run.status,
+        stderr = run.stderr,
+    );
 
     // Disarm the reaper only here, on full success: the one-off daemon has served
     // the test and is exiting on its own, so there's nothing to kill and we avoid

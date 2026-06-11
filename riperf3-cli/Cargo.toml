@@ -29,6 +29,7 @@ nix.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+riperf3-test-support = { path = "../riperf3-test-support" }
 
 [[bin]]
 name = "riperf3"

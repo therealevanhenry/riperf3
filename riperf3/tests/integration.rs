@@ -3,16 +3,18 @@
 //! These tests start a real riperf3 server and client on localhost,
 //! exercise the complete wire protocol, and verify results.
 
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use riperf3::TransportProtocol;
 use riperf3::{ClientBuilder, ServerBuilder};
 
-/// Allocate unique ports for parallel test execution.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(15201);
+mod common;
+
+/// Allocate unique ports for parallel test execution — the shared #176
+/// PID-windowed allocator (#192); the old bare 15201+ counter had no
+/// collision probe and could land inside another binary's PID window.
 fn next_port() -> u16 {
-    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+    common::free_port()
 }
 
 // ---------------------------------------------------------------------------
