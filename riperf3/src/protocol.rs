@@ -465,7 +465,9 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
             // class as the recv side below; the interval still rate-limits.
             match socket.send(&UDP_CONNECT_MSG.to_ne_bytes()).await {
                 Ok(_) => {}
-                Err(e) if transient_udp_handshake_error(&e) => {}
+                Err(e) if transient_udp_handshake_error(&e) => {
+                    saw_icmp_feedback = true;
+                }
                 Err(e) => return Err(RiperfError::Io(e)),
             }
             next_send = tokio::time::Instant::now() + UDP_CONNECT_RETRY_INTERVAL;
@@ -521,15 +523,22 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     // the server's UDP port never came up — saying "only unexpected
     // datagrams" there (or a bare timeout) would misdirect the next session.
     Err(RiperfError::Protocol(
-        if saw_icmp_feedback && !saw_traffic {
-            "UDP connect handshake failed: the server port kept refusing (ICMP unreachable)          for the whole budget"
-            .into()
-        } else if saw_traffic {
-            "UDP connect handshake failed: no valid reply (only unexpected datagrams received)"
-                .into()
-        } else {
-            "UDP connect handshake timed out (no server reply)".into()
-        },
+        match (saw_icmp_feedback, saw_traffic) {
+            (true, false) => {
+                "UDP connect handshake failed: ICMP port unreachable received \
+                              and no valid reply for the whole budget"
+            }
+            (true, true) => {
+                "UDP connect handshake failed: no valid reply (unexpected \
+                             datagrams and ICMP feedback received)"
+            }
+            (false, true) => {
+                "UDP connect handshake failed: no valid reply (only unexpected datagrams \
+                 received)"
+            }
+            (false, false) => "UDP connect handshake timed out (no server reply)",
+        }
+        .into(),
     ))
 }
 
