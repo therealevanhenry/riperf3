@@ -74,8 +74,8 @@ jobs:
         # a bad value sails through `seq | jq` as `[]` and dies two jobs
         # later as a cryptic empty-matrix strategy error.
         run: |
-          [[ "$SHARDS" =~ ^[1-9][0-9]*$ ]] \
-            || { echo "::error::shards must be a positive integer, got '$SHARDS'"; exit 1; }
+          [[ "$SHARDS" =~ ^[1-9][0-9]*$ ]] && (( SHARDS <= 256 )) \
+            || { echo "::error::shards must be a positive integer <= 256 (the matrix cap), got '$SHARDS'"; exit 1; }
           # "8" → [1,2,…,8] for fromJSON into the matrix.
           echo "shards=$(seq 1 "$SHARDS" | jq -cs .)" >> "$GITHUB_OUTPUT"
 
