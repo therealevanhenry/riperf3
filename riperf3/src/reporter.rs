@@ -710,6 +710,9 @@ pub fn spawn_interval_reporter(
         ticker.tick().await; // skip the immediate first tick
 
         let mut interval_num: u64 = 0;
+        // #204: the first tick prints under the start-of-run header; later
+        // ticks at -P > 1 open with the separator.
+        let mut first_tick = true;
         let mut header_printed = false;
         // `-O/--omit` (#31): a real warm-up phase, like iperf3 — ticks during
         // it emit `omitted` intervals on a 0..omit timeline, then the boundary
@@ -995,6 +998,17 @@ pub fn spawn_interval_reporter(
                 // then a combined SUM mixing both directions, even at bidir
                 // P=1 (#143/#187 + review r1 n1).
                 if config.print && !config.json_stream {
+                    // iperf3's iperf_print_intermediate, first stream of a
+                    // tick: the FIRST interval prints the header (riperf3
+                    // prints it at reporter start), every later tick at
+                    // num_streams > 1 opens with the separator — including
+                    // the first post-omit tick; live iperf3 -O does NOT
+                    // reprint the header at the boundary (#204).
+                    let multi_stream = fwd.count > 1 || rev.count > 1;
+                    if !first_tick && multi_stream {
+                        print_separator();
+                    }
+                    first_tick = false;
                     for (acc, dir_is_sender) in [(&fwd, fwd_is_sender), (&rev, !fwd_is_sender)] {
                         for (row_is_sender, row) in &tick_rows {
                             if *row_is_sender == dir_is_sender {

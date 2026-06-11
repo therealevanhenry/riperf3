@@ -165,6 +165,7 @@ pub struct Server {
     pub(crate) json_output: bool,
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub(crate) json_stream: bool,
+    pub(crate) json_stream_full_output: bool,
 }
 
 /// Best-effort source IP the kernel would use to reach `client_addr`, paired
@@ -622,9 +623,11 @@ impl Server {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
-                    // iperf3's discard_json: a json-stream server RETAINS the
-                    // interval objects when the client asked for output (#168).
-                    keep_intervals: want_server_output && self.json_stream,
+                    // iperf3's discard_json: a json-stream run RETAINS the
+                    // interval objects when the client asked for output OR
+                    // under --json-stream-full-output (#168, #213).
+                    keep_intervals: self.json_stream
+                        && (want_server_output || self.json_stream_full_output),
                     bidir: cfg.bidir,
                     is_server: true,
                 },
@@ -1635,10 +1638,16 @@ impl Server {
             start_time_millis,
             interval_data,
         );
+        let report = input.build();
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
-            &input.build().end,
+            &report.end,
         ));
+        // --json-stream-full-output: the monolithic document follows the
+        // stream, like iperf_json_finish under the flag (#213).
+        if self.json_stream_full_output {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
     }
 
     /// `--json-stream`: emit the server's `start` event (#62), before any interval
@@ -1698,6 +1707,7 @@ pub struct ServerBuilder {
     use_pkcs1_padding: bool,
     json_output: bool,
     json_stream: bool,
+    json_stream_full_output: bool,
 }
 
 impl Default for ServerBuilder {
@@ -1721,6 +1731,7 @@ impl Default for ServerBuilder {
             use_pkcs1_padding: false,
             json_output: false,
             json_stream: false,
+            json_stream_full_output: false,
         }
     }
 }
@@ -1758,6 +1769,14 @@ impl ServerBuilder {
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
+        self
+    }
+
+    /// With json-stream, also print the complete monolithic JSON document
+    /// after the stream ends — iperf3's `--json-stream-full-output`, the
+    /// third leg of its discard_json condition (#213).
+    pub fn json_stream_full_output(mut self, enabled: bool) -> Self {
+        self.json_stream_full_output = enabled;
         self
     }
 
@@ -1918,6 +1937,7 @@ impl ServerBuilder {
             use_pkcs1_padding: self.use_pkcs1_padding,
             json_output: self.json_output,
             json_stream: self.json_stream,
+            json_stream_full_output: self.json_stream_full_output,
         })
     }
 }
