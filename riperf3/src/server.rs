@@ -1881,13 +1881,14 @@ impl ServerBuilder {
     }
 
     /// Emit the results as iperf3-schema JSON on stdout instead of text (`-J`).
+    /// When combined with [`Self::json_stream`], stream mode wins (#220).
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
         self
     }
 
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
-    /// Combined with [`Self::json`], stream mode WINS — iperf3's
+    /// Combined with [`Self::json_output`], stream mode WINS — iperf3's
     /// OPT_JSON_STREAM implies -J (#220), same rule as the client builder.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;

@@ -2136,6 +2136,7 @@ impl ClientBuilder {
 
     /// `-J/--json`: emit the results as iperf3-schema JSON on stdout instead
     /// of text.
+    /// When combined with [`Self::json_stream`], stream mode wins (#220).
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
         self
@@ -2158,7 +2159,7 @@ impl ClientBuilder {
     }
 
     /// `--json-stream`: stream line-delimited interval JSON during the test.
-    /// Combined with [`Self::json`], stream mode WINS — iperf3's
+    /// Combined with [`Self::json_output`], stream mode WINS — iperf3's
     /// OPT_JSON_STREAM implies -J, so the hybrid is simply stream mode
     /// (full event stream incl. `end`; the monolithic document only with
     /// [`Self::json_stream_full_output`]) (#220).
