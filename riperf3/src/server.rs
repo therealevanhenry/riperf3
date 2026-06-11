@@ -1902,7 +1902,9 @@ mod tests {
     fn recv_udp_tos(sock: &std::net::UdpSocket) -> Option<u8> {
         use std::os::fd::AsRawFd;
         let mut data = [0u8; 2048];
-        let mut cmsg = [0u8; 64];
+        // u64-aligned backing store: CMSG_FIRSTHDR/NXTHDR deref cmsghdr
+        // fields, and a bare [u8] array has alignment 1 (review r1 n6).
+        let mut cmsg = [0u64; 8];
         let mut iov = libc::iovec {
             iov_base: data.as_mut_ptr() as *mut _,
             iov_len: data.len(),
@@ -1912,7 +1914,7 @@ mod tests {
         // `as _`: msg_iovlen/msg_controllen are usize on glibc but
         // c_int/socklen_t on musl.
         msg.msg_iovlen = 1 as _;
-        msg.msg_controllen = cmsg.len() as _;
+        msg.msg_controllen = std::mem::size_of_val(&cmsg) as _;
         msg.msg_control = cmsg.as_mut_ptr() as *mut _;
         // SAFETY: valid fd, valid buffers sized above; CMSG_* walk the buffer
         // the kernel just filled within msg_controllen.
@@ -1931,6 +1933,24 @@ mod tests {
         None
     }
 
+    /// Sub-ephemeral, PID-windowed UDP port pick for these in-module tests —
+    /// the lib unit tests can't reach tests/common's allocator, and a
+    /// bind-:0-then-drop probe hands back an ephemeral port a concurrent test
+    /// binary's client socket can land on (review r1 n5; the #176 scheme).
+    #[cfg(target_os = "linux")]
+    fn free_udp_port() -> u16 {
+        use std::sync::atomic::AtomicU16;
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        let window = 7000 + (std::process::id() % 250) as u16 * 100;
+        for _ in 0..100 {
+            let port = window + NEXT.fetch_add(1, Ordering::Relaxed) % 100;
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("no free UDP port in test window {window}-{}", window + 99);
+    }
+
     /// Test client half of the UDP connect handshake + first-data capture:
     /// enables IP_RECVTOS, retries the connect magic until the reply lands,
     /// then reads the first DATA datagram's TOS byte.
@@ -1941,15 +1961,18 @@ mod tests {
             let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let on: libc::c_int = 1;
             // SAFETY: plain setsockopt(IP_RECVTOS) on a valid fd.
-            unsafe {
+            let rc = unsafe {
                 libc::setsockopt(
                     sock.as_raw_fd(),
                     libc::IPPROTO_IP,
                     libc::IP_RECVTOS,
                     &on as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
+                )
+            };
+            // A silent failure here would burn the recv window and fail with
+            // a misleading "left: None" (review r1 n7).
+            assert_eq!(rc, 0, "setsockopt(IP_RECVTOS)");
             sock.set_read_timeout(Some(std::time::Duration::from_millis(250)))
                 .unwrap();
             let mut reply = [0u8; 4];
@@ -1979,9 +2002,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn udp_recycling_server_sender_carries_tos() {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = free_udp_port();
 
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
@@ -2036,9 +2057,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn udp_demux_server_sender_carries_tos() {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = free_udp_port();
 
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
