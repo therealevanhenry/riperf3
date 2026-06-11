@@ -886,12 +886,13 @@ impl Client {
                     protocol: self.protocol,
                     format_char: self.format_char,
                     omit_secs: self.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
+                    bidir: self.bidir,
+                    is_server: false,
                 },
                 stream_refs,
                 done.clone(),
@@ -1171,7 +1172,7 @@ impl Client {
             // Bidir tags every line with the STREAM's direction (#184).
             let role_tag = self
                 .bidir
-                .then_some(if s.is_sender { "TX-C" } else { "RX-C" });
+                .then_some(crate::reporter::bidir_role_tag(false, s.is_sender));
             let bytes = if s.is_sender {
                 s.counters.bytes_sent_net()
             } else {
@@ -1931,9 +1932,10 @@ impl ClientBuilder {
         self
     }
 
-    /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
-    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere on
-    /// unix, rejected at `build()` on non-unix.
+    /// `--bind-dev`: bind data sockets to a network device. Linux
+    /// (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`/`IPV6_BOUND_IF`) only;
+    /// rejected at `build()` everywhere else (#149) — matching iperf3, whose
+    /// client-side IP_BOUND_IF fallback covers exactly these two.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
@@ -2167,11 +2169,6 @@ impl ClientBuilder {
                     "this OS does not support sendfile".into(),
                 ));
             }
-            if self.bind_dev.is_some() {
-                return Err(ConfigError::Unsupported(
-                    "SO_BINDTODEVICE is not supported on this platform".into(),
-                ));
-            }
             if self.congestion.is_some() {
                 return Err(ConfigError::Unsupported(
                     "TCP congestion control is not supported on this platform".into(),
@@ -2182,6 +2179,17 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
+        }
+
+        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS). The
+        // old gate only covered not(unix), so FreeBSD/NetBSD silently
+        // no-opped through net.rs's fallback — no binding, no error (#149).
+        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev is not supported on this platform".into(),
+            ));
         }
 
         // sendmmsg's real implementation is Linux/FreeBSD/NetBSD only; elsewhere

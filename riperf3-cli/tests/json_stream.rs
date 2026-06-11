@@ -14,7 +14,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -83,36 +83,18 @@ fn assert_valid_ndjson(stdout: &str, who: &str) {
     }
 }
 
-/// Kills the wrapped child on drop, so a spawned server is reaped even if the
-/// test panics before it is waited on.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+// Reaper guard shared via riperf3-test-support (#192).
+use common::ChildGuard;
 
 /// Wait for a child to exit, bounded by `timeout` (kill + panic on timeout), so a
-/// hang fails the test cleanly instead of stalling the whole suite.
+/// hang fails the test cleanly instead of stalling the whole suite. Thin
+/// panicking shim over the shared bounded wait (#192).
 fn wait_bounded(
     child: &mut std::process::Child,
     timeout: Duration,
     who: &str,
 ) -> std::process::ExitStatus {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => return status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{who}: timed out");
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
+    common::wait_bounded(child, timeout).unwrap_or_else(|| panic!("{who}: timed out"))
 }
 
 /// Run the client to completion (with refused-retry) and return its stdout.

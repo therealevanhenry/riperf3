@@ -322,6 +322,7 @@ pub async fn tcp_listen(
     bind_addr: Option<&str>,
     port: u16,
     ip_version: Option<u8>,
+    bind_dev: Option<&str>,
 ) -> Result<TcpListener> {
     let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
@@ -342,6 +343,12 @@ pub async fn tcp_listen(
         // can't rely on the platform default. For a non-wildcard IPv6 address
         // (e.g. `::1`) the flag is moot but harmless.
         socket.set_only_v6(ip_version == Some(6))?;
+    }
+    // --bind-dev on the LISTENING socket, pre-bind, like iperf3's
+    // netannounce (#149) — which is SO_BINDTODEVICE-only, hence the server
+    // builder's Linux-only gate; inherited by accepted data sockets.
+    if let Some(dev) = bind_dev {
+        set_bind_dev(&socket, dev, addr.is_ipv6())?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -739,9 +746,16 @@ pub fn set_bind_dev(fd: &impl std::os::unix::io::AsFd, dev: &str, is_ipv6: bool)
     Ok(())
 }
 
+// No SO_BINDTODEVICE / IP_BOUND_IF equivalent: error instead of silently
+// no-opping (#149) — iperf3 compiles --bind-dev out entirely on these
+// platforms (no CAN_BIND_TO_DEVICE), so a silent accept-and-ignore is the
+// worst of both. The builders reject at config time; this is defense in
+// depth for internal callers.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn set_bind_dev<F>(_fd: &F, _dev: &str, _is_ipv6: bool) -> Result<()> {
-    Ok(())
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "--bind-dev is not supported on this platform".into(),
+    )))
 }
 
 /// Set TCP keepalive options on a socket.
@@ -906,6 +920,7 @@ pub async fn udp_bind_reusable(
     bind_addr: Option<&str>,
     port: u16,
     ip_version: Option<u8>,
+    bind_dev: Option<&str>,
 ) -> Result<UdpSocket> {
     let host = bind_addr.unwrap_or(default_bind_addr(ip_version));
     let addr: SocketAddr = format_addr(host, port)
@@ -922,6 +937,11 @@ pub async fn udp_bind_reusable(
     if addr.is_ipv6() {
         // Set V6ONLY on every IPv6 bind, explicit `-B` included — see tcp_listen.
         socket.set_only_v6(ip_version == Some(6))?;
+    }
+    // --bind-dev pre-bind, like the TCP listener (#149); iperf3's UDP server
+    // socket goes through the same netannounce path.
+    if let Some(dev) = bind_dev {
+        set_bind_dev(&socket, dev, addr.is_ipv6())?;
     }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -1035,9 +1055,35 @@ mod tests {
         assert_eq!(s2.send_buffer_size().unwrap(), before);
     }
 
+    // #149: the server's listener and UDP socket honor --bind-dev pre-bind
+    // (iperf3's netannounce). Loopback is always present, so bind to it and
+    // read SO_BINDTODEVICE back.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_listen_binds_device() {
+        use nix::sys::socket::{self, sockopt};
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, Some("lo"))
+            .await
+            .unwrap();
+        let dev = socket::getsockopt(&listener, sockopt::BindToDevice).unwrap();
+        // The kernel readback is NUL-padded.
+        assert_eq!(dev.to_string_lossy().trim_end_matches('\0'), "lo");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_bind_reusable_binds_device() {
+        use nix::sys::socket::{self, sockopt};
+        let sock = udp_bind_reusable(Some("127.0.0.1"), 0, None, Some("lo"))
+            .await
+            .unwrap();
+        let dev = socket::getsockopt(&sock, sockopt::BindToDevice).unwrap();
+        assert_eq!(dev.to_string_lossy().trim_end_matches('\0'), "lo");
+    }
+
     #[tokio::test]
     async fn tcp_listen_and_connect() {
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         let client_task = tokio::spawn(async move {
@@ -1078,7 +1124,7 @@ mod tests {
         // Bind the client source to 127.0.0.2 (loopback /8 on Linux). The OS
         // would otherwise pick 127.0.0.1, so observing 127.0.0.2 proves -B
         // actually took effect rather than being silently ignored (#15).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect(
@@ -1107,7 +1153,7 @@ mod tests {
     async fn tcp_connect_rejects_bind_family_mismatch() {
         // A -B with a v6 literal while connecting to a v4 target must error,
         // not silently ignore it (#15 family validation, mirroring #12).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let result = tcp_connect(
             "127.0.0.1",
@@ -1185,7 +1231,7 @@ mod tests {
     async fn tcp_connect_binds_local_address_and_port() {
         // -B and --cport together: the source IP is applied through the same
         // socket2 bind path that also handles the local port (#15).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             // local_port Some(0) = ephemeral, exercised alongside the -B bind.
@@ -1218,7 +1264,7 @@ mod tests {
         // was treated as fatal, so the connect failed on Windows (#79). Use an
         // OS-assigned source port (Some(0)) so this is portable and collision-
         // free while still exercising the explicit-local-port path on every OS.
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, Some(0), None, None, false, None).await
@@ -1342,7 +1388,7 @@ mod tests {
     /// clients on the same port — matches iperf3's dual-stack default.
     #[tokio::test]
     async fn tcp_listen_dual_stack_default() {
-        let listener = tcp_listen(None, 0, None).await.unwrap();
+        let listener = tcp_listen(None, 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         // IPv4 connect must succeed.
@@ -1371,7 +1417,7 @@ mod tests {
     /// `ip_version=Some(4)` restricts the listener to IPv4 only.
     #[tokio::test]
     async fn tcp_listen_ipv4_only() {
-        let listener = tcp_listen(None, 0, Some(4)).await.unwrap();
+        let listener = tcp_listen(None, 0, Some(4), None).await.unwrap();
         let local = listener.local_addr().unwrap();
         assert!(local.is_ipv4(), "expected IPv4 local_addr, got {local}");
         let port = local.port();
@@ -1398,7 +1444,7 @@ mod tests {
     /// addresses; the test guards against that regression.
     #[tokio::test]
     async fn tcp_listen_ipv6_only() {
-        let listener = tcp_listen(None, 0, Some(6)).await.unwrap();
+        let listener = tcp_listen(None, 0, Some(6), None).await.unwrap();
         let local = listener.local_addr().unwrap();
         assert!(local.is_ipv6(), "expected IPv6 local_addr, got {local}");
         let port = local.port();
@@ -1423,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_listen_explicit_bind_respects_ip_version() {
         // `-B :: -6`  → IPv6-only: an IPv4 client must be refused.
-        let v6only = tcp_listen(Some("::"), 0, Some(6)).await.unwrap();
+        let v6only = tcp_listen(Some("::"), 0, Some(6), None).await.unwrap();
         let port = v6only.local_addr().unwrap().port();
         let v4 = tcp_connect("127.0.0.1", port, None, None, None, None, false, None).await;
         assert!(
@@ -1433,7 +1479,7 @@ mod tests {
         drop(v6only);
 
         // `-B ::` alone → dual-stack: an IPv4 client connects via v4-mapped.
-        let dual = tcp_listen(Some("::"), 0, None).await.unwrap();
+        let dual = tcp_listen(Some("::"), 0, None, None).await.unwrap();
         let port = dual.local_addr().unwrap().port();
         let v4 = tcp_connect("127.0.0.1", port, None, None, None, None, false, None).await;
         match v4 {
@@ -1454,7 +1500,7 @@ mod tests {
     async fn tcp_maxseg_reports_mss_for_connected_stream() {
         // A connected TCP stream exposes a positive MSS via TCP_MAXSEG — this
         // is what the UDP datagram-size default is derived from (iperf3 parity).
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, None, None, None, false, None)
@@ -1478,7 +1524,7 @@ mod tests {
         // #37: a connected TCP stream reports its in-effect congestion algorithm,
         // trimmed to a clean C-string (no nul padding / trailing whitespace) like
         // iperf3 — getsockopt(TCP_CONGESTION) returns a fixed-size padded buffer.
-        let listener = tcp_listen(Some("127.0.0.1"), 0, None).await.unwrap();
+        let listener = tcp_listen(Some("127.0.0.1"), 0, None, None).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let client_task = tokio::spawn(async move {
             tcp_connect("127.0.0.1", port, None, None, None, None, false, None)

@@ -42,3 +42,4 @@ windows-sys.workspace = true
 # test-util enables tokio's paused virtual clock (`start_paused`) so
 # timeout-budget tests run instantly instead of waiting real seconds. Test-only.
 tokio = { workspace = true, features = ["test-util"] }
+riperf3-test-support = { path = "../riperf3-test-support" }
