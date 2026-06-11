@@ -828,12 +828,14 @@ impl ReportInput {
             // test's sender flag (!reverse), like iperf3.
             let sent_bytes = match (local_sent, peer_sent) {
                 (0, p) if p > 0 => p,
-                (0, _) => local_recv,
+                // No cross-graft on a terminated run (#170): iperf3's
+                // sum_sent/sum_received carry 0 for the half it never got.
+                (0, _) if self.error.is_none() => local_recv,
                 (s, _) => s,
             };
             let recv_bytes = match (local_recv, peer_recv) {
                 (0, p) if p > 0 => p,
-                (0, _) => local_sent,
+                (0, _) if self.error.is_none() => local_sent,
                 (r, _) => r,
             };
             (
@@ -983,6 +985,11 @@ impl ReportInput {
                 } else {
                     (0, u.packets)
                 }
+            } else if s.is_sender && s.udp.is_none() && self.error.is_some() {
+                // Terminated before the exchange (#170): no peer-measured
+                // stats — iperf3 reports the sender's LOCAL packet count.
+                let blk = self.blksize.max(1) as u64;
+                (s.local_bytes, (s.local_bytes / blk) as i64)
             } else {
                 (s.local_bytes, u.packets)
             };
@@ -1018,10 +1025,12 @@ impl ReportInput {
         // The server never learns the peer's per-stream byte count, so its
         // un-measured side is 0 (iperf3 reports only local counters) — never
         // grafted from `local_bytes` the way the client fills the peer side.
-        let remote_bytes = if self.is_server {
-            0
-        } else {
-            s.remote_bytes.unwrap_or(s.local_bytes)
+        let remote_bytes = match (self.is_server, self.error.is_some()) {
+            (true, _) => 0,
+            // Terminated mid-test (#170): the peer half never arrived —
+            // iperf3 zeroes it (live-verified), never grafts local as peer.
+            (false, true) => s.remote_bytes.unwrap_or(0),
+            (false, false) => s.remote_bytes.unwrap_or(s.local_bytes),
         };
         // The client always emits the sender sub-object's TCP_INFO keys (real on
         // the forward side, 0 on the reverse side it didn't measure). iperf3's

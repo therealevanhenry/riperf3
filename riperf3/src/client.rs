@@ -176,6 +176,10 @@ async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
             Ok(other) => {
                 log::debug!("ignoring control state {other:?} during the data phase");
             }
+            // Recorded deviation (r1 n3): iperf3 splits EOF (IECTRLCLOSE) /
+            // read error (IERECVMESSAGE) / unknown state byte (IEMESSAGE);
+            // riperf3 folds all three into the closed class — the headline
+            // kill case (FIN→EOF) matches byte-for-byte.
             Err(_) => return ControlEvent::Closed,
         }
     }
@@ -980,6 +984,18 @@ impl Client {
         // -n/-k modes had no watch at all, control death in duration mode
         // "completed" the test, and any stray state byte truncated the wait.
         let mut control_event: Option<ControlEvent> = None;
+        // Watch-arm end time (#170 review r1 n2): the reporter timeline is
+        // post-omit-rebased (iperf3 restamps start_time at the boundary), so
+        // an event past the warm-up reports `elapsed - omit`; during the
+        // warm-up the raw elapsed matches iperf3's un-restamped clock.
+        let omit_secs = self.omit as f64;
+        let watch_end_secs = move |raw: f64| {
+            if raw > omit_secs {
+                raw - omit_secs
+            } else {
+                raw
+            }
+        };
         let end_secs = match end_condition {
             EndCondition::Duration(dur) => {
                 // The UDP senders also enforce this deadline themselves inside
@@ -997,7 +1013,7 @@ impl Client {
                     _ = tokio::time::sleep(wall) => dur.as_secs_f64(),
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
-                        report_start.elapsed().as_secs_f64()
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
                 }
             }
@@ -1006,7 +1022,7 @@ impl Client {
                     secs = self.wait_byte_limit(streams, target, &report_start, omit_boundary.as_ref()) => secs,
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
-                        report_start.elapsed().as_secs_f64()
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
                 }
             }
@@ -1021,7 +1037,7 @@ impl Client {
                     ) => secs,
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
-                        report_start.elapsed().as_secs_f64()
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
                 }
             }
@@ -1313,6 +1329,29 @@ impl Client {
                     )
                 });
 
+            // Terminated mid-test (#170): the peer half never arrived.
+            // iperf3 still prints BOTH halves with the missing one ZEROED
+            // (live-captured: `0.00 Bytes 0.00 bits/sec receiver`), so
+            // synthesize a zeroed opposite-role half rather than collapsing
+            // the pair — a lone entry only remains for an odd peer that
+            // exchanged results but skipped this stream id.
+            let peer = peer.or_else(|| {
+                server_results
+                    .is_none()
+                    .then(|| crate::reporter::StreamSummary {
+                        stream_id: s.id,
+                        start: 0.0,
+                        end: test_duration,
+                        bytes: 0,
+                        is_sender: !s.is_sender,
+                        retransmits: None,
+                        jitter: is_udp.then_some(0.0),
+                        lost: is_udp.then_some(0),
+                        total_packets: is_udp.then_some(0),
+                        role_tag,
+                    })
+            });
+
             // iperf3 orders each pair sender-first.
             match peer {
                 Some(peer) if s.is_sender => summaries.extend([local, peer]),
@@ -1538,7 +1577,6 @@ impl Client {
     }
 
     /// `-J`: build and pretty-print the single batched report blob.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn print_results_json(
         &self,
@@ -3395,6 +3433,11 @@ mod client_run_return_value {
             printed.contains("sender"),
             "a partial summary must render from local data (iperf3 flips to \
              DISPLAY_RESULTS); captured: {printed:?}"
+        );
+        assert!(
+            printed.contains("receiver"),
+            "the missing peer half renders ZEROED, like iperf3's client \
+             (review r1 n1) — never collapsed away: {printed:?}"
         );
         let _ = server_task.await;
     }
