@@ -35,37 +35,9 @@ fn free_port() -> u16 {
     common::free_port()
 }
 
-/// Kills the wrapped child on drop, so a spawned server is reaped even if the
-/// test panics before it is waited on.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Wait for a child to exit, bounded by `timeout`. On timeout, kill it and
-/// return `None` — the caller turns that into the "#80 hang" failure with
-/// context, instead of stalling the whole suite.
-fn wait_bounded(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => return Some(status),
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
-}
+// Reaper guard + bounded wait now live in riperf3-test-support (#192).
+use common::ChildGuard;
+use riperf3_test_support::wait_bounded;
 
 /// Run one UDP mode against a demux-forced one-off server and return the client's
 /// parsed `-J` report. `extra` carries the direction flag (`-R`, `--bidir`, or
@@ -86,38 +58,60 @@ fn run_demux_udp(extra: &[&str], who: &str) -> Value {
         .unwrap_or_else(|e| panic!("{who}: spawn server failed: {e}"));
     let mut server = ChildGuard(server);
 
-    // Let the listener bind before connecting.
-    std::thread::sleep(Duration::from_millis(300));
+    // No fixed bind sleep (#177): the client retries on a REFUSED connect for
+    // a bounded window instead (the #176 pattern — a refused connect never
+    // reaches accept(), so retrying is safe for the one-off server). stderr
+    // is captured (was nulled) so refusal is classifiable and failures
+    // aren't semi-blind.
+    let retry_deadline = Instant::now() + Duration::from_secs(10);
+    let (exit, out) = loop {
+        // Short duration-limited UDP run at -P 4: the #80 hang is in
+        // multi-stream setup, so completing at all is the core assertion.
+        // `-J` lets us also check routing produced bytes on every stream.
+        let mut client = Command::new(bin)
+            .args(["-c", "127.0.0.1", "-p", &port_s, "-u", "-t", "2", "-P", "4"])
+            .args(extra)
+            .arg("-J")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{who}: spawn client failed: {e}"));
 
-    // Short duration-limited UDP run at -P 4: the #80 hang is in multi-stream
-    // setup, so completing at all is the core assertion. `-J` lets us also check
-    // routing produced bytes on every stream.
-    let mut client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &port_s, "-u", "-t", "2", "-P", "4"])
-        .args(extra)
-        .arg("-J")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{who}: spawn client failed: {e}"));
+        // Capture stdout concurrently, then bound the wait: a #80 regression
+        // hangs the client at multi-stream setup until its 30 s connect
+        // timeout.
+        let stdout = client.stdout.take().expect("client stdout");
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = std::io::BufReader::new(stdout).read_to_string(&mut s);
+            s
+        });
+        let stderr_pipe = client.stderr.take().expect("client stderr");
+        let err_reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = std::io::BufReader::new(stderr_pipe).read_to_string(&mut s);
+            s
+        });
 
-    // Capture stdout concurrently, then bound the wait: a #80 regression hangs
-    // the client at multi-stream setup until its 30 s connect timeout.
-    let stdout = client.stdout.take().expect("client stdout");
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut s = String::new();
-        let _ = std::io::BufReader::new(stdout).read_to_string(&mut s);
-        s
-    });
+        let exit = wait_bounded(&mut client, Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("{who}: client hung — UDP demux -P 4 setup wedged (#80)"));
+        let out = reader.join().expect("join stdout reader");
+        let err = err_reader.join().expect("join stderr reader");
 
-    let exit = wait_bounded(&mut client, Duration::from_secs(20))
-        .unwrap_or_else(|| panic!("{who}: client hung — UDP demux -P 4 setup wedged (#80)"));
-    let out = reader.join().expect("join stdout reader");
-    assert!(
-        exit.success(),
-        "{who}: client exited non-zero: {exit:?}\n{out}"
-    );
+        if riperf3_test_support::refused(&exit, &err) && Instant::now() < retry_deadline {
+            // Server not listening yet — give it a beat and go again.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        assert!(
+            exit.success(),
+            "{who}: client exited non-zero: {exit:?}\nstderr: {err}\n{out}"
+        );
+        break (exit, out);
+    };
+    let _ = exit;
 
     // The one-off server should now have served and exited on its own.
     let _ = wait_bounded(&mut server.0, Duration::from_secs(5));

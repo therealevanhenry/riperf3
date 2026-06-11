@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "riperf3",
     "riperf3-cli",
+    "riperf3-test-support",
 ]
 
 [workspace.package]

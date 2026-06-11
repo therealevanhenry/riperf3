@@ -1,0 +1,9 @@
+[package]
+name = "riperf3-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Dev-only shared test helpers for the riperf3 workspace (#192)"
+
+[dependencies]
