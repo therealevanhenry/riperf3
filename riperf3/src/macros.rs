@@ -96,8 +96,8 @@ impl Drop for OutputTimestampGuard {
 }
 
 /// The rendered `--timestamps` prefix for the current line, or "" when off.
-/// HH:MM:SS (UTC) — the custom strftime FORMAT argument is a recorded
-/// fidelity gap, tracked separately from #168.
+/// Rendered from the run's stored strftime FORMAT (#202; unix), with a
+/// documented HH:MM:SS fallback on Windows — see `render_timestamp`.
 pub(crate) fn output_timestamp_prefix() -> String {
     let fmt = match OUTPUT_TIMESTAMPS.read() {
         Ok(g) => match g.as_deref() {
