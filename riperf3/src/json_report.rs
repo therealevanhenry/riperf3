@@ -773,20 +773,18 @@ impl ReportInput {
                     .map(|u| u.packets)
                     .sum::<i64>(),
                 {
-                    // #214 (2): iperf3 AVERAGES jitter across measured
-                    // streams (avg_jitter /= num_streams) — the builder twin
-                    // of the #169 reporter fix. fold(max) overstated it.
-                    let measured: Vec<f64> = self
+                    // #214 (2): iperf3 AVERAGES jitter — and divides by
+                    // num_streams (the -P value), not the measured-stream
+                    // count (r1 review): on a #170-terminated partial doc
+                    // iperf3 still divides by the full count. Equal in
+                    // every complete run. fold(max) overstated it.
+                    let sum_jitter: f64 = self
                         .streams
                         .iter()
                         .filter_map(|s| s.udp)
                         .map(|u| u.jitter_secs)
-                        .collect();
-                    if measured.is_empty() {
-                        0.0
-                    } else {
-                        measured.iter().sum::<f64>() / measured.len() as f64
-                    }
+                        .sum();
+                    sum_jitter / (self.num_streams.max(1) as f64)
                 },
             )
         } else {
@@ -833,20 +831,15 @@ impl ReportInput {
                     .filter_map(|s| s.udp)
                     .map(|u| u.lost_packets)
                     .sum::<i64>();
-                let fwd_jitter = {
-                    let m: Vec<f64> = self
-                        .streams
-                        .iter()
-                        .filter(|s| !s.is_sender)
-                        .filter_map(|s| s.udp)
-                        .map(|u| u.jitter_secs)
-                        .collect();
-                    if m.is_empty() {
-                        0.0
-                    } else {
-                        m.iter().sum::<f64>() / m.len() as f64
-                    }
-                };
+                // num_streams divisor, like iperf3 (r1 review).
+                let fwd_jitter = self
+                    .streams
+                    .iter()
+                    .filter(|s| !s.is_sender)
+                    .filter_map(|s| s.udp)
+                    .map(|u| u.jitter_secs)
+                    .sum::<f64>()
+                    / (self.num_streams.max(1) as f64);
                 let rev_sent_packets = (local_sent / blk) as i64;
                 sum = Some(self.udp_sum(0, false, fwd_packets, fwd_lost, fwd_jitter));
                 sum_bidir_reverse = Some(self.udp_sum(local_sent, true, rev_sent_packets, 0, 0.0));
@@ -918,11 +911,10 @@ impl ReportInput {
                     .collect();
                 let packets = m.iter().map(|u| u.packets).sum::<i64>();
                 let lost = m.iter().map(|u| u.lost_packets).sum::<i64>();
-                let jitter = if m.is_empty() {
-                    0.0
-                } else {
-                    m.iter().map(|u| u.jitter_secs).sum::<f64>() / m.len() as f64
-                };
+                // num_streams divisor, like iperf3 (one direction's pass
+                // divides by the -P value, r1 review) — not measured-count.
+                let jitter =
+                    m.iter().map(|u| u.jitter_secs).sum::<f64>() / (self.num_streams.max(1) as f64);
                 (packets, lost, jitter)
             };
             let (fwd_packets, fwd_lost, fwd_jitter) = dir_stats(true);
@@ -938,8 +930,14 @@ impl ReportInput {
                 _ => local_recv,
             };
             sum = Some(self.udp_sum(local_sent, true, fwd_packets, fwd_lost, fwd_jitter));
+            // sum_bidir_reverse.bytes is the SENDER-side figure — iperf3
+            // feeds it from total_sent, the same variable as
+            // sum_sent_bidir_reverse (iperf_api.c:4504/4514; r1 review
+            // proved it live on a lossy run: both stay equal while
+            // *_received_bidir_reverse drops). local_recv here diverged 18%
+            // under loss.
             sum_bidir_reverse =
-                Some(self.udp_sum(local_recv, false, rev_packets, rev_lost, rev_jitter));
+                Some(self.udp_sum(rev_sent, false, rev_packets, rev_lost, rev_jitter));
             sum_sent_bidir_reverse = Some(self.udp_sum(rev_sent, true, rev_packets, 0, 0.0));
             sum_received_bidir_reverse =
                 Some(self.udp_sum(local_recv, false, rev_packets, rev_lost, rev_jitter));
@@ -1537,6 +1535,22 @@ mod tests {
         assert_eq!(
             v["end"]["sum_received_bidir_reverse"]["sender"],
             serde_json::json!(false)
+        );
+
+        // The r1-review blocker, value-pinned: sum_bidir_reverse.bytes is
+        // the SENDER-side figure (== sum_sent_bidir_reverse.bytes, fed from
+        // the peer's exchanged sent count) — NOT local received. Diverges
+        // 18% on a lossy run (live-proven against iperf3 3.21).
+        let rev_sum = &v["end"]["sum_bidir_reverse"];
+        let rev_sent_sum = &v["end"]["sum_sent_bidir_reverse"];
+        assert_eq!(
+            rev_sum["bytes"], rev_sent_sum["bytes"],
+            "iperf3 invariant: sum_bidir_reverse.bytes == sum_sent_bidir_reverse.bytes: {v}"
+        );
+        assert_eq!(
+            rev_sum["bytes"],
+            serde_json::json!(1_000_000u64),
+            "the peer-sent figure, not the 980k local received: {v}"
         );
 
         // And the TCP-bidir negative: no sum/sum_bidir_reverse there (GT).
