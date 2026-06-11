@@ -12,7 +12,9 @@
 use std::time::Duration;
 
 #[allow(unused_imports)] // each test binary uses a subset
-pub use riperf3_test_support::{free_port, udp_serial, ChildGuard, ClientRun};
+pub use riperf3_test_support::{
+    free_port, refused, udp_serial, wait_bounded, ChildGuard, ClientRun,
+};
 
 /// See `riperf3_test_support::run_client_with`.
 pub fn run_client(args: &[&str], timeout: Duration, who: &str) -> ClientRun {

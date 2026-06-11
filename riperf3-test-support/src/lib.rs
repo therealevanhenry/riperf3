@@ -67,12 +67,19 @@ pub struct ClientRun {
     pub elapsed: Duration,
 }
 
-/// Is this run a REFUSED connect (server not listening yet)? Matches both the
-/// pre-#151 Debug rendering (`ConnectionRefused`) and the iperf3-shaped
-/// message (`Connection refused`), so the harness is merge-order-proof.
+/// Is this run a REFUSED connect (server not listening yet)? Matches the
+/// pre-#151 Debug rendering (`ConnectionRefused`), the POSIX strerror text
+/// (`Connection refused`), and Windows' WSAECONNREFUSED rendering (no
+/// "refused"-with-that-casing substring: "No connection could be made
+/// because the target machine actively refused it. (os error 10061)") —
+/// drop any one and the refused-retry silently dies on that platform,
+/// reopening the #176 bind-race flake class (#194 review r2 found exactly
+/// that on windows-latest).
 pub fn refused(status: &ExitStatus, stderr: &str) -> bool {
     !status.success()
-        && (stderr.contains("ConnectionRefused") || stderr.contains("Connection refused"))
+        && (stderr.contains("ConnectionRefused")
+            || stderr.contains("Connection refused")
+            || stderr.contains("(os error 10061)"))
 }
 
 /// Run a riperf3 CLI binary to completion with a hard timeout, retrying while

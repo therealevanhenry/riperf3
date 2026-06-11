@@ -36,8 +36,7 @@ fn free_port() -> u16 {
 }
 
 // Reaper guard + bounded wait now live in riperf3-test-support (#192).
-use common::ChildGuard;
-use riperf3_test_support::wait_bounded;
+use common::{wait_bounded, ChildGuard};
 
 /// Run one UDP mode against a demux-forced one-off server and return the client's
 /// parsed `-J` report. `extra` carries the direction flag (`-R`, `--bidir`, or
@@ -64,7 +63,7 @@ fn run_demux_udp(extra: &[&str], who: &str) -> Value {
     // is captured (was nulled) so refusal is classifiable and failures
     // aren't semi-blind.
     let retry_deadline = Instant::now() + Duration::from_secs(10);
-    let (exit, out) = loop {
+    let out = loop {
         // Short duration-limited UDP run at -P 4: the #80 hang is in
         // multi-stream setup, so completing at all is the core assertion.
         // `-J` lets us also check routing produced bytes on every stream.
@@ -100,7 +99,7 @@ fn run_demux_udp(extra: &[&str], who: &str) -> Value {
         let out = reader.join().expect("join stdout reader");
         let err = err_reader.join().expect("join stderr reader");
 
-        if riperf3_test_support::refused(&exit, &err) && Instant::now() < retry_deadline {
+        if common::refused(&exit, &err) && Instant::now() < retry_deadline {
             // Server not listening yet — give it a beat and go again.
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -109,9 +108,8 @@ fn run_demux_udp(extra: &[&str], who: &str) -> Value {
             exit.success(),
             "{who}: client exited non-zero: {exit:?}\nstderr: {err}\n{out}"
         );
-        break (exit, out);
+        break out;
     };
-    let _ = exit;
 
     // The one-off server should now have served and exited on its own.
     let _ = wait_bounded(&mut server.0, Duration::from_secs(5));
