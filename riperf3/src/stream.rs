@@ -1690,14 +1690,7 @@ pub(crate) fn run_udp_server_demux_receiver(
             // (that needs IP_RECVERR); the arm is live on Windows, where
             // winsock latches WSAECONNRESET per send_to target. A break here
             // would silently end reception for EVERY stream at once.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -1705,6 +1698,18 @@ pub(crate) fn run_udp_server_demux_receiver(
         drain_udp_demux_after_done(&socket, &mut buf);
     }
     Ok(())
+}
+
+/// Reset-class noise on a UDP socket (#178/#180): ICMP port-unreachable
+/// blowback from something WE sent to a port that just closed. Windows
+/// latches WSAECONNRESET per send_to target even on an unconnected socket;
+/// Linux surfaces ECONNREFUSED only on connected sockets. Neither is an EOF
+/// — receivers skip and keep going.
+pub(crate) fn is_reset_class(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// `recv_from` analogue of [`drain_udp_after_done`] for the single-socket demux:
@@ -1722,6 +1727,11 @@ fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
             {
                 break
             }
+            // One client's reset-class noise must not end the SHARED drain
+            // for every client — that reopens the #48 reset against a
+            // still-sending iperf3 <=3.12 peer. The deadline above bounds
+            // the loop, so continuing is safe (#180).
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -1820,14 +1830,7 @@ pub fn run_udp_receiver_blocking(
             // here silently ended the reverse flow: a bidir run completed
             // "normally" with sum_bidir_reverse 0 throughout (windows-latest
             // CI signature).
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -2262,6 +2265,17 @@ mod tests {
         }
         // Effective (post-omit) packet count: 6 - 3 = 3
         assert_eq!(stats.packet_count - stats.omitted_packet_count, 3);
+    }
+    #[test]
+    fn reset_class_covers_both_platform_shapes() {
+        // #180: WSAECONNRESET (Windows, unconnected send_to blowback) and
+        // ECONNREFUSED (Linux, connected sockets) — neither is an EOF.
+        use std::io::{Error, ErrorKind};
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionRefused)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::BrokenPipe)));
     }
 
     // -- RateLimiter --
