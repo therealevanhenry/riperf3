@@ -1788,13 +1788,25 @@ mod unimplemented_flags {
             .build()
             .unwrap();
         let start = std::time::Instant::now();
-        let _ = client.run().await;
+        let result = client.run().await;
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_secs() < 5,
             "server-max-duration didn't cut test: {elapsed:?}"
         );
-        let _ = server_task.await;
+        // #224 ground truth (iperf 3.21): the timer relays SERVER_ERROR with
+        // IESERVERTESTDURATIONEXPIRED; the client adopts its strerror. (When
+        // the upfront requested-duration check lands, this -t run will be
+        // rejected at param exchange instead - revisit then.)
+        let err = result.expect_err("the relayed SERVER_ERROR is the client's error");
+        assert_eq!(err.to_string(), "server test duration expired", "{err:?}");
+        // The server side errors to ITS sink but run() is Ok - iperf3's
+        // one-off exits 0 on self-terminate (live-verified, the #224 wart).
+        let joined = server_task.await.expect("server task");
+        assert!(
+            joined.is_ok(),
+            "server self-terminate is not a run() error: {joined:?}"
+        );
     }
 
     #[tokio::test]
@@ -1815,14 +1827,26 @@ mod unimplemented_flags {
             .build()
             .unwrap();
         let start = std::time::Instant::now();
-        let _ = client.run().await; // may error — server terminates early
+        let result = client.run().await;
         let elapsed = start.elapsed();
         // Should terminate well before 10 seconds
         assert!(
             elapsed.as_secs() < 5,
             "bitrate limit didn't cut test: {elapsed:?}"
         );
-        let _ = server_task.await;
+        // #224 ground truth (iperf 3.21): SERVER_ERROR + IETOTALRATE, the
+        // client adopts iperf_strerror(27); no generic ServerTerminated.
+        let err = result.expect_err("the relayed SERVER_ERROR is the client's error");
+        assert_eq!(
+            err.to_string(),
+            "total required bandwidth is larger than server limit",
+            "{err:?}"
+        );
+        let joined = server_task.await.expect("server task");
+        assert!(
+            joined.is_ok(),
+            "server self-terminate is not a run() error: {joined:?}"
+        );
     }
 
     #[tokio::test]
