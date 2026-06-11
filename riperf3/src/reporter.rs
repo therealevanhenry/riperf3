@@ -511,9 +511,13 @@ pub struct CollectedIntervals {
 /// #159 the driver stops the senders FIRST (with the teardown grace) and
 /// signals `finish` after, so the flush's snapshot includes a starved
 /// sender's catch-up burst — iperf3 reads its counters after the threads
-/// join, and the intervals must cover what the END block accounts. The
-/// stream sockets are still open at flush time (task-join, not teardown),
-/// so the final interval's TCP_INFO read stays live.
+/// join, and the intervals must cover what the END block accounts.
+/// TRADE-OFF (r1 review): the sender task owns its TcpStream and drops it
+/// when its loop exits on `done`, so the final partial interval's TCP_INFO
+/// read usually hits a closed fd and takes the #55 stale-extremes fallback
+/// (Cwnd/RTT from the last boundary, Retr 0) where iperf3 — sockets open
+/// through its end exchange — reads live. Cosmetic on a sub-interval
+/// window; #245 tracks keeping the sockets alive through the flush.
 #[derive(Debug)]
 pub struct ReporterEnd {
     notify: tokio::sync::Notify,
@@ -1183,6 +1187,16 @@ pub fn spawn_interval_reporter(
             tokio::select! {
                 biased;
                 _ = reporter_end.notify.notified() => {
+                    // #159 invariant: the drivers stop the senders BEFORE
+                    // signalling the flush — a finish without done means a
+                    // driver regressed to the pre-#159 order, whose damage
+                    // only resurfaces as the windows-latest starvation flake
+                    // family (the expensive #207 forensics). Debug-only: the
+                    // race-prone shapes live in CI's debug builds.
+                    debug_assert!(
+                        done.load(Ordering::Relaxed),
+                        "reporter finish() signalled before done — the #159 driver order regressed"
+                    );
                     // #55: the run ended part-way through an interval. Flush one
                     // final interval `[last_boundary, end_secs]` using the
                     // driver's authoritative end time, then stop.
@@ -1791,6 +1805,8 @@ mod interval_reporter_tests {
         // as the client/server driver does.
         counters.record_sent(500);
         tokio::time::sleep(Duration::from_millis(120)).await; // ~1.42s
+                                                              // #159 invariant: done precedes finish (the driver order).
+        done.store(true, Ordering::Relaxed);
         reporter_end.finish(report_start.elapsed().as_secs_f64());
         let _ = handle.await;
 
@@ -1868,6 +1884,8 @@ mod interval_reporter_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         counters.record_sent(2000);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // #159 invariant: done precedes finish (the driver order).
+        done.store(true, Ordering::Relaxed);
         reporter_end.finish(report_start.elapsed().as_secs_f64());
         let _ = handle.await;
 
@@ -1951,6 +1969,8 @@ mod interval_reporter_tests {
         // boundary. The authoritative end time is exactly 1.0, so the remainder is
         // zero-length and must be dropped despite these residual bytes.
         counters.record_sent(777);
+        // #159 invariant: done precedes finish (the driver order).
+        done.store(true, Ordering::Relaxed);
         reporter_end.finish(1.0);
         let _ = handle.await;
 
@@ -2023,6 +2043,8 @@ mod interval_reporter_tests {
 
         // end_secs trails the 0.5 boundary (as TEST_END would), but the tail is
         // empty — the residual-bytes guard must drop it.
+        // #159 invariant: done precedes finish (the driver order).
+        done.store(true, Ordering::Relaxed);
         reporter_end.finish(0.62);
         let _ = handle.await;
 
