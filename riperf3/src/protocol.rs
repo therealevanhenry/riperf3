@@ -167,6 +167,8 @@ pub async fn read_server_error_payload(stream: &mut TcpStream) -> Option<(u32, u
     }
 }
 
+/// Read a state-transition byte from the control connection (r1 n4: this doc
+/// was absorbed by the send_server_error insertion; restored).
 pub async fn recv_state(stream: &mut TcpStream) -> Result<TestState> {
     let mut buf = [0u8; 1];
     let n = stream.read(&mut buf).await?;

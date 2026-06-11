@@ -516,6 +516,11 @@ impl Client {
                                     Some(&msg),
                                 );
                             } else {
+                                // KNOWN CORNER (r1 n5): with --logfile set,
+                                // iperf_err writes this line to the logfile;
+                                // riperf3's logfile plumbing lives in the
+                                // CLI (#198), so this lib line stays on
+                                // stderr. Revisit with the sink plumbing.
                                 eprintln!("riperf3: SERVER ERROR - {msg}");
                             }
                             return Err(RiperfError::ServerErrorRelayed(msg));

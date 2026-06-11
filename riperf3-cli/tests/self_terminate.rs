@@ -175,11 +175,13 @@ fn bitrate_limit_json_server_doc_carries_prefixed_error() {
     );
 }
 
-/// --server-max-duration via the wall-clock timer (a `-n` run whose duration
-/// the server cannot know upfront): the literal server line vs the client's
-/// strerror, the same SERVER_ERROR shapes. `-n` keeps this test pinned to the
-/// TIMER arm even after the upfront requested-duration check (iperf3 rejects
-/// `-t`-exceeding runs at param exchange) lands later.
+/// --server-max-duration via the wall-clock timer: the literal server line
+/// vs the client's strerror, the same SERVER_ERROR shapes. NOTE (r1 review,
+/// live-verified): iperf3's upfront check rejects `-n` runs too (it tests
+/// the default `-t 10` sent alongside, iperf_api.c:2666) — so when #230
+/// lands faithfully, this test's `-n` run gets rejected at param exchange
+/// and the TIMER arm needs a new trigger (e.g. a `-t`-within-limit run that
+/// overruns on wall clock). Revisit this test in #230; noted there.
 #[test]
 fn max_duration_timer_relays_expired() {
     let ps = common::free_port().to_string();
