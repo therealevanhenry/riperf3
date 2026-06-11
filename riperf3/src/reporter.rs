@@ -379,6 +379,11 @@ pub struct IntervalReporterConfig {
     /// Datagram size, used to derive the UDP *sender's* per-interval packet count
     /// (the sender doesn't measure loss/jitter, so iperf3 reports only `packets`).
     pub blksize: usize,
+    /// json-stream normally streams intervals without collecting; a SERVER
+    /// whose client requested --get-server-output keeps them too, so the
+    /// attached server_output_json carries populated intervals like iperf3's
+    /// json_top under discard_json (#168).
+    pub keep_intervals: bool,
 }
 
 /// A single TCP_INFO sample reused for the final interval (#55) when the socket
@@ -959,6 +964,14 @@ pub fn spawn_interval_reporter(
                             "{}",
                             crate::json_report::json_stream_event("interval", &interval)
                         );
+                        // A json-stream SERVER additionally keeps them when
+                        // the client requested --get-server-output: iperf3's
+                        // discard_json exists precisely to retain the
+                        // interval objects for the attached
+                        // server_output_json (#168 r1 n2).
+                        if config.keep_intervals {
+                            collected.push(interval);
+                        }
                     } else {
                         collected.push(interval);
                     }
@@ -1492,6 +1505,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         assert!(spawn_interval_reporter(
             config,
@@ -1518,6 +1532,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         assert!(spawn_interval_reporter(
             config,
@@ -1544,6 +1559,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         let handle = spawn_interval_reporter(
             config,
@@ -1597,6 +1613,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let report_start = std::time::Instant::now();
@@ -1679,6 +1696,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let report_start = std::time::Instant::now();
@@ -1756,6 +1774,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let handle = spawn_interval_reporter(
@@ -1829,6 +1848,7 @@ mod interval_reporter_tests {
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
+            keep_intervals: false,
         };
         let reporter_end = Arc::new(ReporterEnd::new());
         let handle = spawn_interval_reporter(
