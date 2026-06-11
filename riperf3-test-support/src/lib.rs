@@ -209,9 +209,14 @@ pub fn run_client_ok_with(bin: &str, args: &[&str], timeout: Duration, who: &str
     let run = run_client_with(bin, args, timeout, who);
     assert!(
         run.status.success(),
-        "{who}: exited unsuccessfully ({status}); stderr: {stderr}",
+        "{who}: exited unsuccessfully ({status}); stderr: {stderr}; stdout: {stdout}",
         status = run.status,
         stderr = run.stderr,
+        // stdout too: #198 routes -J/--json-stream errors into the document
+        // on STDOUT with stderr empty — a stderr-only panic hides exactly
+        // the error this runner exists to surface (#195 rounds, round-7
+        // "empty stderr" mystery).
+        stdout = run.stdout,
     );
     run
 }
