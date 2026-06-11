@@ -1374,13 +1374,18 @@ impl Client {
             }
         };
 
-        // End of test: hand the reporter the authoritative end time, then stop
-        // the senders immediately (`done`) so no bytes leak past the deadline into
-        // the final interval or the summary (#55). The reporter prioritises this
-        // `finish` over `done` (see its select), so the final interval still
-        // flushes; we then wait for it before tearing the streams down.
-        reporter_end.finish(end_secs);
+        // End of test (#55 window, #159 order): stop the senders, let the
+        // catch-up land, then hand the reporter the authoritative end time —
+        // the flush below reads settled counters.
+        // #159: stop the senders FIRST and give their in-flight catch-up the
+        // teardown grace to land in the counters, THEN signal the flush —
+        // iperf3 reads its counters after the threads join, so the intervals
+        // always cover what the END block accounts. The [last_boundary,
+        // end_secs] window stays authoritative (#55) — late-landing bytes
+        // belong to the window they were sent in.
         done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reporter_end.finish(end_secs);
         if let Some(handle) = interval_handle {
             let _ = handle.await;
         }
