@@ -507,9 +507,13 @@ pub struct CollectedIntervals {
 /// authoritative elapsed test time at the exact moment the run ends; the reporter
 /// then flushes one final interval `[last_boundary, end_secs]` and stops. Using the
 /// driver's measured end time (rather than the reporter's own late, polled
-/// detection) keeps the final interval's boundary and bitrate exact, and because
-/// the driver signals *before* it tears the streams down, the final flush still
-/// reads live TCP_INFO.
+/// detection) keeps the final interval's boundary and bitrate exact. Since
+/// #159 the driver stops the senders FIRST (with the teardown grace) and
+/// signals `finish` after, so the flush's snapshot includes a starved
+/// sender's catch-up burst — iperf3 reads its counters after the threads
+/// join, and the intervals must cover what the END block accounts. The
+/// stream sockets are still open at flush time (task-join, not teardown),
+/// so the final interval's TCP_INFO read stays live.
 #[derive(Debug)]
 pub struct ReporterEnd {
     notify: tokio::sync::Notify,
@@ -1210,9 +1214,26 @@ pub fn spawn_interval_reporter(
                     break;
                 }
                 _ = ticker.tick() => {
-                    // `done` without a `finish` is the error/early-teardown path:
-                    // stop without inventing a final interval.
                     if done.load(Ordering::Relaxed) {
+                        // #159: the driver now stops the senders BEFORE
+                        // signalling the final flush, so `done` can be
+                        // visible a beat before the notify. A normal end
+                        // delivers `finish` momentarily — wait bounded,
+                        // then re-arm the notify so the end arm (which owns
+                        // the flush) runs next iteration. An error/early-
+                        // teardown path never calls finish: the timeout
+                        // keeps teardown prompt, and no final interval is
+                        // invented (the pre-#159 semantic, preserved).
+                        if tokio::time::timeout(
+                            Duration::from_secs(2),
+                            reporter_end.notify.notified(),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            reporter_end.notify.notify_one();
+                            continue;
+                        }
                         break;
                     }
                     interval_num += 1;
@@ -2012,5 +2033,134 @@ mod interval_reporter_tests {
             "no trailing empty interval for an idle receiver tail; got {} intervals",
             g.intervals.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod end_race_tests {
+    //! #159 — the reporter end-race, pinned at the component level
+    //! (deterministic, no load): the final flush must run AFTER the senders
+    //! stopped, so a starved sender's catch-up burst is counted by the
+    //! interval the END block already accounts. Pre-fix shapes: a ticker
+    //! tick observing `done` before `finish` exited without flushing (the
+    //! dropped final interval, the #207 forensics mode); and with every
+    //! byte starved into the catch-up, the old flush-before-stop order saw
+    //! residual 0 and skipped (the original empty-intervals hit).
+
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn harness(
+        interval_secs: f64,
+    ) -> (
+        Arc<crate::stream::StreamCounters>,
+        Arc<AtomicBool>,
+        Arc<ReporterEnd>,
+        Arc<Mutex<CollectedIntervals>>,
+        JoinHandle<()>,
+    ) {
+        let counters = Arc::new(crate::stream::StreamCounters::default());
+        let done = Arc::new(AtomicBool::new(false));
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+        let handle = spawn_interval_reporter(
+            IntervalReporterConfig {
+                interval_secs,
+                protocol: TransportProtocol::Tcp,
+                format_char: 'a',
+                omit_secs: 0,
+                forceflush: false,
+                json_stream: false,
+                print: false,
+                blksize: 1024,
+                bidir: false,
+                is_server: false,
+                keep_intervals: false,
+            },
+            vec![IntervalStreamRef {
+                id: 1,
+                is_sender: true,
+                counters: counters.clone(),
+                udp_recv_stats: None,
+                raw_fd: None,
+            }],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+            None,
+            None,
+        )
+        .expect("reporter spawns");
+        (counters, done, reporter_end, collector, handle)
+    }
+
+    fn collected_bytes(collector: &Arc<Mutex<CollectedIntervals>>) -> u64 {
+        let c = collector.lock().unwrap();
+        c.intervals
+            .iter()
+            .flat_map(|i| i.streams.iter())
+            .map(|s| s.bytes)
+            .sum()
+    }
+
+    /// The dropped-final-interval shape: `done` lands between ticks, the
+    /// next tick observes it, `finish` arrives a beat later — the flush
+    /// must still happen and cover the tail.
+    #[tokio::test]
+    async fn tick_observing_done_waits_for_finish_and_flushes() {
+        let (counters, done, reporter_end, collector, handle) = harness(0.05);
+
+        counters.record_sent(1000);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        counters.record_sent(500); // the partial tail
+        done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        reporter_end.finish(0.3);
+        handle.await.expect("reporter exits");
+
+        assert_eq!(
+            collected_bytes(&collector),
+            1500,
+            "the final interval must cover the tail the END block accounts (#159)"
+        );
+    }
+
+    /// The catch-up shape: bytes landing AFTER `done` (the starved sender's
+    /// burst draining during the teardown grace) but before `finish` belong
+    /// to the final interval.
+    #[tokio::test]
+    async fn catchup_bytes_after_done_land_in_the_final_interval() {
+        let (counters, done, reporter_end, collector, handle) = harness(1.0);
+
+        counters.record_sent(1000);
+        done.store(true, Ordering::Relaxed);
+        counters.record_sent(300); // the catch-up burst
+        reporter_end.finish(0.4);
+        handle.await.expect("reporter exits");
+
+        assert_eq!(
+            collected_bytes(&collector),
+            1300,
+            "catch-up bytes between done and finish are part of the run (#159)"
+        );
+    }
+
+    /// The error-path semantic survives: a bare `done` with no `finish`
+    /// still tears down promptly and invents no final interval.
+    #[tokio::test]
+    async fn bare_done_without_finish_exits_without_inventing_intervals() {
+        let (counters, done, _reporter_end, collector, handle) = harness(0.05);
+
+        counters.record_sent(1000);
+        done.store(true, Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        handle.await.expect("reporter exits");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "bounded teardown on the error path"
+        );
+        assert!(collected_bytes(&collector) <= 1000);
     }
 }

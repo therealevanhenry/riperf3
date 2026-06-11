@@ -773,8 +773,11 @@ impl Server {
         // The reporter's timeline restarted at the omit boundary (#31), so its
         // authoritative end time is post-omit; clamp for runs that died inside
         // the warm-up.
-        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
+        // #159: senders stop first, the catch-up grace runs, THEN the flush
+        // is signalled (see the client-side twin for the full rationale).
         done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
         if let Some(handle) = interval_handle {
             let _ = handle.await;
         }
@@ -803,8 +806,8 @@ impl Server {
             }
         }
 
-        // Wait briefly then join tasks (senders may be blocked on write)
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // (The pre-results grace moved up to the #159 stop-then-flush
+        // sequence; the counters are already settled here.)
 
         let mut result_streams = Vec::new();
         // Summary window + bitrate: the measured elapsed for a byte/block-limited
