@@ -2022,7 +2022,7 @@ mod tests {
             tos: Some(0x48),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&params);
+        let cfg = TestConfig::from_params(&params).unwrap();
         let done = Arc::new(AtomicBool::new(false));
         let start = Arc::new(AtomicBool::new(false));
         let mut streams = Vec::new();
@@ -2077,7 +2077,7 @@ mod tests {
             tos: Some(0x48),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&params);
+        let cfg = TestConfig::from_params(&params).unwrap();
         let done = Arc::new(AtomicBool::new(false));
         let start = Arc::new(AtomicBool::new(false));
         let mut streams = Vec::new();
