@@ -302,12 +302,12 @@ impl Server {
         // --timestamps prefixes every text report line — through titled(), so
         // the capture above tees the PREFIXED line like iperf3's linebuffer
         // (#168). Run-scoped; never in the machine-JSON modes.
-        let _ts_guard =
-            (self.timestamps.is_some() && !self.json_output && !self.json_stream).then(|| {
-                crate::macros::OutputTimestampGuard::set(
-                    self.timestamps.as_deref().unwrap_or("%c "),
-                )
-            });
+        let _ts_guard = (!self.json_output && !self.json_stream)
+            .then(|| self.timestamps.as_deref())
+            .flatten()
+            // The bare-flag "%c " default is clap's default_missing_value;
+            // by here the format is always concrete.
+            .map(crate::macros::OutputTimestampGuard::set);
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
