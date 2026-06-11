@@ -46,17 +46,7 @@ pub fn parse_dscp(s: &str) -> std::result::Result<i32, ConfigError> {
         "ef" => 46,
         "voice-admit" => 44,
         "le" => 1,
-        _ => {
-            // Numeric: supports decimal, 0x hex, 0 octal
-            let val = if s.starts_with("0x") || s.starts_with("0X") {
-                i32::from_str_radix(&s[2..], 16)
-            } else if s.starts_with('0') && s.len() > 1 {
-                i32::from_str_radix(&s[1..], 8)
-            } else {
-                s.parse::<i32>()
-            };
-            val.map_err(|_| ConfigError::InvalidValue("dscp", s.to_string()))?
-        }
+        _ => parse_int_base0(s).map_err(|_| ConfigError::InvalidValue("dscp", s.to_string()))?,
     };
 
     if !(0..=63).contains(&dscp_val) {
@@ -68,6 +58,41 @@ pub fn parse_dscp(s: &str) -> std::result::Result<i32, ConfigError> {
 
     // DSCP occupies the top 6 bits of the TOS byte
     Ok(dscp_val << 2)
+}
+
+/// Parse an integer with C `strtol(s, _, 0)` base selection: `0x`/`0X` hex,
+/// leading-`0` octal, decimal otherwise. Shared by the `--dscp` and `-S/--tos`
+/// numeric arms (#167).
+fn parse_int_base0(s: &str) -> std::result::Result<i32, std::num::ParseIntError> {
+    if s.starts_with("0x") || s.starts_with("0X") {
+        i32::from_str_radix(&s[2..], 16)
+    } else if s.starts_with('0') && s.len() > 1 {
+        i32::from_str_radix(&s[1..], 8)
+    } else {
+        s.parse::<i32>()
+    }
+}
+
+/// Parse a `-S/--tos` value like iperf3: `strtol(optarg, &endptr, 0)` (decimal,
+/// `0x` hex, or leading-`0` octal) with the IEBADTOS range check (#167).
+pub fn parse_tos(s: &str) -> std::result::Result<i32, ConfigError> {
+    // Stricter than C strtol on purpose: iperf3 only checks endptr == optarg,
+    // so it ACCEPTS partial parses like `32abc` (→32), `08` (→0), `0x` (→0).
+    // Full-string parsing rejects those; recorded as a deliberate divergence
+    // (#167 review r1 n4).
+    let bad = || {
+        ConfigError::InvalidValue(
+            "tos",
+            // iperf3's IEBADTOS wording, for the unparsable and the
+            // out-of-range case alike (iperf3 raises IEBADTOS for both).
+            format!("bad TOS value (must be between 0 and 255 inclusive): {s}"),
+        )
+    };
+    let val = parse_int_base0(s.trim()).map_err(|_| bad())?;
+    if !(0..=255).contains(&val) {
+        return Err(bad());
+    }
+    Ok(val)
 }
 
 /// Parse a `--cntl-ka` keepalive spec: `idle/interval/count`.
@@ -134,6 +159,12 @@ pub fn system_info() -> String {
 
 /// Maximum UDP payload: 65535 - 8 (UDP header) - 20 (IP header)
 pub const MAX_UDP_BLKSIZE: usize = 65507;
+
+/// iperf3's `MAX_BLOCKSIZE` (1 MiB): the `-l` upper bound for TCP (IEBLOCKSIZE).
+pub const MAX_BLOCKSIZE: usize = 1024 * 1024;
+
+/// iperf3's `MAX_BURST`: the `-b rate/burst` upper bound (IEBURST).
+pub const MAX_BURST: u32 = 1000;
 
 /// Resolve the effective UDP datagram size.
 ///
@@ -228,6 +259,15 @@ pub fn parse_bitrate(s: &str) -> std::result::Result<(u64, u32), ConfigError> {
         let burst: u32 = burst_str
             .parse()
             .map_err(|_| ConfigError::InvalidValue("burst count", burst_str.to_string()))?;
+        // A present burst must be 1..=MAX_BURST, like iperf3's IEBURST check
+        // (`burst <= 0 || burst > MAX_BURST`) — "/0" is an error, distinct
+        // from no slash at all (#160).
+        if burst == 0 || burst > MAX_BURST {
+            return Err(ConfigError::InvalidValue(
+                "burst count",
+                format!("invalid burst count (maximum = {MAX_BURST}): {burst_str}"),
+            ));
+        }
         Ok((rate, burst))
     } else {
         let rate = parse_rate(s)?;
@@ -293,6 +333,41 @@ mod tests {
     #[test]
     fn parse_bitrate_with_burst() {
         assert_eq!(parse_bitrate("100M/10").unwrap(), (100 * 1_000_000, 10));
+    }
+
+    #[test]
+    fn parse_bitrate_burst_range_matches_ieburst() {
+        // iperf3 rejects a present burst outside 1..=MAX_BURST (IEBURST,
+        // iperf_api.c case 'b': burst <= 0 || burst > MAX_BURST). Note a
+        // PRESENT "/0" is an error there, distinct from no slash at all
+        // (burst stays 0 = unset). #160.
+        assert_eq!(parse_bitrate("100M/1").unwrap(), (100 * 1_000_000, 1));
+        assert_eq!(parse_bitrate("100M/1000").unwrap(), (100 * 1_000_000, 1000));
+        assert!(parse_bitrate("100M/0").is_err());
+        assert!(parse_bitrate("100M/1001").is_err());
+        assert!(parse_bitrate("100M/-1").is_err());
+    }
+
+    #[test]
+    fn parse_tos_strtol_base0() {
+        // iperf3 parses -S with strtol(optarg, &endptr, 0): decimal, 0x hex,
+        // leading-0 octal all accepted (#167).
+        assert_eq!(parse_tos("32").unwrap(), 32);
+        assert_eq!(parse_tos("0x20").unwrap(), 0x20);
+        assert_eq!(parse_tos("0X20").unwrap(), 0x20);
+        assert_eq!(parse_tos("020").unwrap(), 16);
+        assert_eq!(parse_tos("0").unwrap(), 0);
+        assert_eq!(parse_tos("255").unwrap(), 255);
+    }
+
+    #[test]
+    fn parse_tos_rejects_out_of_range_and_garbage() {
+        // IEBADTOS: "bad TOS value (must be between 0 and 255 inclusive)".
+        assert!(parse_tos("256").is_err());
+        assert!(parse_tos("-1").is_err());
+        assert!(parse_tos("zzz").is_err());
+        assert!(parse_tos("0x").is_err());
+        assert!(parse_tos("").is_err());
     }
 
     #[test]

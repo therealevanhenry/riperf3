@@ -260,7 +260,9 @@ pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
 /// keeps a `[SUM]` from ever mixing the two directions of a bidir run (#184):
 /// a `P=1` bidir end block (one stream per direction, two lines each) gets no
 /// SUM at all, exactly like iperf3. UDP SUM rows aggregate lost/total
-/// datagrams and carry the worst-case (max) jitter across the grouped streams.
+/// datagrams and carry the MEAN jitter across the grouped streams, matching
+/// iperf3's END block (`avg_jitter += sp->jitter` per stream of the
+/// direction, then `avg_jitter /= test->num_streams` — #169).
 pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
     // Distinct (role_tag, is_sender) keys in first-seen order, so SUM rows
     // come out in the same order iperf3 lists the groups.
@@ -285,11 +287,13 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
         let (jitter, lost, total_packets) = if is_udp {
             let lost = group.iter().filter_map(|s| s.lost).sum();
             let total = group.iter().filter_map(|s| s.total_packets).sum();
-            // Jitter doesn't sum; report the worst stream's jitter on the SUM.
+            // iperf3 averages jitter across the direction's streams in the
+            // END block (it divides by num_streams, the group size — #169).
+            let jitter_sum: f64 = group.iter().filter_map(|s| s.jitter).sum();
             let jitter = group
                 .iter()
-                .filter_map(|s| s.jitter)
-                .fold(None, |acc, j| Some(acc.map_or(j, |a: f64| a.max(j))));
+                .any(|s| s.jitter.is_some())
+                .then(|| jitter_sum / group.len() as f64);
             (jitter, Some(lost), Some(total))
         } else {
             (None, None, None)
@@ -1346,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_summaries_udp_aggregates_loss_and_max_jitter() {
+    fn sum_summaries_udp_aggregates_loss_and_mean_jitter() {
         let streams = vec![
             StreamSummary {
                 stream_id: 1,
@@ -1379,7 +1383,14 @@ mod tests {
         assert_eq!(s.bytes, 300_000);
         assert_eq!(s.lost, Some(7), "lost datagrams summed");
         assert_eq!(s.total_packets, Some(3000), "total datagrams summed");
-        assert_eq!(s.jitter, Some(0.025), "SUM carries worst-case jitter");
+        // iperf3's END-block SUM jitter is the MEAN across the direction's
+        // streams (iperf_api.c: avg_jitter += sp->jitter per stream, then
+        // avg_jitter /= test->num_streams), not the worst case (#169).
+        assert_eq!(
+            s.jitter,
+            Some((0.010f64 + 0.025) / 2.0),
+            "SUM jitter is the mean across streams"
+        );
     }
 
     #[test]
