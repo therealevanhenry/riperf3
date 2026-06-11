@@ -99,7 +99,10 @@ fn run_demux_udp(extra: &[&str], who: &str) -> Value {
         let out = reader.join().expect("join stdout reader");
         let err = err_reader.join().expect("join stderr reader");
 
-        if common::refused(&exit, &err) && Instant::now() < retry_deadline {
+        // #198: -J error text lands in stdout (the document), stderr empty —
+        // scan both for the refused tokens.
+        let combined = format!("{err}\n{out}");
+        if common::refused(&exit, &combined) && Instant::now() < retry_deadline {
             // Server not listening yet — give it a beat and go again.
             std::thread::sleep(Duration::from_millis(100));
             continue;

@@ -8,22 +8,135 @@ mod cli;
 use cli::Cli;
 
 fn main() -> std::process::ExitCode {
-    match run() {
+    // iperf3's getopt path exits 1 on usage errors (clap defaults to 2), and
+    // a bare invocation raises its exact parameter-error sentence (#198).
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            match e.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    let _ = e.print();
+                    return std::process::ExitCode::SUCCESS;
+                }
+                // Wording-coupled detection (r1 n5): holds while the mode
+                // group is the only required argument; the usage_errors test
+                // pins it against a clap bump changing the rendering.
+                ErrorKind::MissingRequiredArgument
+                    if e.to_string().contains("--server") && e.to_string().contains("--client") =>
+                {
+                    eprintln!(
+                        "riperf3: parameter error - must either be a client (-c) or server (-s)"
+                    );
+                    print_usage_trailer();
+                    return std::process::ExitCode::FAILURE;
+                }
+                ErrorKind::ArgumentConflict
+                    if e.to_string().contains("--server") && e.to_string().contains("--client") =>
+                {
+                    // iperf3's IESERVCLIENT (live: exit 1 + usage trailer).
+                    eprintln!("riperf3: parameter error - cannot be both server and client");
+                    print_usage_trailer();
+                    return std::process::ExitCode::FAILURE;
+                }
+                _ => {
+                    let _ = e.print();
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    // Parse-class rejections (#65/#100/#140) resolve BEFORE the sink
+    // dispatch below: iperf3's iperf_exit only emits the JSON document when
+    // json_top exists and only writes the logfile when outfile is open —
+    // both post-parse — so parse-time errors go to STDERR in every mode
+    // (#198 review r1 f1, live-verified: `iperf3 -s -t 5 -J` errors in
+    // plain text on stderr with empty stdout).
+    if let Some(msg) = parse_class_rejection(&cli) {
+        eprintln!("riperf3: error - {msg}");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    // The error SINK is chosen by mode, like iperf_errexit (#198): -J puts
+    // the message in a JSON document on stdout (nothing on stderr),
+    // --json-stream emits an error event + empty end event, --logfile gets
+    // the text line when set, plain text goes to stderr (#151).
+    let json = cli.json;
+    let json_stream = cli.json_stream;
+    let logfile = cli.logfile.clone();
+    match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            // iperf3's iperf_errexit shape ("iperf3: error - <text>", exit 1)
-            // instead of Rust's Debug rendering; ours carries the actual
-            // binary name. The Display strings already mirror iperf3's IE*
-            // wording where riperf3 implements the same rejections (#151).
-            eprintln!("riperf3: error - {e}");
+            // --json-stream wins over -J when combined: iperf3's
+            // --json-stream gates iperf_json_finish into stream events
+            // (review r1 f2, live-verified).
+            if json_stream {
+                println!(
+                    "{}",
+                    riperf3::json_report::error_stream_events(&e.to_string())
+                );
+            } else if json {
+                println!("{}", riperf3::json_report::error_document(&e.to_string()));
+            } else {
+                let line = format!("riperf3: error - {e}");
+                let logged = logfile.as_deref().and_then(|path| {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut f| writeln!(f, "{line}"))
+                        .ok()
+                });
+                if logged.is_none() {
+                    // iperf3's iperf_errexit shape ("iperf3: error - <text>",
+                    // exit 1) instead of Rust's Debug rendering; the Display
+                    // strings mirror iperf3's IE* wording (#151). Also the
+                    // fallback when the logfile cannot be opened.
+                    eprintln!("{line}");
+                }
+            }
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+/// iperf3's parameter-error usage trailer (usage_shortstr + the --help hint).
+fn print_usage_trailer() {
+    eprintln!();
+    eprintln!("Usage: riperf3 [-s|-c host] [options]");
+    eprintln!("Try `riperf3 --help' for more information.");
+}
 
+/// The parse-class rejections (#65 client-only-on-server, #100
+/// server-only-on-client, #140 conflicting end conditions): iperf3 raises
+/// these in parse_arguments, before any output sink exists, so they print to
+/// stderr in every mode. The messages embed iperf3's canonical IE* text as a
+/// substring and add the offending flag name, which iperf3 omits.
+fn parse_class_rejection(cli: &Cli) -> Option<String> {
+    if cli.server {
+        if let Some(flag) = cli.first_client_only_violation() {
+            return Some(format!(
+                "some option you are trying to set is client only: \
+                 {flag} cannot be used with -s/--server"
+            ));
+        }
+    }
+    if cli.client.is_some() {
+        if let Some(flag) = cli.first_server_only_violation() {
+            return Some(format!(
+                "some option you are trying to set is server only: \
+                 {flag} cannot be used with -c/--client"
+            ));
+        }
+        if cli.end_conditions_conflict() {
+            return Some(cli::END_CONDITIONS_MSG.to_string());
+        }
+    }
+    None
+}
+
+fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
     configure_log4rs(cli.debug.unwrap_or(0));
 
     // Reject client-only options on the server (#65) before any side effects
@@ -32,36 +145,6 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // does any work. The message embeds iperf3's canonical IECLIENTONLY text as
     // a substring (so anything matching iperf3's string still matches) and adds
     // the offending flag name, which iperf3 omits.
-    if cli.server {
-        if let Some(flag) = cli.first_client_only_violation() {
-            return Err(format!(
-                "some option you are trying to set is client only: \
-                 {flag} cannot be used with -s/--server"
-            )
-            .into());
-        }
-    }
-
-    // Reject server-only options on the client (#100), symmetric to the
-    // client-only check above. iperf3 raises IESERVERONLY at parse time for any
-    // option whose parse arm sets `server_flag` (e.g. -D, -1, --idle-timeout,
-    // --rsa-private-key-path, --use-pkcs1-padding); mirror that exact set so a
-    // riperf3 client rejects the same options, before any side effects.
-    if cli.client.is_some() {
-        if let Some(flag) = cli.first_server_only_violation() {
-            return Err(format!(
-                "some option you are trying to set is server only: \
-                 {flag} cannot be used with -c/--client"
-            )
-            .into());
-        }
-        // Conflicting end conditions (#140): iperf3 raises IEENDCONDITIONS in
-        // parse_arguments — before pidfile/logfile/affinity — so this check
-        // also runs ahead of the side effects below.
-        if cli.end_conditions_conflict() {
-            return Err(cli::END_CONDITIONS_MSG.into());
-        }
-    }
 
     // Daemonize BEFORE building the tokio runtime. `daemon()` forks, and forking
     // a process that already has a multi-threaded runtime leaves the child with
