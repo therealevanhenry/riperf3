@@ -351,6 +351,17 @@ impl Client {
 
         protocol::send_cookie(&mut ctrl, &cookie).await?;
 
+        // #222 (-V): GT's iperf_connect prints these right after the cookie
+        // write, BEFORE the param exchange (r3 item 2 — a failed exchange
+        // still shows them); the UDP size line only when the blocksize was
+        // DEFAULTED (iperf_client_api.c:505-523).
+        if self.verbose && !self.json_output && !self.json_stream {
+            vprintln!("Control connection MSS {control_mss}");
+            if matches!(self.protocol, TransportProtocol::Udp) && !self.blksize_explicit {
+                vprintln!("Setting UDP block size to {blksize}");
+            }
+        }
+
         // (#222 r2 item 5: the connect text block prints after the param
         // exchange — GT's client on_connect timing — see the ParamExchange
         // arm; a failed exchange must not have printed the banner.)
@@ -390,15 +401,9 @@ impl Client {
                     // lines are -V. JSON modes print none of this.
                     if !self.json_output && !self.json_stream {
                         if self.verbose {
-                            vprintln!("Control connection MSS {control_mss}");
-                            if matches!(self.protocol, TransportProtocol::Udp)
-                                && !self.blksize_explicit
-                            {
-                                // GT prints this only when it DEFAULTED the UDP
-                                // blocksize, right after the MSS line
-                                // (iperf_client_api.c:505-523; r2 item 4).
-                                vprintln!("Setting UDP block size to {blksize}");
-                            }
+                            // (Control connection MSS + the UDP size line
+                            // print at GT's iperf_connect timing, right
+                            // after the cookie write — r3 item 2.)
                             vprintln!(
                                 "Time: {}",
                                 crate::json_report::http_date(

@@ -239,7 +239,8 @@ impl Server {
         if !json {
             // -V reprints version/uname EVERY accept round, like GT's
             // iperf_run_server loop (r1 item 12; #222).
-            if self.verbose && !self.json_output && !self.json_stream {
+            if self.verbose {
+                // (Already inside the !json gate.)
                 vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
                 vprintln!("{}", crate::utils::system_info());
             }
@@ -285,7 +286,7 @@ impl Server {
                 break;
             }
             if !json {
-                if self.verbose && !self.json_output && !self.json_stream {
+                if self.verbose {
                     vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
                     vprintln!("{}", crate::utils::system_info());
                 }
@@ -406,7 +407,13 @@ impl Server {
                     String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
                 );
                 if matches!(cfg.protocol, TransportProtocol::Tcp) {
-                    vprintln!("      TCP MSS: 0 (default)");
+                    // The client's -M arrives in params (r3): GT prints the
+                    // SET value suffix-free, "0 (default)" only when unset —
+                    // the server mirror of the client-side rule.
+                    match params.mss.filter(|&m| m != 0) {
+                        Some(m) => vprintln!("      TCP MSS: {m}"),
+                        None => vprintln!("      TCP MSS: 0 (default)"),
+                    }
                 }
                 // GT's on_connect verbose tail is role-independent (r2
                 // item 3): the client's requested rate arrives in params.
