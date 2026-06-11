@@ -128,12 +128,17 @@ pub fn reset_pre_data(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
     reset_tokens(stdout) && json_output_is_setup_only(stdout)
 }
 
-/// The three reset renderings, mirroring `refused`: Debug form, POSIX
-/// strerror, and Windows' WSAECONNRESET text (no "reset"-cased substring).
+/// The reset renderings (mirroring `refused`: Debug form, POSIX strerror,
+/// Windows' WSAECONNRESET text) PLUS the clean-disconnect shape: a peer that
+/// vanishes mid-setup can surface as FIN-before-RST ordering — FreeBSD's CI
+/// delivered exactly that ("peer disconnected", riperf3's EOF class) for the
+/// same saboteur that RSTs on Linux. Pre-data, they are one phenomenon: the
+/// setup connection died under us.
 fn reset_tokens(s: &str) -> bool {
     s.contains("ConnectionReset")
         || s.contains("Connection reset")
         || s.contains("(os error 10054)")
+        || s.contains("peer disconnected")
 }
 
 /// Did this JSON-mode run die during SETUP — streams never connected, no
@@ -318,6 +323,8 @@ mod tests {
             // POSIX strerror (Linux 104 / macOS 54 — same text, the #195 hit)
             "riperf3: error - Connection reset by peer (os error 104)",
             "riperf3: error - Connection reset by peer (os error 54)",
+            // FreeBSD's FIN-before-RST ordering: the clean-EOF rendering
+            "riperf3: error - peer disconnected",
             // Windows WSAECONNRESET: no "reset"-cased substring at all
             "riperf3: error - An existing connection was forcibly closed by \
              the remote host. (os error 10054)",

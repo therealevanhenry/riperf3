@@ -24,6 +24,32 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Make the drop of this socket send a real RST everywhere. Closing with
+/// unread data RSTs on Linux/Windows, but FreeBSD's CI run delivered the
+/// FIN-before-RST ordering (the client saw a clean "peer disconnected"
+/// EOF) — SO_LINGER(0) removes the ambiguity on every Unix; Windows keeps
+/// the unread-data behavior (std has no stable set_linger).
+#[cfg(unix)]
+fn force_rst_on_drop(sock: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::from_ref(&linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+}
+#[cfg(not(unix))]
+fn force_rst_on_drop(_sock: &std::net::TcpStream) {}
+
 /// The client's first two connects land on a saboteur listener that accepts,
 /// reads ONE byte of the cookie, and closes with the rest unread — closing a
 /// socket with undrained receive data sends RST on every platform, no
@@ -44,6 +70,7 @@ fn pre_data_reset_is_retried_until_a_real_server_arrives() {
             // arrived, so >0 bytes sit unread when we drop → RST, not FIN.
             let mut byte = [0u8; 1];
             let _ = sock.read_exact(&mut byte);
+            force_rst_on_drop(&sock);
             drop(sock);
         }
         // listener drops here; the port frees for the real server
@@ -99,6 +126,7 @@ fn pre_data_reset_is_retried_in_json_mode() {
         let (mut sock, _) = listener.accept().expect("accept");
         let mut byte = [0u8; 1];
         let _ = sock.read_exact(&mut byte);
+        force_rst_on_drop(&sock);
         drop(sock);
     });
     let server = std::thread::spawn(move || {
