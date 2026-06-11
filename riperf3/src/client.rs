@@ -2154,6 +2154,9 @@ impl ClientBuilder {
     /// exit (iperf3 exits 0 on TERM/INT/HUP).
     pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(InterruptWatch(rx));
+        self
+    }
+
     /// With json-stream, also print the complete monolithic JSON document
     /// after the stream ends — iperf3's `--json-stream-full-output`, the
     /// third leg of its discard_json condition (#213).

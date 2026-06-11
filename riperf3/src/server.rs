@@ -201,6 +201,8 @@ impl Server {
     pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(crate::client::InterruptWatch(rx));
         self
+    }
+
     /// A non-report stdout line (the listening banner): iperf3 routes these
     /// through iperf_printf too, so they carry the `--timestamps` prefix
     /// (#216). Not tee'd into the --get-server-output capture — iperf3's
@@ -1876,6 +1878,9 @@ impl ServerBuilder {
     /// the signal-normal exit.
     pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(crate::client::InterruptWatch(rx));
+        self
+    }
+
     /// With json-stream, also print the complete monolithic JSON document
     /// after the stream ends — iperf3's `--json-stream-full-output`, the
     /// third leg of its discard_json condition (#213).
