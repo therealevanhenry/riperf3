@@ -508,6 +508,31 @@ impl Client {
                     return Err(RiperfError::Protocol("server error".into()));
                 }
 
+                // iperf_handle_message_client handles SERVER_TERMINATE in
+                // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
+                // server interrupt racing the client's TestEnd lands here
+                // (the ExchangeResults wait) — dump the partial summary and
+                // surface IESERVERTERM instead of dying later on a bare
+                // peer-disconnect with no dump.
+                TestState::ServerTerminate => {
+                    self.print_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        None,
+                        blksize,
+                        &interval_data,
+                        &StartMeta {
+                            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                                .into_owned(),
+                            tcp_mss_default: control_mss,
+                            start_time_millis: test_start_millis,
+                        },
+                        measured_secs,
+                        Some("the server has terminated"),
+                    );
+                    return Err(RiperfError::ServerTerminated);
+                }
+
                 other => {
                     if self.verbose {
                         vprintln!("Unexpected state: {other:?}");

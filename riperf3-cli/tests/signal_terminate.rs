@@ -130,3 +130,34 @@ fn server_sigterm_dumps_stats_and_terminates_the_client() {
     );
     assert_eq!(ccode, 1, "the client's terminate-by-peer is the error path");
 }
+
+/// #210 review r1 f1: the server's -J document carries the terminate message
+/// in its `error` key (live iperf3: keys [start, intervals, end, error],
+/// stderr EMPTY) — the message must not leak to stderr in JSON mode.
+#[test]
+fn server_json_doc_carries_the_terminate_error_key() {
+    let ps = free_port().to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps, "-J"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "10"]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let cpid = client.0.id() as i32;
+    unsafe {
+        libc::kill(cpid, libc::SIGTERM);
+    }
+    let _ = wait_with_output_bounded(client, Duration::from_secs(5), "client");
+
+    let (sout, serr, _) = wait_with_output_bounded(server, Duration::from_secs(5), "server -J");
+    assert!(
+        serr.trim().is_empty(),
+        "JSON mode keeps stderr silent (iperf_err): {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).expect("server stdout is the JSON document");
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("the client has terminated"),
+        "the doc carries IECLIENTTERM: {doc}"
+    );
+}

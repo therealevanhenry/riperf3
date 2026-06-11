@@ -237,8 +237,12 @@ impl Server {
                 Err(RiperfError::ClientTerminated) => {
                     // iperf3 prints IECLIENTTERM WITHOUT the "error - "
                     // prefix ("iperf3: the client has terminated",
-                    // live-captured) and keeps serving (#210).
-                    eprintln!("riperf3: {}", RiperfError::ClientTerminated);
+                    // live-captured) and keeps serving (#210). In the JSON
+                    // modes the doc/event carried it — stderr stays silent
+                    // like iperf_err (review r1 f1/f3).
+                    if !json {
+                        eprintln!("riperf3: {}", RiperfError::ClientTerminated);
+                    }
                 }
                 Err(e) => {
                     eprintln!("riperf3: error - {e}");
@@ -735,6 +739,16 @@ impl Server {
             let _ = handle.await;
         }
         let cpu_end = CpuSnapshot::now();
+        // The terminate/interrupt message every report sink shares (#210 r1
+        // f1): iperf3's iperf_exit/iperf_err put it in the -J doc's error
+        // key (and suppress stderr) on the server role too.
+        let report_error: Option<String> = if let Some(msg) = &interrupted {
+            Some(msg.clone())
+        } else if client_terminated {
+            Some("the client has terminated".to_string())
+        } else {
+            None
+        };
 
         // Wait briefly then join tasks (senders may be blocked on write)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -843,6 +857,7 @@ impl Server {
                 accepted_port,
                 test_start_millis,
                 &interval_data,
+                report_error.as_deref(),
             );
             let value = serde_json::to_value(&report).ok();
             prebuilt_report = Some(report);
@@ -916,6 +931,7 @@ impl Server {
                     accepted_port,
                     test_start_millis,
                     &interval_data,
+                    report_error.as_deref(),
                 )
             });
             self.print_results_json(&report);
@@ -932,6 +948,7 @@ impl Server {
                 accepted_port,
                 test_start_millis,
                 &interval_data,
+                report_error.as_deref(),
             );
         } else if !was_captured {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
@@ -1460,6 +1477,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
@@ -1556,7 +1574,9 @@ impl Server {
             .collect();
 
         let input = ReportInput {
-            error: None,
+            // iperf_exit puts the terminate/interrupt message in the doc's
+            // error key on the server too (#210 review r1 f1).
+            error: error.map(str::to_string),
             protocol: cfg.protocol,
             reverse: cfg.reverse,
             bidir: cfg.bidir,
@@ -1635,6 +1655,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) -> crate::json_report::Report {
         self.build_report_input(
             streams,
@@ -1647,6 +1668,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            error,
         )
         .build()
     }
@@ -1656,7 +1678,7 @@ impl Server {
     fn print_results_json(&self, report: &crate::json_report::Report) {
         match serde_json::to_string_pretty(report) {
             Ok(s) => println!("{s}"),
-            Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
+            Err(e) => eprintln!("riperf3: error - failed to serialize JSON: {e}"),
         }
     }
 
@@ -1675,6 +1697,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) {
         let input = self.build_report_input(
             streams,
@@ -1687,6 +1710,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            error,
         );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
@@ -1720,6 +1744,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            None,
         );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "start",

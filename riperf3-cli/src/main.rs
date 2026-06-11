@@ -141,6 +141,7 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _pidfile_guard = PidfileGuard(cli.pidfile.clone().map(std::path::PathBuf::from));
     let pidfile = cli.pidfile.clone();
     let is_server = cli.server;
+    let (json, json_stream) = (cli.json, cli.json_stream);
     // #210: the first signal no longer cancels the run outright — it fires
     // this watch with iperf3's formatted message, and the lib dumps the
     // accumulated stats + tells the peer (CLIENT_TERMINATE /
@@ -219,8 +220,13 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // (iperf_got_sigend → iperf_signormalexit → exit 0), printing an
         // interrupt notice first.
         Ok(Exit::Signal(sig)) => {
-            let role = if is_server { "server" } else { "client" };
-            eprintln!("riperf3: interrupt - the {role} has terminated by signal {sig}");
+            // In the JSON modes the document/event already carried the
+            // message — iperf3's signormalexit prints nothing to stderr
+            // there (#210 review r1 f3).
+            if !json && !json_stream {
+                let role = if is_server { "server" } else { "client" };
+                eprintln!("riperf3: interrupt - the {role} has terminated by signal {sig}");
+            }
             Ok(())
         }
         Ok(Exit::Normal) => Ok(()),
