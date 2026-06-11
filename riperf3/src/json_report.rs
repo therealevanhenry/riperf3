@@ -841,14 +841,34 @@ impl ReportInput {
                     .sum::<f64>()
                     / (self.num_streams.max(1) as f64);
                 let rev_sent_packets = (local_sent / blk) as i64;
-                sum = Some(self.udp_sum(0, false, fwd_packets, fwd_lost, fwd_jitter));
-                sum_bidir_reverse = Some(self.udp_sum(local_sent, true, rev_sent_packets, 0, 0.0));
-                sum_sent_bidir_reverse =
-                    Some(self.udp_sum(local_sent, true, rev_sent_packets, 0, 0.0));
-                sum_received_bidir_reverse = Some(self.udp_sum(0, false, 0, 0, 0.0));
+                sum = Some(self.udp_sum(0, false, fwd_packets, fwd_lost, fwd_jitter, fwd_packets));
+                sum_bidir_reverse = Some(self.udp_sum(
+                    local_sent,
+                    true,
+                    rev_sent_packets,
+                    0,
+                    0.0,
+                    rev_sent_packets,
+                ));
+                sum_sent_bidir_reverse = Some(self.udp_sum(
+                    local_sent,
+                    true,
+                    rev_sent_packets,
+                    0,
+                    0.0,
+                    rev_sent_packets,
+                ));
+                sum_received_bidir_reverse = Some(self.udp_sum(0, false, 0, 0, 0.0, 0));
                 (
-                    self.udp_sum(0, true, 0, 0, 0.0),
-                    self.udp_sum(local_recv, false, fwd_packets, fwd_lost, fwd_jitter),
+                    self.udp_sum(0, true, 0, 0, 0.0, 0),
+                    self.udp_sum(
+                        local_recv,
+                        false,
+                        fwd_packets,
+                        fwd_lost,
+                        fwd_jitter,
+                        fwd_packets,
+                    ),
                 )
             } else if self.bidir {
                 // Two flows: forward (client→server, server receives → sender=false)
@@ -879,10 +899,18 @@ impl ReportInput {
                     sum_packets,
                     sum_lost,
                     sum_jitter,
+                    sum_packets,
                 ));
                 (
-                    self.udp_sum(local_sent, true, sent_packets, 0, 0.0),
-                    self.udp_sum(local_recv, false, udp_packets, udp_lost, udp_jitter),
+                    self.udp_sum(local_sent, true, sent_packets, 0, 0.0, sent_packets),
+                    self.udp_sum(
+                        local_recv,
+                        false,
+                        udp_packets,
+                        udp_lost,
+                        udp_jitter,
+                        sum_packets,
+                    ),
                 )
             } else {
                 // Single-direction TCP. sum_sent = bytes the server sent (0 forward),
@@ -950,21 +978,48 @@ impl ReportInput {
             } else {
                 rev_packets
             };
-            sum = Some(self.udp_sum(local_sent, true, sum_fwd_packets, fwd_lost, fwd_jitter));
+            sum = Some(self.udp_sum(
+                local_sent,
+                true,
+                sum_fwd_packets,
+                fwd_lost,
+                fwd_jitter,
+                sum_fwd_packets,
+            ));
             // sum_bidir_reverse.bytes is the SENDER-side figure — iperf3
             // feeds it from total_sent, the same variable as
             // sum_sent_bidir_reverse (iperf_api.c:4504/4514; r1 review
             // proved it live on a lossy run: both stay equal while
             // *_received_bidir_reverse drops). local_recv here diverged 18%
             // under loss.
-            sum_bidir_reverse =
-                Some(self.udp_sum(rev_sent, false, sum_rev_packets, rev_lost, rev_jitter));
-            sum_sent_bidir_reverse = Some(self.udp_sum(rev_sent, true, rev_sent_packets, 0, 0.0));
-            sum_received_bidir_reverse =
-                Some(self.udp_sum(local_recv, false, rev_packets, rev_lost, rev_jitter));
+            sum_bidir_reverse = Some(self.udp_sum(
+                rev_sent,
+                false,
+                sum_rev_packets,
+                rev_lost,
+                rev_jitter,
+                sum_rev_packets,
+            ));
+            sum_sent_bidir_reverse =
+                Some(self.udp_sum(rev_sent, true, rev_sent_packets, 0, 0.0, rev_sent_packets));
+            sum_received_bidir_reverse = Some(self.udp_sum(
+                local_recv,
+                false,
+                rev_packets,
+                rev_lost,
+                rev_jitter,
+                sum_rev_packets,
+            ));
             (
-                self.udp_sum(local_sent, true, fwd_sent_packets, 0, 0.0),
-                self.udp_sum(fwd_recv, false, fwd_packets, fwd_lost, fwd_jitter),
+                self.udp_sum(local_sent, true, fwd_sent_packets, 0, 0.0, fwd_sent_packets),
+                self.udp_sum(
+                    fwd_recv,
+                    false,
+                    fwd_packets,
+                    fwd_lost,
+                    fwd_jitter,
+                    sum_fwd_packets,
+                ),
             )
         } else if self.bidir {
             // Forward (this host → peer) goes in sum_sent/sum_received; reverse
@@ -1013,10 +1068,24 @@ impl ReportInput {
             } else {
                 udp_packets
             };
-            sum = Some(self.udp_sum(sent_bytes, fwd_sender, sum_packets, udp_lost, udp_jitter));
+            sum = Some(self.udp_sum(
+                sent_bytes,
+                fwd_sender,
+                sum_packets,
+                udp_lost,
+                udp_jitter,
+                sum_packets,
+            ));
             (
-                self.udp_sum(sent_bytes, true, sent_packets, 0, 0.0),
-                self.udp_sum(recv_bytes, false, udp_packets, udp_lost, udp_jitter),
+                self.udp_sum(sent_bytes, true, sent_packets, 0, 0.0, sent_packets),
+                self.udp_sum(
+                    recv_bytes,
+                    false,
+                    udp_packets,
+                    udp_lost,
+                    udp_jitter,
+                    sum_packets,
+                ),
             )
         } else {
             // TCP single direction (forward or reverse); both aggregates carry the
@@ -1223,7 +1292,12 @@ impl ReportInput {
                     jitter_ms: u.jitter_secs * 1000.0,
                     lost_packets: u.lost_packets,
                     packets,
-                    lost_percent: pct_lost(u.lost_packets, u.packets),
+                    // r3 review (F1): the denominator follows the same
+                    // sender-side provenance as `packets` — iperf3's
+                    // per-stream pct divides by the sender count
+                    // (iperf_api.c:4288-4293). `packets` already holds the
+                    // arm-appropriate figure (derived, or measured fallback).
+                    lost_percent: pct_lost(u.lost_packets, packets),
                     out_of_order: u.out_of_order,
                     sender: s.is_sender,
                 }),
@@ -1335,6 +1409,12 @@ impl ReportInput {
         }
     }
 
+    /// `pct_packets` is the lost_percent DENOMINATOR — iperf3 computes one
+    /// per-direction pct from (lost, total_packets) where total is the
+    /// sent-with-fallback figure, and REUSES it on the received-side
+    /// aggregates (iperf_api.c:4492-4497 → 4514; r3 review F2). Pass the
+    /// direction's total; for sent-side aggregates (lost=0) it is inert.
+    #[allow(clippy::too_many_arguments)]
     fn udp_sum(
         &self,
         bytes: u64,
@@ -1342,6 +1422,7 @@ impl ReportInput {
         packets: i64,
         lost: i64,
         jitter_secs: f64,
+        pct_packets: i64,
     ) -> SumSide {
         let dur = self.elapsed;
         SumSide {
@@ -1354,7 +1435,7 @@ impl ReportInput {
             jitter_ms: Some(jitter_secs * 1000.0),
             lost_packets: Some(lost),
             packets: Some(packets),
-            lost_percent: Some(pct_lost(lost, packets)),
+            lost_percent: Some(pct_lost(lost, pct_packets)),
             sender,
         }
     }
@@ -1581,6 +1662,19 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+        // lost_percent denominators are the direction's SENT-side totals
+        // (r3 F1/F2): fwd 4/200 = 2.0 (not 4/198), rev 8/200 = 4.0 (not
+        // 8/192), per-stream 4/100 = 4.0 (not 4/96).
+        assert!((end["sum_received"]["lost_percent"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert!(
+            (end["sum_received_bidir_reverse"]["lost_percent"]
+                .as_f64()
+                .unwrap()
+                - 4.0)
+                .abs()
+                < 1e-9
+        );
+
         // Per-stream receiving entries: sender-side bytes AND derived
         // packets (not the 96 measured).
         let streams = end["streams"].as_array().unwrap();
@@ -1590,6 +1684,7 @@ mod tests {
             .unwrap();
         assert_eq!(recv["udp"]["bytes"], serde_json::json!(blk * 100));
         assert_eq!(recv["udp"]["packets"], serde_json::json!(100i64));
+        assert!((recv["udp"]["lost_percent"].as_f64().unwrap() - 4.0).abs() < 1e-9);
         for key in [
             "sum",
             "sum_sent",
