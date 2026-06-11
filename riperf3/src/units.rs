@@ -124,6 +124,7 @@ mod tests {
         assert_eq!(format_bytes(16.0, 'A'), "16.0 Bytes");
         assert_eq!(format_bytes(50.0, 'A'), "50.0 Bytes");
         assert_eq!(format_rate(0.0, 'a'), "0.00 bits/sec");
+        assert_eq!(format_bytes(1.0, 'a'), "8.00 bits");
         assert_eq!(format_bytes(500.0, 'A'), "500 Bytes");
         assert_eq!(format_bytes(1024.0, 'A'), "1.00 KBytes");
         assert_eq!(format_bytes(1024.0 * 1024.0 * 1.5, 'A'), "1.50 MBytes");

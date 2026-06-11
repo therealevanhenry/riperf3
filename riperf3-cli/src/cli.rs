@@ -1784,7 +1784,8 @@ mod cli_tests {
 
         #[test]
         fn format_wired() {
-            // The CLI always sets a format (default 'm'); `-f g` must propagate.
+            // An explicit `-f g` must propagate (absent -f, the lib default
+            // 'a' stands — #221).
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-f", "g"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").format_char('g').build().unwrap());

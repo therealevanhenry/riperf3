@@ -156,21 +156,30 @@ pub(crate) fn emit_json_stream_line(line: &str) {
 }
 
 /// Print one interval line.
-pub fn print_interval(interval: &StreamInterval, format_char: char) {
-    let id = fmt_id_role(interval.stream_id, interval.role_tag);
+/// The interval row's (Transfer, Bitrate) cell pair. Pure so the
+/// Transfer-always-'A' rule is PINNABLE (r2 review: the print path's 'A'
+/// was mutation-silent — no test passes -f, and absent -f both variants
+/// render identically).
+fn interval_cells(bytes: u64, start: f64, end: f64, format_char: char) -> (String, String) {
     // The Transfer column is ALWAYS adaptive — iperf3 hardcodes 'A' at every
     // transfer site (iperf_api.c:4012/4252/4434/4705); -f drives only the
     // Bitrate column (r1 review, live-verified: iperf3 -f m still prints
     // "12.5 GBytes"). to_ascii_uppercase(format_char) was the last way to
     // reproduce the #221 fixed-unit symptom.
-    let transfer = units::format_bytes(interval.bytes as f64, 'A');
-    let seconds = interval.end - interval.start;
+    let transfer = units::format_bytes(bytes as f64, 'A');
+    let seconds = end - start;
     let bits_per_sec = if seconds > 0.0 {
-        interval.bytes as f64 * 8.0 / seconds
+        bytes as f64 * 8.0 / seconds
     } else {
         0.0
     };
-    let rate = units::format_rate(bits_per_sec, format_char);
+    (transfer, units::format_rate(bits_per_sec, format_char))
+}
+
+pub fn print_interval(interval: &StreamInterval, format_char: char) {
+    let id = fmt_id_role(interval.stream_id, interval.role_tag);
+    let (transfer, rate) =
+        interval_cells(interval.bytes, interval.start, interval.end, format_char);
 
     let omit_tag = if interval.omitted { "(omitted) " } else { "" };
 
@@ -1272,6 +1281,17 @@ pub fn spawn_interval_reporter(
 
 #[cfg(test)]
 mod tests {
+    /// #221 r2: the interval row's Transfer stays adaptive under an explicit
+    /// -f while Bitrate follows it — pinned on the pure helper (the print
+    /// path was mutation-silent).
+    #[test]
+    fn interval_cells_transfer_always_adaptive() {
+        let (transfer, rate) = interval_cells(12_120_000_000, 0.0, 1.0, 'm');
+        assert_eq!(transfer, "11.3 GBytes");
+        assert!(rate.ends_with(" Mbits/sec"), "{rate}");
+        assert!(rate.starts_with("96960"), "{rate}");
+    }
+
     use super::*;
 
     #[test]
