@@ -1191,6 +1191,7 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1225,7 +1226,9 @@ pub fn run_udp_sender_sendmmsg(
     // whole batch and starving the async runtime. Blocking lets the kernel
     // backpressure this thread instead; best-effort enlarge the buffer to a
     // batch and bound a wedged link with SO_SNDTIMEO (issue #6).
-    crate::net::configure_udp_sender(&socket, batch_size * blksize)?;
+    // None under an explicit -w: iperf3 applies the user's window and never
+    // a batch-derived size (#163 review r1 n1).
+    crate::net::configure_udp_sender(&socket, (!user_window).then_some(batch_size * blksize))?;
 
     let fd = socket.as_raw_fd();
 
@@ -1322,6 +1325,7 @@ pub fn run_udp_sender_sendmmsg(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1334,6 +1338,7 @@ pub fn run_udp_sender_sendmmsg(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -1438,6 +1443,7 @@ fn udp_send_loop(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1460,7 +1466,10 @@ fn udp_send_loop(
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
-    crate::net::configure_udp_sender(socket, batch_size as usize * blksize)?;
+    crate::net::configure_udp_sender(
+        socket,
+        (!user_window).then_some(batch_size as usize * blksize),
+    )?;
 
     let pacing = if rate_bits_per_sec > 0 {
         let rate_bytes = rate_bits_per_sec as f64 / 8.0;
@@ -1544,6 +1553,7 @@ pub fn run_udp_sender_blocking(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1557,6 +1567,7 @@ pub fn run_udp_sender_blocking(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -1578,6 +1589,7 @@ pub(crate) fn run_udp_server_demux_sender(
     rate_bits_per_sec: u64,
     pacing_timer_us: u32,
     burst: u32,
+    user_window: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1591,6 +1603,7 @@ pub(crate) fn run_udp_server_demux_sender(
         rate_bits_per_sec,
         pacing_timer_us,
         burst,
+        user_window,
         use_64bit,
         start,
         max_duration,
@@ -2448,6 +2461,7 @@ mod tests {
                 0,
                 1000,
                 false,
+                false,
                 started(),
                 None,
             )
@@ -2605,6 +2619,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2645,6 +2660,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2675,6 +2691,7 @@ mod tests {
             0,
             1000,
             0,
+            false,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2713,6 +2730,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             started(),
             None,
         )
@@ -2744,6 +2762,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 s2,
                 Some(Duration::from_secs(10)),
@@ -2787,6 +2806,7 @@ mod tests {
             1000,
             0,
             false,
+            false,
             start,
             Some(Duration::from_secs(10)),
         )
@@ -2817,6 +2837,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 s,
                 Some(Duration::from_secs(10)),
