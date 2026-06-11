@@ -5,6 +5,10 @@ pub const END_CONDITIONS_MSG: &str = "only one test end condition (-t, -n, -k) m
 
 #[derive(Parser, Debug)]
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
+// Last-wins for repeated flags, like iperf3's getopt: wrapper scripts that
+// append override flags to a base command line (`-b 0 ... -b 100M`) must not
+// be rejected by the drop-in (#205).
+#[command(args_override_self = true)]
 #[command(group(
     ArgGroup::new("mode")
         .required(true)
@@ -1179,6 +1183,34 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "256"]);
             let err = cli.build_client().unwrap_err().to_string();
             assert!(err.contains("bad TOS value"), "got: {err}");
+        }
+
+        // #205: repeated flags are last-wins, like iperf3's getopt — wrapper
+        // scripts append override flags to a base line. Pins the value args,
+        // the previously-rejected repeated BOOLS, and the value-optional
+        // reset-to-default (C's bare --timestamps else-leg explicitly resets
+        // to "%c " — iperf_api.c:1566-1573) (review r1 n8).
+        #[test]
+        fn repeated_flags_are_last_wins() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-b", "0", "-b", "100M"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(
+                c,
+                expected_client("h")
+                    .bandwidth_str("100M")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-t", "5", "-t", "30"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").duration(30).build().unwrap());
+            // Repeated bools parse (previously a hard clap error).
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-V", "-V"]);
+            assert!(cli.verbose);
+            // Bare repeat of a value-optional flag resets to the default.
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--timestamps=%H", "--timestamps"]);
+            assert_eq!(cli.timestamps.as_deref(), Some("%c "));
         }
 
         #[test]

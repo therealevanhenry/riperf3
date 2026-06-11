@@ -1132,11 +1132,12 @@ pub fn spawn_interval_reporter(
                         s.counters.set_omit_retransmits(prev_retransmits[i] as i64);
                     }
                     omit_retransmits[i] = prev_retransmits[i];
-                    acc_extremes[i] = StreamExtremes {
-                        stream_id: s.id,
-                        min_rtt: u32::MAX,
-                        ..Default::default()
-                    };
+                    // The TCP_INFO extremes are NOT reset: iperf3's
+                    // iperf_reset_stats clears byte/packet counters, jitter,
+                    // and the retransmit baseline, but stream_max_snd_cwnd/
+                    // snd_wnd/rtt (and even the RTT mean's sum) keep their
+                    // warm-up peaks (#199 — the old full reset under-read
+                    // max_* after an omitted warm-up vs iperf3).
                 }
                 // -n/-k + -O (#31): refill the shared sender budget at the
                 // boundary, where the byte baselines were just snapshotted,
