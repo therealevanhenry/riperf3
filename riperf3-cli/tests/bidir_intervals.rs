@@ -300,3 +300,100 @@ fn tcp_forward_intervals_have_no_bidir_reverse() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #143/#187: bidir TEXT interval rows — role tags, per-direction SUMs, no
+// cross-direction aggregate, and no SUM at all when a direction has a single
+// stream. Ground truth: iperf3 3.20 (iperf_print_intermediate prints each
+// direction's rows + ITS OWN SUM per pass; the SUM is gated on num_streams>1).
+// ---------------------------------------------------------------------------
+
+/// `-u --bidir` at P=1, text mode: every interval row carries the stream's
+/// role tag; there is NO [SUM] row (one stream per direction); the TX (sender)
+/// rows carry a trailing sent-packet count like iperf3's
+/// report_bw_udp_sender_format.
+#[test]
+fn udp_bidir_text_interval_rows_role_tags_no_sum() {
+    let port = free_port().to_string();
+    let _server = spawn_server(&port);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &port,
+            "-u",
+            "--bidir",
+            "-t",
+            "2",
+            "-i",
+            "1",
+        ],
+        Duration::from_secs(25),
+        "udp bidir text",
+    );
+
+    assert!(
+        out.contains("][TX-C]") && out.contains("][RX-C]"),
+        "bidir interval rows must carry role tags (iperf3 mbuf): {out}"
+    );
+    // No interval [SUM] at P=1 — iperf3 gates the text SUM on num_streams>1
+    // PER DIRECTION; the end block's separator-delimited summary is exempt.
+    let interval_section = out.split("- - - - -").next().unwrap_or("");
+    assert!(
+        !interval_section.contains("[SUM]"),
+        "no interval SUM may print at P=1 bidir (cross-direction SUM was the #187 bug): {out}"
+    );
+    // TX (sender) interval rows end with a sent-packet count (no jitter/loss).
+    let tx_data_row = interval_section
+        .lines()
+        .find(|l| {
+            l.contains("][TX-C]") && l.contains("Mbits/sec")
+                || l.contains("][TX-C]") && l.contains("bits/sec")
+        })
+        .unwrap_or_else(|| panic!("no TX-C interval row: {out}"));
+    let last = tx_data_row.split_whitespace().last().unwrap_or("");
+    assert!(
+        last.parse::<u64>().is_ok() || last == "(omitted)",
+        "TX interval rows carry iperf3's trailing sent-packet count, got line: {tx_data_row}"
+    );
+}
+
+/// TCP `--bidir -P 2`, text mode: per-direction [SUM] rows with role tags
+/// (one per direction), never a combined cross-direction SUM.
+#[test]
+fn tcp_bidir_text_interval_sums_split_per_direction() {
+    let port = free_port().to_string();
+    let _server = spawn_server(&port);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &port,
+            "--bidir",
+            "-P",
+            "2",
+            "-t",
+            "2",
+            "-i",
+            "1",
+        ],
+        Duration::from_secs(25),
+        "tcp bidir P2 text",
+    );
+
+    let interval_section = out.split("- - - - -").next().unwrap_or("");
+    assert!(
+        interval_section.contains("[SUM][TX-C]") && interval_section.contains("[SUM][RX-C]"),
+        "bidir P2 must print one SUM per direction with role tags: {out}"
+    );
+    for l in interval_section.lines() {
+        if l.contains("[SUM]") {
+            assert!(
+                l.contains("[SUM][TX-C]") || l.contains("[SUM][RX-C]"),
+                "every interval SUM must be direction-tagged (no mixed SUM): {l}"
+            );
+        }
+    }
+}
