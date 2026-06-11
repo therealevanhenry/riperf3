@@ -2050,6 +2050,7 @@ mod end_race_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    #[allow(clippy::type_complexity)] // a test harness 5-tuple, not API
     fn harness(
         interval_secs: f64,
     ) -> (
