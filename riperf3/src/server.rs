@@ -212,6 +212,11 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
+        // -V opens with the version and uname lines, like iperf3 (#222).
+        if self.verbose && !self.json_output && !self.json_stream {
+            vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+            vprintln!("{}", crate::utils::system_info());
+        }
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
@@ -320,8 +325,27 @@ impl Server {
             Some(r) => r?,
             None => return Ok(()),
         };
-        if self.verbose {
-            vprintln!("Accepted connection from {peer_addr}");
+        // #222: Time (-V) then the UNCONDITIONAL accept banner
+        // (iperf_on_connect's server half, iperf_api.c:1017) — text only.
+        if !self.json_output && !self.json_stream {
+            if self.verbose {
+                vprintln!(
+                    "Time: {}",
+                    crate::json_report::http_date(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                );
+            }
+            // iperf3's shape: "host, port N", with v4-mapped v6 addresses
+            // unmapped for display (mapped_v4_to_regular_v4).
+            vprintln!(
+                "Accepted connection from {}, port {}",
+                peer_addr.ip().to_canonical(),
+                peer_addr.port()
+            );
         }
         net::configure_tcp_stream(&ctrl, true)?;
 
@@ -337,6 +361,12 @@ impl Server {
 
         // ---- Cookie ----
         let cookie = protocol::recv_cookie(&mut ctrl).await?;
+        if self.verbose && !self.json_output && !self.json_stream {
+            vprintln!(
+                "      Cookie: {}",
+                String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+            );
+        }
 
         // ---- ParamExchange ----
         protocol::send_state(&mut ctrl, TestState::ParamExchange).await?;
@@ -607,6 +637,37 @@ impl Server {
         }
 
         // ---- TestStart / TestRunning ----
+        // #222: the per-stream preamble (unconditional, text) and the -V
+        // Starting Test parameter line, like the client side.
+        if !self.json_output && !self.json_stream {
+            for s in &streams {
+                if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
+                    vprintln!(
+                        "[{:3}] local {} port {} connected to {} port {}",
+                        s.id,
+                        l.ip().to_canonical(),
+                        l.port(),
+                        p.ip().to_canonical(),
+                        p.port()
+                    );
+                }
+            }
+            if self.verbose {
+                vprintln!(
+                    "Starting Test: protocol: {}, {} streams, {} byte blocks, \
+                     omitting {} seconds, {} second test, tos {}",
+                    match cfg.protocol {
+                        TransportProtocol::Tcp => "TCP",
+                        TransportProtocol::Udp => "UDP",
+                    },
+                    streams.len(),
+                    cfg.blksize,
+                    cfg.omit,
+                    cfg.duration,
+                    cfg.tos
+                );
+            }
+        }
         // All streams are set up — release the UDP senders.
         start.store(true, Ordering::Relaxed);
         protocol::send_state(&mut ctrl, TestState::TestStart).await?;
@@ -1029,8 +1090,23 @@ impl Server {
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
+            // #222 (-V): iperf3 captions the final block; the server closes
+            // with its measured side's congestion line (no CPU line — GT).
+            if self.verbose {
+                vprintln!("Test Complete. Summary Results:");
+            }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
+                if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
+                    let is_sender = streams.iter().any(|s| s.is_sender);
+                    if is_sender {
+                        vprintln!("snd_tcp_congestion {c}");
+                    } else {
+                        vprintln!("rcv_tcp_congestion {c}");
+                    }
+                }
+            }
         }
 
         // Join stream tasks (best-effort, they should be done)

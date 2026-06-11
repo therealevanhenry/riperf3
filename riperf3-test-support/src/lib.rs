@@ -111,7 +111,12 @@ pub fn reset_pre_data(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
     if status.success() {
         return false;
     }
-    if stdout.is_empty() {
+    if stdout.is_empty() || text_is_setup_only(stdout) {
+        // #222 made the connect banner and per-stream preamble print
+        // unconditionally BEFORE data flows — exactly the refinement the
+        // setup_retry tests were built to force (the empty-stdout proxy's
+        // documented expiry). A stdout consisting only of setup-phase
+        // lines is still pre-data.
         return reset_tokens(stderr);
     }
     // -J/--json-stream render setup errors INTO stdout (#198) with stderr
@@ -139,6 +144,26 @@ fn reset_tokens(s: &str) -> bool {
         || s.contains("Connection reset")
         || s.contains("(os error 10054)")
         || s.contains("peer disconnected")
+}
+
+/// Is every stdout line a SETUP-phase text line (#222's unconditional
+/// banner/preamble, or the -V detail block)? The first interval header,
+/// data row, or separator breaks the pattern — those mean the run was past
+/// setup and a reset is real.
+fn text_is_setup_only(stdout: &str) -> bool {
+    stdout.lines().all(|l| {
+        let t = l.trim();
+        t.is_empty()
+            || t.starts_with("Connecting to host ")
+            || t.starts_with("Accepted connection from ")
+            || t.starts_with("riperf3 ")
+            || t.starts_with("Control connection MSS ")
+            || t.starts_with("Time: ")
+            || t.starts_with("Cookie: ")
+            || t.starts_with("TCP MSS: ")
+            || t.starts_with("Starting Test: ")
+            || (t.starts_with('[') && t.contains("] local ") && t.contains(" connected to "))
+    })
 }
 
 /// Did this JSON-mode run die during SETUP — streams never connected, no
@@ -369,6 +394,26 @@ mod tests {
         assert!(reset_pre_data(&failed, stream_setup, ""));
         let stream_mid = "{\"event\":\"start\",\"data\":{}}\n{\"event\":\"interval\",\"data\":{}}\n{\"event\":\"error\",\"data\":\"Connection reset by peer (os error 104)\"}";
         assert!(!reset_pre_data(&failed, stream_mid, ""));
+    }
+
+    /// #222's unconditional banner/preamble lines are still pre-data; the
+    /// first interval header or data row breaks the pattern.
+    #[test]
+    fn banner_only_stdout_is_still_pre_data() {
+        let failed = status(1);
+        let banner_only = "Connecting to host 127.0.0.1, port 7001\n\
+                           [  1] local 127.0.0.1 port 40000 connected to 127.0.0.1 port 7001\n";
+        assert!(reset_pre_data(
+            &failed,
+            banner_only,
+            "riperf3: error - Connection reset by peer (os error 104)",
+        ));
+        let with_header = format!("{banner_only}[ ID] Interval           Transfer     Bitrate\n");
+        assert!(!reset_pre_data(
+            &failed,
+            &with_header,
+            "riperf3: error - Connection reset by peer (os error 104)",
+        ));
     }
 
     /// The guards: output already produced (data phase, or a -J error doc),

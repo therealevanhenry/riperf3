@@ -676,7 +676,7 @@ fn pct_lost(lost: i64, total: i64) -> f64 {
 /// Format a Unix timestamp (seconds) as an RFC 1123 GMT string, e.g.
 /// "Sat, 30 May 2026 02:20:49 GMT" — matching iperf3's `start.timestamp.time`.
 /// Pure safe Rust (no chrono): epoch → civil date via Howard Hinnant's algorithm.
-fn http_date(epoch_secs: u64) -> String {
+pub(crate) fn http_date(epoch_secs: u64) -> String {
     const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MON: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
