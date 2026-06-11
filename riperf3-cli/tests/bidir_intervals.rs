@@ -12,6 +12,13 @@ use serde_json::Value;
 
 mod common;
 
+/// Harness deadline for every client run in this binary: above the client's
+/// own 30 s UDP_CONNECT_TOTAL_TIMEOUT (protocol.rs), so a setup-starved run
+/// dies on ITS error instead of an empty harness kill — the #195 dossier's
+/// "empty stdout+stderr" hits were this binary's 20 s deadlines firing first
+/// and destroying the diagnosis. Costs nothing when tests pass.
+const RUN_TIMEOUT: Duration = Duration::from_secs(40);
+
 fn free_port() -> u16 {
     // Sub-ephemeral, PID-windowed allocation — see common::free_port.
     common::free_port()
@@ -86,7 +93,7 @@ fn tcp_bidir_client_intervals_split_directions() {
             "1",
             "-J",
         ],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "client",
     );
     let _ = server.0.wait();
@@ -147,7 +154,7 @@ fn tcp_bidir_server_intervals_split_directions() {
             "-i",
             "1",
         ],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "client",
     );
 
@@ -173,6 +180,11 @@ fn tcp_bidir_server_intervals_split_directions() {
 /// packet count, exactly like iperf3.
 #[test]
 fn udp_bidir_interval_sums_split_udp_stats() {
+    // #191's per-binary UDP serialization, extended here (#195): this
+    // binary's UDP tests were the dossier's live hits — on a 2-core runner,
+    // concurrent UDP-connect handshakes starve each other past their
+    // budgets. TCP tests stay parallel by design.
+    let _serial = common::udp_serial();
     let port = free_port();
     let ps = port.to_string();
     let mut server = spawn_server(&ps);
@@ -191,7 +203,7 @@ fn udp_bidir_interval_sums_split_udp_stats() {
             "1",
             "-J",
         ],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "client",
     );
     let _ = server.0.wait();
@@ -226,6 +238,7 @@ fn udp_bidir_interval_sums_split_udp_stats() {
 /// zero-filled udp block: `packets: 0` despite real bytes.
 #[test]
 fn udp_bidir_sender_end_stream_carries_peer_measured_stats() {
+    let _serial = common::udp_serial(); // #191/#195 — see the first UDP test
     let port = free_port();
     let ps = port.to_string();
     let mut server = spawn_server(&ps);
@@ -242,7 +255,7 @@ fn udp_bidir_sender_end_stream_carries_peer_measured_stats() {
             "1",
             "-J",
         ],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "client",
     );
     let _ = server.0.wait();
@@ -284,7 +297,7 @@ fn tcp_forward_intervals_have_no_bidir_reverse() {
     // exactly on its only boundary can legitimately emit zero intervals (#55).
     let out = run_capturing(
         &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1", "-J"],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "client",
     );
     let _ = server.0.wait();
@@ -314,6 +327,7 @@ fn tcp_forward_intervals_have_no_bidir_reverse() {
 /// report_bw_udp_sender_format.
 #[test]
 fn udp_bidir_text_interval_rows_role_tags_no_sum() {
+    let _serial = common::udp_serial(); // #191/#195 — see the first UDP test
     let port = free_port().to_string();
     let _server = spawn_server(&port);
     let out = run_capturing(
@@ -329,7 +343,7 @@ fn udp_bidir_text_interval_rows_role_tags_no_sum() {
             "-i",
             "1",
         ],
-        Duration::from_secs(25),
+        RUN_TIMEOUT,
         "udp bidir text",
     );
 
@@ -397,7 +411,7 @@ fn tcp_bidir_text_interval_sums_split_per_direction() {
             "-i",
             "1",
         ],
-        Duration::from_secs(25),
+        RUN_TIMEOUT,
         "tcp bidir P2 text",
     );
 
@@ -454,7 +468,7 @@ fn parallel_text_ticks_open_with_separator() {
             "-P",
             "2",
         ],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "tcp P2 text",
     );
     // Tie the count to the ticks that actually PRINTED (review r2): under
@@ -499,7 +513,7 @@ fn single_stream_text_has_only_the_end_separator() {
     let mut server = spawn_server(&ps);
     let out = run_capturing(
         &["-c", "127.0.0.1", "-p", &ps, "-t", "3", "-i", "1"],
-        Duration::from_secs(20),
+        RUN_TIMEOUT,
         "tcp P1 text",
     );
     assert_eq!(

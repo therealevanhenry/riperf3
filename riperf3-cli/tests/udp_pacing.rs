@@ -51,7 +51,9 @@ fn default_rate_udp_paces_across_intervals() {
             "1",
             "-J",
         ],
-        Duration::from_secs(20),
+        // > the client's 30 s UDP_CONNECT_TOTAL_TIMEOUT so a starved setup
+        // dies on its own error, not an empty harness kill (#195).
+        Duration::from_secs(40),
         "client",
     )
     .stdout;
