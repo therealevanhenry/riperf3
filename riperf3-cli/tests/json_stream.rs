@@ -433,6 +433,12 @@ fn json_flag_plus_stream_full_output_appends_the_document() {
         .expect("the monolithic document follows under full-output");
     let doc: Value = serde_json::from_str(out[doc_pos..].trim()).expect("document parses");
     assert!(doc["end"].is_object());
+    // Self-contained hybrid coverage (r1 n2): the doc's intervals are
+    // populated, like the #213 plain-stream analog asserts.
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "hybrid full-output doc carries populated intervals: {doc}"
+    );
 }
 
 /// Server `-s -J --json-stream`: stream wins on the server role too.

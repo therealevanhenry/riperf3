@@ -1887,6 +1887,8 @@ impl ServerBuilder {
     }
 
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
+    /// Combined with [`Self::json`], stream mode WINS — iperf3's
+    /// OPT_JSON_STREAM implies -J (#220), same rule as the client builder.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
         self

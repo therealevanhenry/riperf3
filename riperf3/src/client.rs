@@ -2158,6 +2158,10 @@ impl ClientBuilder {
     }
 
     /// `--json-stream`: stream line-delimited interval JSON during the test.
+    /// Combined with [`Self::json`], stream mode WINS — iperf3's
+    /// OPT_JSON_STREAM implies -J, so the hybrid is simply stream mode
+    /// (full event stream incl. `end`; the monolithic document only with
+    /// [`Self::json_stream_full_output`]) (#220).
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
         self
