@@ -533,16 +533,38 @@ const UDP_SEND_TIMEOUT_MS: u64 = 1000;
 /// send buffer fills, redundantly re-staging the whole batch and starving the
 /// async runtime. Switching to blocking lets the kernel backpressure the
 /// sender thread instead. The `SO_SNDBUF` bump is best-effort (clamped by
-/// `net.core.wmem_max`); `SO_SNDTIMEO` bounds a wedged link (see
+/// `net.core.wmem_max`) and GROW-ONLY (#163); `SO_SNDTIMEO` bounds a wedged link (see
 /// [`UDP_SEND_TIMEOUT_MS`]). Note: this is `SO_SNDTIMEO`, *not* the
 /// `TCP_USER_TIMEOUT` of [`set_snd_timeout`] (which is a no-op on UDP).
 #[cfg(unix)]
-pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) -> Result<()> {
+pub fn configure_udp_sender(
+    socket: &std::net::UdpSocket,
+    sndbuf_target: Option<usize>,
+) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
     socket.set_nonblocking(false)?;
     let sock = socket2::SockRef::from(socket);
-    let _ = sock.set_send_buffer_size(sndbuf_target);
+    // GROW-ONLY, and not at all under an explicit -w (#163; callers pass
+    // None then): iperf3 never sets UDP SO_SNDBUF except for -w. The
+    // old unconditional set shrank the buffer ~9-90x below the OS default
+    // whenever batch x blksize was small (a quantum batch at moderate -b, or
+    // -b rate/1's single datagram) and clobbered an earlier -w bump — on a
+    // completion-latency-bound path (real NIC/qdisc; virtio under light
+    // load) that serializes the blocking sender well below target. The
+    // readback compare only ever grows (Linux doubles the requested value;
+    // BSDs don't — comparing against the readback is correct on both).
+    if let Some(target) = sndbuf_target {
+        // A readback failure degrades to SKIP (the faithful direction), not
+        // to an unconditional set. Linux readback is doubled (BSDs aren't):
+        // a target inside (current/2, current] is a deliberate forgone grow
+        // — blocking-socket kernel backpressure is iperf3's own behavior, so
+        // don't "fix" this comparison to a pre-doubled value.
+        let current = sock.send_buffer_size().unwrap_or(usize::MAX);
+        if target > current {
+            let _ = sock.set_send_buffer_size(target);
+        }
+    }
     let tv = TimeVal::new(
         (UDP_SEND_TIMEOUT_MS / 1000) as libc::time_t,
         ((UDP_SEND_TIMEOUT_MS % 1000) * 1000) as libc::suseconds_t,
@@ -555,7 +577,10 @@ pub fn configure_udp_sender(socket: &std::net::UdpSocket, sndbuf_target: usize) 
 // wedged send can block until the link recovers; the per-batch deadline can't
 // fire mid-block. Acceptable given the sendmmsg fast path is Unix-only anyway.
 #[cfg(not(unix))]
-pub fn configure_udp_sender(socket: &std::net::UdpSocket, _sndbuf_target: usize) -> Result<()> {
+pub fn configure_udp_sender(
+    socket: &std::net::UdpSocket,
+    _sndbuf_target: Option<usize>,
+) -> Result<()> {
     socket.set_nonblocking(false)?;
     Ok(())
 }
@@ -932,6 +957,71 @@ pub async fn udp_bind_reusable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #163: configure_udp_sender must be GROW-ONLY. The old unconditional
+    /// set_send_buffer_size shrank SO_SNDBUF ~9-90x below the OS default at
+    /// moderate batch×blksize products (worst at -b rate/1: one datagram!) —
+    /// iperf3 never sets UDP SO_SNDBUF except for an explicit -w.
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_never_shrinks_sndbuf() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let default_buf = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, Some(4096)).unwrap();
+        assert!(
+            sock.send_buffer_size().unwrap() >= default_buf,
+            "a small batch target must not shrink the send buffer below the default"
+        );
+    }
+
+    /// #163: an explicit -w bump applied earlier (apply_socket_window runs
+    /// before the data thread) must survive configure_udp_sender.
+    /// #163 review r2 nit: the None path (explicit -w given) must leave
+    /// SO_SNDBUF exactly untouched while still switching to blocking — the
+    /// regression guard against the buffer setup migrating inside the
+    /// Some-arm.
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_none_leaves_buffer_untouched() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let _ = sock.set_send_buffer_size(64 * 1024);
+        let before = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, None).unwrap();
+        assert_eq!(
+            sock.send_buffer_size().unwrap(),
+            before,
+            "None must not touch SO_SNDBUF"
+        );
+        // Blocking mode still applied: a recv on an empty socket with the
+        // SO_SNDTIMEO-class timeout... cheapest observable: nonblocking off
+        // means recv_from with a read timeout blocks ~that long, while a
+        // nonblocking socket returns WouldBlock instantly.
+        s.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 8];
+        let _ = s.recv_from(&mut buf);
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(30),
+            "socket must be in blocking mode after configure_udp_sender(None)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_udp_sender_preserves_window_bump() {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = socket2::SockRef::from(&s);
+        let _ = sock.set_send_buffer_size(1024 * 1024);
+        let bumped = sock.send_buffer_size().unwrap();
+        configure_udp_sender(&s, Some(11_584)).unwrap();
+        assert!(
+            sock.send_buffer_size().unwrap() >= bumped,
+            "-w's bump must not be clobbered down to batch x blksize"
+        );
+    }
 
     // #59: -w/--window must be applied to UDP sockets, not just TCP. Requesting a
     // size *below* the default and asserting the read-back drops is robust across
@@ -1490,7 +1580,7 @@ mod tests {
             "precondition: socket starts non-blocking"
         );
 
-        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
         assert!(
             !is_nonblocking(socket.as_raw_fd()),
             "sender socket must be switched to blocking"
@@ -1505,7 +1595,7 @@ mod tests {
         // is a no-op on UDP and would leave the timeout unset (#6 review).
         use nix::sys::socket::{getsockopt, sockopt};
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        configure_udp_sender(&socket, 128 * 1460).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
         let tv = getsockopt(&socket, sockopt::SendTimeout).unwrap();
         assert!(
             tv.tv_sec() > 0 || tv.tv_usec() > 0,

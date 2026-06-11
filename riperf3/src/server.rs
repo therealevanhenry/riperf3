@@ -987,11 +987,12 @@ impl Server {
                 let pt = cfg.pacing_timer; // #185: pace the UDP batch too
                 let u64bit = cfg.udp_counters_64bit;
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(
-                        std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                        std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
                 streams.push(DataStream {
@@ -1212,6 +1213,7 @@ impl Server {
                 let c = counters.clone();
                 let d = done.clone();
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
@@ -1224,6 +1226,7 @@ impl Server {
                         rate,
                         pt,
                         bu,
+                        uw,
                         u64bit,
                         st,
                         md,
