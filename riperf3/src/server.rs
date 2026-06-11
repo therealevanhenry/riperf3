@@ -291,6 +291,12 @@ impl Server {
         // server_output event).
         let capture = (want_server_output && !self.json_output && !self.json_stream)
             .then(crate::macros::OutputCaptureGuard::start);
+        // --timestamps prefixes every text report line — through titled(), so
+        // the capture above tees the PREFIXED line like iperf3's linebuffer
+        // (#168). Run-scoped; never in the machine-JSON modes.
+        let _ts_guard = crate::macros::OutputTimestampGuard::set(
+            self.timestamps.is_some() && !self.json_output && !self.json_stream,
+        );
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -593,7 +599,6 @@ impl Server {
                     omit_secs: cfg.omit,
                     num_streams: streams.len(),
                     forceflush: self.forceflush,
-                    timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
@@ -756,7 +761,12 @@ impl Server {
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
             (Some(capture.take()), None)
-        } else if want_server_output && self.json_output {
+        } else if want_server_output && (self.json_output || self.json_stream) {
+            // A --json-stream server attaches its JSON report too: iperf3
+            // keeps json_top alive specifically for this flag
+            // (discard_json = json_stream && ... && !(server && get_server_output),
+            // iperf_api.c:3900) — without this a real iperf3 client
+            // requesting output silently got none (#168).
             let report = self.build_report(
                 &streams,
                 &cfg,

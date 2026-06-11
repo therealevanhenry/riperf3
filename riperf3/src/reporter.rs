@@ -71,7 +71,12 @@ fn fmt_id_role(id: i32, role_tag: Option<&'static str>) -> String {
 /// when a title is active (#34). Every report line routes through this so the
 /// prefix matches iperf3 without changing the public printer signatures.
 fn titled(line: std::fmt::Arguments) {
-    let rendered = format!("{}{}", crate::macros::output_title_prefix(), line);
+    let rendered = format!(
+        "{}{}{}",
+        crate::macros::output_timestamp_prefix(),
+        crate::macros::output_title_prefix(),
+        line
+    );
     // --get-server-output (#33): a capturing server TEES its report lines
     // into the exchange buffer while still printing — iperf3's iperf_printf
     // dual-writes (console + server_output_list).
@@ -367,7 +372,6 @@ pub struct IntervalReporterConfig {
     pub omit_secs: u32,
     pub num_streams: usize,
     pub forceflush: bool,
-    pub timestamp_format: Option<String>,
     pub json_stream: bool,
     /// Print interval lines live (text or json-stream). When false the reporter
     /// runs purely to collect intervals for the final `-J` blob (issue #36 PR2).
@@ -684,19 +688,9 @@ pub fn spawn_interval_reporter(
             if do_emit {
                 let seconds = end - start;
 
-                // Timestamp prefix for this tick (text decoration; never on --json-stream)
-                if config.print && !config.json_stream && config.timestamp_format.is_some() {
-                    // Use libc strftime for iperf3-compatible timestamp formatting
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    let secs = now.as_secs();
-                    // Simple ISO-ish format without pulling in chrono
-                    let hours = (secs % 86400) / 3600;
-                    let mins = (secs % 3600) / 60;
-                    let s = secs % 60;
-                    print!("{hours:02}:{mins:02}:{s:02} ");
-                }
+                // The --timestamps prefix rides every titled() line now —
+                // per line AND into the capture, like iperf3's prefixed
+                // linebuffer (#168).
 
                 // The text header banner is suppressed under --json-stream (pure NDJSON).
                 if config.print && !config.json_stream && !header_printed {
@@ -1495,7 +1489,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
@@ -1522,7 +1515,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
@@ -1549,7 +1541,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 0,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: true,
             blksize: 128 * 1024,
@@ -1603,7 +1594,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
@@ -1686,7 +1676,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: false, // collect-only; assert on the collector
             blksize: 128 * 1024,
@@ -1764,7 +1753,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
@@ -1838,7 +1826,6 @@ mod interval_reporter_tests {
             omit_secs: 0,
             num_streams: 1,
             forceflush: false,
-            timestamp_format: None,
             json_stream: false,
             print: false,
             blksize: 128 * 1024,
