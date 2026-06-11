@@ -11,6 +11,112 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.7.3] - 2026-06-11
+
+A non-breaking patch continuing 0.7.2's faithfulness campaign: 18 PRs closing
+24 issues — signal/failure-mode parity with iperf3's sigend and select loops,
+bidir text-output parity, json-stream completions, error-sink parity, strftime
+timestamps, platform fixes for Windows/FreeBSD/macOS, and a shared
+test-support crate. Every merge was gated on the cross-tool compat matrix
+(48-52 cells incl. iperf3 3.12 cross-pairs), all clean — fourteen consecutive
+gates, plus a perf-drift bench against the 0.7.2 baseline at parity.
+
+### Added
+- **Signal-handling parity with iperf_got_sigend** (#210, completing #158): a
+  signal mid-test dumps the accumulated stats on both roles, tells the peer
+  via CLIENT_TERMINATE/SERVER_TERMINATE (cross-tool verified live against
+  iperf3 in both directions), and exits via the signal-normal path; a second
+  signal during the dump window hard-exits, dying by the signal. New additive
+  lib API: `interrupt`/`with_interrupt` (a watch channel carrying the
+  caller's message into the `-J` error key). The server's CLIENT_TERMINATE
+  handling also gained the missing stats dump (and stopped leaking the
+  reporter).
+- **`--json-stream-full-output`** (#213): the third leg of discard_json —
+  intervals retained on both roles and the complete monolithic document
+  printed after the stream's `end` event.
+- **Error-sink parity with iperf_exit** (#198): `-J` errors land in the JSON
+  document's `error` key on stdout (byte-matching iperf3's pre-test document
+  shape) with stderr silent; `--json-stream` emits `error` + empty `end`
+  events; `--logfile` receives the error line; usage errors exit 1 like
+  getopt (with iperf3's parameter-error sentences and usage trailer for the
+  no-mode and both-modes cases). Parse-time rejections stay on stderr in
+  every mode, matching iperf3's post-parse-only sink gating.
+- **Control-socket watch during the data phase** (#170): control death mid-test
+  surfaces promptly as `control socket has closed unexpectedly` in every
+  end-condition mode (`-n`/`-k` previously had no watch and could hang);
+  `SERVER_TERMINATE` renders a partial summary from local data (peer half
+  zeroed, like iperf3) before `the server has terminated`; `-J` carries the
+  blob `error` key, `--json-stream` the `error` event.
+- **`-b rate/burst` honored** (#160): iperf3's multisend batch on both TCP and
+  UDP, both roles, carried in the param exchange; present burst range-checked
+  per IEBURST. Pacing green-light waits are interruptible (a burst-sized debt
+  no longer outlives the test); `--pacing-timer` accepts unit suffixes; the
+  TCP sender re-checks `done` after the throttle sleep.
+- **Server-side `--bind-dev`** (#149): applied pre-bind on the TCP listener
+  and every UDP server socket, like iperf3's netannounce (Linux-only on the
+  server — netannounce is SO_BINDTODEVICE-only; the client keeps Linux+macOS).
+  Platforms that can't honor it now reject at config time instead of silently
+  no-opping (FreeBSD/NetBSD).
+- **Windows signal handling** (#158): Ctrl+C/Break/close/logoff/shutdown take
+  the clean pidfile-unlink path (tokio ≥ 1.44 for the handler-park fix); the
+  pidfile is unlinked via an RAII guard (panics included); a second signal
+  during teardown exits immediately, dying by the signal.
+- **`riperf3-test-support`** (#192): dev-only crate consolidating the
+  port allocator, UDP serialization lock, refused-retry runner, and child
+  guard; fixed bind sleeps retired from the test harness (#177).
+- Paced-UDP compat coverage: `-b 100M` forward/reverse cells in the interop
+  matrix (#163's missing signal).
+
+### Changed
+- **Repeated CLI flags are last-wins** (#205), like iperf3's getopt — wrapper
+  scripts appending override flags work against the drop-in.
+- **`-l 0` means "unset"** and block size is bounds-checked at config like
+  iperf3 (IEBLOCKSIZE / IEUDPBLOCKSIZE), including negotiated params from
+  broken/hostile peers (#188).
+- **`-S/--tos` accepts strtol base-0 forms** (hex/octal) with the IEBADTOS
+  range check (#167).
+- **Top-level CLI errors print iperf3's shape** (`riperf3: error - ...`,
+  exit 1); control-connect failures carry the canonical IECONNECT sentence
+  (#151).
+- **UDP `SO_SNDBUF` is grow-only and skipped entirely under `-w`** (#163):
+  iperf3 never sets it outside `-w`; the old unconditional set shrank the
+  buffer up to ~90× at small batch products. (The filed #163 throughput
+  symptom was fixed by 0.7.2's #190 quantum batching — verified by a fleet
+  rate sweep at 10M/100M/1G and burst=1.)
+- **The `-O` omit boundary keeps TCP_INFO extremes** (#199): iperf3's
+  iperf_reset_stats never clears max cwnd/snd_wnd/RTT (or the RTT mean's sum);
+  the old full reset under-read every `max_*` after a warm-up.
+- **`--timestamps[=FORMAT]` renders localtime through strftime** (#202) with
+  iperf3's `"%c "` default and verbatim user formats (was hardcoded HH:MM:SS
+  UTC ignoring the argument); the prefix now covers every printed line —
+  verbose output and the server's listening banner included, like
+  iperf_printf (#216). Windows keeps a documented HH:MM:SS fallback.
+- **Per-tick `- - - -` separator at `-P > 1`** (#204), matching
+  iperf_print_intermediate's first-stream rule (live A/B byte-parity,
+  including the no-header-reprint-after-omit shape).
+
+### Fixed
+- **Bidir text interval rows match iperf_print_intermediate** (#143, #187):
+  role tags (`[TX-C]`-style) on rows and SUMs, per-direction passes (a
+  direction's rows then ITS SUM), no SUM at P=1, no cross-direction
+  aggregate, the `[Role]` bidir header, mode-selected UDP headers, and UDP
+  sender rows carry iperf3's trailing sent-datagram count.
+- **END-block SUM jitter is the mean across streams** (#169), not the max —
+  divergent at `-P ≥ 2` UDP.
+- **`--get-server-output` × `--json-stream`** (#168): a json-stream server
+  attaches its JSON report (populated intervals, per discard_json); a
+  json-stream client emits `server_output_*` events before `end`;
+  `--timestamps` prefixes ride the capture per line.
+- **Server UDP paths apply TOS** (#154) on both architectures, like
+  iperf_common_sockopts — reverse/bidir egress is marked.
+- **Live `tcpi_snd_wnd`/`tcpi_reord_seen` on Linux** (#161, partial): a UAPI
+  tcp_info mirror unlocks the fields libc truncates; FreeBSD forwards its
+  value. (macOS's `-1` sentinel needs i64 report fields — deferred to 0.8.0.)
+- **Windows reset-class ICMP noise** (#180) no longer aborts UDP demux setup
+  or the shared teardown drain.
+- The UDP pacing test tolerates a dropped final interval on loaded Windows
+  runners (#159 — the reporter end-race is tracked for 0.7.4).
+
 ## [0.7.2] - 2026-06-10
 
 A non-breaking patch closing out the long-standing faithfulness backlog: every
