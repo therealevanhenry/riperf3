@@ -22,6 +22,9 @@ jobs:
   interop:
     name: iperf3 ${{ matrix.iperf3 }}
     runs-on: ubuntu-latest
+    # Wedge guard (see ci.yml's test job): the iperf3 source build + matrix
+    # run completes in well under half this.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
