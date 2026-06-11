@@ -189,18 +189,20 @@ impl Client {
             // varies by platform/locale anyway (review r1 n4).
             let (kind, detail) = match e {
                 RiperfError::Io(io) => (io.kind(), io.to_string()),
-                // iperf3's suffix is strerror(ETIMEDOUT).
+                // iperf3's suffix is strerror(ETIMEDOUT) — glibc's text;
+                // macOS/BSD say "Operation timed out" (recorded, like the
+                // os-error suffix above).
                 RiperfError::ConnectionTimeout => (
                     std::io::ErrorKind::TimedOut,
                     "Connection timed out".to_string(),
                 ),
                 // Not dial failures: the family-conflict validation (#15)
                 // keeps its Protocol classification (pinned by the lib
-                // tests). Recorded deviation: a failed `-B` local bind is
-                // also Protocol here, where iperf3's netdial would fold it
-                // into IECONNECT (review r1 n3) — it shares the variant with
-                // the validations, so reclassifying needs a net.rs error
-                // split; ledgered.
+                // tests). Recorded deviations sharing that variant (a
+                // net.rs error split would be needed to reclassify): a
+                // failed `-B` local bind (review r1 n3) and resolve_host's
+                // "no IPvX address found" (r2 n2) — both fold into
+                // IECONNECT in iperf3's netdial.
                 other => return other,
             };
             RiperfError::Io(std::io::Error::new(
