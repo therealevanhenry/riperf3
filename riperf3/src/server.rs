@@ -192,6 +192,14 @@ fn demux_local_addr_for(
 }
 
 impl Server {
+    /// A non-report stdout line (the listening banner): iperf3 routes these
+    /// through iperf_printf too, so they carry the `--timestamps` prefix
+    /// (#216). Not tee'd into the --get-server-output capture — iperf3's
+    /// banner prints before the test's JSON/capture exists.
+    fn banner_line(line: &str) {
+        println!("{}{line}", crate::macros::output_timestamp_prefix());
+    }
+
     pub async fn run(&self) -> Result<()> {
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
@@ -208,11 +216,19 @@ impl Server {
         // "Server listening" banners are suppressed) so the document parses
         // cleanly; match that.
         let json = self.json_output || self.json_stream;
+        // Run-scoped, BEFORE the banner: iperf3 prefixes every iperf_printf
+        // line, the listening banner included (#216). --timestamps is the
+        // server's own flag (not exchanged), so run scope is its natural
+        // home; the per-test guard this replaces missed the banner.
+        let _ts_guard = (!json)
+            .then_some(self.timestamps.as_deref())
+            .flatten()
+            .map(crate::macros::OutputTimestampGuard::set);
         let sep = "-----------------------------------------------------------";
         if !json {
-            println!("{sep}");
-            println!("Server listening on {}", self.port);
-            println!("{sep}");
+            Self::banner_line(sep);
+            Self::banner_line(&format!("Server listening on {}", self.port));
+            Self::banner_line(sep);
         }
 
         loop {
@@ -232,9 +248,9 @@ impl Server {
                 break;
             }
             if !json {
-                println!("{sep}");
-                println!("Server listening on {}", self.port);
-                println!("{sep}");
+                Self::banner_line(sep);
+                Self::banner_line(&format!("Server listening on {}", self.port));
+                Self::banner_line(sep);
             }
         }
         Ok(())
@@ -299,15 +315,9 @@ impl Server {
         // server_output event).
         let capture = (want_server_output && !self.json_output && !self.json_stream)
             .then(crate::macros::OutputCaptureGuard::start);
-        // --timestamps prefixes every text report line — through titled(), so
-        // the capture above tees the PREFIXED line like iperf3's linebuffer
-        // (#168). Run-scoped; never in the machine-JSON modes.
-        let _ts_guard = (!self.json_output && !self.json_stream)
-            .then_some(self.timestamps.as_deref())
-            .flatten()
-            // The bare-flag "%c " default is clap's default_missing_value;
-            // by here the format is always concrete.
-            .map(crate::macros::OutputTimestampGuard::set);
+        // The timestamp guard is run-scoped — set in `run()` before the
+        // banner (#216) — so the capture above tees PREFIXED lines like
+        // iperf3's linebuffer (#168) with nothing to do per test.
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =

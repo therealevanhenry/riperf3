@@ -335,3 +335,72 @@ fn regex_lite_timestamp(line: &str) -> bool {
         && b[4].is_ascii_digit()
         && b[5] == b':'
 }
+
+/// #216: iperf3 prefixes EVERY iperf_printf line — the server's listening
+/// banner and verbose lines included (iperf_api.c:995/1017,
+/// iperf_server_api.c:137). A literal strftime format (no % directives)
+/// renders verbatim, making the assertion deterministic.
+#[test]
+fn server_banner_carries_the_timestamp_prefix() {
+    let ps = free_port().to_string();
+    let server = spawn_server_capturing(&["--timestamps=TSTAMP "], &ps);
+    let _ = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "1"],
+        Duration::from_secs(20),
+        "client for ts server",
+    );
+    let out = collect_stdout(server);
+    let banner = out
+        .lines()
+        .find(|l| l.contains("Server listening on"))
+        .expect("banner printed");
+    assert!(
+        banner.starts_with("TSTAMP "),
+        "the listening banner must carry the prefix: {banner:?}"
+    );
+    let sep = out
+        .lines()
+        .find(|l| l.contains("-----------"))
+        .expect("separator printed");
+    assert!(
+        sep.starts_with("TSTAMP "),
+        "the separator banner line too: {sep:?}"
+    );
+}
+
+/// #216: the client's verbose lines (vprintln!) carry the prefix — live
+/// iperf3 prefixes "Connecting to host" under -V --timestamps.
+#[test]
+fn client_verbose_lines_carry_the_timestamp_prefix() {
+    let ps = free_port().to_string();
+    let server = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "-1", "-p", &ps])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = common::ChildGuard(server);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "-V",
+            "--timestamps=TSTAMP ",
+        ],
+        Duration::from_secs(20),
+        "verbose timestamps",
+    );
+    let connecting = out
+        .lines()
+        .find(|l| l.contains("Connecting to host"))
+        .expect("verbose connect line");
+    assert!(
+        connecting.starts_with("TSTAMP "),
+        "vprintln lines must carry the prefix: {connecting:?}"
+    );
+    let _ = server.0.kill();
+}
