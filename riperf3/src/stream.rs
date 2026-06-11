@@ -1146,6 +1146,7 @@ pub fn run_udp_sender_sendmmsg(
     blksize: usize,
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
+    pacing_timer_us: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1166,11 +1167,13 @@ pub fn run_udp_sender_sendmmsg(
     // sendmmsg returns EAGAIN and the loop re-checks the deadline.
     let deadline = max_duration.map(|d| Instant::now() + d);
 
-    // Larger batch than the per-packet sender: sendmmsg amortizes syscall
+    // Larger ceiling than the per-packet sender: sendmmsg amortizes syscall
     // overhead so bigger batches help more than with individual send() calls.
-    // Always batch — pacing (below) is what's gated on the rate; an unlimited
-    // run (rate 0, -b 0) still needs the full batch, not one packet (#17).
-    let batch_size: usize = 128;
+    // Still bounded to about one pacing quantum at a low rate so a paced run
+    // doesn't stage one huge burst then sleep past a short test (#185); an
+    // unlimited run (rate 0, -b 0) keeps the full 128.
+    let batch_size: usize =
+        udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 128) as usize;
 
     // Switch to blocking I/O — tokio's into_std() leaves the socket
     // non-blocking, which makes sendmmsg busy-spin on EAGAIN once SO_SNDBUF
@@ -1279,6 +1282,7 @@ pub fn run_udp_sender_sendmmsg(
     blksize: usize,
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
+    pacing_timer_us: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1289,10 +1293,47 @@ pub fn run_udp_sender_sendmmsg(
         blksize,
         done,
         rate_bits_per_sec,
+        pacing_timer_us,
         use_64bit,
         start,
         max_duration,
     )
+}
+
+/// Datagrams to send between pacing clock-checks (#185). The old fixed batch
+/// represented a fixed packet COUNT regardless of rate, so at a low `-b` over a
+/// large datagram one batch was many seconds of send budget: the sender emitted
+/// a single burst, then slept past the end of a short test and reported near-zero
+/// throughput (e.g. default 1 Mbit/s on loopback, blksize ~32 KiB → a 8.4 s batch
+/// interval). Size the batch so its paced interval is about one pacing quantum
+/// (`--pacing-timer`, default 1 ms) instead, clamped to `[1, max_batch]`.
+///
+/// Whenever a quantum's worth of budget is at least `max_batch` packets — every
+/// unlimited (`-b 0`, short-circuited) run, and any paced run above
+/// `max_batch * blksize / quantum` bits/s (≈1.5 Gbit/s at `max_batch` 128, a
+/// 1448-byte datagram, and the 1 ms default) — this saturates at `max_batch`,
+/// leaving the high-rate path at the old fixed value. BELOW that, a paced run
+/// deliberately uses a smaller batch (the fix): the cost is fewer packets per
+/// `send`/`sendmmsg`, but the rate is the cap so throughput is unaffected and
+/// the amortization is still ample (e.g. ~43 packets at `-b 500M --sendmmsg`).
+fn udp_pacing_batch(
+    rate_bits_per_sec: u64,
+    blksize: usize,
+    pacing_timer_us: u32,
+    max_batch: u32,
+) -> u32 {
+    if rate_bits_per_sec == 0 {
+        return max_batch;
+    }
+    let rate_bytes = rate_bits_per_sec as f64 / 8.0;
+    let pacing_us = if pacing_timer_us == 0 {
+        crate::utils::DEFAULT_PACING_TIMER_US
+    } else {
+        pacing_timer_us
+    };
+    let quantum = Duration::from_micros(pacing_us as u64).as_secs_f64();
+    let per_quantum = (quantum * rate_bytes / blksize.max(1) as f64).floor() as u32;
+    per_quantum.clamp(1, max_batch)
 }
 
 /// Batch pacing: sends N packets in a tight loop, then does a single clock
@@ -1313,6 +1354,7 @@ fn udp_send_loop(
     blksize: usize,
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
+    pacing_timer_us: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1327,11 +1369,11 @@ fn udp_send_loop(
     let mut buf = vec![0u8; blksize];
     let mut seq: u64 = 0;
 
-    // Send 32 packets between clock checks: small enough to maintain pacing
-    // accuracy, large enough to amortize Instant::now() and atomic-counter
-    // overhead. Unconditional — pacing (below) is gated on the rate, so an
-    // unlimited run (rate 0, -b 0) still batches rather than dropping to 1 (#17).
-    let batch_size: u32 = 32;
+    // Packets between clock checks: enough to amortize Instant::now() and the
+    // atomic counters, but bounded so one batch is about a pacing quantum of
+    // send budget, not a fixed count that becomes seconds at a low rate (#185).
+    // 32 is the high-rate ceiling (the old fixed value).
+    let batch_size: u32 = udp_pacing_batch(rate_bits_per_sec, blksize, pacing_timer_us, 32);
 
     // Blocking I/O so send() backpressures in-kernel instead of returning
     // WouldBlock and truncating the batch once SO_SNDBUF fills (issue #6).
@@ -1423,6 +1465,7 @@ pub fn run_udp_sender_blocking(
     blksize: usize,
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
+    pacing_timer_us: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1434,6 +1477,7 @@ pub fn run_udp_sender_blocking(
         blksize,
         done,
         rate_bits_per_sec,
+        pacing_timer_us,
         use_64bit,
         start,
         max_duration,
@@ -1453,6 +1497,7 @@ pub(crate) fn run_udp_server_demux_sender(
     blksize: usize,
     done: Arc<AtomicBool>,
     rate_bits_per_sec: u64,
+    pacing_timer_us: u32,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1464,6 +1509,7 @@ pub(crate) fn run_udp_server_demux_sender(
         blksize,
         done,
         rate_bits_per_sec,
+        pacing_timer_us,
         use_64bit,
         start,
         max_duration,
@@ -1707,6 +1753,36 @@ pub fn run_udp_receiver_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #185: the paced UDP batch is sized to ~one pacing quantum of send budget,
+    // not a fixed packet count. A low rate over a large datagram must drop to a
+    // small batch (else one batch is many seconds and the sender bursts then
+    // starves); a high rate saturates at the ceiling; unlimited keeps it.
+    #[test]
+    fn udp_pacing_batch_scales_with_rate() {
+        // Default 1 Mbit/s over a loopback-MSS datagram: one packet already
+        // exceeds a 1 ms quantum's budget, so the batch floors at 1 (the bug
+        // was a fixed 32 → an ~8 s batch interval).
+        assert_eq!(udp_pacing_batch(1_000_000, 32_741, 1000, 32), 1);
+        // A high rate over a small datagram saturates at the ceiling.
+        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 32), 32);
+        assert_eq!(udp_pacing_batch(10_000_000_000, 1448, 1000, 128), 128);
+        // Unlimited (-b 0) is unpaced and keeps the full ceiling.
+        assert_eq!(udp_pacing_batch(0, 32_741, 1000, 32), 32);
+        // A larger --pacing-timer admits a larger batch at the same rate.
+        let small_q = udp_pacing_batch(100_000_000, 1448, 1000, 64);
+        let big_q = udp_pacing_batch(100_000_000, 1448, 10_000, 64);
+        assert!(big_q > small_q, "{big_q} should exceed {small_q}");
+        // pacing_timer 0 resolves to iperf3's 1 ms default, not a div-by-zero.
+        assert_eq!(
+            udp_pacing_batch(100_000_000, 1448, 0, 64),
+            udp_pacing_batch(100_000_000, 1448, 1000, 64),
+        );
+        // A degenerate blksize cannot divide by zero — it yields a valid
+        // clamped batch (here the max, since 1-byte packets are tiny), not a
+        // panic or a garbage value.
+        assert_eq!(udp_pacing_batch(1_000_000, 0, 1000, 32), 32);
+    }
 
     // #178 readiness barrier: wait() is trivially true with nothing spawned,
     // true once every gate-spawned thread checks in (even when the threads
@@ -2319,6 +2395,7 @@ mod tests {
             1400,
             done.clone(),
             0,
+            1000,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2357,6 +2434,7 @@ mod tests {
             1400,
             done.clone(),
             100_000_000, // 100 Mbps → rate>0 → batched + paced
+            1000,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2386,6 +2464,7 @@ mod tests {
             1400,
             done.clone(),
             0,
+            1000,
             false,
             started(),
             Some(Duration::from_millis(200)),
@@ -2415,7 +2494,8 @@ mod tests {
         });
 
         let t0 = Instant::now();
-        run_udp_sender_blocking(send, counters, 1400, done, 0, false, started(), None).unwrap();
+        run_udp_sender_blocking(send, counters, 1400, done, 0, 1000, false, started(), None)
+            .unwrap();
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "should stop shortly after done is set"
@@ -2441,6 +2521,7 @@ mod tests {
                 1400,
                 d2,
                 0,
+                1000,
                 false,
                 s2,
                 Some(Duration::from_secs(10)),
@@ -2481,6 +2562,7 @@ mod tests {
             1400,
             done,
             0,
+            1000,
             false,
             start,
             Some(Duration::from_secs(10)),
@@ -2504,7 +2586,17 @@ mod tests {
         let d = done.clone();
         let s = start.clone();
         let h = std::thread::spawn(move || {
-            run_udp_sender_blocking(send, c, 1400, d, 0, false, s, Some(Duration::from_secs(10)))
+            run_udp_sender_blocking(
+                send,
+                c,
+                1400,
+                d,
+                0,
+                1000,
+                false,
+                s,
+                Some(Duration::from_secs(10)),
+            )
         });
 
         // Parked on the barrier — nothing transmitted.

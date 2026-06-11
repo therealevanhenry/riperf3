@@ -1,0 +1,88 @@
+//! #185: a rate-limited UDP sender must pace smoothly across the run, not send
+//! one fixed-size batch then sleep past the end of a short test.
+//!
+//! At a low `-b` (the default 1 Mbit/s) over a large datagram (loopback derives
+//! a ~32 KiB blksize from the control MSS), the old fixed 32-packet batch was a
+//! ~8 s send-budget interval: the sender emitted one burst at t=0, then slept
+//! past the whole `-t` window — every datagram landed in the first interval and
+//! the rest read zero. The fix sizes the batch to ~one pacing quantum, so the
+//! traffic spreads across every interval like iperf3.
+
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use serde_json::Value;
+
+mod common;
+
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_server(port: &str) -> ChildGuard {
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    ChildGuard(
+        Command::new(bin)
+            .args(["-s", "-1", "-p", port])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    )
+}
+
+/// Default-rate UDP `-t 3 -i 1`: every one-second interval must carry traffic,
+/// and no single interval may hold the bulk of it — the signature of the old
+/// burst-then-starve (all bytes in interval 0, the rest empty).
+#[test]
+fn default_rate_udp_paces_across_intervals() {
+    let port = common::free_port().to_string();
+    let mut server = spawn_server(&port);
+
+    let out = common::run_client_ok(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &port,
+            "-u",
+            "-t",
+            "3",
+            "-i",
+            "1",
+            "-J",
+        ],
+        Duration::from_secs(20),
+        "client",
+    )
+    .stdout;
+    let _ = server.0.wait();
+
+    let v: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("client -u -J is not valid JSON ({e}): {out}"));
+    let intervals = v["intervals"].as_array().expect("intervals");
+
+    // The three full one-second intervals (a -t 3 run lands on its boundaries).
+    let per: Vec<u64> = intervals
+        .iter()
+        .map(|i| i["sum"]["bytes"].as_u64().unwrap_or(0))
+        .collect();
+    assert!(per.len() >= 3, "expected ~3 intervals: {out}");
+    let total: u64 = per.iter().sum();
+    assert!(total > 0, "no bytes sent at all: {out}");
+
+    for (n, &b) in per.iter().enumerate() {
+        assert!(
+            b > 0,
+            "interval {n} carried no bytes — sender burst then starved (#185): {per:?}"
+        );
+        assert!(
+            (b as f64) < 0.8 * total as f64,
+            "interval {n} held {b} of {total} bytes — one burst, not paced (#185): {per:?}"
+        );
+    }
+}

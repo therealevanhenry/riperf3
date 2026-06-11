@@ -900,11 +900,12 @@ impl Server {
                 let bs = cfg.blksize;
                 // Already resolved in TestConfig (#17); 0 = unlimited.
                 let rate = cfg.bandwidth;
+                let pt = cfg.pacing_timer; // #185: pace the UDP batch too
                 let u64bit = cfg.udp_counters_64bit;
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
-                    stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, u64bit, st, md)
+                    stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, pt, u64bit, st, md)
                 });
                 streams.push(DataStream {
                     id: stream_id,
@@ -1092,6 +1093,7 @@ impl Server {
         let mut routes: HashMap<SocketAddr, stream::UdpDemuxRoute> = HashMap::new();
         let bs = cfg.blksize;
         let rate = cfg.bandwidth;
+        let pt = cfg.pacing_timer; // #185: pace the UDP batch too
         let u64bit = cfg.udp_counters_64bit;
         // #178: every spawn_blocking data thread (each sender + the one demux
         // receiver) is spawned through the gate; the barrier below holds
@@ -1122,6 +1124,7 @@ impl Server {
                         bs,
                         d,
                         rate,
+                        pt,
                         u64bit,
                         st,
                         md,
