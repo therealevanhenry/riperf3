@@ -1,0 +1,132 @@
+name: Hammer
+
+# Loaded-runner flake hammer — the #178 throwaway-branch technique made
+# permanent. Replays a test profile across N parallel shard jobs × M suite
+# iterations on the chosen runner OS, to reproduce or rule out low-frequency
+# CI flakes at statistical scale. The standard protocol: hammer the unfixed
+# ref for a red baseline, then hammer the fix at the same scale (#178: 5/8
+# shards red unfixed → 24/24 green fixed).
+#
+# Read all-green honestly: 24 samples catch a true 1/20 flake with only
+# ~71% confidence (1 − 0.95²⁴). For rarer flakes, scale `iterations` up —
+# a targeted test_args profile makes hundreds of iterations affordable —
+# rather than treating one all-green dispatch as proof.
+#
+# workflow_dispatch only — never a PR check. The dispatched ref supplies both
+# this workflow file and the tested tree, so a PR branch can be hammered
+# pre-merge once the branch contains this file (branches cut before it
+# reached main 422 on dispatch — merge main into them first):
+#
+#   gh workflow run hammer.yml --ref <branch> \
+#     -f os=windows-latest -f test_args='-p riperf3-cli --test bidir_intervals' \
+#     -f shards=8 -f iterations=3
+#
+# Each shard is its own runner VM of the same class real CI jobs use, so the
+# per-run load profile matches CI — shards multiply samples, not load. (Don't
+# bake core counts in here; they change. For local repro, pin to the runner's
+# CURRENT core count — the ci-flake-repro taskset methodology.)
+
+run-name: "Hammer ${{ inputs.os }} ${{ inputs.shards }}×${{ inputs.iterations }} ${{ inputs.test_args || '--workspace' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner OS
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        default: ubuntu-latest
+      test_args:
+        description: "Args after `cargo test` (empty = --workspace), e.g. -p riperf3-cli --test bidir_intervals"
+        type: string
+        default: ""
+      shards:
+        description: Parallel shard jobs (each its own runner VM)
+        type: string
+        default: "8"
+      iterations:
+        description: Suite iterations per shard
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - id: gen
+        shell: bash
+        env:
+          SHARDS: ${{ inputs.shards }}
+        # Validate here, where the error is readable — under plain `bash -e`
+        # a bad value sails through `seq | jq` as `[]` and dies two jobs
+        # later as a cryptic empty-matrix strategy error.
+        run: |
+          [[ "$SHARDS" =~ ^[1-9][0-9]*$ ]] && (( SHARDS <= 256 )) \
+            || { echo "::error::shards must be a positive integer <= 256 (the matrix cap), got '$SHARDS'"; exit 1; }
+          # "8" → [1,2,…,8] for fromJSON into the matrix.
+          echo "shards=$(seq 1 "$SHARDS" | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  hammer:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ inputs.os }}
+    # Cold cache + full workspace × several iterations is the slow tail
+    # (ci.yml budgets 40 for ONE cold Windows run); dispatches are manual
+    # and rare, so headroom is free.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hammer-${{ inputs.os }}
+          # All shards finishing together would race to save the same cache
+          # key (benign "unable to reserve" warnings); let shard 1 own the
+          # save. cache-on-failure because the documented FIRST phase of the
+          # protocol is a red baseline — rust-cache's post step is otherwise
+          # gated on job success, and every baseline dispatch would start
+          # cold forever.
+          cache-on-failure: true
+          save-if: ${{ matrix.shard == 1 }}
+      - name: Run suite ${{ inputs.iterations }}×
+        shell: bash
+        env:
+          TEST_ARGS: ${{ inputs.test_args }}
+          ITERATIONS: ${{ inputs.iterations }}
+        # Keep going after a red iteration — a hammer measures failure RATE,
+        # so every iteration is a sample. Exit code = red-iteration count,
+        # capped at 255 (bash exits wrap mod 256 — an uncapped 256 reds
+        # would read as green).
+        run: |
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::iterations must be a positive integer, got '$ITERATIONS'"; exit 1; }
+          args="${TEST_ARGS:---workspace}"
+          fails=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "::group::iteration $i/$ITERATIONS"
+            # shellcheck disable=SC2086 # word-splitting $args is the contract
+            if ! cargo test $args; then
+              fails=$((fails + 1))
+              echo "::error::shard ${{ matrix.shard }} iteration $i failed"
+            fi
+            echo "::endgroup::"
+          done
+          echo "shard ${{ matrix.shard }}: $((ITERATIONS - fails))/$ITERATIONS iterations green"
+          exit "$(( fails > 255 ? 255 : fails ))"
