@@ -1690,14 +1690,7 @@ pub(crate) fn run_udp_server_demux_receiver(
             // (that needs IP_RECVERR); the arm is live on Windows, where
             // winsock latches WSAECONNRESET per send_to target. A break here
             // would silently end reception for EVERY stream at once.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -1707,10 +1700,6 @@ pub(crate) fn run_udp_server_demux_receiver(
     Ok(())
 }
 
-/// `recv_from` analogue of [`drain_udp_after_done`] for the single-socket demux:
-/// after the test ends, keep the shared socket open and discard late datagrams
-/// (from any source) until one read-timeout of silence, bounded by
-/// [`UDP_RECEIVER_DRAIN_TIMEOUT`]. See [`drain_udp_after_done`] for the why.
 /// Reset-class noise on a UDP socket (#178/#180): ICMP port-unreachable
 /// blowback from something WE sent to a port that just closed. Windows
 /// latches WSAECONNRESET per send_to target even on an unconnected socket;
@@ -1723,6 +1712,10 @@ pub(crate) fn is_reset_class(e: &std::io::Error) -> bool {
     )
 }
 
+/// `recv_from` analogue of [`drain_udp_after_done`] for the single-socket demux:
+/// after the test ends, keep the shared socket open and discard late datagrams
+/// (from any source) until one read-timeout of silence, bounded by
+/// [`UDP_RECEIVER_DRAIN_TIMEOUT`]. See [`drain_udp_after_done`] for the why.
 fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
     let deadline = Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
     while Instant::now() < deadline {
@@ -1837,14 +1830,7 @@ pub fn run_udp_receiver_blocking(
             // here silently ended the reverse flow: a bidir run completed
             // "normally" with sum_bidir_reverse 0 throughout (windows-latest
             // CI signature).
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                continue
-            }
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -2280,13 +2266,6 @@ mod tests {
         // Effective (post-omit) packet count: 6 - 3 = 3
         assert_eq!(stats.packet_count - stats.omitted_packet_count, 3);
     }
-
-    // -- RateLimiter --
-
-    // #116: with TCP's 128 KiB default block, the old token bucket's burst
-    // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
-    // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
-    // total sent to elapsed*rate + one in-flight block at any rate/blksize.
     #[test]
     fn reset_class_covers_both_platform_shapes() {
         // #180: WSAECONNRESET (Windows, unconnected send_to blowback) and
@@ -2299,6 +2278,12 @@ mod tests {
         assert!(!is_reset_class(&Error::from(ErrorKind::BrokenPipe)));
     }
 
+    // -- RateLimiter --
+
+    // #116: with TCP's 128 KiB default block, the old token bucket's burst
+    // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
+    // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
+    // total sent to elapsed*rate + one in-flight block at any rate/blksize.
     /// A `done` flag that never fires, for limiter tests.
     fn never_done() -> AtomicBool {
         AtomicBool::new(false)
