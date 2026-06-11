@@ -172,6 +172,16 @@ impl PartialEq for InterruptWatch {
     }
 }
 
+// The watch receiver is not UnwindSafe (its shared slot uses interior
+// mutability), which would strip the marker from Client/Server and their
+// builders — a semver break (CI's auto_trait_impl_removed). riperf3's usage
+// is panic-consistent: the receiver is only ever POLLED (changed +
+// borrow_and_update) and the channel's state is a version counter plus an
+// Arc'd value slot, so observing it across an unwind cannot expose a broken
+// invariant of ours.
+impl std::panic::UnwindSafe for InterruptWatch {}
+impl std::panic::RefUnwindSafe for InterruptWatch {}
+
 #[derive(Debug)]
 enum ControlEvent {
     /// A local interrupt (the CLI's first signal, #210) carrying the
