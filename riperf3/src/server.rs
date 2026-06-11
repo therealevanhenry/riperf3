@@ -697,9 +697,18 @@ impl Server {
         rate_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         rate_check.tick().await; // skip immediate tick
 
-        let mut server_terminated = false;
-        // #210: a peer- or self-terminated test skips the results exchange
-        // (the peer is gone / told to stop) but still dumps local results.
+        // #224 (iperf 3.21 ground truth): a SELF-terminated test (bitrate
+        // limit / max duration) relays SERVER_ERROR + i_errno and skips BOTH
+        // the exchange and the local summary dump; the message lands on the
+        // server's own error sink. iperf_strerror(IETOTALRATE) for the rate
+        // arm; the duration arm prints server_timer_proc's LITERAL line
+        // (the client side shows strerror(160) instead).
+        const SELF_TERM_RATE_MSG: &str = "total required bandwidth is larger than server limit";
+        const SELF_TERM_DURATION_MSG: &str =
+            "server test duration expired - test is terminated by the server";
+        let mut server_error: Option<&'static str> = None;
+        // #210: a peer-terminated or interrupted test skips the results
+        // exchange (the peer is gone) but still dumps local results.
         let mut client_terminated = false;
         let mut interrupted: Option<String> = None;
         let mut interrupt_rx = self.interrupt.clone().map(|w| w.0);
@@ -736,22 +745,24 @@ impl Server {
                         let bits_per_sec = total_bytes as f64 * 8.0 / elapsed;
                         if let Some(limit) = bitrate_limit {
                             if bits_per_sec > limit as f64 {
-                                protocol::send_state(&mut ctrl, TestState::ServerTerminate).await?;
-                                server_terminated = true;
+                                // #224: SERVER_ERROR + IETOTALRATE(27), not
+                                // SERVER_TERMINATE (iperf 3.21 GT).
+                                protocol::send_server_error(&mut ctrl, 27).await?;
+                                server_error = Some(SELF_TERM_RATE_MSG);
                                 break;
                             }
                         }
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(max_dur_secs)), if max_dur_secs > 0 => {
-                    protocol::send_state(&mut ctrl, TestState::ServerTerminate).await?;
-                    server_terminated = true;
+                    // #224: iperf3's server_timer_proc — SERVER_ERROR +
+                    // IESERVERTESTDURATIONEXPIRED(160) on the wire.
+                    protocol::send_server_error(&mut ctrl, 160).await?;
+                    server_error = Some(SELF_TERM_DURATION_MSG);
                     break;
                 }
             }
         }
-
-        let _ = server_terminated;
 
         // ---- Shut down streams ----
         // Hand the reporter the authoritative end time, then stop the streams
@@ -776,8 +787,21 @@ impl Server {
         } else if client_terminated {
             Some("the client has terminated".to_string())
         } else {
-            None
+            // iperf_err's in-doc wart, mirrored exactly: on SELF-terminate
+            // the -J error key carries an "error - " prefix (GT iperf 3.21:
+            // "error - total required bandwidth is larger than server
+            // limit") where the peer-terminate keys carry none.
+            server_error.map(|msg| format!("error - {msg}"))
         };
+        // The self-terminate line on the server's own stderr (iperf_err; the
+        // JSON sinks carry it via report_error instead). iperf3's one-off
+        // still EXITS 0 after this — live-verified wart, mirrored by NOT
+        // returning an error from this path (#224).
+        if let Some(msg) = server_error {
+            if !self.json_output && !self.json_stream {
+                eprintln!("riperf3: error - {msg}");
+            }
+        }
 
         // Wait briefly then join tasks (senders may be blocked on write)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -790,6 +814,7 @@ impl Server {
             || params.blockcount.is_some()
             || client_terminated
             || interrupted.is_some()
+            || server_error.is_some()
         {
             // Rebase to the post-omit window (#31): the measured elapsed
             // includes the warm-up the summary must exclude. A terminated
@@ -895,29 +920,32 @@ impl Server {
             (None, None)
         };
         let was_captured = server_output_text.is_some();
-        let server_results = TestResultsJson {
-            cpu_util_total: cpu_util.host_total,
-            cpu_util_user: cpu_util.host_user,
-            cpu_util_system: cpu_util.host_system,
-            // #156: 1 when this side is a retransmit-capable TCP sender
-            // (reverse/bidir), like iperf3's check_sender_has_retransmits.
-            sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
-                i64::from(
-                    matches!(cfg.protocol, TransportProtocol::Tcp)
-                        && crate::tcp_info::has_retransmit_info(),
-                )
-            } else {
-                -1
-            },
-            // #37: the congestion algorithm actually in effect (read back at stream
-            // creation); None for UDP / unsupported platforms.
-            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
-            server_output_text,
-            server_output_json,
-            streams: result_streams,
-        };
 
-        if !client_terminated && interrupted.is_none() {
+        if !client_terminated && interrupted.is_none() && server_error.is_none() {
+            // Built only when the exchange actually runs — it was dead work
+            // on every terminate path (#224).
+            let server_results = TestResultsJson {
+                cpu_util_total: cpu_util.host_total,
+                cpu_util_user: cpu_util.host_user,
+                cpu_util_system: cpu_util.host_system,
+                // #156: 1 when this side is a retransmit-capable TCP sender
+                // (reverse/bidir), like iperf3's check_sender_has_retransmits.
+                sender_has_retransmits: if streams.iter().any(|s| s.is_sender) {
+                    i64::from(
+                        matches!(cfg.protocol, TransportProtocol::Tcp)
+                            && crate::tcp_info::has_retransmit_info(),
+                    )
+                } else {
+                    -1
+                },
+                // #37: the congestion algorithm actually in effect (read back at stream
+                // creation); None for UDP / unsupported platforms.
+                congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
+                server_output_text,
+                server_output_json,
+                streams: result_streams,
+            };
+
             protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
             // iperf3 protocol: server reads client results first, then sends its
             // own. The client's results are not used in the server's own report —
@@ -938,11 +966,6 @@ impl Server {
                     Err(e) => return Err(e),
                 }
             }
-        } else {
-            // A terminated run still uses the built local results for the
-            // report below; the exchange is skipped (iperf3's sigend/peer-
-            // terminate paths never reach it).
-            let _ = &server_results;
         }
 
         // #220: stream mode WINS when both flags are set — iperf3's
@@ -993,9 +1016,12 @@ impl Server {
                 )
             });
             self.print_results_json(&report);
-        } else if !was_captured {
+        } else if !was_captured && server_error.is_none() {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
+            // Also skipped on self-terminate: iperf3 prints NO summary there
+            // (#224 GT — text gets only the stderr line, -J still gets the
+            // full doc via the branch above).
             // Skipped when --get-server-output already rendered them (#33):
             // the pre-exchange render TEE'd to console + capture (iperf3 also
             // prints at TEST_END, before its exchange), so printing here again
