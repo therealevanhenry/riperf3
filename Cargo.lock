@@ -832,6 +832,9 @@ dependencies = [
 [[package]]
 name = "riperf3-test-support"
 version = "0.7.3"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "rpassword"
