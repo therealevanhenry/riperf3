@@ -2166,11 +2166,6 @@ impl ClientBuilder {
                     "this OS does not support sendfile".into(),
                 ));
             }
-            if self.bind_dev.is_some() {
-                return Err(ConfigError::Unsupported(
-                    "SO_BINDTODEVICE is not supported on this platform".into(),
-                ));
-            }
             if self.congestion.is_some() {
                 return Err(ConfigError::Unsupported(
                     "TCP congestion control is not supported on this platform".into(),
@@ -2181,6 +2176,17 @@ impl ClientBuilder {
                     "UDP GSO/GRO is not supported on this platform".into(),
                 ));
             }
+        }
+
+        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS). The
+        // old gate only covered not(unix), so FreeBSD/NetBSD silently
+        // no-opped through net.rs's fallback — no binding, no error (#149).
+        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev is not supported on this platform".into(),
+            ));
         }
 
         // sendmmsg's real implementation is Linux/FreeBSD/NetBSD only; elsewhere

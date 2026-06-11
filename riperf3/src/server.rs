@@ -151,6 +151,9 @@ pub struct Server {
     pub(crate) server_max_duration: Option<u32>,
     pub(crate) forceflush: bool,
     pub(crate) bind_address: Option<String>,
+    /// `--bind-dev`: bind the listener (and UDP server sockets) to a device,
+    /// like iperf3's netannounce (#149).
+    pub(crate) bind_dev: Option<String>,
     pub(crate) ip_version: Option<u8>,
     pub(crate) timestamps: Option<String>,
     pub(crate) file: Option<String>,
@@ -194,8 +197,13 @@ impl Server {
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
         // threads (#81). The library must not fork here.
-        let listener =
-            net::tcp_listen(self.bind_address.as_deref(), self.port, self.ip_version).await?;
+        let listener = net::tcp_listen(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
         // Under -J / --json-stream iperf3's server stdout is pure JSON (the
         // "Server listening" banners are suppressed) so the document parses
         // cleanly; match that.
@@ -897,9 +905,13 @@ impl Server {
         start: &Arc<AtomicBool>,
         streams: &mut Vec<DataStream>,
     ) -> Result<()> {
-        let mut udp_listener =
-            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
-                .await?;
+        let mut udp_listener = net::udp_bind_reusable(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -925,6 +937,7 @@ impl Server {
                     self.bind_address.as_deref(),
                     self.port,
                     self.ip_version,
+                    self.bind_dev.as_deref(),
                 )
                 .await?;
             } else {
@@ -1050,9 +1063,13 @@ impl Server {
         // One unconnected dual-stack socket for the whole test. Never connect()'d
         // and never sharing its port with a second socket, so there is no
         // connected+wildcard pair for winsock to drop a new source against (#80).
-        let udp_sock =
-            net::udp_bind_reusable(self.bind_address.as_deref(), self.port, self.ip_version)
-                .await?;
+        let udp_sock = net::udp_bind_reusable(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -1620,6 +1637,7 @@ pub struct ServerBuilder {
     server_max_duration: Option<u32>,
     forceflush: bool,
     bind_address: Option<String>,
+    bind_dev: Option<String>,
     ip_version: Option<u8>,
     timestamps: Option<String>,
     file: Option<String>,
@@ -1642,6 +1660,7 @@ impl Default for ServerBuilder {
             server_max_duration: None,
             forceflush: false,
             bind_address: None,
+            bind_dev: None,
             ip_version: None,
             timestamps: None,
             file: None,
@@ -1719,6 +1738,16 @@ impl ServerBuilder {
     }
 
     /// `-B/--bind`: bind the listener to a specific local address.
+    /// `--bind-dev`: bind the listening socket (and the UDP server sockets)
+    /// to a network device, like iperf3's netannounce (#149). Linux
+    /// (SO_BINDTODEVICE) and macOS (IP_BOUND_IF) only; rejected at `build()`
+    /// elsewhere, mirroring iperf3 (which compiles the option out without
+    /// CAN_BIND_TO_DEVICE).
+    pub fn bind_dev(mut self, dev: &str) -> Self {
+        self.bind_dev = Some(dev.to_string());
+        self
+    }
+
     pub fn bind_address(mut self, addr: &str) -> Self {
         self.bind_address = Some(addr.to_string());
         self
@@ -1787,6 +1816,17 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> std::result::Result<Server, ConfigError> {
+        // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS);
+        // everywhere else reject at config time like the client builder —
+        // iperf3 without CAN_BIND_TO_DEVICE doesn't recognize the option at
+        // all, so a silent no-op bind would be the worst behavior (#149).
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if self.bind_dev.is_some() {
+            return Err(ConfigError::Unsupported(
+                "--bind-dev is not supported on this platform".into(),
+            ));
+        }
+
         // Reject -4/-6 contradicting an explicit -B of the opposite family,
         // instead of silently letting the bind address win (issue #12).
         if let (Some(v), Some(addr)) = (self.ip_version, self.bind_address.as_deref()) {
@@ -1813,6 +1853,7 @@ impl ServerBuilder {
             server_max_duration: self.server_max_duration,
             forceflush: self.forceflush,
             bind_address: self.bind_address,
+            bind_dev: self.bind_dev,
             ip_version: self.ip_version,
             timestamps: self.timestamps,
             file: self.file,
