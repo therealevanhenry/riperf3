@@ -211,3 +211,131 @@ fn server_json_stream_is_valid_ndjson() {
         .unwrap();
     assert_valid_ndjson(&out, "server");
 }
+
+/// #213: --json-stream-full-output is the third leg of discard_json — the
+/// NDJSON stream is followed by the complete monolithic -J document
+/// (iperf_api.c:5323 keeps print_full_json under the flag), with populated
+/// intervals.
+#[test]
+fn json_stream_full_output_appends_the_monolithic_document() {
+    let ps = free_port().to_string();
+    let server = Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "-1", "-p", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "2",
+            "-i",
+            "1",
+            "--json-stream",
+            "--json-stream-full-output",
+        ],
+        Duration::from_secs(20),
+        "json-stream full-output",
+    );
+    // The NDJSON part still leads (event-enveloped single lines)…
+    let first = out.lines().next().expect("output");
+    assert!(
+        first.starts_with("{\"event\":"),
+        "stream still leads: {first}"
+    );
+    // …and a pretty multi-line document follows the `end` event.
+    let end_pos = out.find("{\"event\":\"end\"").expect("end event");
+    let doc_pos = out[end_pos..]
+        .find("{\n")
+        .map(|i| i + end_pos)
+        .expect("a pretty monolithic document must follow the end event");
+    let doc: Value = serde_json::from_str(out[doc_pos..].trim()).expect("document parses");
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "the document carries populated intervals (discard_json off)"
+    );
+    assert!(doc["end"].is_object());
+    let _ = server.0.kill();
+}
+
+/// #213 negative: without the flag, nothing follows the end event.
+#[test]
+fn json_stream_without_full_output_ends_at_the_end_event() {
+    let ps = free_port().to_string();
+    let server = Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "-1", "-p", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "--json-stream"],
+        Duration::from_secs(20),
+        "json-stream plain",
+    );
+    let end_pos = out.find("{\"event\":\"end\"").expect("end event");
+    let tail = out[end_pos..].lines().skip(1).collect::<Vec<_>>().join("");
+    assert!(
+        tail.trim().is_empty(),
+        "nothing may follow the end event without the flag: {tail:?}"
+    );
+    let _ = server.0.kill();
+}
+
+/// #213 (server role): the server keeps intervals under the flag and its
+/// stdout carries the trailing document after its own NDJSON stream.
+#[test]
+fn server_json_stream_full_output_appends_the_document() {
+    let ps = free_port().to_string();
+    let server = Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args([
+            "-s",
+            "-1",
+            "-p",
+            &ps,
+            "--json-stream",
+            "--json-stream-full-output",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"],
+        Duration::from_secs(20),
+        "plain client",
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.0.try_wait().expect("try_wait").is_none() {
+        assert!(std::time::Instant::now() < deadline, "server did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut out = String::new();
+    server
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let end_pos = out.find("{\"event\":\"end\"").expect("server end event");
+    let doc_pos = out[end_pos..]
+        .find("{\n")
+        .map(|i| i + end_pos)
+        .expect("server document follows its stream");
+    let doc: Value = serde_json::from_str(out[doc_pos..].trim()).expect("server document parses");
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "server-side intervals retained under the flag"
+    );
+}

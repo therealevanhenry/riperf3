@@ -189,7 +189,8 @@ macro_rules! vprintln {
         {
             log::info!($($arg)*);
             let line = format!(
-                "{}{}",
+                "{}{}{}",
+                $crate::macros::output_timestamp_prefix(),
                 $crate::macros::output_title_prefix(),
                 format_args!($($arg)*)
             );

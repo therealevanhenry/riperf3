@@ -51,6 +51,7 @@ pub struct Client {
     /// formatted interrupt message; the run dumps stats, sends
     /// CLIENT_TERMINATE, and returns normally.
     pub(crate) interrupt: Option<InterruptWatch>,
+    pub(crate) json_stream_full_output: bool,
     pub(crate) bytes_to_send: Option<u64>,
     pub(crate) blocks_to_send: Option<u64>,
     pub(crate) repeating_payload: bool,
@@ -1068,7 +1069,10 @@ impl Client {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
-                    keep_intervals: false,
+                    // The client keeps intervals only under
+                    // --json-stream-full-output (iperf3's discard_json,
+                    // second leg) (#213).
+                    keep_intervals: self.json_stream_full_output,
                     bidir: self.bidir,
                     is_server: false,
                 },
@@ -1804,10 +1808,17 @@ impl Client {
             start_meta,
             test_duration,
         );
+        let report = input.build();
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
-            &input.build().end,
+            &report.end,
         ));
+        // --json-stream-full-output: the complete monolithic document also
+        // prints after the stream, like iperf_json_finish keeping
+        // print_full_json under the flag (iperf_api.c:5323) (#213).
+        if self.json_stream_full_output {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
     }
 }
 
@@ -1855,6 +1866,7 @@ pub struct ClientBuilder {
     json_output: bool,
     json_stream: bool,
     interrupt: Option<InterruptWatch>,
+    json_stream_full_output: bool,
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
     repeating_payload: bool,
@@ -1914,6 +1926,7 @@ impl Default for ClientBuilder {
             json_output: false,
             json_stream: false,
             interrupt: None,
+            json_stream_full_output: false,
             bytes_to_send: None,
             blocks_to_send: None,
             repeating_payload: false,
@@ -2141,6 +2154,11 @@ impl ClientBuilder {
     /// exit (iperf3 exits 0 on TERM/INT/HUP).
     pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(InterruptWatch(rx));
+    /// With json-stream, also print the complete monolithic JSON document
+    /// after the stream ends — iperf3's `--json-stream-full-output`, the
+    /// third leg of its discard_json condition (#213).
+    pub fn json_stream_full_output(mut self, enabled: bool) -> Self {
+        self.json_stream_full_output = enabled;
         self
     }
 
@@ -2589,6 +2607,7 @@ impl ClientBuilder {
             json_output: self.json_output,
             json_stream: self.json_stream,
             interrupt: self.interrupt.clone(),
+            json_stream_full_output: self.json_stream_full_output,
             // 0 means "no limit" in iperf3 (`-n 0`/`-k 0` run a plain duration
             // test — its end-condition checks gate on the value), so normalize
             // to unset here rather than ending the test instantly (#140).

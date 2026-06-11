@@ -168,6 +168,7 @@ pub struct Server {
     /// #210: fired by the consumer (the CLI's first signal); a running test
     /// dumps stats, sends SERVER_TERMINATE, and `run()` returns.
     pub(crate) interrupt: Option<crate::client::InterruptWatch>,
+    pub(crate) json_stream_full_output: bool,
 }
 
 /// Best-effort source IP the kernel would use to reach `client_addr`, paired
@@ -200,6 +201,12 @@ impl Server {
     pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(crate::client::InterruptWatch(rx));
         self
+    /// A non-report stdout line (the listening banner): iperf3 routes these
+    /// through iperf_printf too, so they carry the `--timestamps` prefix
+    /// (#216). Not tee'd into the --get-server-output capture — iperf3's
+    /// banner prints before the test's JSON/capture exists.
+    fn banner_line(line: &str) {
+        println!("{}{line}", crate::macros::output_timestamp_prefix());
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -218,11 +225,19 @@ impl Server {
         // "Server listening" banners are suppressed) so the document parses
         // cleanly; match that.
         let json = self.json_output || self.json_stream;
+        // Run-scoped, BEFORE the banner: iperf3 prefixes every iperf_printf
+        // line, the listening banner included (#216). --timestamps is the
+        // server's own flag (not exchanged), so run scope is its natural
+        // home; the per-test guard this replaces missed the banner.
+        let _ts_guard = (!json)
+            .then_some(self.timestamps.as_deref())
+            .flatten()
+            .map(crate::macros::OutputTimestampGuard::set);
         let sep = "-----------------------------------------------------------";
         if !json {
-            println!("{sep}");
-            println!("Server listening on {}", self.port);
-            println!("{sep}");
+            Self::banner_line(sep);
+            Self::banner_line(&format!("Server listening on {}", self.port));
+            Self::banner_line(sep);
         }
 
         let mut interrupt_fired = self.interrupt.clone().map(|w| w.0);
@@ -262,9 +277,9 @@ impl Server {
                 break;
             }
             if !json {
-                println!("{sep}");
-                println!("Server listening on {}", self.port);
-                println!("{sep}");
+                Self::banner_line(sep);
+                Self::banner_line(&format!("Server listening on {}", self.port));
+                Self::banner_line(sep);
             }
         }
         Ok(())
@@ -329,15 +344,9 @@ impl Server {
         // server_output event).
         let capture = (want_server_output && !self.json_output && !self.json_stream)
             .then(crate::macros::OutputCaptureGuard::start);
-        // --timestamps prefixes every text report line — through titled(), so
-        // the capture above tees the PREFIXED line like iperf3's linebuffer
-        // (#168). Run-scoped; never in the machine-JSON modes.
-        let _ts_guard = (!self.json_output && !self.json_stream)
-            .then_some(self.timestamps.as_deref())
-            .flatten()
-            // The bare-flag "%c " default is clap's default_missing_value;
-            // by here the format is always concrete.
-            .map(crate::macros::OutputTimestampGuard::set);
+        // The timestamp guard is run-scoped — set in `run()` before the
+        // banner (#216) — so the capture above tees PREFIXED lines like
+        // iperf3's linebuffer (#168) with nothing to do per test.
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -642,9 +651,11 @@ impl Server {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
-                    // iperf3's discard_json: a json-stream server RETAINS the
-                    // interval objects when the client asked for output (#168).
-                    keep_intervals: want_server_output && self.json_stream,
+                    // iperf3's discard_json: a json-stream run RETAINS the
+                    // interval objects when the client asked for output OR
+                    // under --json-stream-full-output (#168, #213).
+                    keep_intervals: self.json_stream
+                        && (want_server_output || self.json_stream_full_output),
                     bidir: cfg.bidir,
                     is_server: true,
                 },
@@ -1722,10 +1733,16 @@ impl Server {
             interval_data,
             error,
         );
+        let report = input.build();
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
-            &input.build().end,
+            &report.end,
         ));
+        // --json-stream-full-output: the monolithic document follows the
+        // stream, like iperf_json_finish under the flag (#213).
+        if self.json_stream_full_output {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
     }
 
     /// `--json-stream`: emit the server's `start` event (#62), before any interval
@@ -1787,6 +1804,7 @@ pub struct ServerBuilder {
     json_output: bool,
     json_stream: bool,
     interrupt: Option<crate::client::InterruptWatch>,
+    json_stream_full_output: bool,
 }
 
 impl Default for ServerBuilder {
@@ -1811,6 +1829,7 @@ impl Default for ServerBuilder {
             json_output: false,
             json_stream: false,
             interrupt: None,
+            json_stream_full_output: false,
         }
     }
 }
@@ -1857,6 +1876,11 @@ impl ServerBuilder {
     /// the signal-normal exit.
     pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
         self.interrupt = Some(crate::client::InterruptWatch(rx));
+    /// With json-stream, also print the complete monolithic JSON document
+    /// after the stream ends — iperf3's `--json-stream-full-output`, the
+    /// third leg of its discard_json condition (#213).
+    pub fn json_stream_full_output(mut self, enabled: bool) -> Self {
+        self.json_stream_full_output = enabled;
         self
     }
 
@@ -2018,6 +2042,7 @@ impl ServerBuilder {
             json_output: self.json_output,
             json_stream: self.json_stream,
             interrupt: self.interrupt.clone(),
+            json_stream_full_output: self.json_stream_full_output,
         })
     }
 }

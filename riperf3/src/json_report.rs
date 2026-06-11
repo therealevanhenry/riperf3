@@ -154,6 +154,50 @@ pub struct Report {
 /// notably the cJSON-style float rendering (`ser_f64`, #57) — so a streamed
 /// `start` / `interval` / `end` object is byte-for-byte the same as the
 /// corresponding section of the batched `-J` report.
+/// The minimal pre-test error document for `-J` runs (#198): iperf3's
+/// iperf_errexit emits `{start:{connected:[],version,system_info},
+/// intervals:[], end:{}, error}` on stdout and nothing to stderr
+/// (live-captured against 3.20+). Pretty-printed like the normal `-J` body.
+pub fn error_document(error: &str) -> String {
+    // Field-ordered structs, not serde_json::json! — its maps serialize
+    // alphabetically, breaking iperf3's start/intervals/end/error order
+    // (the #168 envelope lesson).
+    #[derive(Serialize)]
+    struct ErrStart {
+        connected: [(); 0],
+        version: String,
+        system_info: String,
+    }
+    #[derive(Serialize)]
+    struct ErrDoc {
+        start: ErrStart,
+        intervals: [(); 0],
+        end: serde_json::Map<String, serde_json::Value>,
+        error: String,
+    }
+    serde_json::to_string_pretty(&ErrDoc {
+        start: ErrStart {
+            connected: [],
+            version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+            system_info: crate::utils::system_info(),
+        },
+        intervals: [],
+        end: serde_json::Map::new(),
+        error: error.to_string(),
+    })
+    .unwrap()
+}
+
+/// The `--json-stream` pre-test error tail (#198): an `error` event followed
+/// by an empty `end` event, iperf3's JSONStream_Output order on errexit.
+pub fn error_stream_events(error: &str) -> String {
+    format!(
+        "{}\n{}",
+        json_stream_event("error", &error),
+        json_stream_event("end", &serde_json::json!({}))
+    )
+}
+
 pub(crate) fn json_stream_event<T: Serialize>(event: &'static str, data: &T) -> String {
     #[derive(Serialize)]
     struct Event<'a, T: Serialize> {
