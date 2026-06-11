@@ -36,15 +36,11 @@ pub struct Cli {
     pub port: Option<u16>,
 
     /// Format to report: Kbits, Mbits, Gbits, Tbits
-    #[arg(
-        short,
-        long,
-        ignore_case = true,
-        value_enum,
-        value_name = "format",
-        default_value = "m"
-    )]
-    pub format: Format,
+    #[arg(short, long, ignore_case = true, value_enum, value_name = "format")]
+    /// iperf3 has NO default -f: absent, every figure auto-scales
+    /// (unit_snprintf 'a'/'A'). The old forced "m" default printed
+    /// 12120.88 MBytes where iperf3 prints 11.8 GBytes (#221).
+    pub format: Option<Format>,
 
     /// Seconds between periodic throughput reports
     #[arg(short, long, value_name = "interval")]
@@ -481,14 +477,16 @@ impl Cli {
 
         let mut builder = riperf3::ClientBuilder::new(host);
 
-        // Format: K/M/G/T → lowercase char for bits, uppercase for bytes
-        let format_char = match self.format {
-            Format::K => 'k',
-            Format::M => 'm',
-            Format::G => 'g',
-            Format::T => 't',
-        };
-        builder = builder.format_char(format_char);
+        // Format: K/M/G/T → lowercase char for bits, uppercase for bytes;
+        // absent → the library's adaptive default ('a'), like iperf3 (#221).
+        if let Some(f) = &self.format {
+            builder = builder.format_char(match f {
+                Format::K => 'k',
+                Format::M => 'm',
+                Format::G => 'g',
+                Format::T => 't',
+            });
+        }
 
         if let Some(port) = self.port {
             builder = builder.port(Some(port));
@@ -1013,13 +1011,11 @@ mod cli_tests {
             cli.build_server().unwrap()
         }
 
-        /// A `ClientBuilder` pre-seeded with the CLI's unconditional defaults, so
-        /// wiring-test expectations match what `build_client` produces. The CLI
-        /// always sets the report format (default `-f m`), whereas the bare
-        /// library builder defaults to 'a' (auto); without this baseline the
-        /// comparisons would differ only in `format_char`.
+        /// A `ClientBuilder` matching the CLI's no-flag defaults. Since #221
+        /// the CLI no longer forces a format: absent -f, the library's
+        /// adaptive default ('a') stands, like iperf3.
         fn expected_client(host: &str) -> riperf3::ClientBuilder {
-            riperf3::ClientBuilder::new(host).format_char('m')
+            riperf3::ClientBuilder::new(host)
         }
 
         #[test]
