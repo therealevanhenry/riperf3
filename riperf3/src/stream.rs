@@ -1711,6 +1711,18 @@ pub(crate) fn run_udp_server_demux_receiver(
 /// after the test ends, keep the shared socket open and discard late datagrams
 /// (from any source) until one read-timeout of silence, bounded by
 /// [`UDP_RECEIVER_DRAIN_TIMEOUT`]. See [`drain_udp_after_done`] for the why.
+/// Reset-class noise on a UDP socket (#178/#180): ICMP port-unreachable
+/// blowback from something WE sent to a port that just closed. Windows
+/// latches WSAECONNRESET per send_to target even on an unconnected socket;
+/// Linux surfaces ECONNREFUSED only on connected sockets. Neither is an EOF
+/// — receivers skip and keep going.
+pub(crate) fn is_reset_class(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
     let deadline = Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
     while Instant::now() < deadline {
@@ -1722,6 +1734,11 @@ fn drain_udp_demux_after_done(socket: &std::net::UdpSocket, buf: &mut [u8]) {
             {
                 break
             }
+            // One client's reset-class noise must not end the SHARED drain
+            // for every client — that reopens the #48 reset against a
+            // still-sending iperf3 <=3.12 peer. The deadline above bounds
+            // the loop, so continuing is safe (#180).
+            Err(e) if is_reset_class(&e) => continue,
             Err(_) => break,
         }
     }
@@ -2270,6 +2287,18 @@ mod tests {
     // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
     // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
     // total sent to elapsed*rate + one in-flight block at any rate/blksize.
+    #[test]
+    fn reset_class_covers_both_platform_shapes() {
+        // #180: WSAECONNRESET (Windows, unconnected send_to blowback) and
+        // ECONNREFUSED (Linux, connected sockets) — neither is an EOF.
+        use std::io::{Error, ErrorKind};
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_reset_class(&Error::from(ErrorKind::ConnectionRefused)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_reset_class(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
     /// A `done` flag that never fires, for limiter tests.
     fn never_done() -> AtomicBool {
         AtomicBool::new(false)
