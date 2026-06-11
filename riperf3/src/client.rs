@@ -165,12 +165,12 @@ impl Client {
             .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
         // --timestamps prefixes every text report line, run-scoped like the
         // title; never in the machine-JSON modes (#168).
-        let _ts_guard =
-            (self.timestamps.is_some() && !self.json_output && !self.json_stream).then(|| {
-                crate::macros::OutputTimestampGuard::set(
-                    self.timestamps.as_deref().unwrap_or("%c "),
-                )
-            });
+        let _ts_guard = (!self.json_output && !self.json_stream)
+            .then(|| self.timestamps.as_deref())
+            .flatten()
+            // The bare-flag "%c " default is clap's default_missing_value;
+            // by here the format is always concrete.
+            .map(crate::macros::OutputTimestampGuard::set);
 
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
