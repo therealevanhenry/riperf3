@@ -155,7 +155,6 @@ pub(crate) fn emit_json_stream_line(line: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Print one interval line.
 /// The interval row's (Transfer, Bitrate) cell pair. Pure so the
 /// Transfer-always-'A' rule is PINNABLE (r2 review: the print path's 'A'
 /// was mutation-silent — no test passes -f, and absent -f both variants
@@ -176,6 +175,7 @@ fn interval_cells(bytes: u64, start: f64, end: f64, format_char: char) -> (Strin
     (transfer, units::format_rate(bits_per_sec, format_char))
 }
 
+/// Print one interval line.
 pub fn print_interval(interval: &StreamInterval, format_char: char) {
     let id = fmt_id_role(interval.stream_id, interval.role_tag);
     let (transfer, rate) =
@@ -1281,6 +1281,8 @@ pub fn spawn_interval_reporter(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// #221 r2: the interval row's Transfer stays adaptive under an explicit
     /// -f while Bitrate follows it — pinned on the pure helper (the print
     /// path was mutation-silent).
@@ -1291,8 +1293,6 @@ mod tests {
         assert!(rate.ends_with(" Mbits/sec"), "{rate}");
         assert!(rate.starts_with("96960"), "{rate}");
     }
-
-    use super::*;
 
     #[test]
     fn stream_interval_tcp_basic() {
