@@ -396,11 +396,17 @@ pub struct IntervalSum {
 #[non_exhaustive]
 pub struct End {
     pub streams: Vec<EndStream>,
-    pub sum_sent: SumSide,
-    pub sum_received: SumSide,
-    /// UDP only: the single-direction datagram aggregate iperf3 emits as `sum`.
+    /// UDP only: the datagram aggregate iperf3 emits as `sum` — BEFORE the
+    /// sent/received pair in its key order (GT 3.21, fwd and bidir alike;
+    /// the old field position serialized it after, a raw-diff divergence).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sum: Option<SumSide>,
+    pub sum_sent: SumSide,
+    pub sum_received: SumSide,
+    /// UDP bidir only (#214): the reverse-direction datagram aggregate,
+    /// between the forward pair and the reverse pair, like iperf3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sum_bidir_reverse: Option<SumSide>,
     /// Bidir only: the reverse-direction aggregates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_sent_bidir_reverse: Option<SumSide>,
@@ -766,11 +772,22 @@ impl ReportInput {
                     .filter_map(|s| s.udp)
                     .map(|u| u.packets)
                     .sum::<i64>(),
-                self.streams
-                    .iter()
-                    .filter_map(|s| s.udp)
-                    .map(|u| u.jitter_secs)
-                    .fold(0.0_f64, f64::max),
+                {
+                    // #214 (2): iperf3 AVERAGES jitter across measured
+                    // streams (avg_jitter /= num_streams) — the builder twin
+                    // of the #169 reporter fix. fold(max) overstated it.
+                    let measured: Vec<f64> = self
+                        .streams
+                        .iter()
+                        .filter_map(|s| s.udp)
+                        .map(|u| u.jitter_secs)
+                        .collect();
+                    if measured.is_empty() {
+                        0.0
+                    } else {
+                        measured.iter().sum::<f64>() / measured.len() as f64
+                    }
+                },
             )
         } else {
             (0_i64, 0_i64, 0.0_f64)
@@ -781,6 +798,7 @@ impl ReportInput {
         let retransmits = self.sender_retransmits();
 
         let mut sum = None;
+        let mut sum_bidir_reverse = None;
         let mut sum_sent_bidir_reverse = None;
         let mut sum_received_bidir_reverse = None;
 
@@ -791,7 +809,55 @@ impl ReportInput {
             // genuinely 0 (forward → sent 0, reverse → received 0). The aggregate
             // `sender` flag is the server's role: it is the sender only in reverse.
             let server_is_sender = self.reverse;
-            if self.bidir {
+            if self.bidir && is_udp {
+                // #214 (1), server role — GT iperf 3.21 (-s -J vs -u --bidir):
+                // six aggregates, every one UDP-shaped, strict no-graft:
+                // the fwd direction the server RECEIVES has measured
+                // packets/loss/jitter but `bytes` stays the SENDER-side
+                // figure the server lacks (0 — the iperf3 quirk, mirrored);
+                // the reverse direction it SENds has real bytes + derived
+                // packets and zero measurement; the perspectives it never
+                // held (sum_sent fwd, sum_received_bidir_reverse) are
+                // all-zero.
+                let fwd_packets = self
+                    .streams
+                    .iter()
+                    .filter(|s| !s.is_sender)
+                    .filter_map(|s| s.udp)
+                    .map(|u| u.packets)
+                    .sum::<i64>();
+                let fwd_lost = self
+                    .streams
+                    .iter()
+                    .filter(|s| !s.is_sender)
+                    .filter_map(|s| s.udp)
+                    .map(|u| u.lost_packets)
+                    .sum::<i64>();
+                let fwd_jitter = {
+                    let m: Vec<f64> = self
+                        .streams
+                        .iter()
+                        .filter(|s| !s.is_sender)
+                        .filter_map(|s| s.udp)
+                        .map(|u| u.jitter_secs)
+                        .collect();
+                    if m.is_empty() {
+                        0.0
+                    } else {
+                        m.iter().sum::<f64>() / m.len() as f64
+                    }
+                };
+                let rev_sent_packets = (local_sent / blk) as i64;
+                sum = Some(self.udp_sum(0, false, fwd_packets, fwd_lost, fwd_jitter));
+                sum_bidir_reverse = Some(self.udp_sum(local_sent, true, rev_sent_packets, 0, 0.0));
+                sum_sent_bidir_reverse =
+                    Some(self.udp_sum(local_sent, true, rev_sent_packets, 0, 0.0));
+                sum_received_bidir_reverse = Some(self.udp_sum(0, false, 0, 0, 0.0));
+                (
+                    self.udp_sum(0, true, 0, 0, 0.0),
+                    self.udp_sum(local_recv, false, fwd_packets, fwd_lost, fwd_jitter),
+                )
+            } else if self.bidir {
                 // Two flows: forward (client→server, server receives → sender=false)
                 // in sum_sent/sum_received; reverse (server→client, server sends →
                 // sender=true) in the *_bidir_reverse pair. Retransmits, measured on
@@ -834,6 +900,53 @@ impl ReportInput {
                     self.tcp_sum(local_recv, server_is_sender, None),
                 )
             }
+        } else if self.bidir && is_udp {
+            // #214 (1), client role — GT iperf 3.21 (-u --bidir -J): six
+            // aggregates, all UDP-shaped. The fwd direction's measured stats
+            // ride this host's SENDER streams (the peer-measured exchange,
+            // #182); the reverse direction's are measured locally on the
+            // receiving streams. Per GT: `sum` is the fwd direction
+            // (sender=true, peer-measured jitter attached), the *_sent
+            // perspectives carry zero measurement, and byte values follow
+            // the same graft-with-#170-error-guard rules as the TCP arm.
+            let dir_stats = |want_sender: bool| {
+                let m: Vec<UdpStreamStats> = self
+                    .streams
+                    .iter()
+                    .filter(|s| s.is_sender == want_sender)
+                    .filter_map(|s| s.udp)
+                    .collect();
+                let packets = m.iter().map(|u| u.packets).sum::<i64>();
+                let lost = m.iter().map(|u| u.lost_packets).sum::<i64>();
+                let jitter = if m.is_empty() {
+                    0.0
+                } else {
+                    m.iter().map(|u| u.jitter_secs).sum::<f64>() / m.len() as f64
+                };
+                (packets, lost, jitter)
+            };
+            let (fwd_packets, fwd_lost, fwd_jitter) = dir_stats(true);
+            let (rev_packets, rev_lost, rev_jitter) = dir_stats(false);
+            let fwd_recv = match (peer_recv, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_sent,
+            };
+            let rev_sent = match (peer_sent, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_recv,
+            };
+            sum = Some(self.udp_sum(local_sent, true, fwd_packets, fwd_lost, fwd_jitter));
+            sum_bidir_reverse =
+                Some(self.udp_sum(local_recv, false, rev_packets, rev_lost, rev_jitter));
+            sum_sent_bidir_reverse = Some(self.udp_sum(rev_sent, true, rev_packets, 0, 0.0));
+            sum_received_bidir_reverse =
+                Some(self.udp_sum(local_recv, false, rev_packets, rev_lost, rev_jitter));
+            (
+                self.udp_sum(local_sent, true, fwd_packets, 0, 0.0),
+                self.udp_sum(fwd_recv, false, fwd_packets, fwd_lost, fwd_jitter),
+            )
         } else if self.bidir {
             // Forward (this host → peer) goes in sum_sent/sum_received; reverse
             // (peer → this host) in the *_bidir_reverse pair, matching iperf3 —
@@ -931,6 +1044,7 @@ impl ReportInput {
             sum_sent,
             sum_received,
             sum,
+            sum_bidir_reverse,
             sum_sent_bidir_reverse,
             sum_received_bidir_reverse,
             cpu_utilization_percent: self.cpu.clone(),
@@ -1058,6 +1172,12 @@ impl ReportInput {
                 // count the dead peer never reported — iperf3 emits 0 while
                 // keeping the locally measured packets (#170 r2 f2).
                 (0, u.packets)
+            } else if !s.is_sender {
+                // #214 (3): `bytes` is a SENDER-side count — a stream this
+                // client RECEIVED reports the peer's exchanged sent figure
+                // (diverges from local received under loss); fall back to
+                // local only when the peer never reported one.
+                (s.remote_bytes.unwrap_or(s.local_bytes), u.packets)
             } else {
                 (s.local_bytes, u.packets)
             };
@@ -1339,6 +1459,146 @@ mod tests {
             intervals: vec![],
             streams: vec![],
         }
+    }
+
+    fn udp_stream(
+        id: i32,
+        is_sender: bool,
+        local: u64,
+        remote: Option<u64>,
+        jitter_secs: f64,
+        lost: i64,
+        packets: i64,
+    ) -> StreamReport {
+        StreamReport {
+            id,
+            local_host: "127.0.0.1".into(),
+            local_port: 40000 + id as u16,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 5201,
+            is_sender,
+            local_bytes: local,
+            remote_bytes: remote,
+            retransmits: None,
+            tcp_end: None,
+            udp: Some(UdpStreamStats {
+                jitter_secs,
+                lost_packets: lost,
+                packets,
+                out_of_order: 0,
+            }),
+        }
+    }
+
+    /// #214 (1): a UDP bidir end block carries SIX aggregates, every one
+    /// UDP-shaped (packets/lost_packets/lost_percent/jitter_ms) — GT iperf3
+    /// 3.21 live-capture 2026-06-11. TCP bidir stays four TCP-shaped
+    /// aggregates (no sum/sum_bidir_reverse) — also GT. Pre-fix the bidir
+    /// branch preceded the is_udp branch and emitted tcp_sum for all four,
+    /// with no sum/sum_bidir_reverse at all.
+    #[test]
+    fn udp_bidir_end_aggregates_are_udp_shaped() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.bidir = true;
+        input.streams = vec![
+            // fwd sender: peer-measured stats ride the sender entry (#182)
+            udp_stream(1, true, 1_000_000, Some(990_000), 0.001, 2, 100),
+            // reverse receiver: locally measured
+            udp_stream(2, false, 980_000, Some(1_000_000), 0.002, 4, 99),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        for key in [
+            "sum",
+            "sum_sent",
+            "sum_received",
+            "sum_bidir_reverse",
+            "sum_sent_bidir_reverse",
+            "sum_received_bidir_reverse",
+        ] {
+            let agg = &v["end"][key];
+            assert!(agg.is_object(), "missing end.{key}: {v}");
+            for f in ["packets", "lost_packets", "lost_percent", "jitter_ms"] {
+                assert!(
+                    agg.get(f).is_some(),
+                    "end.{key} lacks {f} — the tcp_sum leak (#214): {agg}"
+                );
+            }
+        }
+        // Sender flags per GT: sum carries the fwd direction (sender=true),
+        // sum_bidir_reverse the reverse (sender=false); the *_sent/_received
+        // pairs carry their fixed perspectives.
+        assert_eq!(v["end"]["sum"]["sender"], serde_json::json!(true));
+        assert_eq!(
+            v["end"]["sum_bidir_reverse"]["sender"],
+            serde_json::json!(false)
+        );
+        assert_eq!(v["end"]["sum_sent"]["sender"], serde_json::json!(true));
+        assert_eq!(
+            v["end"]["sum_received_bidir_reverse"]["sender"],
+            serde_json::json!(false)
+        );
+
+        // And the TCP-bidir negative: no sum/sum_bidir_reverse there (GT).
+        let mut tcp = base_input();
+        tcp.bidir = true;
+        tcp.streams = vec![
+            tcp_stream(1, true, 1_000_000, 990_000),
+            tcp_stream(2, false, 980_000, 1_000_000),
+        ];
+        let tv = serde_json::to_value(tcp.build()).unwrap();
+        assert!(
+            tv["end"].get("sum").is_none() && tv["end"].get("sum_bidir_reverse").is_none(),
+            "TCP bidir emits four aggregates, not six (GT): {tv}"
+        );
+    }
+
+    /// #214 (2): the -J builder's end-sum UDP jitter is the AVERAGE across
+    /// measured streams (iperf3's avg_jitter /= num_streams) — the reporter-
+    /// path twin was fixed in #193/#169; this pins the builder's own
+    /// aggregation. Pre-fix: fold(max) → 4.0 here.
+    #[test]
+    fn udp_multistream_end_sum_jitter_is_the_average() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true; // receiving side measures jitter locally
+        input.num_streams = 2;
+        input.streams = vec![
+            udp_stream(1, false, 1_000_000, Some(1_000_000), 0.002, 0, 100),
+            udp_stream(2, false, 1_000_000, Some(1_000_000), 0.004, 0, 100),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let jitter = v["end"]["sum"]["jitter_ms"].as_f64().expect("jitter_ms");
+        assert!(
+            (jitter - 3.0).abs() < 1e-9,
+            "sum.jitter_ms must average (2ms+4ms)/2=3ms, not max: {jitter}"
+        );
+    }
+
+    /// #214 (3): a reverse-UDP per-stream entry reports the EXCHANGED
+    /// peer-sent byte count, not the local received count — they diverge
+    /// under loss (iperf3's stream accounting uses the sender's figure).
+    /// Pre-fix: local 900k reported.
+    #[test]
+    fn reverse_udp_stream_bytes_use_the_exchanged_peer_sent_count() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true;
+        input.streams = vec![udp_stream(
+            1,
+            false,
+            900_000,
+            Some(1_000_000),
+            0.001,
+            10,
+            100,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["streams"][0]["udp"]["bytes"],
+            serde_json::json!(1_000_000u64),
+            "stream bytes = peer-sent (exchanged), not local received: {v}"
+        );
     }
 
     fn tcp_stream(id: i32, is_sender: bool, local: u64, remote: u64) -> StreamReport {
