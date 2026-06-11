@@ -442,7 +442,18 @@ fn parallel_text_ticks_open_with_separator() {
     let ps = free_port().to_string();
     let mut server = spawn_server(&ps);
     let out = run_capturing(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "3", "-i", "1", "-P", "2"],
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "3",
+            "-i",
+            "1",
+            "-P",
+            "2",
+        ],
         Duration::from_secs(20),
         "tcp P2 text",
     );

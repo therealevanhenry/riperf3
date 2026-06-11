@@ -47,6 +47,7 @@ pub struct Client {
     pub(crate) verbose: bool,
     pub(crate) json_output: bool,
     pub(crate) json_stream: bool,
+    pub(crate) json_stream_full_output: bool,
     pub(crate) bytes_to_send: Option<u64>,
     pub(crate) blocks_to_send: Option<u64>,
     pub(crate) repeating_payload: bool,
@@ -958,7 +959,10 @@ impl Client {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
-                    keep_intervals: false,
+                    // The client keeps intervals only under
+                    // --json-stream-full-output (iperf3's discard_json,
+                    // second leg) (#213).
+                    keep_intervals: self.json_stream_full_output,
                     bidir: self.bidir,
                     is_server: false,
                 },
@@ -1682,10 +1686,17 @@ impl Client {
             start_meta,
             test_duration,
         );
+        let report = input.build();
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
-            &input.build().end,
+            &report.end,
         ));
+        // --json-stream-full-output: the complete monolithic document also
+        // prints after the stream, like iperf_json_finish keeping
+        // print_full_json under the flag (iperf_api.c:5323) (#213).
+        if self.json_stream_full_output {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
     }
 }
 
@@ -1732,6 +1743,7 @@ pub struct ClientBuilder {
     verbose: bool,
     json_output: bool,
     json_stream: bool,
+    json_stream_full_output: bool,
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
     repeating_payload: bool,
@@ -1790,6 +1802,7 @@ impl Default for ClientBuilder {
             verbose: false,
             json_output: false,
             json_stream: false,
+            json_stream_full_output: false,
             bytes_to_send: None,
             blocks_to_send: None,
             repeating_payload: false,
@@ -2006,6 +2019,14 @@ impl ClientBuilder {
     /// `--json-stream`: stream line-delimited interval JSON during the test.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
+        self
+    }
+
+    /// With json-stream, also print the complete monolithic JSON document
+    /// after the stream ends — iperf3's `--json-stream-full-output`, the
+    /// third leg of its discard_json condition (#213).
+    pub fn json_stream_full_output(mut self, enabled: bool) -> Self {
+        self.json_stream_full_output = enabled;
         self
     }
 
@@ -2453,6 +2474,7 @@ impl ClientBuilder {
             verbose: self.verbose,
             json_output: self.json_output,
             json_stream: self.json_stream,
+            json_stream_full_output: self.json_stream_full_output,
             // 0 means "no limit" in iperf3 (`-n 0`/`-k 0` run a plain duration
             // test — its end-condition checks gate on the value), so normalize
             // to unset here rather than ending the test instantly (#140).

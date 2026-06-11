@@ -274,6 +274,11 @@ pub struct Cli {
     #[arg(long)]
     pub json_stream: bool,
 
+    /// With --json-stream, also print the complete monolithic JSON document
+    /// after the stream ends
+    #[arg(long = "json-stream-full-output")]
+    pub json_stream_full_output: bool,
+
     /// Enable UDP GSO/GRO
     #[arg(long)]
     pub gsro: bool,
@@ -557,6 +562,9 @@ impl Cli {
         if self.json_stream {
             builder = builder.json_stream(true);
         }
+        if self.json_stream_full_output {
+            builder = builder.json_stream_full_output(true);
+        }
         if self.udp_counters_64bit {
             builder = builder.udp_counters_64bit(true);
         }
@@ -663,6 +671,9 @@ impl Cli {
         }
         if self.json_stream {
             builder = builder.json_stream(true);
+        }
+        if self.json_stream_full_output {
+            builder = builder.json_stream_full_output(true);
         }
         if let Some(secs) = self.idle_timeout {
             builder = builder.idle_timeout(secs);
@@ -1563,6 +1574,27 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--json-stream"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").json_stream(true).build().unwrap());
+        }
+
+        // #213: the full-output leg rides json-stream.
+        #[test]
+        fn json_stream_full_output_wired() {
+            let cli = Cli::parse_from([
+                "riperf3",
+                "-c",
+                "h",
+                "--json-stream",
+                "--json-stream-full-output",
+            ]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(
+                c,
+                expected_client("h")
+                    .json_stream(true)
+                    .json_stream_full_output(true)
+                    .build()
+                    .unwrap()
+            );
         }
 
         // sendmmsg(2) is Linux/FreeBSD/NetBSD-only (stream.rs); build() rejects
