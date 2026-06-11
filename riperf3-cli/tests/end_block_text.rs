@@ -43,7 +43,10 @@ fn end_block(out: &str) -> Vec<&str> {
 fn run(port: &str, args: &[&str]) -> String {
     let mut full = vec!["-c", "127.0.0.1", "-p", port];
     full.extend_from_slice(args);
-    common::run_client_ok(&full, Duration::from_secs(20), "client").stdout
+    // 40 s > the client's own 30 s UDP_CONNECT_TOTAL_TIMEOUT (protocol.rs):
+    // a starved run must die on ITS error, not an empty harness kill that
+    // destroys the diagnosis (#195 — this binary was the most-hit one).
+    common::run_client_ok(&full, Duration::from_secs(40), "client").stdout
 }
 
 /// UDP bidir: per stream a sender AND a receiver line (4 stream lines), the

@@ -166,7 +166,9 @@ fn client_json_stream_udp_is_valid_ndjson() {
             "1",
             "--json-stream",
         ],
-        Duration::from_secs(20),
+        // > the client's 30 s UDP_CONNECT_TOTAL_TIMEOUT so a starved setup
+        // dies on its own error, not an empty harness kill (#195).
+        Duration::from_secs(40),
         "client-udp",
     );
     let _ = server.0.wait();
