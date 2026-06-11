@@ -17,7 +17,11 @@ fn free_port() -> u16 {
     riperf3_test_support::free_port()
 }
 
-fn wait_with_output_bounded(mut child: ChildGuard, timeout: Duration, who: &str) -> (String, String, i32) {
+fn wait_with_output_bounded(
+    mut child: ChildGuard,
+    timeout: Duration,
+    who: &str,
+) -> (String, String, i32) {
     let deadline = Instant::now() + timeout;
     while child.0.try_wait().expect("try_wait").is_none() {
         assert!(Instant::now() < deadline, "{who}: did not exit");
