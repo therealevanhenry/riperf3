@@ -175,6 +175,56 @@ fn bitrate_limit_json_server_doc_carries_prefixed_error() {
     );
 }
 
+/// #237: the duration timer must be ONE absolute deadline. With
+/// --server-bitrate-limit also set, the 1 Hz under-limit rate ticks re-enter
+/// the select loop; a sleep() recreated per iteration restarts from zero on
+/// every tick, so any max duration > ~1s never fires and a -t 10 run goes
+/// the full 10 s. A 1T limit never trips, even on fast loopback (100G
+/// does); the 1 s max duration must still cut the run at ~1 s with the
+/// same SERVER_ERROR(160) shapes as the plain timer path. NOTE: shares #230's test interplay —
+/// the upfront requested-duration check will reject `-t 10` vs a 1 s limit
+/// at param exchange when it lands; this test then needs the within-limit
+/// wall-clock-overrun trigger too (noted on #230).
+#[test]
+fn max_duration_timer_survives_rate_ticks() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(
+        &["--server-bitrate-limit", "1T", "--server-max-duration", "1"],
+        &ps,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let start = Instant::now();
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "10"],
+        Duration::from_secs(40),
+        "client -t 10",
+    );
+    let elapsed = start.elapsed();
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "rate ticks must not reset the duration timer (#237) — a 1 s max \
+         duration left this -t 10 run running for {elapsed:?}"
+    );
+    assert_eq!(client.status.code(), Some(1));
+    assert!(
+        client
+            .stderr
+            .contains("riperf3: SERVER ERROR - server test duration expired"),
+        "client adopts strerror(IESERVERTESTDURATIONEXPIRED): {stderr}",
+        stderr = client.stderr
+    );
+    assert!(
+        serr.contains(
+            "riperf3: error - server test duration expired - test is terminated by the server"
+        ),
+        "the server's literal timer line: {serr}"
+    );
+    assert_eq!(scode, 0);
+}
+
 /// --server-max-duration via the wall-clock timer: the literal server line
 /// vs the client's strerror, the same SERVER_ERROR shapes. NOTE (r1 review,
 /// live-verified): iperf3's upfront check rejects `-n` runs too (it tests
