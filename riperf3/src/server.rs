@@ -964,6 +964,14 @@ impl Server {
                     sock.recv_buffer_size().ok().map(|v| v as u64),
                 )
             };
+            // iperf3 runs iperf_common_sockopts (IP_TOS/IPV6_TCLASS) on UDP
+            // stream sockets on BOTH roles — it matters for reverse/bidir,
+            // where the server marks egress. Fatal like every other set_tos
+            // site (#45). The TCP accept loop has had this since #45; the
+            // UDP paths never did (#154).
+            if cfg.tos != 0 {
+                net::set_tos(&data_sock, cfg.tos as u32)?;
+            }
             // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
             net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
 
@@ -1159,6 +1167,12 @@ impl Server {
         // single-socket demux path the recv buffer is sized to the aggregate, but a
         // genuine wmem/rmem_max clamp still drives the readback below the request.
         net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+        // iperf3 applies IP_TOS/IPV6_TCLASS per UDP stream socket on both
+        // roles; every stream here shares this one socket and one cfg.tos,
+        // so once-per-socket is semantically identical (#154). Fatal per #45.
+        if cfg.tos != 0 {
+            net::set_tos(&udp_std, cfg.tos as u32)?;
+        }
         // The connected recycling path reports each stream's local_host as the
         // kernel-selected source IP for that client. The demux socket is never
         // connect()'d, so its own local_addr is the wildcard bind — only on a
@@ -1878,6 +1892,205 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Receive one datagram and return the IP_TOS control message byte, via
+    /// raw libc recvmsg (nix 0.29's UnknownCmsg fields are private). The
+    /// socket must have IP_RECVTOS enabled; with it on, the kernel delivers
+    /// the cmsg for every datagram (value 0 included), so asserting the byte
+    /// distinguishes "TOS applied" from "TOS defaulted" (#154).
+    #[cfg(target_os = "linux")]
+    fn recv_udp_tos(sock: &std::net::UdpSocket) -> Option<u8> {
+        use std::os::fd::AsRawFd;
+        let mut data = [0u8; 2048];
+        let mut cmsg = [0u8; 64];
+        let mut iov = libc::iovec {
+            iov_base: data.as_mut_ptr() as *mut _,
+            iov_len: data.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        // `as _`: msg_iovlen/msg_controllen are usize on glibc but
+        // c_int/socklen_t on musl.
+        msg.msg_iovlen = 1 as _;
+        msg.msg_controllen = cmsg.len() as _;
+        msg.msg_control = cmsg.as_mut_ptr() as *mut _;
+        // SAFETY: valid fd, valid buffers sized above; CMSG_* walk the buffer
+        // the kernel just filled within msg_controllen.
+        unsafe {
+            if libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) < 0 {
+                return None;
+            }
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::IPPROTO_IP && (*c).cmsg_type == libc::IP_TOS {
+                    return Some(*libc::CMSG_DATA(c));
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        None
+    }
+
+    /// Test client half of the UDP connect handshake + first-data capture:
+    /// enables IP_RECVTOS, retries the connect magic until the reply lands,
+    /// then reads the first DATA datagram's TOS byte.
+    #[cfg(target_os = "linux")]
+    fn udp_tos_probe_client(server: std::net::SocketAddr) -> std::thread::JoinHandle<Option<u8>> {
+        use std::os::fd::AsRawFd;
+        std::thread::spawn(move || {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let on: libc::c_int = 1;
+            // SAFETY: plain setsockopt(IP_RECVTOS) on a valid fd.
+            unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_RECVTOS,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(250)))
+                .unwrap();
+            let mut reply = [0u8; 4];
+            // Handshake: retry the magic until the reply arrives (the server
+            // task may bind after our first send).
+            for _ in 0..40 {
+                let _ = sock.send_to(&protocol::UDP_CONNECT_MSG.to_ne_bytes(), server);
+                match sock.recv_from(&mut reply) {
+                    Ok((4, _)) => break,
+                    _ => continue,
+                }
+            }
+            // First data datagram after TestStart carries the socket's TOS.
+            for _ in 0..40 {
+                if let Some(tos) = recv_udp_tos(&sock) {
+                    return Some(tos);
+                }
+            }
+            None
+        })
+    }
+
+    /// #154: the server's UDP data sockets must carry IP_TOS — iperf3 runs
+    /// iperf_common_sockopts on UDP stream sockets on both roles (matters
+    /// for reverse/bidir egress marking). Reverse, one stream: the server is
+    /// the sender. Recycling path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_recycling_server_sender_carries_tos() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+
+        let srv = ServerBuilder::new()
+            .port(Some(port))
+            .bind_address("127.0.0.1")
+            .build()
+            .unwrap();
+        let params = TestParams {
+            udp: Some(true),
+            reverse: Some(true),
+            parallel: Some(1),
+            tos: Some(0x48),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params);
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false));
+        let mut streams = Vec::new();
+
+        let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
+
+        srv.setup_udp_recycling_streams(
+            &mut ctrl_srv,
+            &cfg,
+            0,
+            1,
+            None,
+            &done,
+            &start,
+            &mut streams,
+        )
+        .await
+        .unwrap();
+        start.store(true, Ordering::Relaxed);
+
+        let tos = client.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        for s in streams {
+            let _ = s.task.await;
+        }
+        assert_eq!(tos, Some(0x48), "server UDP egress must carry cfg.tos");
+    }
+
+    /// #154, demux flavor: one shared socket for every stream — TOS applied
+    /// once to it covers all (single cfg.tos). Calling the setup fn directly
+    /// avoids the RIPERF3_UDP_SERVER_DEMUX env-var gate (process-global).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_demux_server_sender_carries_tos() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+
+        let srv = ServerBuilder::new()
+            .port(Some(port))
+            .bind_address("127.0.0.1")
+            .build()
+            .unwrap();
+        let params = TestParams {
+            udp: Some(true),
+            reverse: Some(true),
+            parallel: Some(1),
+            tos: Some(0x48),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params);
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(false));
+        let mut streams = Vec::new();
+        let mut demux_handle = None;
+
+        let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
+
+        srv.setup_udp_demux_streams(
+            &mut ctrl_srv,
+            &cfg,
+            0,
+            1,
+            None,
+            &done,
+            &start,
+            &mut streams,
+            &mut demux_handle,
+        )
+        .await
+        .unwrap();
+        start.store(true, Ordering::Relaxed);
+
+        let tos = client.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        for s in streams {
+            let _ = s.task.await;
+        }
+        if let Some(h) = demux_handle {
+            h.abort();
+        }
+        assert_eq!(tos, Some(0x48), "demux UDP egress must carry cfg.tos");
+    }
 
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
     // when `Server`'s fields became `pub(crate)` (#43): an external test crate
