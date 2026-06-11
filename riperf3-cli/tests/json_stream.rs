@@ -341,3 +341,143 @@ fn server_json_stream_full_output_appends_the_document() {
         "server-side intervals retained under the flag"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #220: -J + --json-stream — iperf3's OPT_JSON_STREAM implies -J
+// (iperf_api.c:1280-1282), so the hybrid IS stream mode: the full event
+// stream including `end`, with the monolithic document only under
+// --json-stream-full-output. riperf3's json_output-wins dispatch emitted a
+// TRUNCATED stream (start+intervals, no end event) followed by the doc.
+// ---------------------------------------------------------------------------
+
+/// Client `-J --json-stream`: pure stream behavior — an `end` event arrives,
+/// and nothing follows it.
+#[test]
+fn json_flag_plus_stream_behaves_as_stream_mode() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "2",
+            "-i",
+            "1",
+            "-J",
+            "--json-stream",
+        ],
+        Duration::from_secs(20),
+        "client -J --json-stream",
+    );
+    let _ = server.0.wait();
+
+    assert_valid_ndjson(&out, "client hybrid");
+    let end_pos = out
+        .find("{\"event\":\"end\"")
+        .unwrap_or_else(|| panic!("stream mode emits the end event (#220): {out}"));
+    let tail = out[end_pos..].lines().skip(1).collect::<Vec<_>>().join("");
+    assert!(
+        tail.trim().is_empty(),
+        "no monolithic document after end without --json-stream-full-output: {tail:?}"
+    );
+}
+
+/// The hybrid + --json-stream-full-output: the document still follows the
+/// end event (the #213 behavior is mode-independent).
+#[test]
+fn json_flag_plus_stream_full_output_appends_the_document() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "2",
+            "-J",
+            "--json-stream",
+            "--json-stream-full-output",
+        ],
+        Duration::from_secs(20),
+        "client hybrid full-output",
+    );
+    let _ = server.0.wait();
+
+    let end_pos = out.find("{\"event\":\"end\"").expect("end event");
+    let doc_pos = out[end_pos..]
+        .find("{\n")
+        .map(|i| i + end_pos)
+        .expect("the monolithic document follows under full-output");
+    let doc: Value = serde_json::from_str(out[doc_pos..].trim()).expect("document parses");
+    assert!(doc["end"].is_object());
+    // Self-contained hybrid coverage (r1 n2): the doc's intervals are
+    // populated, like the #213 plain-stream analog asserts.
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "hybrid full-output doc carries populated intervals: {doc}"
+    );
+}
+
+/// Server `-s -J --json-stream`: stream wins on the server role too.
+#[test]
+fn server_json_flag_plus_stream_behaves_as_stream_mode() {
+    let port = free_port();
+    let ps = port.to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-J", "--json-stream", "-p", &ps])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let _ = common::run_client_ok(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-i", "1"],
+        Duration::from_secs(20),
+        "client",
+    );
+
+    wait_bounded(&mut server.0, Duration::from_secs(20), "server");
+    let mut out = String::new();
+    server
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+
+    assert_valid_ndjson(&out, "server hybrid");
+    let end_pos = out
+        .find("{\"event\":\"end\"")
+        .unwrap_or_else(|| panic!("server stream mode emits the end event (#220): {out}"));
+    let tail = out[end_pos..].lines().skip(1).collect::<Vec<_>>().join("");
+    assert!(
+        tail.trim().is_empty(),
+        "no document after end on the server either: {tail:?}"
+    );
+}
