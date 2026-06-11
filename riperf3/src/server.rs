@@ -765,16 +765,17 @@ impl Server {
         }
 
         // ---- Shut down streams ----
-        // Hand the reporter the authoritative end time, then stop the streams
-        // (`done`) so no received bytes leak past the deadline into the final
-        // interval (#55). The reporter prioritises `finish` over `done`, so the
-        // final interval still flushes; wait for it before tearing streams down.
+        // #55 window, #159 order: stop the streams, let the catch-up land,
+        // then hand the reporter the authoritative end time for the flush.
         let measured_elapsed = report_start.elapsed().as_secs_f64();
         // The reporter's timeline restarted at the omit boundary (#31), so its
         // authoritative end time is post-omit; clamp for runs that died inside
         // the warm-up.
-        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
+        // #159: senders stop first, the catch-up grace runs, THEN the flush
+        // is signalled (see the client-side twin for the full rationale).
         done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        reporter_end.finish((measured_elapsed - cfg.omit as f64).max(0.0));
         if let Some(handle) = interval_handle {
             let _ = handle.await;
         }
@@ -803,8 +804,8 @@ impl Server {
             }
         }
 
-        // Wait briefly then join tasks (senders may be blocked on write)
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // (The pre-results grace moved up to the #159 stop-then-flush
+        // sequence; the counters are already settled here.)
 
         let mut result_streams = Vec::new();
         // Summary window + bitrate: the measured elapsed for a byte/block-limited
