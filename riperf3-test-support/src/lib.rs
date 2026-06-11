@@ -117,9 +117,14 @@ pub fn reset_pre_data(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
     // -J/--json-stream render setup errors INTO stdout (#198) with stderr
     // empty, so "empty stdout" cannot be the only pre-data proxy (the 2-core
     // rounds proved it: every quiet-host residual failure was a -J doc whose
-    // connected list never populated). A rendered error whose run never
-    // built streams and never ticked an interval is pre-data by
-    // construction.
+    // connected list never populated). CAVEAT (r1 review): the CLI's
+    // error_document hardcodes connected:[] + intervals:[] for EVERY error
+    // escaping run(), so this shape is "setup-only" for the dominant paths
+    // but not by construction — a raw reset at the TestEnd send or during
+    // ExchangeResults (post-data, no lib-rendered doc) classifies too and
+    // gets retried. Accepted: the bounded window still surfaces
+    // deterministic failures (~10 s late), and the alternative was the
+    // empty-kill that destroyed every diagnosis.
     reset_tokens(stdout) && json_output_is_setup_only(stdout)
 }
 
@@ -215,8 +220,11 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
 
         // #198 moved -J/--json-stream error text into STDOUT (the document /
         // the error event) with stderr empty — scan both sinks for the
-        // refused tokens. The reset classifier scans stderr alone: its
-        // empty-stdout guard already excludes every doc-rendered error.
+        // refused tokens; the reset classifier reads stdout too (the JSON
+        // branch). NOTE the retry WINDOW starts at the first spawn: one slow
+        // attempt (the kill deadline allows 40 s) can consume it entirely,
+        // leaving a late failure zero retries — pre-existing #176 semantics,
+        // fine for the instant-failure shapes this targets.
         let combined = format!("{stderr}\n{stdout}");
         if (refused(&status, &combined) || reset_pre_data(&status, &stdout, &stderr))
             && Instant::now() < retry_deadline
@@ -337,6 +345,10 @@ mod tests {
 }"#;
         assert!(reset_pre_data(&failed, setup_doc, ""));
 
+        // A doc with populated connected/intervals can only come from a
+        // LIB-rendered report (e.g. a terminate-path doc) — the CLI's
+        // error_document never produces one (r1 review). The guard still
+        // matters for exactly those lib-rendered shapes.
         let mid_test_doc = r#"{
   "start": {"connected": [{"socket": 1}]},
   "intervals": [{"sum": {"bytes": 1}}],

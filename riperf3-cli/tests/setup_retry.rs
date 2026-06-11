@@ -57,6 +57,9 @@ fn pre_data_reset_is_retried_until_a_real_server_arrives() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
+            // Guarded immediately: a panicking client assert must not leak
+            // a -s -1 process (r1 n7).
+            .map(ChildGuard)
             .expect("spawn real server")
     });
 
@@ -66,7 +69,7 @@ fn pre_data_reset_is_retried_until_a_real_server_arrives() {
         Duration::from_secs(40),
         "client",
     );
-    let mut server = ChildGuard(server.join().expect("server thread"));
+    let mut server = server.join().expect("server thread");
     let _ = server.0.wait();
 
     // run_client_ok already asserted success; the end block proves the final
@@ -105,6 +108,9 @@ fn pre_data_reset_is_retried_in_json_mode() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
+            // Guarded immediately: a panicking client assert must not leak
+            // a -s -1 process (r1 n7).
+            .map(ChildGuard)
             .expect("spawn real server")
     });
 
@@ -114,7 +120,7 @@ fn pre_data_reset_is_retried_in_json_mode() {
         Duration::from_secs(40),
         "client -J",
     );
-    let mut server = ChildGuard(server.join().expect("server thread"));
+    let mut server = server.join().expect("server thread");
     let _ = server.0.wait();
 
     let doc: serde_json::Value = serde_json::from_str(run.stdout.trim())
