@@ -82,6 +82,39 @@ pub fn refused(status: &ExitStatus, output: &str) -> bool {
             || output.contains("(os error 10061)"))
 }
 
+/// Is this run a PRE-DATA reset — the peer (or a loaded kernel) RST the
+/// connection during setup, before the client produced any output? The #195
+/// macOS shape: under runner load the control handshake dies with
+/// `Connection reset by peer (os error 54)` while stdout is still empty; the
+/// run completes cleanly when simply tried again. Like the refused-retry,
+/// retrying is observably safe because nothing has happened yet.
+///
+/// The guards, in order:
+/// - non-success exit: a clean run is never reclassified;
+/// - **empty stdout** as the pre-data proxy: once a run printed anything —
+///   interval rows, or the -J document #198 routes errors into — a reset is
+///   real and must stay fatal. (Mid-test control-plane resets also never
+///   render raw: they map to named errors like "control socket has closed
+///   unexpectedly". If connect banners ever become unconditional (#222),
+///   this proxy needs refining — `setup_retry.rs` pins the behavior and
+///   will go red there.)
+/// - the three reset renderings, mirroring `refused`: the Debug form, the
+///   POSIX strerror, and Windows' WSAECONNRESET text (which contains no
+///   "reset"-cased substring at all).
+///
+/// One-off-server caveat: if the server's single accept was consumed before
+/// the RST, the retried client meets ECONNREFUSED and the refused-retry spins
+/// out the shared bounded window — the failure still surfaces, just later and
+/// less precisely. Accepted: rare, bounded, and the alternative is the #195
+/// empty-output kill that destroys the diagnosis entirely.
+pub fn reset_pre_data(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
+    !status.success()
+        && stdout.is_empty()
+        && (stderr.contains("ConnectionReset")
+            || stderr.contains("Connection reset")
+            || stderr.contains("(os error 10054)"))
+}
+
 /// Run a riperf3 CLI binary to completion with a hard timeout, retrying while
 /// the run is REFUSED for up to a bounded retry window. This replaces fixed
 /// server-bind sleeps: on loaded CI runners the (debug, cold) server can take
@@ -149,10 +182,14 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
 
         // #198 moved -J/--json-stream error text into STDOUT (the document /
         // the error event) with stderr empty — scan both sinks for the
-        // refused tokens.
+        // refused tokens. The reset classifier scans stderr alone: its
+        // empty-stdout guard already excludes every doc-rendered error.
         let combined = format!("{stderr}\n{stdout}");
-        if refused(&status, &combined) && Instant::now() < retry_deadline {
-            // Server not listening yet — give it a beat and go again.
+        if (refused(&status, &combined) || reset_pre_data(&status, &stdout, &stderr))
+            && Instant::now() < retry_deadline
+        {
+            // Server not listening yet (refused) or it RST us mid-setup
+            // (#195) — give it a beat and go again.
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -205,5 +242,72 @@ pub fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> 
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::ExitStatus;
+
+    #[cfg(unix)]
+    fn status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // wait(2) encoding: exit code in the high byte.
+        ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    fn status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    /// #195: each platform's reset rendering classifies as a pre-data reset
+    /// when the run failed with an empty stdout. Drop any one rendering and
+    /// the retry silently dies on that platform (the `refused` lesson, #194).
+    #[test]
+    fn reset_pre_data_matches_each_platform_rendering() {
+        let failed = status(1);
+        for stderr in [
+            // POSIX strerror (Linux 104 / macOS 54 — same text, the #195 hit)
+            "riperf3: error - Connection reset by peer (os error 104)",
+            "riperf3: error - Connection reset by peer (os error 54)",
+            // Windows WSAECONNRESET: no "reset"-cased substring at all
+            "riperf3: error - An existing connection was forcibly closed by \
+             the remote host. (os error 10054)",
+            // io::ErrorKind Debug rendering (unwrap/expect paths)
+            "thread 'main' panicked: ConnectionReset",
+        ] {
+            assert!(
+                reset_pre_data(&failed, "", stderr),
+                "must classify as pre-data reset: {stderr}"
+            );
+        }
+    }
+
+    /// The guards: output already produced (data phase, or a -J error doc),
+    /// a clean exit, or a refused connect — none of these may classify.
+    #[test]
+    fn reset_guards_hold() {
+        let failed = status(1);
+        let clean = status(0);
+        // Once anything printed, a reset is real and stays fatal.
+        assert!(!reset_pre_data(
+            &failed,
+            "[ ID] Interval           Transfer     Bitrate",
+            "riperf3: error - Connection reset by peer (os error 104)",
+        ));
+        // A clean exit is never reclassified, whatever stderr says.
+        assert!(!reset_pre_data(
+            &clean,
+            "",
+            "Connection reset by peer (os error 104)",
+        ));
+        // Refused is the refused-retry's business, not this classifier's.
+        assert!(!reset_pre_data(
+            &failed,
+            "",
+            "riperf3: error - Connection refused (os error 111)",
+        ));
     }
 }
