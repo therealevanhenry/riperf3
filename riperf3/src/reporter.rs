@@ -85,23 +85,58 @@ fn titled(line: std::fmt::Arguments) {
 }
 
 /// Print the header line for interval reports.
-pub fn print_header(protocol: TransportProtocol, has_retransmits: bool) {
+/// iperf3's bidir role tag (its `mbuf`): TX/RX by sender-ness, C/S by role.
+/// One table for the four call sites (interval rows, interval SUMs, and the
+/// client/server end blocks) so they can't drift (#143 review r1 n6).
+pub(crate) fn bidir_role_tag(is_server: bool, is_sender: bool) -> &'static str {
+    match (is_server, is_sender) {
+        (false, true) => "TX-C",
+        (false, false) => "RX-C",
+        (true, true) => "TX-S",
+        (true, false) => "RX-S",
+    }
+}
+
+/// The UDP header variant: iperf3 picks by test mode (print_interval_results)
+/// — the sender header has "Total Datagrams" and no Jitter/Lost columns.
+#[derive(Clone, Copy, PartialEq)]
+pub enum UdpHeaderMode {
+    Sender,
+    Receiver,
+}
+
+pub fn print_header(
+    protocol: TransportProtocol,
+    has_retransmits: bool,
+    bidir: bool,
+    udp_mode: UdpHeaderMode,
+) {
+    // iperf3's bidir headers add the [Role] column (report_bw_*_header_bidir).
+    let role = if bidir { "[Role]" } else { "" };
     match protocol {
         TransportProtocol::Tcp => {
             if has_retransmits {
                 titled(format_args!(
-                    "[ ID] Interval           Transfer     Bitrate         Retr  Cwnd"
+                    "[ ID]{role} Interval           Transfer     Bitrate         Retr  Cwnd"
                 ));
             } else {
                 titled(format_args!(
-                    "[ ID] Interval           Transfer     Bitrate"
+                    "[ ID]{role} Interval           Transfer     Bitrate"
                 ));
             }
         }
         TransportProtocol::Udp => {
-            titled(format_args!(
-                "[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
-            ));
+            // Bidir mixes both directions under the receiver-shaped header,
+            // exactly like report_bw_udp_header_bidir.
+            if udp_mode == UdpHeaderMode::Sender && !bidir {
+                titled(format_args!(
+                    "[ ID]{role} Interval           Transfer     Bitrate         Total Datagrams"
+                ));
+            } else {
+                titled(format_args!(
+                    "[ ID]{role} Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
+                ));
+            }
         }
     }
 }
@@ -146,11 +181,26 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
             omit_tag,
         ));
     } else if let Some(sent) = interval.sent_packets {
-        // UDP sender row: blank jitter/loss region + the sent-datagram count,
-        // like iperf3's report_bw_udp_sender_format (#187).
+        // UDP sender row: the sent-datagram count, with the blank jitter/loss
+        // pad ONLY in bidir — iperf3's zbuf is 10 spaces in bidir and empty
+        // otherwise (report_bw_udp_sender_format; #187 review r1 n4).
+        let pad = if interval.role_tag.is_some() {
+            "           "
+        } else {
+            ""
+        };
         titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}             {sent}  {}",
+            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {pad}{sent}  {}",
             interval.start, interval.end, transfer, rate, omit_tag,
+        ));
+    } else if let (Some(retr), None) = (interval.retransmits, interval.snd_cwnd) {
+        // TCP [SUM] with retransmits: iperf3's report_sum_bw_retrans_format
+        // carries Retr but no Cwnd (a SUM has no single congestion window) —
+        // without this branch the populated Retr fell through to the bare
+        // format and vanished (#143 review r1 n3).
+        titled(format_args!(
+            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}            {}",
+            interval.start, interval.end, transfer, rate, retr, omit_tag,
         ));
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
@@ -718,7 +768,15 @@ pub fn spawn_interval_reporter(
 
                 // The text header banner is suppressed under --json-stream (pure NDJSON).
                 if config.print && !config.json_stream && !header_printed {
-                    print_header(config.protocol, has_retransmits);
+                    // iperf3's UDP header is mode-selected: all-sender (a
+                    // forward client / reverse server) gets the sender
+                    // variant; bidir gets the receiver-shaped bidir header.
+                    let udp_mode = if streams.iter().all(|s| s.udp_recv_stats.is_none()) {
+                        UdpHeaderMode::Sender
+                    } else {
+                        UdpHeaderMode::Receiver
+                    };
+                    print_header(config.protocol, has_retransmits, config.bidir, udp_mode);
                     header_printed = true;
                 }
 
@@ -728,6 +786,7 @@ pub fn spawn_interval_reporter(
                 // server its receivers — `rev` the opposite. Non-bidir runs leave
                 // `rev` empty.
                 let fwd_is_sender = streams.first().is_none_or(|s| s.is_sender);
+                let mut tick_rows: Vec<(bool, StreamInterval)> = Vec::new();
                 let mut fwd = DirAcc::default();
                 let mut rev = DirAcc::default();
                 let mut collected_streams: Vec<crate::json_report::IntervalStream> = Vec::new();
@@ -823,15 +882,9 @@ pub fn spawn_interval_reporter(
 
                     // Bidir role tag for this stream's rows, iperf3's mbuf
                     // (`[TX-C]`-style; the S half on the server) (#143/#187).
-                    let role_tag =
-                        config
-                            .bidir
-                            .then_some(match (config.is_server, stream.is_sender) {
-                                (false, true) => "TX-C",
-                                (false, false) => "RX-C",
-                                (true, true) => "TX-S",
-                                (true, false) => "RX-S",
-                            });
+                    let role_tag = config
+                        .bidir
+                        .then_some(bidir_role_tag(config.is_server, stream.is_sender));
                     // UDP sender rows carry the sent-datagram count with a
                     // blank jitter/loss region (iperf3's
                     // report_bw_udp_sender_format) — senders measure no
@@ -844,21 +897,27 @@ pub fn spawn_interval_reporter(
                     // from the same typed streams the `-J` collector builds), so it
                     // has nothing to print per stream.
                     if config.print && !config.json_stream {
-                        let interval = StreamInterval {
-                            stream_id: stream.id,
-                            start,
-                            end,
-                            bytes,
-                            retransmits,
-                            snd_cwnd,
-                            jitter,
-                            lost,
-                            total_packets: total,
-                            sent_packets: sent_pkts,
-                            role_tag,
-                            omitted,
-                        };
-                        print_interval(&interval, config.format_char);
+                        // Buffered, not printed: iperf3 emits each DIRECTION's
+                        // rows followed by that direction's [SUM] (its
+                        // per-mode pass), so printing waits until the whole
+                        // tick is gathered (#143 review r1 n1).
+                        tick_rows.push((
+                            stream.is_sender,
+                            StreamInterval {
+                                stream_id: stream.id,
+                                start,
+                                end,
+                                bytes,
+                                retransmits,
+                                snd_cwnd,
+                                jitter,
+                                lost,
+                                total_packets: total,
+                                sent_packets: sent_pkts,
+                                role_tag,
+                                omitted,
+                            },
+                        ));
                     }
 
                     if collecting {
@@ -930,25 +989,25 @@ pub fn spawn_interval_reporter(
                     }
                 }
 
-                // Text [SUM] rows, iperf3's iperf_print_intermediate: one per
-                // DIRECTION (its per-mode pass prints each direction's own
-                // SUM, tagged in bidir), and only when that direction has
-                // more than one stream — the old combined row mixed both
-                // directions and printed even at bidir P=1 (#143/#187).
+                // Text emission, iperf3's iperf_print_intermediate: one pass
+                // per DIRECTION — that direction's stream rows, then ITS OWN
+                // [SUM] (tagged in bidir), the SUM only when the direction
+                // has more than one stream. The old code printed all rows
+                // then a combined SUM mixing both directions, even at bidir
+                // P=1 (#143/#187 + review r1 n1).
                 if config.print && !config.json_stream {
                     for (acc, dir_is_sender) in [(&fwd, fwd_is_sender), (&rev, !fwd_is_sender)] {
+                        for (row_is_sender, row) in &tick_rows {
+                            if *row_is_sender == dir_is_sender {
+                                print_interval(row, config.format_char);
+                            }
+                        }
                         if acc.count <= 1 {
                             continue;
                         }
-                        let role_tag =
-                            config
-                                .bidir
-                                .then_some(match (config.is_server, dir_is_sender) {
-                                    (false, true) => "TX-C",
-                                    (false, false) => "RX-C",
-                                    (true, true) => "TX-S",
-                                    (true, false) => "RX-S",
-                                });
+                        let role_tag = config
+                            .bidir
+                            .then_some(bidir_role_tag(config.is_server, dir_is_sender));
                         // A receiving direction reports loss + mean jitter
                         // (#142); a sending direction reports only the sent
                         // count, like the per-stream sender rows.
@@ -965,8 +1024,7 @@ pub fn spawn_interval_reporter(
                                 .then(|| acc.jitter_sum / acc.udp_recv_count.max(1) as f64),
                             lost: (is_udp && receiving).then_some(acc.lost),
                             total_packets: (is_udp && receiving).then_some(acc.packets),
-                            sent_packets: (is_udp && !receiving)
-                                .then(|| (acc.bytes / blk.max(1)) as i64),
+                            sent_packets: (is_udp && !receiving).then(|| (acc.bytes / blk) as i64),
                             role_tag,
                             omitted,
                         };

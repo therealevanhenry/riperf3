@@ -337,6 +337,11 @@ fn udp_bidir_text_interval_rows_role_tags_no_sum() {
         out.contains("][TX-C]") && out.contains("][RX-C]"),
         "bidir interval rows must carry role tags (iperf3 mbuf): {out}"
     );
+    assert!(
+        out.contains("[ ID][Role] Interval"),
+        "the bidir interval header carries the [Role] column \
+         (report_bw_*_header_bidir; review r1 n2): {out}"
+    );
     // No interval [SUM] at P=1 — iperf3 gates the text SUM on num_streams>1
     // PER DIRECTION; the end block's separator-delimited summary is exempt.
     let interval_section = out.split("- - - - -").next().unwrap_or("");
@@ -395,5 +400,20 @@ fn tcp_bidir_text_interval_sums_split_per_direction() {
                 "every interval SUM must be direction-tagged (no mixed SUM): {l}"
             );
         }
+    }
+
+    // iperf3's per-mode pass order: a direction's rows then ITS SUM — the
+    // first TX SUM precedes the first RX row (review r1 n1).
+    let lines: Vec<&str> = interval_section.lines().collect();
+    let first_tx_sum = lines.iter().position(|l| l.contains("[SUM][TX-C]"));
+    let first_rx_row = lines
+        .iter()
+        .position(|l| l.contains("][RX-C]") && !l.contains("[SUM]"));
+    if let (Some(ts), Some(rr)) = (first_tx_sum, first_rx_row) {
+        assert!(
+            ts < rr,
+            "SUM placement: TX SUM must close the TX pass before RX rows \
+             (iperf3 per-direction pass): {out}"
+        );
     }
 }

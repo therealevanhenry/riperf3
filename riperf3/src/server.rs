@@ -1346,7 +1346,7 @@ impl Server {
                     // Bidir tags every line with the stream's direction (#184).
                     role_tag: cfg
                         .bidir
-                        .then_some(if s.is_sender { "TX-S" } else { "RX-S" }),
+                        .then_some(crate::reporter::bidir_role_tag(true, s.is_sender)),
                 }
             })
             .collect()
