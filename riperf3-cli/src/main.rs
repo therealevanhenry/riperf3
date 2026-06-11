@@ -163,12 +163,18 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // only); Drop doesn't run under _exit, so it unlinks the pidfile itself.
     #[cfg(unix)]
     if matches!(outcome, Ok(Exit::Signal(_))) {
-        drop(sigend); // release tokio's handler state before re-registering
+        // tokio never unregisters its libc sigaction (dropping the streams
+        // only detaches listeners) — the libc::signal overwrite below is the
+        // operative action and wins regardless; the drop just tidies.
+        drop(sigend);
         second_signal_exits_immediately(pidfile.as_deref());
     }
-    // Windows: best-effort runtime watcher (close/shutdown events carry the
-    // OS's own ~5 s force-kill backstop, so a wedged teardown is bounded
-    // there regardless).
+    // Windows: best-effort runtime watcher. Once rt-drop cancels it, every
+    // listener is gone, tokio's console handler returns 0 ("run the next
+    // handler"), and the DEFAULT handler terminates the process — so a
+    // second Ctrl+C during a drain hang still exits immediately by
+    // fall-through, just without the notice; the pidfile was already
+    // unlinked by the guard (drop order: guard before rt).
     #[cfg(windows)]
     if matches!(outcome, Ok(Exit::Signal(_))) {
         let pf = pidfile.clone();
@@ -181,7 +187,7 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         });
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = &pidfile;
     match outcome {
         // iperf3 treats SIGTERM/SIGINT/SIGHUP as a NORMAL exit
@@ -215,16 +221,20 @@ fn second_signal_exits_immediately(pidfile: Option<&str>) {
     use std::sync::atomic::{AtomicPtr, Ordering};
     static PIDFILE: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
 
-    extern "C" fn hard_exit(_sig: libc::c_int) {
-        // SAFETY: async-signal-safe calls only (write/unlink/_exit).
+    extern "C" fn hard_exit(sig: libc::c_int) {
+        // SAFETY: async-signal-safe calls only (write/unlink/signal/raise/_exit).
         unsafe {
             let msg = b"riperf3: interrupt - second signal, exiting immediately\n";
             let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
-            let p = PIDFILE.load(Ordering::Relaxed);
+            let p = PIDFILE.load(Ordering::Acquire);
             if !p.is_null() {
                 let _ = libc::unlink(p);
             }
-            libc::_exit(1);
+            // Die BY the signal (supervisors distinguish signal-death from
+            // exit-1; a pre-#150 second Ctrl-C read as 130 in shells).
+            libc::signal(sig, libc::SIG_DFL);
+            let _ = libc::raise(sig);
+            libc::_exit(1); // unreachable fallback
         }
     }
 
@@ -232,7 +242,7 @@ fn second_signal_exits_immediately(pidfile: Option<&str>) {
         if let Ok(c) = std::ffi::CString::new(path) {
             // Leaked deliberately: the process exits via _exit shortly; the
             // handler needs a stable pointer.
-            PIDFILE.store(c.into_raw(), Ordering::Relaxed);
+            PIDFILE.store(c.into_raw(), Ordering::Release);
         }
     }
     // SAFETY: replacing the dispositions with our handler; tokio's streams
@@ -289,15 +299,19 @@ impl Sigend {
     }
 }
 
-/// Windows console-event analog of the unix set (#158): iperf3 installs its
-/// sigend handler via CRT signal() for SIGINT/SIGTERM on Windows too. Ctrl+C,
-/// Ctrl+Break, console close, and system shutdown all take the clean
-/// pidfile-unlink path; close/shutdown grant ~5 s before the force-kill.
+/// Windows console-event analog of the unix set (#158): iperf3's CRT
+/// signal() only ever yields Ctrl+C there (SIGTERM is never OS-delivered);
+/// the extra events are pidfile hygiene on paths where iperf3 dies dirty.
+/// Close/logoff/shutdown's grace window exists only while the handler runs —
+/// tokio < 1.44 returned from its HandlerRoutine immediately (losing the
+/// race to TerminateProcess); the lockfile pins >= 1.44, whose handler parks
+/// for those events (tokio #7122), so the clean unlink path holds.
 #[cfg(windows)]
 struct Sigend {
     ctrl_c: tokio::signal::windows::CtrlC,
     ctrl_break: tokio::signal::windows::CtrlBreak,
     ctrl_close: tokio::signal::windows::CtrlClose,
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
     ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
@@ -310,6 +324,7 @@ impl Sigend {
             ctrl_c: windows::ctrl_c()?,
             ctrl_break: windows::ctrl_break()?,
             ctrl_close: windows::ctrl_close()?,
+            ctrl_logoff: windows::ctrl_logoff()?,
             ctrl_shutdown: windows::ctrl_shutdown()?,
         })
     }
@@ -319,6 +334,7 @@ impl Sigend {
             _ = self.ctrl_c.recv() => "Interrupt(2)",
             _ = self.ctrl_break.recv() => "Break",
             _ = self.ctrl_close.recv() => "Close",
+            _ = self.ctrl_logoff.recv() => "Logoff",
             _ = self.ctrl_shutdown.recv() => "Shutdown",
         }
     }

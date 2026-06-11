@@ -135,3 +135,68 @@ fn pidfile_unlinked_after_one_off_run() {
         "pidfile must be unlinked when a one-off server exits normally (#105)"
     );
 }
+
+/// #158: a SECOND signal during teardown exits immediately. A UDP peer
+/// blasting at unlimited rate holds the server's shared receiver drain (up to
+/// 10 s) after the first SIGTERM; the second must escape it via the raw libc
+/// handler. Race guard: if teardown won before the second signal landed
+/// (fast machine), the run exits cleanly on the FIRST signal — the hard
+/// assertions (bounded exit, pidfile gone) hold either way.
+#[cfg(unix)]
+#[test]
+fn second_signal_during_teardown_exits_immediately() {
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let dir = std::env::temp_dir();
+    let pf = dir.join(format!("riperf3-2sig-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pf);
+    let port = free_port().to_string();
+
+    let server = Command::new(bin)
+        .args(["-s", "-I"])
+        .arg(&pf)
+        .args(["-p", &port])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    wait_for(
+        || pf.exists(),
+        Duration::from_secs(5),
+        "server pidfile written",
+    );
+
+    // A blasting UDP client makes the post-signal drain non-trivial.
+    let client = Command::new(bin)
+        .args(["-c", "127.0.0.1", "-p", &port, "-u", "-b", "0", "-t", "8"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn client");
+    let mut client = ChildGuard(client);
+    std::thread::sleep(Duration::from_secs(2)); // mid-test
+
+    let pid = server.0.id() as i32;
+    // SAFETY: plain kill(2) on our own child.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+
+    // Bounded exit: well under the 10 s drain either way (second-signal
+    // escape, or the teardown simply won the race).
+    let exited = common::wait_bounded(&mut server.0, Duration::from_secs(4));
+    assert!(
+        exited.is_some(),
+        "server must exit promptly after the second signal, not ride out the drain"
+    );
+    wait_for(
+        || !pf.exists(),
+        Duration::from_secs(2),
+        "pidfile unlinked on the signal path",
+    );
+    let _ = client.0.kill();
+}
