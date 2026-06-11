@@ -23,6 +23,8 @@ pub(crate) struct TestConfig {
     pub mss: Option<i32>,
     pub window: Option<i32>,
     pub bandwidth: u64,
+    /// `-b rate/burst` block count from the client (0 = unset) (#160).
+    pub burst: u32,
     pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
@@ -32,7 +34,7 @@ pub(crate) struct TestConfig {
 impl TestConfig {
     // Crate-internal: takes the wire `TestParams` (now `pub(crate)` per #67),
     // so it cannot be part of the public API.
-    pub(crate) fn from_params(params: &TestParams) -> Self {
+    pub(crate) fn from_params(params: &TestParams) -> std::result::Result<Self, ConfigError> {
         let is_udp = params.udp.unwrap_or(false);
         let protocol = if is_udp {
             TransportProtocol::Udp
@@ -46,11 +48,63 @@ impl TestConfig {
             DEFAULT_TCP_BLKSIZE
         };
 
-        Self {
+        // Bound a negotiated `burst` like the client parse (IEBURST,
+        // 1..=MAX_BURST): no real iperf3 client can send more (its own parse
+        // enforces the cap), and an unbounded value drives the sender's
+        // per-batch loop and green-light debt for hours — the same
+        // hostile-peer posture as `len` below (#160 review r2). Absent or
+        // non-positive (iperf3 gates on nonzero before sending) = unset.
+        let burst = match params.burst {
+            Some(b) if b > MAX_BURST as i32 => {
+                return Err(ConfigError::InvalidValue(
+                    "burst count",
+                    format!("invalid burst count (maximum = {MAX_BURST}): {b}"),
+                ));
+            }
+            Some(b) if b > 0 => b as u32,
+            _ => 0,
+        };
+
+        // Bounds-check a negotiated `len` like the client builder (#188):
+        // 0/absent → protocol default (iperf3 clients omit len 0); negative
+        // would wrap `as usize` into a multi-EiB allocation; UDP below
+        // MIN_UDP_BLKSIZE panicked the datagram-header write; oversized is an
+        // allocation DoS. iperf3's server never sees these from real clients
+        // (they validate locally), so rejection only fires for broken or
+        // hostile peers — drop the test rather than run degenerate.
+        let blksize = match params.len {
+            None | Some(0) => default_blksize,
+            Some(l) if l < 0 => {
+                return Err(ConfigError::InvalidValue(
+                    "len",
+                    format!("negative block size: {l}"),
+                ));
+            }
+            Some(l) => {
+                let l = l as usize;
+                if is_udp && !(MIN_UDP_BLKSIZE..=MAX_UDP_BLKSIZE).contains(&l) {
+                    return Err(ConfigError::InvalidValue(
+                        "len",
+                        format!(
+                            "block size invalid (minimum = {MIN_UDP_BLKSIZE} bytes, maximum = {MAX_UDP_BLKSIZE} bytes): {l}"
+                        ),
+                    ));
+                }
+                if !is_udp && l > MAX_BLOCKSIZE {
+                    return Err(ConfigError::InvalidValue(
+                        "len",
+                        format!("block size too large (maximum = {MAX_BLOCKSIZE} bytes): {l}"),
+                    ));
+                }
+                l
+            }
+        };
+
+        Ok(Self {
             protocol,
             duration: params.time.unwrap_or(DEFAULT_DURATION as i32) as u32,
             num_streams: params.parallel.unwrap_or(1) as u32,
-            blksize: params.len.unwrap_or(default_blksize as i32) as usize,
+            blksize,
             reverse: params.reverse.unwrap_or(false),
             bidir: params.bidirectional.unwrap_or(false),
             omit: params.omit.unwrap_or(0) as u32,
@@ -64,6 +118,7 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
+            burst,
             // The client's --pacing-timer quantum (#32); iperf3 always sends
             // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
             pacing_timer: params
@@ -74,7 +129,7 @@ impl TestConfig {
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
-        }
+        })
     }
 }
 
@@ -219,7 +274,12 @@ impl Server {
         // unlimited so the byte-limit checks below don't misread a duration test
         // as byte-limited (#119).
         params.normalize_unlimited();
-        let cfg = TestConfig::from_params(&params);
+        // Malformed negotiated params (e.g. len 0 < l < 16 on UDP, negative,
+        // or oversized) refuse the test outright (#188). No SERVER_ERROR
+        // state: iperf3's client follows that with an errno exchange we don't
+        // speak, and real iperf3 clients never send these values — dropping
+        // the control connection is the safe shape for a hostile peer.
+        let cfg = TestConfig::from_params(&params)?;
         // --get-server-output (#33): when the client asks and this server is
         // in text mode, TEE the console report into the exchange buffer
         // (iperf3's iperf_printf dual-write — the console stays live).
@@ -384,9 +444,11 @@ impl Server {
                         // quantum. #102/#32
                         let rate = cfg.bandwidth;
                         let pt = cfg.pacing_timer;
+                        let bu = cfg.burst;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
-                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb).await
+                            stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bu, bb)
+                                .await
                         })
                     } else {
                         let c = counters.clone();
@@ -902,10 +964,13 @@ impl Server {
                 let rate = cfg.bandwidth;
                 let pt = cfg.pacing_timer; // #185: pace the UDP batch too
                 let u64bit = cfg.udp_counters_64bit;
+                let bu = cfg.burst;
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
-                    stream::run_udp_sender_blocking(std_sock, c, bs, d, rate, pt, u64bit, st, md)
+                    stream::run_udp_sender_blocking(
+                        std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                    )
                 });
                 streams.push(DataStream {
                     id: stream_id,
@@ -1114,6 +1179,7 @@ impl Server {
                 let s = shared.clone();
                 let c = counters.clone();
                 let d = done.clone();
+                let bu = cfg.burst;
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
@@ -1125,6 +1191,7 @@ impl Server {
                         d,
                         rate,
                         pt,
+                        bu,
                         u64bit,
                         st,
                         md,
@@ -1328,6 +1395,7 @@ impl Server {
                     .find(|e| e.stream_id == s.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
+                    max_snd_wnd: e.max_snd_wnd,
                     max_rtt: e.max_rtt,
                     min_rtt: e.min_rtt,
                     mean_rtt: e.mean_rtt(),
@@ -1879,7 +1947,7 @@ mod test_config_tests {
             tcp: Some(true),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.protocol, TransportProtocol::Tcp);
         assert_eq!(cfg.duration, 10);
         assert_eq!(cfg.num_streams, 1);
@@ -1894,7 +1962,7 @@ mod test_config_tests {
             udp: Some(true),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.protocol, TransportProtocol::Udp);
         assert_eq!(cfg.blksize, 1460);
     }
@@ -1918,7 +1986,7 @@ mod test_config_tests {
             udp_counters_64bit: Some(1),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.duration, 30);
         assert_eq!(cfg.num_streams, 4);
         assert_eq!(cfg.blksize, 65536);
@@ -1943,17 +2011,91 @@ mod test_config_tests {
             pacing_timer: Some(250),
             ..Default::default()
         };
-        assert_eq!(TestConfig::from_params(&p).pacing_timer, 250);
+        assert_eq!(TestConfig::from_params(&p).unwrap().pacing_timer, 250);
         let p = TestParams::default();
-        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
+        assert_eq!(TestConfig::from_params(&p).unwrap().pacing_timer, 1000);
         let p = TestParams {
             pacing_timer: Some(0),
             ..Default::default()
         };
-        assert_eq!(TestConfig::from_params(&p).pacing_timer, 1000);
+        assert_eq!(TestConfig::from_params(&p).unwrap().pacing_timer, 1000);
     }
 
     // -- server mirrors the client's rate resolution (#17) --
+
+    #[test]
+    fn from_params_validates_len_bounds() {
+        // A negotiated `len` is bounds-checked like the client builder (#188):
+        // 0/absent → protocol default; negative would wrap `as usize` into a
+        // multi-EiB buffer; UDP below MIN_UDP_BLKSIZE panicked the header
+        // write; oversized is an allocation DoS. iperf3 clients never send
+        // these (they validate locally and omit len 0), so rejection only
+        // fires for broken/hostile peers.
+        let udp = |len| TestParams {
+            udp: Some(true),
+            len,
+            ..Default::default()
+        };
+        let tcp = |len| TestParams {
+            tcp: Some(true),
+            len,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            TestConfig::from_params(&udp(None)).unwrap().blksize,
+            crate::utils::DEFAULT_UDP_BLKSIZE
+        );
+        assert_eq!(
+            TestConfig::from_params(&udp(Some(0))).unwrap().blksize,
+            crate::utils::DEFAULT_UDP_BLKSIZE
+        );
+        assert_eq!(
+            TestConfig::from_params(&tcp(Some(0))).unwrap().blksize,
+            crate::utils::DEFAULT_TCP_BLKSIZE
+        );
+        assert_eq!(
+            TestConfig::from_params(&udp(Some(1460))).unwrap().blksize,
+            1460
+        );
+
+        assert!(TestConfig::from_params(&udp(Some(-1))).is_err());
+        assert!(TestConfig::from_params(&tcp(Some(-1))).is_err());
+        assert!(TestConfig::from_params(&udp(Some(8))).is_err());
+        assert!(TestConfig::from_params(&udp(Some(70_000))).is_err());
+        assert!(TestConfig::from_params(&tcp(Some(2 * 1024 * 1024))).is_err());
+        assert!(TestConfig::from_params(&tcp(Some(1024 * 1024))).is_ok());
+    }
+
+    #[test]
+    fn from_params_honors_burst() {
+        // `-b rate/burst` arrives on the wire only when set (#160).
+        let p = TestParams {
+            tcp: Some(true),
+            burst: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).unwrap().burst, 10);
+        let p = TestParams {
+            tcp: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).unwrap().burst, 0);
+        // Hostile/broken peers: above MAX_BURST is rejected (no real iperf3
+        // client can produce it), non-positive is unset (#160 review r2).
+        let p = TestParams {
+            tcp: Some(true),
+            burst: Some(1001),
+            ..Default::default()
+        };
+        assert!(TestConfig::from_params(&p).is_err());
+        let p = TestParams {
+            tcp: Some(true),
+            burst: Some(-5),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).unwrap().burst, 0);
+    }
 
     #[test]
     fn udp_absent_bandwidth_is_unlimited() {
@@ -1966,7 +2108,7 @@ mod test_config_tests {
             udp: Some(true),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.bandwidth, 0);
     }
 
@@ -1979,7 +2121,7 @@ mod test_config_tests {
             bandwidth: Some(0),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.bandwidth, 0);
     }
 
@@ -1989,7 +2131,7 @@ mod test_config_tests {
             tcp: Some(true),
             ..Default::default()
         };
-        let cfg = TestConfig::from_params(&p);
+        let cfg = TestConfig::from_params(&p).unwrap();
         assert_eq!(cfg.bandwidth, 0);
     }
 }

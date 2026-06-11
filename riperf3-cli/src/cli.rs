@@ -161,9 +161,11 @@ pub struct Cli {
     #[arg(short = 'b', long, value_name = "rate[/burst]")]
     pub bitrate: Option<String>,
 
-    /// Set the IP type of service (0-255)
+    /// Set the IP type of service (0-255; decimal, 0x hex, or 0 octal)
+    // String, parsed by the builder's `tos_str` with iperf3's strtol-base-0
+    // semantics + IEBADTOS range check (#167).
     #[arg(short = 'S', long, value_name = "tos")]
-    pub tos: Option<i32>,
+    pub tos: Option<String>,
 
     /// Omit the first N seconds of the test
     #[arg(short = 'O', long, value_name = "secs")]
@@ -202,10 +204,11 @@ pub struct Cli {
     pub cport: Option<u16>,
 
     /// Set the server timing for pacing in microseconds (deprecated)
-    // Capped at i32::MAX: the wire TestParams field is i32 (a larger u32
-    // would wrap negative on the wire — review r1).
-    #[arg(long, value_name = "usec", value_parser = clap::value_parser!(u32).range(..=i32::MAX as i64))]
-    pub pacing_timer: Option<u32>,
+    // String, parsed by the builder's `pacing_timer_str`: iperf3 reads it
+    // with unit_atoi, so KMG suffixes (1024-based) work; the i32::MAX wire
+    // cap (review r1) is enforced there too (#160).
+    #[arg(long, value_name = "usec")]
+    pub pacing_timer: Option<String>,
 
     /// Only use IPv4
     #[arg(short = '4', long, conflicts_with = "version6")]
@@ -487,8 +490,8 @@ impl Cli {
         if let Some(t) = self.time {
             builder = builder.duration(t);
         }
-        if let Some(us) = self.pacing_timer {
-            builder = builder.pacing_timer(us);
+        if let Some(ref s) = self.pacing_timer {
+            builder = builder.pacing_timer_str(s)?;
         }
         if let Some(ref s) = self.bytes {
             builder = builder.bytes_str(s)?;
@@ -523,8 +526,8 @@ impl Cli {
         if let Some(ref s) = self.bitrate {
             builder = builder.bandwidth_str(s)?;
         }
-        if let Some(tos) = self.tos {
-            builder = builder.tos(tos);
+        if let Some(ref s) = self.tos {
+            builder = builder.tos_str(s)?;
         }
         if let Some(o) = self.omit {
             builder = builder.omit(o);
@@ -1155,6 +1158,25 @@ mod cli_tests {
             assert_eq!(c, expected_client("host").tos(16).build().unwrap());
         }
 
+        // #167: -S takes iperf3's strtol-base-0 forms (hex/octal), and bad
+        // values fail the build with IEBADTOS wording instead of parsing.
+        #[test]
+        fn tos_flag_accepts_hex_and_octal() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "0x20"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("host").tos(0x20).build().unwrap());
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "020"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("host").tos(16).build().unwrap());
+        }
+
+        #[test]
+        fn tos_flag_rejects_out_of_range() {
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "256"]);
+            let err = cli.build_client().unwrap_err().to_string();
+            assert!(err.contains("bad TOS value"), "got: {err}");
+        }
+
         #[test]
         fn omit_flag_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-O", "3"]);
@@ -1636,6 +1658,14 @@ mod cli_tests {
         }
 
         // #32: --pacing-timer was parsed but never wired — a silent no-op.
+        #[test]
+        fn pacing_timer_accepts_kmg_suffix() {
+            // #160: iperf3 parses --pacing-timer with unit_atoi (1024-based).
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "1K"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").pacing_timer(1024).build().unwrap());
+        }
+
         #[test]
         fn pacing_timer_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "500"]);

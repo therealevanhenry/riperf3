@@ -35,6 +35,8 @@ pub struct Client {
     pub(crate) mss: Option<i32>,
     pub(crate) window: Option<i32>,
     pub(crate) bandwidth: u64,
+    /// `-b rate/burst` block count (0 = unset) — iperf3's multisend batch (#160).
+    pub(crate) burst: u32,
     pub(crate) pacing_timer: u32,
     pub(crate) tos: i32,
     pub(crate) congestion: Option<String>,
@@ -174,7 +176,43 @@ impl Client {
             self.mptcp,
             self.ip_version,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            // iperf3 raises IECONNECT for ANY netdial failure
+            // (iperf_client_api.c:441) — refused, timed out (netdial sets
+            // ETIMEDOUT), and bind-local failures alike — so wrap every
+            // error from the control connect. The io kind is preserved so
+            // callers (and the test harness's refused-retry) can still
+            // classify it (#151). The `(os error N)` suffix std's io::Error
+            // appends is a deliberate, recorded deviation from iperf3's bare
+            // strerror text: substring matchers survive, and strerror text
+            // varies by platform/locale anyway (review r1 n4).
+            let (kind, detail) = match e {
+                RiperfError::Io(io) => (io.kind(), io.to_string()),
+                // iperf3's suffix is strerror(ETIMEDOUT) — glibc's text;
+                // macOS/BSD say "Operation timed out" (recorded, like the
+                // os-error suffix above).
+                RiperfError::ConnectionTimeout => (
+                    std::io::ErrorKind::TimedOut,
+                    "Connection timed out".to_string(),
+                ),
+                // Not dial failures: the family-conflict validation (#15)
+                // keeps its Protocol classification (pinned by the lib
+                // tests). Recorded deviations sharing that variant (a
+                // net.rs error split would be needed to reclassify): a
+                // failed `-B` local bind (review r1 n3) and resolve_host's
+                // "no IPvX address found" (r2 n2) — both fold into
+                // IECONNECT in iperf3's netdial.
+                other => return other,
+            };
+            RiperfError::Io(std::io::Error::new(
+                kind,
+                format!(
+                    "unable to connect to server - server may have stopped running \
+                     or use a different port, firewall issue, etc.: {detail}"
+                ),
+            ))
+        })?;
         net::configure_tcp_stream(&ctrl, true)?;
 
         // The control connection's MSS sizes UDP datagrams (issue #6) and feeds
@@ -365,6 +403,9 @@ impl Client {
         // it. `bandwidth` is the effective rate after the build-time default
         // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
         p.bandwidth = Some(self.bandwidth);
+        // Sent only when set, like iperf3 (`if (test->settings->burst)`): the
+        // server's reverse/bidir sender batches on the client's burst (#160).
+        p.burst = (self.burst > 0).then_some(self.burst as i32);
         // Always sent, like iperf3 (default 1000 µs): the server's
         // reverse/bidir sender paces on the client's quantum (#32).
         p.pacing_timer = Some(self.pacing_timer as i32);
@@ -536,6 +577,7 @@ impl Client {
                         let zc = self.zerocopy;
                         let rate = self.bandwidth;
                         let pt = self.pacing_timer;
+                        let bu = self.burst;
                         let bb = byte_budget.clone();
                         tokio::spawn(async move {
                             // Zerocopy (sendfile) is used only for an unlimited,
@@ -565,11 +607,21 @@ impl Client {
                                     target_os = "freebsd"
                                 )))]
                                 {
-                                    stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb)
-                                        .await
+                                    stream::run_tcp_sender(
+                                        data_stream,
+                                        c,
+                                        buf,
+                                        d,
+                                        fp,
+                                        rate,
+                                        pt,
+                                        bu,
+                                        bb,
+                                    )
+                                    .await
                                 }
                             } else {
-                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bb)
+                                stream::run_tcp_sender(data_stream, c, buf, d, fp, rate, pt, bu, bb)
                                     .await
                             }
                         })
@@ -672,6 +724,7 @@ impl Client {
                         // #185: honor --pacing-timer on the UDP send batch too,
                         // so a low -b over a large datagram paces smoothly.
                         let pt = self.pacing_timer;
+                        let bu = self.burst;
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -679,11 +732,11 @@ impl Client {
                         thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
                                 )
                             } else {
                                 stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, pt, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
                                 )
                             }
                         })
@@ -1297,6 +1350,7 @@ impl Client {
                     .find(|e| e.stream_id == s.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
+                    max_snd_wnd: e.max_snd_wnd,
                     max_rtt: e.max_rtt,
                     min_rtt: e.min_rtt,
                     mean_rtt: e.mean_rtt(),
@@ -1517,6 +1571,7 @@ pub struct ClientBuilder {
     mss: Option<i32>,
     window: Option<i32>,
     bandwidth: Option<u64>,
+    burst: u32,
     pacing_timer: u32,
     tos: i32,
     congestion: Option<String>,
@@ -1574,6 +1629,7 @@ impl Default for ClientBuilder {
             mss: None,
             window: None,
             bandwidth: None,
+            burst: 0,
             pacing_timer: 0,
             tos: 0,
             congestion: None,
@@ -1705,6 +1761,14 @@ impl ClientBuilder {
         // `Some` even for 0: an explicit `-b 0` means unlimited and must be
         // distinguishable from "unset" (which resolves to the UDP default) (#17).
         self.bandwidth = Some(bps);
+        self
+    }
+
+    /// `-b rate/burst` burst count: blocks sent per throttle green light
+    /// (iperf3's multisend batch, 1..=1000; 0 = unset) (#160). Range-checked
+    /// at `build()`.
+    pub fn burst(mut self, blocks: u32) -> Self {
+        self.burst = blocks;
         self
     }
 
@@ -2017,11 +2081,29 @@ impl ClientBuilder {
         Ok(self.window(parse_kmg(s)? as i32))
     }
 
-    /// Like [`Self::bandwidth`], accepting an iperf3 rate string (`-b 10M`;
-    /// decimal, 1000-based). A `/burst` suffix is parsed but not applied.
+    /// Like [`Self::bandwidth`], accepting an iperf3 rate string
+    /// (`-b 10M[/burst]`; decimal, 1000-based). A `/burst` count is applied
+    /// per [`Self::burst`] (#160).
     pub fn bandwidth_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
-        let (rate, _burst) = parse_bitrate(s)?;
-        Ok(self.bandwidth(rate))
+        let (rate, burst) = parse_bitrate(s)?;
+        Ok(self.bandwidth(rate).burst(burst))
+    }
+
+    /// Like [`Self::tos`], accepting iperf3's `-S` string forms: decimal,
+    /// `0x` hex, or leading-`0` octal (strtol base 0), range 0-255 (#167).
+    pub fn tos_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        Ok(self.tos(crate::utils::parse_tos(s)?))
+    }
+
+    /// Like [`Self::pacing_timer`], accepting a KMG-suffixed string
+    /// (`--pacing-timer 1K`; binary, 1024-based, like iperf3's `unit_atoi`) (#160).
+    pub fn pacing_timer_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
+        let us = parse_kmg(s)?;
+        // The wire TestParams field is i32; larger would wrap negative.
+        if us > i32::MAX as u64 {
+            return Err(ConfigError::InvalidValue("pacing_timer", s.to_string()));
+        }
+        Ok(self.pacing_timer(us as u32))
     }
 
     /// Like [`Self::fq_rate`], accepting an iperf3 rate string
@@ -2122,6 +2204,59 @@ impl ClientBuilder {
         } else {
             self.tos
         };
+        // IEBADTOS parity for the i32 setter path (the string path validates
+        // in parse_tos; --dscp resolves to 0-252 by construction) (#167).
+        if !(0..=255).contains(&tos) {
+            return Err(ConfigError::InvalidValue(
+                "tos",
+                format!("bad TOS value (must be between 0 and 255 inclusive): {tos}"),
+            ));
+        }
+
+        // IEBURST parity for the u32 setter path (#160).
+        if self.burst > crate::utils::MAX_BURST {
+            return Err(ConfigError::InvalidValue(
+                "burst count",
+                format!(
+                    "invalid burst count (maximum = {}): {}",
+                    crate::utils::MAX_BURST,
+                    self.burst
+                ),
+            ));
+        }
+
+        // -l 0 means "unset", like iperf3 (blksize 0 picks up the protocol
+        // default before validation; for UDP the dynamic-MSS resolution
+        // applies). A nonzero value is bounds-checked per protocol: TCP
+        // 1..=MAX_BLOCKSIZE (IEBLOCKSIZE), UDP MIN..=MAX_UDP_BLKSIZE
+        // (IEUDPBLOCKSIZE) (#188).
+        let blksize_req = self.blksize.filter(|&b| b != 0);
+        if let Some(b) = blksize_req {
+            match self.protocol {
+                TransportProtocol::Tcp if b > crate::utils::MAX_BLOCKSIZE => {
+                    return Err(ConfigError::InvalidValue(
+                        "len",
+                        format!(
+                            "block size too large (maximum = {} bytes): {b}",
+                            crate::utils::MAX_BLOCKSIZE
+                        ),
+                    ));
+                }
+                TransportProtocol::Udp
+                    if !(crate::utils::MIN_UDP_BLKSIZE..=MAX_UDP_BLKSIZE).contains(&b) =>
+                {
+                    return Err(ConfigError::InvalidValue(
+                        "len",
+                        format!(
+                            "block size invalid (minimum = {} bytes, maximum = {} bytes): {b}",
+                            crate::utils::MIN_UDP_BLKSIZE,
+                            MAX_UDP_BLKSIZE
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         Ok(Client {
             host,
@@ -2129,8 +2264,8 @@ impl ClientBuilder {
             protocol: self.protocol,
             duration: self.duration,
             num_streams: self.num_streams,
-            blksize: self.blksize.unwrap_or(default_blksize),
-            blksize_explicit: self.blksize.is_some(),
+            blksize: blksize_req.unwrap_or(default_blksize),
+            blksize_explicit: blksize_req.is_some(),
             reverse: self.reverse,
             bidir: self.bidir,
             omit: self.omit,
@@ -2144,6 +2279,7 @@ impl ClientBuilder {
                 TransportProtocol::Udp => DEFAULT_UDP_RATE,
                 TransportProtocol::Tcp => 0,
             }),
+            burst: self.burst,
             // 0 = unset → iperf3's default quantum, like its pacing_timer
             // option parsing (it never sends 0).
             pacing_timer: if self.pacing_timer == 0 {
@@ -2295,6 +2431,7 @@ mod tests {
             None,
             0,
             1000,
+            0,
             Some(budget.clone()),
         ));
         while budget.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -2528,6 +2665,100 @@ mod tests {
         }
 
         #[test]
+        fn build_blksize_zero_is_default() {
+            // -l 0 means "unset", like iperf3: blksize 0 resolves to the
+            // protocol default pre-validation; for UDP the dynamic-MSS path
+            // stays live (blksize_explicit = false) (#188).
+            let c = ClientBuilder::new("h").blksize(0).build().unwrap();
+            assert_eq!(c.blksize, DEFAULT_TCP_BLKSIZE);
+            assert!(!c.blksize_explicit);
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .blksize(0)
+                .build()
+                .unwrap();
+            assert_eq!(c.blksize, DEFAULT_UDP_BLKSIZE);
+            assert!(!c.blksize_explicit);
+        }
+
+        #[test]
+        fn build_blksize_bounds_match_iperf3() {
+            // TCP: 1..=MAX_BLOCKSIZE (IEBLOCKSIZE); UDP: MIN..=MAX_UDP_BLKSIZE
+            // (IEUDPBLOCKSIZE) (#188).
+            let tcp = |b| ClientBuilder::new("h").blksize(b).build();
+            let udp = |b| {
+                ClientBuilder::new("h")
+                    .protocol(TransportProtocol::Udp)
+                    .blksize(b)
+                    .build()
+            };
+            assert!(tcp(MAX_BLOCKSIZE).is_ok());
+            assert!(tcp(MAX_BLOCKSIZE + 1).is_err());
+            assert!(udp(MIN_UDP_BLKSIZE).is_ok());
+            assert!(udp(MIN_UDP_BLKSIZE - 1).is_err());
+            assert!(udp(MAX_UDP_BLKSIZE).is_ok());
+            assert!(udp(MAX_UDP_BLKSIZE + 1).is_err());
+        }
+
+        #[test]
+        fn build_tos_range_checked() {
+            // IEBADTOS parity for the i32 setter path (#167).
+            assert!(ClientBuilder::new("h").tos(255).build().is_ok());
+            assert!(ClientBuilder::new("h").tos(256).build().is_err());
+            assert!(ClientBuilder::new("h").tos(-1).build().is_err());
+        }
+
+        #[test]
+        fn tos_str_parses_strtol_base0() {
+            // -S accepts decimal/hex/octal like iperf3's strtol base 0 (#167).
+            let c = ClientBuilder::new("h")
+                .tos_str("0x20")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(c.tos, 0x20);
+            assert!(ClientBuilder::new("h").tos_str("256").is_err());
+        }
+
+        #[test]
+        fn bandwidth_str_applies_burst() {
+            // The /burst count is no longer discarded (#160).
+            let c = ClientBuilder::new("h")
+                .bandwidth_str("100M/10")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(c.bandwidth, 100_000_000);
+            assert_eq!(c.burst, 10);
+            // IEBURST parity on the setter path too.
+            assert!(ClientBuilder::new("h").burst(1001).build().is_err());
+        }
+
+        #[test]
+        fn pacing_timer_str_enforces_i32_wire_cap() {
+            // The wire TestParams field is i32; larger would wrap negative
+            // (review r1 of #32; coverage restored per #193 review r1 n2).
+            assert!(ClientBuilder::new("h").pacing_timer_str("3G").is_err());
+            assert!(ClientBuilder::new("h")
+                .pacing_timer_str("2147483647")
+                .is_ok());
+            assert!(ClientBuilder::new("h")
+                .pacing_timer_str("2147483648")
+                .is_err());
+        }
+
+        #[test]
+        fn pacing_timer_str_accepts_kmg() {
+            // iperf3 parses --pacing-timer with unit_atoi (1024-based) (#160).
+            let c = ClientBuilder::new("h")
+                .pacing_timer_str("1K")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(c.pacing_timer, 1024);
+        }
+
+        #[test]
         fn client_builder_bandwidth() {
             let c = ClientBuilder::new("h")
                 .bandwidth(1_000_000)
@@ -2748,6 +2979,21 @@ mod tests {
         // #32: iperf3 ALWAYS sends pacing_timer in the param exchange (default
         // 1000 µs), so the server's reverse/bidir sender paces on the same
         // quantum. riperf3 left it unset.
+        #[test]
+        fn build_params_sends_burst_only_when_set() {
+            // iperf3 gates the param on nonzero (`if (test->settings->burst)`,
+            // iperf_api.c:2461) — absent otherwise, so the wire JSON is
+            // byte-identical for every burst-less invocation (#160 review r2 n4).
+            let c = ClientBuilder::new("h")
+                .bandwidth_str("100M/10")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(c.build_params(1460).burst, Some(10));
+            let c = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(c.build_params(1460).burst, None);
+        }
+
         #[test]
         fn build_params_always_sends_pacing_timer() {
             let c = ClientBuilder::new("h").build().unwrap();

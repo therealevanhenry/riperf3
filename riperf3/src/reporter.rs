@@ -260,7 +260,9 @@ pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
 /// keeps a `[SUM]` from ever mixing the two directions of a bidir run (#184):
 /// a `P=1` bidir end block (one stream per direction, two lines each) gets no
 /// SUM at all, exactly like iperf3. UDP SUM rows aggregate lost/total
-/// datagrams and carry the worst-case (max) jitter across the grouped streams.
+/// datagrams and carry the MEAN jitter across the grouped streams, matching
+/// iperf3's END block (`avg_jitter += sp->jitter` per stream of the
+/// direction, then `avg_jitter /= test->num_streams` — #169).
 pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
     // Distinct (role_tag, is_sender) keys in first-seen order, so SUM rows
     // come out in the same order iperf3 lists the groups.
@@ -285,11 +287,13 @@ pub fn sum_summaries(streams: &[StreamSummary]) -> Vec<StreamSummary> {
         let (jitter, lost, total_packets) = if is_udp {
             let lost = group.iter().filter_map(|s| s.lost).sum();
             let total = group.iter().filter_map(|s| s.total_packets).sum();
-            // Jitter doesn't sum; report the worst stream's jitter on the SUM.
+            // iperf3 averages jitter across the direction's streams in the
+            // END block (it divides by num_streams, the group size — #169).
+            let jitter_sum: f64 = group.iter().filter_map(|s| s.jitter).sum();
             let jitter = group
                 .iter()
-                .filter_map(|s| s.jitter)
-                .fold(None, |acc, j| Some(acc.map_or(j, |a: f64| a.max(j))));
+                .any(|s| s.jitter.is_some())
+                .then(|| jitter_sum / group.len() as f64);
             (jitter, Some(lost), Some(total))
         } else {
             (None, None, None)
@@ -378,6 +382,7 @@ pub struct IntervalReporterConfig {
 #[derive(Clone, Copy)]
 struct TcpSample {
     snd_cwnd: u64,
+    snd_wnd: u64,
     rtt: u32,
     rttvar: u32,
     pmtu: u32,
@@ -390,6 +395,7 @@ struct TcpSample {
 pub struct StreamExtremes {
     pub stream_id: i32,
     pub max_snd_cwnd: u64,
+    pub max_snd_wnd: u64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub reorder: u32,
@@ -718,7 +724,7 @@ pub fn spawn_interval_reporter(
                     };
 
                     // TCP_INFO for the interval detail and the end extremes.
-                    let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) =
+                    let (retransmits, snd_cwnd, snd_wnd, rtt, rttvar, pmtu, reorder_iv) =
                         if has_retransmits && stream.is_sender {
                             if let Some(fd) = stream.raw_fd {
                                 if let Some(info) = tcp_info::get_tcp_info(fd) {
@@ -728,6 +734,7 @@ pub fn spawn_interval_reporter(
                                     // Accumulate sender-side extremes for the end report.
                                     let e = &mut acc_extremes[i];
                                     e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
+                                    e.max_snd_wnd = e.max_snd_wnd.max(info.snd_wnd);
                                     e.reorder = e.reorder.max(info.reorder);
                                     if info.rtt > 0 {
                                         e.max_rtt = e.max_rtt.max(info.rtt);
@@ -738,6 +745,7 @@ pub fn spawn_interval_reporter(
                                     e.total_retransmits = Some(info.total_retransmits);
                                     last_tcp[i] = Some(TcpSample {
                                         snd_cwnd: info.snd_cwnd,
+                                        snd_wnd: info.snd_wnd,
                                         rtt: info.rtt,
                                         rttvar: info.rttvar,
                                         pmtu: info.pmtu,
@@ -746,6 +754,7 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(delta as i64),
                                         Some(info.snd_cwnd),
+                                        Some(info.snd_wnd),
                                         Some(info.rtt),
                                         Some(info.rttvar),
                                         Some(info.pmtu),
@@ -759,19 +768,20 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(0),
                                         Some(s.snd_cwnd),
+                                        Some(s.snd_wnd),
                                         Some(s.rtt),
                                         Some(s.rttvar),
                                         Some(s.pmtu),
                                         Some(s.reorder),
                                     )
                                 } else {
-                                    (None, None, None, None, None, None)
+                                    (None, None, None, None, None, None, None)
                                 }
                             } else {
-                                (None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None)
                             }
                         } else {
-                            (None, None, None, None, None, None)
+                            (None, None, None, None, None, None, None)
                         };
 
                     // UDP stats (compute deltas for loss/packets)
@@ -843,9 +853,10 @@ pub fn spawn_interval_reporter(
                             bits_per_second: bps_val,
                             retransmits,
                             snd_cwnd,
-                            // snd_wnd is unavailable via libc (see TcpStreamSide); emit
-                            // 0 alongside the other TCP detail, like iperf3.
-                            snd_wnd: snd_cwnd.map(|_| 0u64),
+                            // The live tcpi_snd_wnd where the platform reader
+                            // captures it (Linux UAPI mirror / FreeBSD), like
+                            // iperf3's get_snd_wnd (#161).
+                            snd_wnd,
                             rtt,
                             rttvar,
                             pmtu,
@@ -1346,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn sum_summaries_udp_aggregates_loss_and_max_jitter() {
+    fn sum_summaries_udp_aggregates_loss_and_mean_jitter() {
         let streams = vec![
             StreamSummary {
                 stream_id: 1,
@@ -1379,7 +1390,14 @@ mod tests {
         assert_eq!(s.bytes, 300_000);
         assert_eq!(s.lost, Some(7), "lost datagrams summed");
         assert_eq!(s.total_packets, Some(3000), "total datagrams summed");
-        assert_eq!(s.jitter, Some(0.025), "SUM carries worst-case jitter");
+        // iperf3's END-block SUM jitter is the MEAN across the direction's
+        // streams (iperf_api.c: avg_jitter += sp->jitter per stream, then
+        // avg_jitter /= test->num_streams), not the worst case (#169).
+        assert_eq!(
+            s.jitter,
+            Some((0.010f64 + 0.025) / 2.0),
+            "SUM jitter is the mean across streams"
+        );
     }
 
     #[test]

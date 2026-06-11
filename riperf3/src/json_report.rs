@@ -273,7 +273,8 @@ pub struct IntervalStream {
     #[serde(serialize_with = "ser_f64")]
     pub bits_per_second: f64,
     // TCP per-interval detail (sender side); omitted where TCP_INFO is
-    // unavailable. `snd_wnd` is absent — see TcpStreamSide.
+    // unavailable. `snd_wnd` carries the live tcpi_snd_wnd where the
+    // platform reader has it (#161).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retransmits: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,8 +397,8 @@ pub struct TcpStreamSide {
     // Sender-side TCP_INFO fields. iperf3 ALWAYS emits these on the sender
     // sub-object (0 when it couldn't measure them), so riperf3 does too for
     // drop-in schema parity; they're omitted on the receiver sub-object.
-    // `max_snd_wnd` and `reorder` are always 0 on Linux — libc's `tcp_info`
-    // exposes neither `tcpi_snd_wnd` nor `tcpi_reord_seen` — matching what iperf3
+    // `max_snd_wnd` and `reorder` carry the live tcpi_snd_wnd/tcpi_reord_seen
+    // on Linux via the UAPI tcp_info mirror (#161), matching what iperf3
     // emits when those are unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_snd_cwnd: Option<u64>,
@@ -519,6 +520,9 @@ pub struct StreamReport {
 #[non_exhaustive]
 pub struct TcpEndExtras {
     pub max_snd_cwnd: u64,
+    /// Peak peer-advertised send window, where the platform reader captures
+    /// it (Linux UAPI mirror / FreeBSD) — iperf3's stream_max_snd_wnd (#161).
+    pub max_snd_wnd: u64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub mean_rtt: u32,
@@ -1029,7 +1033,7 @@ impl ReportInput {
             bits_per_second: bps(bytes, dur),
             retransmits: if emit_extras { retransmits } else { None },
             max_snd_cwnd: emit_extras.then_some(e.max_snd_cwnd),
-            max_snd_wnd: emit_extras.then_some(0), // tcpi_snd_wnd unavailable via libc; 0 like iperf3
+            max_snd_wnd: emit_extras.then_some(e.max_snd_wnd),
             max_rtt: emit_extras.then_some(e.max_rtt),
             min_rtt: emit_extras.then_some(e.min_rtt),
             mean_rtt: emit_extras.then_some(e.mean_rtt),
@@ -1653,13 +1657,14 @@ mod tests {
     #[test]
     fn server_reverse_sender_emits_tcp_info_keys() {
         // On a reverse test the server sends, so its sender block carries the
-        // TCP_INFO extras (real cwnd/rtt, snd_wnd 0 like iperf3).
+        // TCP_INFO extras (real cwnd/rtt/snd_wnd, like iperf3 — #161).
         let mut input = base_input();
         input.is_server = true;
         input.reverse = true;
         input.streams = vec![StreamReport {
             tcp_end: Some(TcpEndExtras {
                 max_snd_cwnd: 65535,
+                max_snd_wnd: 1_500_000,
                 max_rtt: 200,
                 min_rtt: 90,
                 mean_rtt: 120,
@@ -1671,7 +1676,7 @@ mod tests {
         let sender = &v["end"]["streams"][0]["sender"];
         assert_eq!(sender["max_snd_cwnd"], 65535);
         assert_eq!(sender["max_rtt"], 200);
-        assert_eq!(sender["max_snd_wnd"], 0); // libc has no tcpi_snd_wnd
+        assert_eq!(sender["max_snd_wnd"], 1_500_000); // real value forwarded (#161)
         assert!(sender["retransmits"].is_number());
     }
 
@@ -1963,6 +1968,7 @@ mod tests {
         s.retransmits = Some(2);
         s.tcp_end = Some(TcpEndExtras {
             max_snd_cwnd: 64000,
+            max_snd_wnd: 0,
             max_rtt: 17,
             min_rtt: 14,
             mean_rtt: 15,
@@ -1987,8 +1993,8 @@ mod tests {
         assert_eq!(snd["mean_rtt"], 15);
         assert_eq!(snd["reorder"], 0);
 
-        // snd_wnd / max_snd_wnd are emitted as 0 — libc can't read tcpi_snd_wnd,
-        // and iperf3 likewise emits 0 when the field is unavailable.
+        // This fixture feeds snd_wnd / max_snd_wnd as 0 — live runs carry the
+        // platform reader's real value since #161.
         assert_eq!(i0["snd_wnd"], 0);
         assert_eq!(snd["max_snd_wnd"], 0);
     }
