@@ -45,6 +45,15 @@ pub enum RiperfError {
     #[error("test aborted: {0}")]
     Aborted(String),
 
+    /// iperf3's IECTRLCLOSE: the control connection died mid-test (#170).
+    #[error("control socket has closed unexpectedly")]
+    ControlSocketClosed,
+
+    /// iperf3's IESERVERTERM: the server sent SERVER_TERMINATE mid-test; a
+    /// partial summary is rendered from local data before this surfaces (#170).
+    #[error("the server has terminated")]
+    ServerTerminated,
+
     #[error("peer disconnected")]
     PeerDisconnected,
 }

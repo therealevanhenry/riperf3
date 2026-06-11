@@ -140,6 +140,10 @@ pub struct Report {
     /// full `-J` report, appended at the end of the top level like iperf3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_output_text: Option<String>,
+    /// Top-level `"error"` key, like iperf_json_finish: a -J run that ends in
+    /// IESERVERTERM still emits the partial blob, error attached (#170).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_output_json: Option<serde_json::Value>,
 }
@@ -541,6 +545,8 @@ pub struct UdpStreamStats {
 #[non_exhaustive]
 pub struct ReportInput {
     pub protocol: TransportProtocol,
+    /// iperf3's `"error"` blob key (e.g. "the server has terminated") (#170).
+    pub error: Option<String>,
     pub reverse: bool,
     pub bidir: bool,
     /// The requested `-t` duration parameter, reported under `test_start`. Stays
@@ -789,8 +795,18 @@ impl ReportInput {
             // (peer → this host) in the *_bidir_reverse pair, matching iperf3 —
             // rather than folding the reverse flow into sum_received (which would
             // make the two aggregates describe different directions).
-            let fwd_recv = if peer_recv > 0 { peer_recv } else { local_sent };
-            let rev_sent = if peer_sent > 0 { peer_sent } else { local_recv };
+            // No cross-graft on a terminated run (#170 review r2 f1): the
+            // peer halves never arrived — iperf3's bidir sums carry 0 there.
+            let fwd_recv = match (peer_recv, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_sent,
+            };
+            let rev_sent = match (peer_sent, self.error.is_some()) {
+                (p, _) if p > 0 => p,
+                (_, true) => 0,
+                _ => local_recv,
+            };
             sum_sent_bidir_reverse = Some(self.tcp_sum(rev_sent, false, None));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
@@ -812,7 +828,16 @@ impl ReportInput {
                 peer_recv
             };
             let sent_packets = (sent_bytes / blk) as i64;
-            sum = Some(self.udp_sum(sent_bytes, fwd_sender, sent_packets, udp_lost, udp_jitter));
+            // iperf3's `sum` packet count falls back to the RECEIVER count
+            // when the sender count is absent (iperf_api.c:4242, the
+            // `packet_count = sender ? sender : receiver` running total) —
+            // reachable when a terminated -R run never exchanged (#170 r2 f2).
+            let sum_packets = if sent_packets > 0 {
+                sent_packets
+            } else {
+                udp_packets
+            };
+            sum = Some(self.udp_sum(sent_bytes, fwd_sender, sum_packets, udp_lost, udp_jitter));
             (
                 self.udp_sum(sent_bytes, true, sent_packets, 0, 0.0),
                 self.udp_sum(recv_bytes, false, udp_packets, udp_lost, udp_jitter),
@@ -822,12 +847,14 @@ impl ReportInput {
             // test's sender flag (!reverse), like iperf3.
             let sent_bytes = match (local_sent, peer_sent) {
                 (0, p) if p > 0 => p,
-                (0, _) => local_recv,
+                // No cross-graft on a terminated run (#170): iperf3's
+                // sum_sent/sum_received carry 0 for the half it never got.
+                (0, _) if self.error.is_none() => local_recv,
                 (s, _) => s,
             };
             let recv_bytes = match (local_recv, peer_recv) {
                 (0, p) if p > 0 => p,
-                (0, _) => local_sent,
+                (0, _) if self.error.is_none() => local_sent,
                 (r, _) => r,
             };
             (
@@ -947,6 +974,7 @@ impl ReportInput {
             end,
             extra_data: self.extra_data.clone(),
             server_output_text: self.server_output_text.clone(),
+            error: self.error.clone(),
             server_output_json: self.server_output_json.clone(),
         }
     }
@@ -976,6 +1004,16 @@ impl ReportInput {
                 } else {
                     (0, u.packets)
                 }
+            } else if s.is_sender && s.udp.is_none() && self.error.is_some() {
+                // Terminated before the exchange (#170): no peer-measured
+                // stats — iperf3 reports the sender's LOCAL packet count.
+                let blk = self.blksize.max(1) as u64;
+                (s.local_bytes, (s.local_bytes / blk) as i64)
+            } else if !s.is_sender && self.error.is_some() {
+                // Terminated receiver stream (-R): `bytes` is a SENDER-side
+                // count the dead peer never reported — iperf3 emits 0 while
+                // keeping the locally measured packets (#170 r2 f2).
+                (0, u.packets)
             } else {
                 (s.local_bytes, u.packets)
             };
@@ -1011,10 +1049,12 @@ impl ReportInput {
         // The server never learns the peer's per-stream byte count, so its
         // un-measured side is 0 (iperf3 reports only local counters) — never
         // grafted from `local_bytes` the way the client fills the peer side.
-        let remote_bytes = if self.is_server {
-            0
-        } else {
-            s.remote_bytes.unwrap_or(s.local_bytes)
+        let remote_bytes = match (self.is_server, self.error.is_some()) {
+            (true, _) => 0,
+            // Terminated mid-test (#170): the peer half never arrived —
+            // iperf3 zeroes it (live-verified), never grafts local as peer.
+            (false, true) => s.remote_bytes.unwrap_or(0),
+            (false, false) => s.remote_bytes.unwrap_or(s.local_bytes),
         };
         // The client always emits the sender sub-object's TCP_INFO keys (real on
         // the forward side, 0 on the reverse side it didn't measure). iperf3's
@@ -1209,6 +1249,7 @@ mod tests {
 
     fn base_input() -> ReportInput {
         ReportInput {
+            error: None,
             server_output_text: None,
             server_output_json: None,
             protocol: TransportProtocol::Tcp,
@@ -1270,6 +1311,69 @@ mod tests {
             tcp_end: None,
             udp: None,
         }
+    }
+
+    /// #170 r3: the terminated-run shapes only existed in live matrices —
+    /// these pins keep a json_report refactor from silently regrowing the
+    /// fabrication family (it escaped two cold rounds for exactly this lack).
+    #[test]
+    fn terminated_bidir_sums_zero_the_absent_peer_halves() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.error = Some("the server has terminated".into());
+        let mut fwd = tcp_stream(1, true, 1_000_000, 0);
+        fwd.remote_bytes = None;
+        fwd.retransmits = None;
+        let mut rev = tcp_stream(3, false, 500_000, 0);
+        rev.remote_bytes = None;
+        rev.retransmits = None;
+        input.streams = vec![fwd, rev];
+        let v = serde_json::to_value(input.build()).unwrap();
+        // iperf3 (live-captured at #170 r2): locals kept, peer halves 0.
+        assert_eq!(v["end"]["sum_sent"]["bytes"], 1_000_000);
+        assert_eq!(v["end"]["sum_received"]["bytes"], 0);
+        assert_eq!(v["end"]["sum_sent_bidir_reverse"]["bytes"], 0);
+        assert_eq!(v["end"]["sum_received_bidir_reverse"]["bytes"], 500_000);
+    }
+
+    #[test]
+    fn terminated_reverse_udp_keeps_measured_packets_with_zero_bytes() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true;
+        input.blksize = 1460;
+        input.error = Some("the server has terminated".into());
+        let mut st = tcp_stream(1, false, 360_151, 0);
+        st.remote_bytes = None;
+        st.retransmits = None;
+        st.udp = Some(UdpStreamStats {
+            jitter_secs: 0.0001,
+            lost_packets: 1,
+            packets: 13,
+            out_of_order: 0,
+        });
+        input.streams = vec![st];
+        let v = serde_json::to_value(input.build()).unwrap();
+        // iperf3 (live-captured at #170 r2/r3): the sender-side bytes the
+        // dead peer never reported are 0; the locally measured packets stay;
+        // sum.packets falls back to the receiver count (iperf_api.c:4242).
+        assert_eq!(v["end"]["streams"][0]["udp"]["bytes"], 0);
+        assert_eq!(v["end"]["streams"][0]["udp"]["packets"], 13);
+        assert_eq!(v["end"]["sum"]["bytes"], 0);
+        assert_eq!(v["end"]["sum"]["packets"], 13);
+    }
+
+    /// The error=None peer-absent graft (legacy-peer tolerance) is unchanged:
+    /// locks the normal-path equivalence r3 verified by inspection.
+    #[test]
+    fn peer_absent_without_error_still_grafts() {
+        let mut input = base_input();
+        let mut st = tcp_stream(1, true, 1_000_000, 0);
+        st.remote_bytes = None;
+        input.streams = vec![st];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["streams"][0]["receiver"]["bytes"], 1_000_000);
+        assert_eq!(v["end"]["sum_received"]["bytes"], 1_000_000);
     }
 
     #[test]

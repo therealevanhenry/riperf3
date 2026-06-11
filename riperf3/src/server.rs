@@ -1489,6 +1489,7 @@ impl Server {
             .collect();
 
         let input = ReportInput {
+            error: None,
             protocol: cfg.protocol,
             reverse: cfg.reverse,
             bidir: cfg.bidir,
