@@ -457,11 +457,21 @@ fn parallel_text_ticks_open_with_separator() {
         Duration::from_secs(20),
         "tcp P2 text",
     );
-    let seps = out.matches(SEPARATOR).count();
-    // 3 ticks → 2 per-tick separators (ticks 2 and 3) + the end-block one.
+    // Tie the count to the ticks that actually PRINTED (review r2): under
+    // scheduler load a tick can starve and fold into the end block, so a
+    // wall-clock ">= 3" flakes at 2-core. Each printed tick at P=2 carries
+    // exactly one interval [SUM] row before the end-block separator;
+    // iperf3's rule gives T-1 per-tick separators + the end-block one.
+    let summary_sep = out.rfind(SEPARATOR).expect("end-block separator");
+    let ticks = out[..summary_sep].matches("[SUM]").count();
     assert!(
-        seps >= 3,
-        "expected per-tick separators at P=2 (>=3 incl. end block), got {seps}:\n{out}"
+        ticks >= 2,
+        "need >=2 printed ticks to exercise the mid-run separator:\n{out}"
+    );
+    let seps = out.matches(SEPARATOR).count();
+    assert_eq!(
+        seps, ticks,
+        "T-1 per-tick separators + the end-block one (T={ticks}):\n{out}"
     );
     // Shape: a separator line sits between tick SUM rows (not only at the end).
     let first_sum = out.find("[SUM]").expect("SUM rows at P=2");
