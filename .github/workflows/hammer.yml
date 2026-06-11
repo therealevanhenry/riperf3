@@ -4,21 +4,29 @@ name: Hammer
 # permanent. Replays a test profile across N parallel shard jobs × M suite
 # iterations on the chosen runner OS, to reproduce or rule out low-frequency
 # CI flakes at statistical scale. The standard protocol: hammer the unfixed
-# ref for a red baseline, then hammer the fix at the same scale and require
-# all-green (#178: 5/8 shards red unfixed → 24/24 green fixed).
+# ref for a red baseline, then hammer the fix at the same scale (#178: 5/8
+# shards red unfixed → 24/24 green fixed).
+#
+# Read all-green honestly: 24 samples catch a true 1/20 flake with only
+# ~71% confidence (1 − 0.95²⁴). For rarer flakes, scale `iterations` up —
+# a targeted test_args profile makes hundreds of iterations affordable —
+# rather than treating one all-green dispatch as proof.
 #
 # workflow_dispatch only — never a PR check. The dispatched ref supplies both
-# this workflow file and the tested tree, so a PR branch (which inherits the
-# file from main) can be hammered pre-merge:
+# this workflow file and the tested tree, so a PR branch can be hammered
+# pre-merge once the branch contains this file (branches cut before it
+# reached main 422 on dispatch — merge main into them first):
 #
 #   gh workflow run hammer.yml --ref <branch> \
 #     -f os=windows-latest -f test_args='-p riperf3-cli --test bidir_intervals' \
 #     -f shards=8 -f iterations=3
 #
-# Each shard is its own runner VM under the same 2-core load profile as a
-# real CI job — shards multiply samples, not per-run load. 8×3 ≈ 24 suite
-# runs resolves a ~1/20 flake; a targeted test_args profile runs much faster
-# than the full workspace, so prefer it when the flaky binary is known.
+# Each shard is its own runner VM of the same class real CI jobs use, so the
+# per-run load profile matches CI — shards multiply samples, not load. (Don't
+# bake core counts in here; they change. For local repro, pin to the runner's
+# CURRENT core count — the ci-flake-repro taskset methodology.)
+
+run-name: "Hammer ${{ inputs.os }} ${{ inputs.shards }}×${{ inputs.iterations }} ${{ inputs.test_args || '--workspace' }}"
 
 on:
   workflow_dispatch:
@@ -59,9 +67,15 @@ jobs:
       shards: ${{ steps.gen.outputs.shards }}
     steps:
       - id: gen
+        shell: bash
         env:
           SHARDS: ${{ inputs.shards }}
+        # Validate here, where the error is readable — under plain `bash -e`
+        # a bad value sails through `seq | jq` as `[]` and dies two jobs
+        # later as a cryptic empty-matrix strategy error.
         run: |
+          [[ "$SHARDS" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::shards must be a positive integer, got '$SHARDS'"; exit 1; }
           # "8" → [1,2,…,8] for fromJSON into the matrix.
           echo "shards=$(seq 1 "$SHARDS" | jq -cs .)" >> "$GITHUB_OUTPUT"
 
@@ -69,7 +83,10 @@ jobs:
     name: Shard ${{ matrix.shard }}
     needs: plan
     runs-on: ${{ inputs.os }}
-    timeout-minutes: 60
+    # Cold cache + full workspace × several iterations is the slow tail
+    # (ci.yml budgets 40 for ONE cold Windows run); dispatches are manual
+    # and rare, so headroom is free.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +98,12 @@ jobs:
         with:
           key: hammer-${{ inputs.os }}
           # All shards finishing together would race to save the same cache
-          # key; let shard 1 own the save.
+          # key (benign "unable to reserve" warnings); let shard 1 own the
+          # save. cache-on-failure because the documented FIRST phase of the
+          # protocol is a red baseline — rust-cache's post step is otherwise
+          # gated on job success, and every baseline dispatch would start
+          # cold forever.
+          cache-on-failure: true
           save-if: ${{ matrix.shard == 1 }}
       - name: Run suite ${{ inputs.iterations }}×
         shell: bash
@@ -89,8 +111,12 @@ jobs:
           TEST_ARGS: ${{ inputs.test_args }}
           ITERATIONS: ${{ inputs.iterations }}
         # Keep going after a red iteration — a hammer measures failure RATE,
-        # so every iteration is a sample. Exit code = number of red iterations.
+        # so every iteration is a sample. Exit code = red-iteration count,
+        # capped at 255 (bash exits wrap mod 256 — an uncapped 256 reds
+        # would read as green).
         run: |
+          [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::iterations must be a positive integer, got '$ITERATIONS'"; exit 1; }
           args="${TEST_ARGS:---workspace}"
           fails=0
           for i in $(seq 1 "$ITERATIONS"); do
@@ -103,4 +129,4 @@ jobs:
             echo "::endgroup::"
           done
           echo "shard ${{ matrix.shard }}: $((ITERATIONS - fails))/$ITERATIONS iterations green"
-          exit "$fails"
+          exit "$(( fails > 255 ? 255 : fails ))"
