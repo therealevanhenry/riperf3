@@ -13,6 +13,11 @@ jobs:
   test:
     name: Test (Linux)
     runs-on: ubuntu-latest
+    # Wedge guard, freebsd-test's rationale applied to every job: a hung test
+    # must fail the job in minutes, not burn the 6 h default (the 0.7.2
+    # campaign's local 8 h sender-wedge, translated to CI). Budgets are
+    # generous multiples of observed warm runs.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,6 +27,7 @@ jobs:
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
@@ -33,6 +39,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +52,7 @@ jobs:
   semver:
     name: SemVer
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       # Compares the library crate's public API against the latest version
@@ -59,6 +67,7 @@ jobs:
   cross-check:
     name: Cross-platform (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         target:
@@ -88,6 +97,9 @@ jobs:
   native-test:
     name: Native test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Windows cold-cache builds are the slow tail; 40 is still 9× better than
+    # the default on a wedge.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -108,6 +120,7 @@ jobs:
   musl-check:
     name: musl check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -1,0 +1,106 @@
+name: Hammer
+
+# Loaded-runner flake hammer — the #178 throwaway-branch technique made
+# permanent. Replays a test profile across N parallel shard jobs × M suite
+# iterations on the chosen runner OS, to reproduce or rule out low-frequency
+# CI flakes at statistical scale. The standard protocol: hammer the unfixed
+# ref for a red baseline, then hammer the fix at the same scale and require
+# all-green (#178: 5/8 shards red unfixed → 24/24 green fixed).
+#
+# workflow_dispatch only — never a PR check. The dispatched ref supplies both
+# this workflow file and the tested tree, so a PR branch (which inherits the
+# file from main) can be hammered pre-merge:
+#
+#   gh workflow run hammer.yml --ref <branch> \
+#     -f os=windows-latest -f test_args='-p riperf3-cli --test bidir_intervals' \
+#     -f shards=8 -f iterations=3
+#
+# Each shard is its own runner VM under the same 2-core load profile as a
+# real CI job — shards multiply samples, not per-run load. 8×3 ≈ 24 suite
+# runs resolves a ~1/20 flake; a targeted test_args profile runs much faster
+# than the full workspace, so prefer it when the flaky binary is known.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Runner OS
+        type: choice
+        options:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        default: ubuntu-latest
+      test_args:
+        description: "Args after `cargo test` (empty = --workspace), e.g. -p riperf3-cli --test bidir_intervals"
+        type: string
+        default: ""
+      shards:
+        description: Parallel shard jobs (each its own runner VM)
+        type: string
+        default: "8"
+      iterations:
+        description: Suite iterations per shard
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - id: gen
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          # "8" → [1,2,…,8] for fromJSON into the matrix.
+          echo "shards=$(seq 1 "$SHARDS" | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  hammer:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hammer-${{ inputs.os }}
+          # All shards finishing together would race to save the same cache
+          # key; let shard 1 own the save.
+          save-if: ${{ matrix.shard == 1 }}
+      - name: Run suite ${{ inputs.iterations }}×
+        shell: bash
+        env:
+          TEST_ARGS: ${{ inputs.test_args }}
+          ITERATIONS: ${{ inputs.iterations }}
+        # Keep going after a red iteration — a hammer measures failure RATE,
+        # so every iteration is a sample. Exit code = number of red iterations.
+        run: |
+          args="${TEST_ARGS:---workspace}"
+          fails=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "::group::iteration $i/$ITERATIONS"
+            # shellcheck disable=SC2086 # word-splitting $args is the contract
+            if ! cargo test $args; then
+              fails=$((fails + 1))
+              echo "::error::shard ${{ matrix.shard }} iteration $i failed"
+            fi
+            echo "::endgroup::"
+          done
+          echo "shard ${{ matrix.shard }}: $((ITERATIONS - fails))/$ITERATIONS iterations green"
+          exit "$fails"
