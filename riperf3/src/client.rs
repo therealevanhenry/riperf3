@@ -1332,18 +1332,14 @@ impl Client {
         test_duration: f64,
         error: Option<&str>,
     ) {
-        if self.json_output {
-            self.print_results_json(
-                streams,
-                cpu_start,
-                remote_cpu,
-                blksize,
-                interval_data,
-                start_meta,
-                test_duration,
-                error,
-            );
-        } else if self.json_stream {
+        // #220: stream mode WINS when both flags are set — iperf3's
+        // OPT_JSON_STREAM implies -J (iperf_api.c:1280-1282), so `-J
+        // --json-stream` IS stream mode (full event stream incl. `end`; the
+        // monolithic doc only under --json-stream-full-output, which the
+        // stream arm already honors). The old json_output-first dispatch
+        // emitted a truncated stream (no end event) followed by the doc.
+        // The CLI's error-sink dispatch has always been stream-first (#198).
+        if self.json_stream {
             // iperf3's NDJSON tail order is: error?, server_output_json,
             // server_output_text, end (iperf_api.c:5310-5323) (#170 + #168).
             if let Some(e) = error {
@@ -1379,6 +1375,17 @@ impl Client {
                 interval_data,
                 start_meta,
                 test_duration,
+            );
+        } else if self.json_output {
+            self.print_results_json(
+                streams,
+                cpu_start,
+                remote_cpu,
+                blksize,
+                interval_data,
+                start_meta,
+                test_duration,
+                error,
             );
         } else {
             self.print_results_text(streams, remote_cpu, blksize, test_duration);

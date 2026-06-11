@@ -945,26 +945,11 @@ impl Server {
             let _ = &server_results;
         }
 
-        if self.json_output {
-            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
-            // pre-exchange build when --get-server-output attached it (#33).
-            let report = prebuilt_report.unwrap_or_else(|| {
-                self.build_report(
-                    &streams,
-                    &cfg,
-                    &params,
-                    &cpu_util,
-                    test_duration,
-                    &cookie,
-                    &accepted_host,
-                    accepted_port,
-                    test_start_millis,
-                    &interval_data,
-                    report_error.as_deref(),
-                )
-            });
-            self.print_results_json(&report);
-        } else if self.json_stream {
+        // #220: stream mode WINS when both flags are set — iperf3's
+        // OPT_JSON_STREAM implies -J, so `-s -J --json-stream` IS stream
+        // mode (the client-side dispatch and the CLI error sinks already
+        // follow this rule).
+        if self.json_stream {
             // A terminated/interrupted run emits the discrete `error` event
             // BEFORE `end`, like iperf_json_finish on both roles
             // (iperf_api.c:5310-5323) — without this the r1 stderr gating
@@ -989,6 +974,25 @@ impl Server {
                 &interval_data,
                 report_error.as_deref(),
             );
+        } else if self.json_output {
+            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
+            // pre-exchange build when --get-server-output attached it (#33).
+            let report = prebuilt_report.unwrap_or_else(|| {
+                self.build_report(
+                    &streams,
+                    &cfg,
+                    &params,
+                    &cpu_util,
+                    test_duration,
+                    &cookie,
+                    &accepted_host,
+                    accepted_port,
+                    test_start_millis,
+                    &interval_data,
+                    report_error.as_deref(),
+                )
+            });
+            self.print_results_json(&report);
         } else if !was_captured {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
