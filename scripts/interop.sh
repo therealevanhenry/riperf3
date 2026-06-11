@@ -241,6 +241,7 @@ order=(
     tcp_fwd tcp_rev tcp_bidir tcp_p4 tcp_len128k tcp_win256k tcp_mss1400
     tcp_omit tcp_zerocopy tcp_get_output
     udp_fwd udp_rev udp_bidir udp_p4 udp_len8192 udp_64bit
+    udp_b100m udp_b100m_rev
 )
 declare -A opts=(
     [tcp_fwd]="-t $DUR"
@@ -259,6 +260,10 @@ declare -A opts=(
     [udp_p4]="-u -P 4 -b 0 -t $DUR"
     [udp_len8192]="-u -l 8192 -b 0 -t $DUR"
     [udp_64bit]="-u --udp-counters-64bit -b 0 -t $DUR"
+    # Paced UDP at a moderate rate (#163): the matrices only ran -b 0, so the
+    # rate-limited send path had no cross-tool coverage at all.
+    [udp_b100m]="-u -b 100M -t $DUR"
+    [udp_b100m_rev]="-u -b 100M -R -t $DUR"
 )
 
 for name in "${order[@]}"; do
