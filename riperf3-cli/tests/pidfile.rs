@@ -203,3 +203,45 @@ fn second_signal_during_teardown_exits_immediately() {
         "pidfile unlinked on the hard path",
     );
 }
+
+/// Post-#223 regression (macOS CI red on main): an IDLE server's first
+/// SIGTERM must exit promptly — the accept wait races the interrupt watch.
+/// Without the arm, the signal burned the CLI's full 5 s dump window
+/// (systemd-style stop felt a 5 s hang). Bound: well under the window.
+#[cfg(unix)]
+#[test]
+fn idle_server_exits_promptly_on_sigterm() {
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let dir = std::env::temp_dir();
+    let pf = dir.join(format!("riperf3-idle-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pf);
+    let ps = free_port().to_string();
+
+    let server = Command::new(bin)
+        .args(["-s", "-I"])
+        .arg(&pf)
+        .args(["-p", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    wait_for(|| pf.exists(), Duration::from_secs(5), "pidfile written");
+
+    let t0 = Instant::now();
+    unsafe {
+        libc::kill(server.0.id() as i32, libc::SIGTERM);
+    }
+    let exited = common::wait_bounded(&mut server.0, Duration::from_secs(2));
+    let status = exited.unwrap_or_else(|| {
+        panic!(
+            "an idle server must exit well under the 5 s dump window; \
+             still alive after {:?}",
+            t0.elapsed()
+        )
+    });
+    // The prompt exit is the GRACEFUL path (exit 0), not an escape hatch
+    // (review r1 n1).
+    assert_eq!(status.code(), Some(0), "graceful signal-normal exit");
+    wait_for(|| !pf.exists(), Duration::from_secs(2), "pidfile unlinked");
+}

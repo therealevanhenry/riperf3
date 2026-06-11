@@ -289,20 +289,36 @@ impl Server {
 
     async fn handle_one_test(&self, listener: &tokio::net::TcpListener) -> Result<()> {
         // ---- Accept control connection (with optional idle timeout) ----
-        let (mut ctrl, peer_addr) = if let Some(secs) = self.idle_timeout {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(secs as u64),
-                listener.accept(),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(RiperfError::Aborted("idle timeout".into()));
+        // The IDLE wait races the interrupt watch (#210 follow-through): an
+        // idle server's first signal must exit promptly — without this arm
+        // it burned the CLI's full 5 s dump window (the post-merge macOS CI
+        // red: systemd-style SIGTERM-while-listening took ~5 s). There is
+        // nothing to dump while idle; returning Ok lets the run loop's
+        // interrupt check exit the serve loop. The post-accept phases
+        // (cookie/param reads) stay interrupt-blind by design — the #158
+        // second-signal wedge test depends on that window.
+        let mut accept_interrupt = self.interrupt.clone().map(|w| w.0);
+        let accepted = tokio::select! {
+            r = async {
+                if let Some(secs) = self.idle_timeout {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(secs as u64),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(RiperfError::from),
+                        Err(_) => Err(RiperfError::Aborted("idle timeout".into())),
+                    }
+                } else {
+                    listener.accept().await.map_err(RiperfError::from)
                 }
-            }
-        } else {
-            listener.accept().await?
+            } => Some(r),
+            _ = crate::client::wait_interrupt(accept_interrupt.as_mut()) => None,
+        };
+        let (mut ctrl, peer_addr) = match accepted {
+            Some(r) => r?,
+            None => return Ok(()),
         };
         if self.verbose {
             vprintln!("Accepted connection from {peer_addr}");
