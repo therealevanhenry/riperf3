@@ -166,7 +166,7 @@ impl Client {
         // --timestamps prefixes every text report line, run-scoped like the
         // title; never in the machine-JSON modes (#168).
         let _ts_guard = (!self.json_output && !self.json_stream)
-            .then(|| self.timestamps.as_deref())
+            .then_some(self.timestamps.as_deref())
             .flatten()
             // The bare-flag "%c " default is clap's default_missing_value;
             // by here the format is always concrete.

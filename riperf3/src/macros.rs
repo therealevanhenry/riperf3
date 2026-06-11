@@ -73,9 +73,9 @@ static OUTPUT_TIMESTAMPS: RwLock<Option<String>> = RwLock::new(None);
 pub(crate) struct OutputTimestampGuard;
 
 impl OutputTimestampGuard {
-    /// Construct ONLY when timestamps are active (callers use
-    /// `cond.then(OutputTimestampGuard::set)`): an unconditional `set(false)`
-    /// from a concurrent in-process run would clobber another run's `true` —
+    /// Construct ONLY when timestamps are active (callers gate then
+    /// `.map(OutputTimestampGuard::set)`): an unconditional clear from a
+    /// concurrent in-process run would clobber another run's stored format —
     /// the exact server-clobbers-client topology of the lib's
     /// `timestamps_runs` test (#168 review r1 n3). Mirrors OutputTitleGuard,
     /// whose construct-only-when-titled shape has no such mode.

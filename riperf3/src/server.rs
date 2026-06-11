@@ -303,7 +303,7 @@ impl Server {
         // the capture above tees the PREFIXED line like iperf3's linebuffer
         // (#168). Run-scoped; never in the machine-JSON modes.
         let _ts_guard = (!self.json_output && !self.json_stream)
-            .then(|| self.timestamps.as_deref())
+            .then_some(self.timestamps.as_deref())
             .flatten()
             // The bare-flag "%c " default is clap's default_missing_value;
             // by here the format is always concrete.
