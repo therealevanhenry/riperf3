@@ -370,7 +370,13 @@ impl RateLimiter {
     /// 2..=burst of a batch skip the check entirely — iperf3's multisend
     /// loop sends the whole burst per green light and only then re-checks
     /// the throttle (#160).
-    pub async fn acquire(&mut self, bytes: u64) {
+    ///
+    /// The green-light wait is interruptible by `done`: a burst-sized debt
+    /// can exceed the remaining test, and cleanup joins the sender (#160
+    /// review r2). On interruption the bytes are NOT accounted — the caller
+    /// re-checks `done` after acquire and breaks without sending.
+    pub async fn acquire(&mut self, bytes: u64, done: &AtomicBool) {
+        const SLICE: Duration = Duration::from_millis(100);
         if self.in_burst > 0 {
             self.in_burst -= 1;
             self.sent += bytes;
@@ -382,12 +388,16 @@ impl RateLimiter {
             if behind <= 0.0 {
                 break;
             }
-            // Sleep to the green-light instant, but never less than the pacing
-            // quantum — the documented --pacing-timer semantics (iperf3
-            // <= 3.17's minimum wakeup was one tick; 3.18+ deprecated the
-            // quantum). The cumulative math absorbs any oversleep.
+            if done.load(Ordering::Relaxed) {
+                return;
+            }
+            // Sleep toward the green-light instant in bounded slices, but
+            // never less than the pacing quantum — the documented
+            // --pacing-timer semantics (iperf3 <= 3.17's minimum wakeup was
+            // one tick; 3.18+ deprecated the quantum). The cumulative math
+            // absorbs any oversleep.
             let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
-            tokio::time::sleep(to_green.max(self.pacing)).await;
+            tokio::time::sleep(to_green.max(self.pacing).min(SLICE)).await;
         }
         self.sent += bytes;
         self.in_burst = self.burst.saturating_sub(1);
@@ -562,8 +572,8 @@ pub async fn run_tcp_sender(
         }
 
         if let Some(rl) = limiter.as_mut() {
-            rl.acquire(buf.len() as u64).await;
-            // The green-light sleep can outlast the test at very low -b:
+            rl.acquire(buf.len() as u64, &done).await;
+            // The green-light wait can end early because the test is over:
             // re-check `done` after waking instead of writing one more block
             // past the end, like modern iperf3's send worker (#160).
             if done.load(Ordering::Relaxed) {
@@ -960,7 +970,11 @@ pub async fn run_udp_sender(
 
     while !done.load(Ordering::Relaxed) {
         if let Some(ref mut limiter) = rate_limiter {
-            limiter.acquire(blksize as u64).await;
+            limiter.acquire(blksize as u64, &done).await;
+            // Test may have ended during the green-light wait (#160 r2).
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
         }
 
         seq += 1;
@@ -1280,18 +1294,12 @@ pub fn run_udp_sender_sendmmsg(
             }
         }
 
-        // Rate pacing: one clock check per batch
+        // Rate pacing: one clock check per batch, interruptible by `done`
+        // and the `-t` deadline (#160 review r2).
         if let Some(batch_interval) = pacing {
             next_send += batch_interval;
-            let now = Instant::now();
-            if next_send > now {
-                let remaining = next_send - now;
-                if remaining > Duration::from_micros(50) {
-                    std::thread::sleep(remaining - Duration::from_micros(20));
-                }
-                while Instant::now() < next_send {
-                    std::hint::spin_loop();
-                }
+            if !pace_until(next_send, &done, deadline) {
+                break;
             }
         }
     }
@@ -1325,6 +1333,38 @@ pub fn run_udp_sender_sendmmsg(
         start,
         max_duration,
     )
+}
+
+/// Sleep until `next_send` in bounded slices, re-checking `done` and the
+/// `-t` deadline each slice. A burst-sized green-light debt
+/// (`burst x blksize x 8 / rate`) can exceed the remaining test (#160 review
+/// r2: measured 11.7 s wall vs iperf3's 3.0 s on `-u -b 1M/1000 -t 3`):
+/// iperf3 sleeps the same debt but escapes it via pthread_cancel at test
+/// end, which Rust threads don't have — so the sleep itself must be
+/// interruptible, or test cleanup joins a sleeping sender for the residue.
+/// Returns false when interrupted (the caller breaks out of its send loop);
+/// keeps the original 20 µs sleep margin + spin to the line for pacing
+/// precision on the final stretch.
+fn pace_until(next_send: Instant, done: &AtomicBool, deadline: Option<Instant>) -> bool {
+    const SLICE: Duration = Duration::from_millis(100);
+    const SPIN_GUARD: Duration = Duration::from_micros(50);
+    loop {
+        let now = Instant::now();
+        if now >= next_send {
+            return true;
+        }
+        if done.load(Ordering::Relaxed) || deadline.is_some_and(|d| now >= d) {
+            return false;
+        }
+        let remaining = next_send - now;
+        if remaining <= SPIN_GUARD {
+            while Instant::now() < next_send {
+                std::hint::spin_loop();
+            }
+            return true;
+        }
+        std::thread::sleep((remaining - Duration::from_micros(20)).min(SLICE));
+    }
 }
 
 /// Datagrams to send between pacing clock-checks (#185). The old fixed batch
@@ -1473,21 +1513,15 @@ fn udp_send_loop(
 
         counters.record_sent(batch_bytes);
 
-        // Rate pacing: one clock check per batch
+        // Rate pacing: one clock check per batch, interruptible by `done`
+        // and the `-t` deadline (#160 review r2). If behind schedule,
+        // next_send stays in the past — sends immediately until caught up
+        // (no accumulating debt).
         if let Some(batch_interval) = pacing {
             next_send += batch_interval;
-            let now = Instant::now();
-            if next_send > now {
-                let remaining = next_send - now;
-                if remaining > Duration::from_micros(50) {
-                    std::thread::sleep(remaining - Duration::from_micros(20));
-                }
-                while Instant::now() < next_send {
-                    std::hint::spin_loop();
-                }
+            if !pace_until(next_send, &done, deadline) {
+                break;
             }
-            // If behind schedule, next_send stays in the past — sends
-            // immediately until caught up (no accumulating debt)
         }
     }
     Ok(())
@@ -2218,6 +2252,11 @@ mod tests {
     // floor (max(rate*0.1, 4*blksize) = 512 KiB, granted instantly) overshoots
     // a low -b by ~2x at 1 Mbit/s. iperf3's cumulative-average throttle bounds
     // total sent to elapsed*rate + one in-flight block at any rate/blksize.
+    /// A `done` flag that never fires, for limiter tests.
+    fn never_done() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     #[tokio::test]
     async fn rate_limiter_total_accuracy_low_rate_large_blocks() {
         let rate_bits: u64 = 1_000_000; // 1 Mbit/s
@@ -2226,7 +2265,7 @@ mod tests {
         let start = Instant::now();
         let mut sent: u64 = 0;
         while start.elapsed() < Duration::from_millis(1000) {
-            limiter.acquire(blk).await;
+            limiter.acquire(blk, &never_done()).await;
             sent += blk;
         }
         let budget = (rate_bits as f64 / 8.0) * start.elapsed().as_secs_f64();
@@ -2244,7 +2283,7 @@ mod tests {
         let mut limiter = RateLimiter::new(1_000_000, 0, 0); // 1 Mbit/s
         let start = Instant::now();
         // Cumulative average: nothing sent yet → always green-lit.
-        limiter.acquire(1000).await;
+        limiter.acquire(1000, &never_done()).await;
         assert!(start.elapsed() < Duration::from_millis(10));
     }
 
@@ -2254,9 +2293,9 @@ mod tests {
         // the average is 1000 bytes ahead of schedule, so block 2 waits ~100ms
         // — there is no up-front burst grant (#116).
         let mut limiter = RateLimiter::new(80_000, 0, 0);
-        limiter.acquire(1000).await; // instant
+        limiter.acquire(1000, &never_done()).await; // instant
         let start = Instant::now();
-        limiter.acquire(1000).await; // must wait ~100ms
+        limiter.acquire(1000, &never_done()).await; // must wait ~100ms
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50)); // generous lower bound
         assert!(elapsed < Duration::from_millis(300)); // generous upper bound
@@ -2274,7 +2313,7 @@ mod tests {
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
         while start.elapsed() < Duration::from_millis(100) {
-            limiter.acquire(blksize).await;
+            limiter.acquire(blksize, &never_done()).await;
             total_bytes += blksize;
         }
 
@@ -2295,7 +2334,7 @@ mod tests {
 
         // 10 × 1000-byte blocks at 125 KB/s ≈ 72ms of pacing after block 1.
         for _ in 0..10 {
-            limiter.acquire(1000).await;
+            limiter.acquire(1000, &never_done()).await;
             total_bytes += 1000;
         }
 
@@ -2314,7 +2353,7 @@ mod tests {
         let mut limiter = RateLimiter::new(8_000, 0, 4);
         let t0 = tokio::time::Instant::now();
         for _ in 0..4 {
-            limiter.acquire(1000).await;
+            limiter.acquire(1000, &never_done()).await;
         }
         assert_eq!(
             t0.elapsed(),
@@ -2323,7 +2362,7 @@ mod tests {
         );
         // Block 5 is the next batch head: 4000 B sent against a 1000 B/s
         // schedule → it must wait to the green-light instant (~4 s).
-        limiter.acquire(1000).await;
+        limiter.acquire(1000, &never_done()).await;
         assert!(
             t0.elapsed() >= Duration::from_secs(4),
             "next batch head waits to green light, got {:?}",
@@ -2358,6 +2397,7 @@ mod tests {
         let (peer, _) = listener.accept().await.unwrap();
 
         // Flip `done` mid-sleep (5 s < the ~10 s green-light instant).
+        let t0 = tokio::time::Instant::now();
         tokio::time::sleep(Duration::from_secs(5)).await;
         done.store(true, Ordering::Relaxed);
 
@@ -2368,9 +2408,56 @@ mod tests {
             blksize,
             "sender wrote a block after `done` despite the post-sleep re-check"
         );
+        // The wait itself must be interruptible (#160 review r2): the sender
+        // exits shortly after `done` (~5 s + one 100 ms slice), not at the
+        // 10 s green-light instant — cleanup joins this task.
+        assert!(
+            t0.elapsed() < Duration::from_secs(6),
+            "sender slept out the full green-light debt past done: {:?}",
+            t0.elapsed()
+        );
     }
 
-    // -- TCP send/recv integration --
+    #[test]
+    fn udp_blocking_sender_pacing_interruptible_by_done() {
+        // #160 review r2: a burst-sized batch debt (here 1000 x 100 B at
+        // 400 kbit/s = 2 s) used to be slept in one uninterruptible chunk;
+        // cleanup joins the sender thread, so the process outlived the test
+        // by the residue (measured 11.7 s vs iperf3's 3.0 s wall). pace_until
+        // re-checks `done` per 100 ms slice.
+        let recv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        send.connect(recv.local_addr().unwrap()).unwrap();
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || {
+            run_udp_sender_blocking(
+                send,
+                counters,
+                100,
+                d,
+                400_000,
+                0,
+                1000,
+                false,
+                started(),
+                None,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        done.store(true, Ordering::Relaxed);
+        h.join().unwrap().unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "sender slept out the batch debt past done: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // -- TCP send/recv integration --    // -- TCP send/recv integration --
 
     #[tokio::test]
     async fn tcp_send_recv_counts_bytes() {

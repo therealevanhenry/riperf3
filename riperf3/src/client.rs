@@ -2943,6 +2943,21 @@ mod tests {
         // 1000 µs), so the server's reverse/bidir sender paces on the same
         // quantum. riperf3 left it unset.
         #[test]
+        fn build_params_sends_burst_only_when_set() {
+            // iperf3 gates the param on nonzero (`if (test->settings->burst)`,
+            // iperf_api.c:2461) — absent otherwise, so the wire JSON is
+            // byte-identical for every burst-less invocation (#160 review r2 n4).
+            let c = ClientBuilder::new("h")
+                .bandwidth_str("100M/10")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(c.build_params(1460).burst, Some(10));
+            let c = ClientBuilder::new("h").build().unwrap();
+            assert_eq!(c.build_params(1460).burst, None);
+        }
+
+        #[test]
         fn build_params_always_sends_pacing_timer() {
             let c = ClientBuilder::new("h").build().unwrap();
             assert_eq!(c.build_params(1460).pacing_timer, Some(1000));

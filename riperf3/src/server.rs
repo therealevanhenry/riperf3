@@ -48,6 +48,23 @@ impl TestConfig {
             DEFAULT_TCP_BLKSIZE
         };
 
+        // Bound a negotiated `burst` like the client parse (IEBURST,
+        // 1..=MAX_BURST): no real iperf3 client can send more (its own parse
+        // enforces the cap), and an unbounded value drives the sender's
+        // per-batch loop and green-light debt for hours — the same
+        // hostile-peer posture as `len` below (#160 review r2). Absent or
+        // non-positive (iperf3 gates on nonzero before sending) = unset.
+        let burst = match params.burst {
+            Some(b) if b > MAX_BURST as i32 => {
+                return Err(ConfigError::InvalidValue(
+                    "burst count",
+                    format!("invalid burst count (maximum = {MAX_BURST}): {b}"),
+                ));
+            }
+            Some(b) if b > 0 => b as u32,
+            _ => 0,
+        };
+
         // Bounds-check a negotiated `len` like the client builder (#188):
         // 0/absent → protocol default (iperf3 clients omit len 0); negative
         // would wrap `as usize` into a multi-EiB allocation; UDP below
@@ -101,13 +118,7 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
-            // Present only when the client set `-b rate/burst`, like iperf3
-            // (it gates on nonzero before sending) (#160).
-            burst: params
-                .burst
-                .filter(|&b| b > 0)
-                .map(|b| b as u32)
-                .unwrap_or(0),
+            burst,
             // The client's --pacing-timer quantum (#32); iperf3 always sends
             // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
             pacing_timer: params
@@ -2066,6 +2077,20 @@ mod test_config_tests {
         assert_eq!(TestConfig::from_params(&p).unwrap().burst, 10);
         let p = TestParams {
             tcp: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(TestConfig::from_params(&p).unwrap().burst, 0);
+        // Hostile/broken peers: above MAX_BURST is rejected (no real iperf3
+        // client can produce it), non-positive is unset (#160 review r2).
+        let p = TestParams {
+            tcp: Some(true),
+            burst: Some(1001),
+            ..Default::default()
+        };
+        assert!(TestConfig::from_params(&p).is_err());
+        let p = TestParams {
+            tcp: Some(true),
+            burst: Some(-5),
             ..Default::default()
         };
         assert_eq!(TestConfig::from_params(&p).unwrap().burst, 0);
