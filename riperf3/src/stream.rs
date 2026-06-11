@@ -391,11 +391,16 @@ impl RateLimiter {
             if done.load(Ordering::Relaxed) {
                 return;
             }
-            // Sleep toward the green-light instant in bounded slices, but
-            // never less than the pacing quantum — the documented
-            // --pacing-timer semantics (iperf3 <= 3.17's minimum wakeup was
-            // one tick; 3.18+ deprecated the quantum). The cumulative math
-            // absorbs any oversleep.
+            // Sleep toward the green-light instant in bounded slices, no
+            // shorter than the pacing quantum (the documented --pacing-timer
+            // wakeup; iperf3 3.18+ deprecated it) but capped at the 100 ms
+            // interruptibility slice — a quantum above the slice only adds
+            // internal wakeups; the loop re-checks `behind` and still sends
+            // no earlier than the green light. The cap is also load-bearing:
+            // from_params accepts any positive wire pacing_timer, and an
+            // uncapped hostile quantum would recreate the uninterruptible
+            // sleep this fixes (#160 r2/r3). The cumulative math absorbs any
+            // oversleep.
             let to_green = Duration::from_secs_f64(behind / self.rate_bytes_per_sec);
             tokio::time::sleep(to_green.max(self.pacing).min(SLICE)).await;
         }
@@ -2457,7 +2462,7 @@ mod tests {
         );
     }
 
-    // -- TCP send/recv integration --    // -- TCP send/recv integration --
+    // -- TCP send/recv integration --
 
     #[tokio::test]
     async fn tcp_send_recv_counts_bytes() {
