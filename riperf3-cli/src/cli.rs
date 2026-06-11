@@ -36,15 +36,12 @@ pub struct Cli {
     pub port: Option<u16>,
 
     /// Format to report: Kbits, Mbits, Gbits, Tbits
-    #[arg(
-        short,
-        long,
-        ignore_case = true,
-        value_enum,
-        value_name = "format",
-        default_value = "m"
-    )]
-    pub format: Format,
+    // iperf3 has NO default -f: absent, every figure auto-scales
+    // (unit_snprintf 'a'/'A'). The old forced "m" default printed
+    // 12120.88 MBytes where iperf3 prints 11.8 GBytes (#221). NB: a ///
+    // here would leak into clap's --help text (r1 blocker).
+    #[arg(short, long, ignore_case = true, value_enum, value_name = "format")]
+    pub format: Option<Format>,
 
     /// Seconds between periodic throughput reports
     #[arg(short, long, value_name = "interval")]
@@ -481,14 +478,17 @@ impl Cli {
 
         let mut builder = riperf3::ClientBuilder::new(host);
 
-        // Format: K/M/G/T → lowercase char for bits, uppercase for bytes
-        let format_char = match self.format {
-            Format::K => 'k',
-            Format::M => 'm',
-            Format::G => 'g',
-            Format::T => 't',
-        };
-        builder = builder.format_char(format_char);
+        // Format: each letter maps to its bit-rate char (#241 tracks the
+        // uppercase byte-rate meanings); absent → the library's adaptive
+        // default ('a'), like iperf3 (#221).
+        if let Some(f) = &self.format {
+            builder = builder.format_char(match f {
+                Format::K => 'k',
+                Format::M => 'm',
+                Format::G => 'g',
+                Format::T => 't',
+            });
+        }
 
         if let Some(port) = self.port {
             builder = builder.port(Some(port));
@@ -744,7 +744,8 @@ mod cli_tests {
             assert!(cli.server);
             assert!(cli.client.is_none());
             assert_eq!(cli.port, None);
-            assert_eq!(cli.format, Format::M);
+            // #221: no -f means ADAPTIVE (None) — iperf3 has no default format.
+            assert_eq!(cli.format, None);
             assert_eq!(cli.interval, None);
             assert!(!cli.verbose);
             assert_eq!(cli.debug, None);
@@ -754,7 +755,8 @@ mod cli_tests {
             assert!(!cli.server);
             assert_eq!(cli.client, Some("localhost".to_string()));
             assert_eq!(cli.port, None);
-            assert_eq!(cli.format, Format::M);
+            // #221: no -f means ADAPTIVE (None) — iperf3 has no default format.
+            assert_eq!(cli.format, None);
             assert_eq!(cli.interval, None);
             assert!(!cli.verbose);
             assert_eq!(cli.debug, None);
@@ -773,28 +775,28 @@ mod cli_tests {
         #[test]
         fn test_common_format() {
             let cli = Cli::parse_from(["riperf3", "--server", "--format", "k"]);
-            assert_eq!(cli.format, Format::K);
+            assert_eq!(cli.format, Some(Format::K));
 
             let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "g"]);
-            assert_eq!(cli.format, Format::G);
+            assert_eq!(cli.format, Some(Format::G));
 
             let cli = Cli::parse_from(["riperf3", "--server", "--format", "t"]);
-            assert_eq!(cli.format, Format::T);
+            assert_eq!(cli.format, Some(Format::T));
 
             let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "m"]);
-            assert_eq!(cli.format, Format::M);
+            assert_eq!(cli.format, Some(Format::M));
 
             let cli = Cli::parse_from(["riperf3", "--server", "--format", "M"]);
-            assert_eq!(cli.format, Format::M);
+            assert_eq!(cli.format, Some(Format::M));
 
             let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "T"]);
-            assert_eq!(cli.format, Format::T);
+            assert_eq!(cli.format, Some(Format::T));
 
             let cli = Cli::parse_from(["riperf3", "--server", "--format", "G"]);
-            assert_eq!(cli.format, Format::G);
+            assert_eq!(cli.format, Some(Format::G));
 
             let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "K"]);
-            assert_eq!(cli.format, Format::K);
+            assert_eq!(cli.format, Some(Format::K));
         }
     }
 
@@ -1013,13 +1015,11 @@ mod cli_tests {
             cli.build_server().unwrap()
         }
 
-        /// A `ClientBuilder` pre-seeded with the CLI's unconditional defaults, so
-        /// wiring-test expectations match what `build_client` produces. The CLI
-        /// always sets the report format (default `-f m`), whereas the bare
-        /// library builder defaults to 'a' (auto); without this baseline the
-        /// comparisons would differ only in `format_char`.
+        /// A `ClientBuilder` matching the CLI's no-flag defaults. Since #221
+        /// the CLI no longer forces a format: absent -f, the library's
+        /// adaptive default ('a') stands, like iperf3.
         fn expected_client(host: &str) -> riperf3::ClientBuilder {
-            riperf3::ClientBuilder::new(host).format_char('m')
+            riperf3::ClientBuilder::new(host)
         }
 
         #[test]
@@ -1785,7 +1785,8 @@ mod cli_tests {
 
         #[test]
         fn format_wired() {
-            // The CLI always sets a format (default 'm'); `-f g` must propagate.
+            // An explicit `-f g` must propagate (absent -f, the lib default
+            // 'a' stands — #221).
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-f", "g"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").format_char('g').build().unwrap());
