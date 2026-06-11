@@ -185,7 +185,7 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
         // pad ONLY in bidir — iperf3's zbuf is 10 spaces in bidir and empty
         // otherwise (report_bw_udp_sender_format; #187 review r1 n4).
         let pad = if interval.role_tag.is_some() {
-            "           "
+            "          " // iperf3's zbuf: exactly 10 spaces
         } else {
             ""
         };

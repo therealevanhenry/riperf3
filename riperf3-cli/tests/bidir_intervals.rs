@@ -362,6 +362,19 @@ fn udp_bidir_text_interval_rows_role_tags_no_sum() {
         last.parse::<u64>().is_ok() || last == "(omitted)",
         "TX interval rows carry iperf3's trailing sent-packet count, got line: {tx_data_row}"
     );
+    // Pin the pad width: rate + 2 literal spaces + iperf3's 10-space zbuf =
+    // exactly 12 spaces between "bits/sec" and the count (review r2 n1 — the
+    // one r1 fix the tests didn't pin, which is exactly how it slipped).
+    let after_rate = tx_data_row
+        .split("bits/sec")
+        .nth(1)
+        .unwrap_or_default()
+        .trim_end();
+    let gap = after_rate.len() - after_rate.trim_start().len();
+    assert_eq!(
+        gap, 12,
+        "TX row gap between rate and count must be 12 (2 + zbuf 10): {tx_data_row:?}"
+    );
 }
 
 /// TCP `--bidir -P 2`, text mode: per-direction [SUM] rows with role tags
