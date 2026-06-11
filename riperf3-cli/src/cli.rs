@@ -5,6 +5,10 @@ pub const END_CONDITIONS_MSG: &str = "only one test end condition (-t, -n, -k) m
 
 #[derive(Parser, Debug)]
 #[command(about, author, long_about = None, name = "riperf3", version, disable_version_flag = true)]
+// Last-wins for repeated flags, like iperf3's getopt: wrapper scripts that
+// append override flags to a base command line (`-b 0 ... -b 100M`) must not
+// be rejected by the drop-in (#205).
+#[command(args_override_self = true)]
 #[command(group(
     ArgGroup::new("mode")
         .required(true)
@@ -1164,6 +1168,25 @@ mod cli_tests {
 
         // #167: -S takes iperf3's strtol-base-0 forms (hex/octal), and bad
         // values fail the build with IEBADTOS wording instead of parsing.
+        // #205: repeated flags are last-wins, like iperf3's getopt — wrapper
+        // scripts append override flags to a base line.
+        #[test]
+        fn repeated_flags_are_last_wins() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-b", "0", "-b", "100M"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(
+                c,
+                expected_client("h")
+                    .bandwidth_str("100M")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-t", "5", "-t", "30"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").duration(30).build().unwrap());
+        }
+
         #[test]
         fn tos_flag_accepts_hex_and_octal() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "0x20"]);
