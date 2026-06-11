@@ -112,7 +112,7 @@ pub fn run_client(args: &[&str], timeout: Duration, who: &str) -> ClientRun {
             .unwrap();
 
         if !status.success()
-            && stderr.contains("ConnectionRefused")
+            && (stderr.contains("ConnectionRefused") || stderr.contains("Connection refused"))
             && Instant::now() < retry_deadline
         {
             // Server not listening yet — give it a beat and go again.

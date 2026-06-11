@@ -7,7 +7,21 @@ use log4rs::encode::pattern::PatternEncoder;
 mod cli;
 use cli::Cli;
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // iperf3's iperf_errexit shape ("iperf3: error - <text>", exit 1)
+            // instead of Rust's Debug rendering; ours carries the actual
+            // binary name. The Display strings already mirror iperf3's IE*
+            // wording where riperf3 implements the same rejections (#151).
+            eprintln!("riperf3: error - {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     configure_log4rs(cli.debug.unwrap_or(0));

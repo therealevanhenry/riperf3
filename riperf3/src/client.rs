@@ -176,7 +176,19 @@ impl Client {
             self.mptcp,
             self.ip_version,
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            // iperf3's IECONNECT wording for a failed control connect; the
+            // io kind is preserved so callers (and the test harness's
+            // refused-retry) can still classify it (#151).
+            RiperfError::Io(io) => RiperfError::Io(std::io::Error::new(
+                io.kind(),
+                format!(
+                    "unable to connect to server - server may have stopped running                      or use a different port, firewall issue, etc.: {io}"
+                ),
+            )),
+            other => other,
+        })?;
         net::configure_tcp_stream(&ctrl, true)?;
 
         // The control connection's MSS sizes UDP datagrams (issue #6) and feeds
@@ -1314,6 +1326,7 @@ impl Client {
                     .find(|e| e.stream_id == s.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
+                    max_snd_wnd: e.max_snd_wnd,
                     max_rtt: e.max_rtt,
                     min_rtt: e.min_rtt,
                     mean_rtt: e.mean_rtt(),
