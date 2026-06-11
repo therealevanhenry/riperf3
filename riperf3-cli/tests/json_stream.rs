@@ -211,3 +211,81 @@ fn server_json_stream_is_valid_ndjson() {
         .unwrap();
     assert_valid_ndjson(&out, "server");
 }
+
+/// #213: --json-stream-full-output is the third leg of discard_json — the
+/// NDJSON stream is followed by the complete monolithic -J document
+/// (iperf_api.c:5323 keeps print_full_json under the flag), with populated
+/// intervals.
+#[test]
+fn json_stream_full_output_appends_the_monolithic_document() {
+    let ps = free_port().to_string();
+    let server = Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "-1", "-p", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "2",
+            "-i",
+            "1",
+            "--json-stream",
+            "--json-stream-full-output",
+        ],
+        Duration::from_secs(20),
+        "json-stream full-output",
+    );
+    // The NDJSON part still leads (event-enveloped single lines)…
+    let first = out.lines().next().expect("output");
+    assert!(
+        first.starts_with("{\"event\":"),
+        "stream still leads: {first}"
+    );
+    // …and a pretty multi-line document follows the `end` event.
+    let end_pos = out.find("{\"event\":\"end\"").expect("end event");
+    let doc_pos = out[end_pos..]
+        .find("{\n")
+        .map(|i| i + end_pos)
+        .expect("a pretty monolithic document must follow the end event");
+    let doc: Value = serde_json::from_str(out[doc_pos..].trim()).expect("document parses");
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "the document carries populated intervals (discard_json off)"
+    );
+    assert!(doc["end"].is_object());
+    let _ = server.0.kill();
+}
+
+/// #213 negative: without the flag, nothing follows the end event.
+#[test]
+fn json_stream_without_full_output_ends_at_the_end_event() {
+    let ps = free_port().to_string();
+    let server = Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "-1", "-p", &ps])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    std::thread::sleep(Duration::from_millis(200));
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "--json-stream"],
+        Duration::from_secs(20),
+        "json-stream plain",
+    );
+    let end_pos = out.find("{\"event\":\"end\"").expect("end event");
+    let tail = out[end_pos..].lines().skip(1).collect::<Vec<_>>().join("");
+    assert!(
+        tail.trim().is_empty(),
+        "nothing may follow the end event without the flag: {tail:?}"
+    );
+    let _ = server.0.kill();
+}

@@ -430,3 +430,54 @@ fn tcp_bidir_text_interval_sums_split_per_direction() {
         );
     }
 }
+
+const SEPARATOR: &str = "- - - - - - - - - - - - - - - - - - - - - - - - -";
+
+/// #204: at -P > 1, every tick after the first opens with iperf3's
+/// report_bw_separator line (iperf_print_intermediate: first interval →
+/// header, else if num_streams > 1 → separator). At P=1 the only separator
+/// is the end-block one.
+#[test]
+fn parallel_text_ticks_open_with_separator() {
+    let ps = free_port().to_string();
+    let mut server = spawn_server(&ps);
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "3", "-i", "1", "-P", "2"],
+        Duration::from_secs(20),
+        "tcp P2 text",
+    );
+    let seps = out.matches(SEPARATOR).count();
+    // 3 ticks → 2 per-tick separators (ticks 2 and 3) + the end-block one.
+    assert!(
+        seps >= 3,
+        "expected per-tick separators at P=2 (>=3 incl. end block), got {seps}:\n{out}"
+    );
+    // Shape: a separator line sits between tick SUM rows (not only at the end).
+    let first_sum = out.find("[SUM]").expect("SUM rows at P=2");
+    let sep_after_sum = out[first_sum..].find(SEPARATOR).map(|i| i + first_sum);
+    let summary_hdr = out.rfind("- - -").unwrap();
+    assert!(
+        sep_after_sum.unwrap_or(usize::MAX) < summary_hdr,
+        "a separator must appear mid-run, between ticks:\n{out}"
+    );
+    let _ = server.0.kill();
+}
+
+/// #204 negative: P=1 prints NO per-tick separator (num_streams == 1) — only
+/// the end-block one.
+#[test]
+fn single_stream_text_has_only_the_end_separator() {
+    let ps = free_port().to_string();
+    let mut server = spawn_server(&ps);
+    let out = run_capturing(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "3", "-i", "1"],
+        Duration::from_secs(20),
+        "tcp P1 text",
+    );
+    assert_eq!(
+        out.matches(SEPARATOR).count(),
+        1,
+        "P=1 must print exactly the end-block separator:\n{out}"
+    );
+    let _ = server.0.kill();
+}
