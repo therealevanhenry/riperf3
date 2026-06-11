@@ -67,16 +67,34 @@ fn main() -> std::process::ExitCode {
     match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
+            // #225: on ServerTerminated the lib has ALREADY rendered the
+            // partial report — error key inside — into the active JSON sink
+            // before returning; re-rendering here concatenated a second
+            // document (or a second error+end event pair), which breaks
+            // every -J consumer. iperf3 emits exactly one. Text mode is
+            // exempt: its stderr line is iperf3's errexit shape, and the
+            // lib's text dump carries no error line.
+            let lib_already_rendered = e.downcast_ref::<riperf3::RiperfError>().is_some_and(|le| {
+                matches!(
+                    le,
+                    riperf3::RiperfError::ServerTerminated
+                        | riperf3::RiperfError::ServerErrorRelayed(_)
+                )
+            });
             // --json-stream wins over -J when combined: iperf3's
             // --json-stream gates iperf_json_finish into stream events
             // (review r1 f2, live-verified).
             if json_stream {
-                println!(
-                    "{}",
-                    riperf3::json_report::error_stream_events(&e.to_string())
-                );
+                if !lib_already_rendered {
+                    println!(
+                        "{}",
+                        riperf3::json_report::error_stream_events(&e.to_string())
+                    );
+                }
             } else if json {
-                println!("{}", riperf3::json_report::error_document(&e.to_string()));
+                if !lib_already_rendered {
+                    println!("{}", riperf3::json_report::error_document(&e.to_string()));
+                }
             } else {
                 let line = format!("riperf3: error - {e}");
                 let logged = logfile.as_deref().and_then(|path| {

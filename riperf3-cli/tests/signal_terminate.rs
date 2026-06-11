@@ -162,6 +162,85 @@ fn server_json_doc_carries_the_terminate_error_key() {
     );
 }
 
+/// #225: a `-J` CLIENT whose server terminates mid-test emits EXACTLY ONE
+/// document — the lib already rendered the partial report with the error key
+/// before returning ServerTerminated, and the CLI's generic error path must
+/// not append a second `error_document`. Two concatenated docs break every
+/// JSON consumer; iperf3 emits one (stderr empty, error rides the doc).
+#[test]
+fn server_sigterm_json_client_emits_exactly_one_doc() {
+    let ps = free_port().to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "10", "-i", "1", "-J"]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let spid = server.0.id() as i32;
+    unsafe {
+        libc::kill(spid, libc::SIGTERM);
+    }
+    let _ = wait_with_output_bounded(server, Duration::from_secs(5), "server");
+
+    let (cout, cerr, ccode) = wait_with_output_bounded(client, Duration::from_secs(8), "client -J");
+    assert_eq!(ccode, 1, "terminate-by-peer is the error path");
+    assert!(
+        cerr.trim().is_empty(),
+        "-J keeps stderr empty (the error rides the doc): {cerr:?}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(cout.trim())
+        .unwrap_or_else(|e| panic!("client -J stdout must be EXACTLY one document ({e}): {cout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("the server has terminated"),
+        "the single doc carries IESERVERTERM: {doc}"
+    );
+    assert!(
+        doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+        "the doc is the lib's PARTIAL report (data ran ~2 s), not the CLI's \
+         empty error doc: {doc}"
+    );
+}
+
+/// #225, stream flavor: a `--json-stream` client on server-terminate emits
+/// exactly one error event and one end event — not the lib's pair plus the
+/// CLI's `error_stream_events` pair.
+#[test]
+fn server_sigterm_json_stream_client_single_error_end_pair() {
+    let ps = free_port().to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&[
+        "-c",
+        "127.0.0.1",
+        "-p",
+        &ps,
+        "-t",
+        "10",
+        "-i",
+        "1",
+        "--json-stream",
+    ]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let spid = server.0.id() as i32;
+    unsafe {
+        libc::kill(spid, libc::SIGTERM);
+    }
+    let _ = wait_with_output_bounded(server, Duration::from_secs(5), "server");
+
+    let (cout, cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client --json-stream");
+    assert_eq!(ccode, 1);
+    assert!(cerr.trim().is_empty(), "stderr silent: {cerr:?}");
+    let errors = cout.matches("{\"event\":\"error\"").count();
+    let ends = cout.matches("{\"event\":\"end\"").count();
+    assert_eq!(
+        (errors, ends),
+        (1, 1),
+        "exactly one error+end pair (lib renders, CLI must not re-render):\n{cout}"
+    );
+}
+
 /// #210 review r2 d: the server's json-stream emits the discrete `error`
 /// event BEFORE `end` on terminate (iperf_json_finish is role-agnostic);
 /// stderr stays empty.

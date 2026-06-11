@@ -63,6 +63,96 @@ pub enum RiperfError {
 
     #[error("peer disconnected")]
     PeerDisconnected,
+
+    /// iperf3's SERVER_ERROR relay (#224): the server failed mid-test and
+    /// sent its (i_errno, errno) pair on the control connection; the client
+    /// ADOPTS the mapped iperf_strerror text as its own error, exactly like
+    /// iperf_handle_message_client (iperf_client_api.c:392). The Display is
+    /// the mapped message alone — the CLI prefixes it ("riperf3: error - …"),
+    /// matching iperf3's errexit line.
+    #[error("{0}")]
+    ServerErrorRelayed(String),
+}
+
+/// iperf3's SERVER_ERROR relay rendering, client side (#224). The errno
+/// append follows iperf_handle_message_client (iperf_client_api.c:403-404),
+/// which appends ", errno: <strerror>" UNCONDITIONALLY whenever the relayed
+/// os errno is non-zero — for any code (r1 review, live-verified; real
+/// iperf3 servers relay stale/live errno from the bitrate and
+/// cleanup_server sites). Rendered via io::Error, whose "(os error N)"
+/// suffix is the convention riperf3's raw os errors already carry (#151).
+/// CONSCIOUS DEVIATION: iperf_strerror's perr codes emit a dangling ": "
+/// even at errno==0 (live: "server test duration expired: ") — an artifact
+/// we do not mirror. Unknown codes use iperf3's literal "int_errno=%d"
+/// fallback (iperf_error.c default case).
+pub(crate) fn iperf3_strerror(i_errno: u32, os_errno: u32) -> String {
+    let base = match i_errno {
+        // IETOTALRATE — the --server-bitrate-limit breach
+        27 => "total required bandwidth is larger than server limit".to_string(),
+        // IEMAXSERVERTESTDURATIONEXCEEDED — the upfront param-exchange
+        // reject modern iperf3 servers send for over-limit or unbounded
+        // requests. riperf3's own upfront check is #230, but a real iperf3
+        // server can relay this TODAY, so the client must render it.
+        37 => {
+            "client's requested duration exceeds the server's maximum permitted limit".to_string()
+        }
+        // IESERVERTERM — a server relaying its own terminate as an error
+        120 => "the server has terminated".to_string(),
+        // IESERVERTESTDURATIONEXPIRED — the --server-max-duration timer
+        160 => "server test duration expired".to_string(),
+        other => format!("int_errno={other}"),
+    };
+    if os_errno > 0 {
+        format!(
+            "{base}, errno: {}",
+            std::io::Error::from_raw_os_error(os_errno as i32)
+        )
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod strerror_tests {
+    use super::iperf3_strerror;
+
+    /// The #224 relay codes, pinned to iperf 3.21's iperf_error.c strings.
+    #[test]
+    fn maps_the_relay_codes() {
+        assert_eq!(
+            iperf3_strerror(27, 0),
+            "total required bandwidth is larger than server limit"
+        );
+        assert_eq!(iperf3_strerror(120, 0), "the server has terminated");
+        assert_eq!(iperf3_strerror(160, 0), "server test duration expired");
+    }
+
+    /// The errno append is UNCONDITIONAL on errno > 0 for every code
+    /// (iperf_client_api.c:403-404 — the r1 review corrected the earlier
+    /// perr-gated model with a live probe); errno == 0 appends nothing (the
+    /// dangling-": " iperf_strerror artifact is a documented conscious
+    /// deviation). Unknown codes fall back to iperf3's literal int_errno=%d.
+    #[test]
+    fn errno_append_and_fallback() {
+        assert_eq!(iperf3_strerror(9999, 0), "int_errno=9999");
+        for (code, base) in [
+            (160u32, "server test duration expired"),
+            (
+                27u32,
+                "total required bandwidth is larger than server limit",
+            ),
+        ] {
+            let with_errno = iperf3_strerror(code, 104);
+            assert!(
+                with_errno.starts_with(&format!("{base}, errno: ")),
+                "{with_errno}"
+            );
+        }
+        assert_eq!(
+            iperf3_strerror(37, 0),
+            "client's requested duration exceeds the server's maximum permitted limit"
+        );
+    }
 }
 
 /// Result alias used throughout the library.
