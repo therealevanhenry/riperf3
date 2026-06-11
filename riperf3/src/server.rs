@@ -786,6 +786,16 @@ impl Server {
         rate_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         rate_check.tick().await; // skip immediate tick
 
+        // #237: ONE absolute deadline, pinned before the loop. A sleep()
+        // recreated inside select! restarts from zero every time another arm
+        // (the 1 Hz rate ticks) re-enters the loop, so a max duration > ~1 s
+        // could never fire. Guarded below, so the 0-when-unset deadline
+        // (already in the past) is never polled.
+        let max_dur_deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
+            test_start + std::time::Duration::from_secs(max_dur_secs),
+        ));
+        tokio::pin!(max_dur_deadline);
+
         // #224 (iperf 3.21 ground truth): a SELF-terminated test (bitrate
         // limit / max duration) relays SERVER_ERROR + i_errno and skips BOTH
         // the exchange and the local summary dump; the message lands on the
@@ -843,7 +853,7 @@ impl Server {
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(max_dur_secs)), if max_dur_secs > 0 => {
+                _ = &mut max_dur_deadline, if max_dur_secs > 0 => {
                     // #224: iperf3's server_timer_proc — SERVER_ERROR +
                     // IESERVERTESTDURATIONEXPIRED(160) on the wire.
                     protocol::send_server_error(&mut ctrl, 160).await?;
