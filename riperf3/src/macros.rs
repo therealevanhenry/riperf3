@@ -72,9 +72,15 @@ static OUTPUT_TIMESTAMPS: RwLock<bool> = RwLock::new(false);
 pub(crate) struct OutputTimestampGuard;
 
 impl OutputTimestampGuard {
-    pub(crate) fn set(active: bool) -> Self {
+    /// Construct ONLY when timestamps are active (callers use
+    /// `cond.then(OutputTimestampGuard::set)`): an unconditional `set(false)`
+    /// from a concurrent in-process run would clobber another run's `true` —
+    /// the exact server-clobbers-client topology of the lib's
+    /// `timestamps_runs` test (#168 review r1 n3). Mirrors OutputTitleGuard,
+    /// whose construct-only-when-titled shape has no such mode.
+    pub(crate) fn set() -> Self {
         if let Ok(mut g) = OUTPUT_TIMESTAMPS.write() {
-            *g = active;
+            *g = true;
         }
         OutputTimestampGuard
     }

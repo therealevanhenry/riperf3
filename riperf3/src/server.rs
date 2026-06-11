@@ -302,9 +302,8 @@ impl Server {
         // --timestamps prefixes every text report line — through titled(), so
         // the capture above tees the PREFIXED line like iperf3's linebuffer
         // (#168). Run-scoped; never in the machine-JSON modes.
-        let _ts_guard = crate::macros::OutputTimestampGuard::set(
-            self.timestamps.is_some() && !self.json_output && !self.json_stream,
-        );
+        let _ts_guard = (self.timestamps.is_some() && !self.json_output && !self.json_stream)
+            .then(crate::macros::OutputTimestampGuard::set);
 
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
@@ -610,6 +609,9 @@ impl Server {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
+                    // iperf3's discard_json: a json-stream server RETAINS the
+                    // interval objects when the client asked for output (#168).
+                    keep_intervals: want_server_output && self.json_stream,
                 },
                 stream_refs,
                 done.clone(),

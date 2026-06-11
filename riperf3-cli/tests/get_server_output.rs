@@ -224,6 +224,15 @@ fn json_stream_server_attaches_json_output() {
         "a --json-stream server must attach server_output_json (iperf3 keeps \
          json_top alive for get_server_output): {out}"
     );
+    let n_intervals = v["server_output_json"]["intervals"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert!(
+        n_intervals >= 1,
+        "the attached report carries populated intervals — discard_json's \
+         whole purpose (review r1 n2): {out}"
+    );
 }
 
 /// A `--json-stream` client emits the returned server output as an NDJSON
