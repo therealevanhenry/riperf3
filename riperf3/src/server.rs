@@ -237,6 +237,13 @@ impl Server {
             .map(crate::macros::OutputTimestampGuard::set);
         let sep = "-----------------------------------------------------------";
         if !json {
+            // -V reprints version/uname EVERY accept round, like GT's
+            // iperf_run_server loop (r1 item 12; #222).
+            if self.verbose {
+                // (Already inside the !json gate.)
+                vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+                vprintln!("{}", crate::utils::system_info());
+            }
             Self::banner_line(sep);
             Self::banner_line(&format!("Server listening on {}", self.port));
             Self::banner_line(sep);
@@ -279,6 +286,10 @@ impl Server {
                 break;
             }
             if !json {
+                if self.verbose {
+                    vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+                    vprintln!("{}", crate::utils::system_info());
+                }
                 Self::banner_line(sep);
                 Self::banner_line(&format!("Server listening on {}", self.port));
                 Self::banner_line(sep);
@@ -320,9 +331,9 @@ impl Server {
             Some(r) => r?,
             None => return Ok(()),
         };
-        if self.verbose {
-            vprintln!("Accepted connection from {peer_addr}");
-        }
+        // (#222 r1 item 6: the Time/banner/Cookie/MSS block prints AFTER the
+        // param exchange — GT's iperf_on_connect fires there — so a
+        // --get-server-output capture relays it; see below.)
         net::configure_tcp_stream(&ctrl, true)?;
 
         let json = self.json_output || self.json_stream;
@@ -366,6 +377,54 @@ impl Server {
         // banner (#216) — so the capture above tees PREFIXED lines like
         // iperf3's linebuffer (#168) with nothing to do per test.
 
+        // #222: the connect text block, in GT's order and GT's TIMING —
+        // iperf_on_connect fires post-param-exchange, which also puts these
+        // lines inside the --get-server-output capture (r1 item 6). The
+        // banner is unconditional in text mode; the rest is -V. The server's
+        // control MSS is 0 "(default)" (ctrl_sck_mss, r1 item 2).
+        if !self.json_output && !self.json_stream {
+            if self.verbose {
+                vprintln!(
+                    "Time: {}",
+                    crate::json_report::http_date(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                );
+            }
+            // iperf3's shape: "host, port N", with v4-mapped v6 addresses
+            // unmapped for display (mapped_v4_to_regular_v4).
+            vprintln!(
+                "Accepted connection from {}, port {}",
+                peer_addr.ip().to_canonical(),
+                peer_addr.port()
+            );
+            if self.verbose {
+                vprintln!(
+                    "      Cookie: {}",
+                    String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                );
+                if matches!(cfg.protocol, TransportProtocol::Tcp) {
+                    // The client's -M arrives in params (r3): GT prints the
+                    // SET value suffix-free, "0 (default)" only when unset —
+                    // the server mirror of the client-side rule.
+                    match params.mss.filter(|&m| m != 0) {
+                        Some(m) => vprintln!("      TCP MSS: {m}"),
+                        None => vprintln!("      TCP MSS: 0 (default)"),
+                    }
+                }
+                // GT's on_connect verbose tail is role-independent (r2
+                // item 3): the client's requested rate arrives in params.
+                if let Some(b) = params.bandwidth {
+                    if b != 0 {
+                        vprintln!("      Target Bitrate: {b}");
+                    }
+                }
+            }
+        }
+
         // ---- Auth validation (after params, before streams) ----
         if let (Some(ref privkey_path), Some(ref users_path)) =
             (&self.rsa_private_key_path, &self.authorized_users_path)
@@ -399,15 +458,8 @@ impl Server {
             }
         }
 
-        if self.verbose {
-            vprintln!(
-                "Test: {:?} {} stream(s) blksize={} duration={}s",
-                cfg.protocol,
-                cfg.num_streams,
-                cfg.blksize,
-                cfg.duration
-            );
-        }
+        // (The legacy "Test: Tcp N stream(s)..." -V line is gone — its GT
+        // replacement is the Starting Test line below; r1 item 14.)
 
         // ---- CreateStreams ----
         let done = Arc::new(AtomicBool::new(false));
@@ -607,6 +659,43 @@ impl Server {
         }
 
         // ---- TestStart / TestRunning ----
+        // #222: the per-stream preamble (unconditional, text) and the -V
+        // Starting Test parameter line, like the client side.
+        if !self.json_output && !self.json_stream {
+            for s in &streams {
+                if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
+                    vprintln!(
+                        "[{:3}] local {} port {} connected to {} port {}",
+                        s.id,
+                        l.ip().to_canonical(),
+                        l.port(),
+                        p.ip().to_canonical(),
+                        p.port()
+                    );
+                }
+            }
+            if self.verbose {
+                // The bytes/blocks/time variants, like the client side (r2
+                // item 1): a -n/-k client's server printed a phantom
+                // duration before.
+                let proto = match cfg.protocol {
+                    TransportProtocol::Tcp => "TCP",
+                    TransportProtocol::Udp => "UDP",
+                };
+                let head = format!(
+                    "Starting Test: protocol: {proto}, {} streams, {} byte blocks, \
+                     omitting {} seconds",
+                    cfg.num_streams, cfg.blksize, cfg.omit
+                );
+                if let Some(bytes) = params.num.filter(|&n| n > 0) {
+                    vprintln!("{head}, {bytes} bytes to send, tos {}", cfg.tos);
+                } else if let Some(blocks) = params.blockcount.filter(|&n| n > 0) {
+                    vprintln!("{head}, {blocks} blocks to send, tos {}", cfg.tos);
+                } else {
+                    vprintln!("{head}, {} second test, tos {}", cfg.duration, cfg.tos);
+                }
+            }
+        }
         // All streams are set up — release the UDP senders.
         start.store(true, Ordering::Relaxed);
         protocol::send_state(&mut ctrl, TestState::TestStart).await?;
@@ -892,8 +981,34 @@ impl Server {
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
+            // The -V additions render here too (r1 item 7): the captured
+            // pre-exchange path is the console output AND the relay.
+            if self.verbose {
+                vprintln!("Test Complete. Summary Results:");
+            }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && streams.iter().any(|s| s.is_sender) {
+                // GT gates the CPU line on the SENDING side (iperf_api.c:
+                // 4563): a -R server prints it, with ZERO remote figures —
+                // the peer's CPU is never exchanged to the server (#50).
+                vprintln!(
+                    "CPU Utilization: local/sender {:.1}% ({:.1}%u/{:.1}%s), \
+                     remote/receiver 0.0% (0.0%u/0.0%s)",
+                    cpu_util.host_total,
+                    cpu_util.host_user,
+                    cpu_util.host_system
+                );
+            }
+            if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
+                if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
+                    if streams.iter().any(|s| s.is_sender) {
+                        vprintln!("snd_tcp_congestion {c}");
+                    } else {
+                        vprintln!("rcv_tcp_congestion {c}");
+                    }
+                }
+            }
             (Some(capture.take()), None)
         } else if want_server_output && (self.json_output || self.json_stream) {
             // A --json-stream server attaches its JSON report too: iperf3
@@ -1030,8 +1145,35 @@ impl Server {
             let summaries = Self::text_summaries(&streams, test_duration, &cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();
+            // #222 (-V): iperf3 captions the final block; the server closes
+            // with its measured side's congestion line (no CPU line — GT).
+            if self.verbose {
+                vprintln!("Test Complete. Summary Results:");
+            }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
             crate::reporter::print_final_summaries(&summaries, 'a');
+            if self.verbose && streams.iter().any(|s| s.is_sender) {
+                // GT gates the CPU line on the SENDING side (iperf_api.c:
+                // 4563): a -R server prints it, with ZERO remote figures —
+                // the peer's CPU is never exchanged to the server (#50).
+                vprintln!(
+                    "CPU Utilization: local/sender {:.1}% ({:.1}%u/{:.1}%s), \
+                     remote/receiver 0.0% (0.0%u/0.0%s)",
+                    cpu_util.host_total,
+                    cpu_util.host_user,
+                    cpu_util.host_system
+                );
+            }
+            if self.verbose && matches!(cfg.protocol, TransportProtocol::Tcp) {
+                if let Some(c) = streams.iter().find_map(|s| s.congestion_used.clone()) {
+                    let is_sender = streams.iter().any(|s| s.is_sender);
+                    if is_sender {
+                        vprintln!("snd_tcp_congestion {c}");
+                    } else {
+                        vprintln!("rcv_tcp_congestion {c}");
+                    }
+                }
+            }
         }
 
         // Join stream tasks (best-effort, they should be done)

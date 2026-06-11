@@ -268,6 +268,14 @@ impl Client {
             // by here the format is always concrete.
             .map(crate::macros::OutputTimestampGuard::set);
 
+        // -V opens with the version and uname lines, like iperf3 — printed
+        // AFTER the guards so --timestamps/-T prefix them (r1 item 10; GT
+        // prefixes both, the uname doubly — that jank is not mirrored).
+        if self.verbose && !self.json_output && !self.json_stream {
+            vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+            vprintln!("{}", crate::utils::system_info());
+        }
+
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
         let mut ctrl = net::tcp_connect(
@@ -343,9 +351,20 @@ impl Client {
 
         protocol::send_cookie(&mut ctrl, &cookie).await?;
 
-        if self.verbose {
-            vprintln!("Connecting to host {}, port {}", self.host, self.port);
+        // #222 (-V): GT's iperf_connect prints these right after the cookie
+        // write, BEFORE the param exchange (r3 item 2 — a failed exchange
+        // still shows them); the UDP size line only when the blocksize was
+        // DEFAULTED (iperf_client_api.c:505-523).
+        if self.verbose && !self.json_output && !self.json_stream {
+            vprintln!("Control connection MSS {control_mss}");
+            if matches!(self.protocol, TransportProtocol::Udp) && !self.blksize_explicit {
+                vprintln!("Setting UDP block size to {blksize}");
+            }
         }
+
+        // (#222 r2 item 5: the connect text block prints after the param
+        // exchange — GT's client on_connect timing — see the ParamExchange
+        // arm; a failed exchange must not have printed the banner.)
 
         let done = Arc::new(AtomicBool::new(false));
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
@@ -375,14 +394,93 @@ impl Client {
                 TestState::ParamExchange => {
                     let params = self.build_params(blksize);
                     protocol::send_params(&mut ctrl, &params).await?;
+                    // #222: iperf3's connect text block — printed HERE,
+                    // after the param exchange (GT's on_connect timing, r2
+                    // item 5: a failed exchange prints no banner). The
+                    // banner is UNCONDITIONAL in text mode; the detail
+                    // lines are -V. JSON modes print none of this.
+                    if !self.json_output && !self.json_stream {
+                        if self.verbose {
+                            // (Control connection MSS + the UDP size line
+                            // print at GT's iperf_connect timing, right
+                            // after the cookie write — r3 item 2.)
+                            vprintln!(
+                                "Time: {}",
+                                crate::json_report::http_date(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0)
+                                )
+                            );
+                        }
+                        vprintln!("Connecting to host {}, port {}", self.host, self.port);
+                        if self.reverse {
+                            // Unconditional like the banner (iperf_api.c:995-998).
+                            vprintln!("Reverse mode, remote host {} is sending", self.host);
+                        }
+                        if self.verbose {
+                            vprintln!(
+                                "      Cookie: {}",
+                                String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                            );
+                            if matches!(self.protocol, TransportProtocol::Tcp) {
+                                // -M prints the SET value with no suffix (iperf_api.c:
+                                // 1034-1037); only the unset case is "(default)".
+                                match self.mss {
+                                    Some(m) => vprintln!("      TCP MSS: {m}"),
+                                    None => vprintln!("      TCP MSS: {control_mss} (default)"),
+                                }
+                            }
+                            if self.bandwidth != 0 {
+                                vprintln!("      Target Bitrate: {}", self.bandwidth);
+                            }
+                        }
+                    }
                 }
 
                 TestState::CreateStreams => {
                     (streams, byte_budget) =
                         self.create_streams(&cookie, &done, &start, blksize).await?;
+                    // #222: the per-stream preamble, unconditional in text
+                    // mode (iperf3 prints it for every stream on connect).
+                    if !self.json_output && !self.json_stream {
+                        for s in &streams {
+                            if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
+                                vprintln!(
+                                    "[{:3}] local {} port {} connected to {} port {}",
+                                    s.id,
+                                    l.ip().to_canonical(),
+                                    l.port(),
+                                    p.ip().to_canonical(),
+                                    p.port()
+                                );
+                            }
+                        }
+                    }
                 }
 
                 TestState::TestStart => {
+                    // #222 (-V): iperf3's Starting Test parameter line —
+                    // the bytes/blocks/time variants (iperf_api.c:929-935).
+                    if self.verbose && !self.json_output && !self.json_stream {
+                        let proto = match self.protocol {
+                            TransportProtocol::Tcp => "TCP",
+                            TransportProtocol::Udp => "UDP",
+                        };
+                        let head = format!(
+                            "Starting Test: protocol: {proto}, {} streams, {blksize} \
+                             byte blocks, omitting {} seconds",
+                            self.num_streams, self.omit
+                        );
+                        if let Some(bytes) = self.bytes_to_send {
+                            vprintln!("{head}, {bytes} bytes to send, tos {}", self.tos);
+                        } else if let Some(blocks) = self.blocks_to_send {
+                            vprintln!("{head}, {blocks} blocks to send, tos {}", self.tos);
+                        } else {
+                            vprintln!("{head}, {} second test, tos {}", self.duration, self.tos);
+                        }
+                    }
                     // All streams are set up — release the UDP senders.
                     start.store(true, Ordering::Relaxed);
                     cpu_start = Some(CpuSnapshot::now());
@@ -641,9 +739,19 @@ impl Client {
             let _ = s.task.await;
         }
 
-        server_results.ok_or_else(|| {
+        // #222: every clean text-mode client run closes with a blank line +
+        // "iperf Done." (iperf_client_api.c:853) — AFTER the results check
+        // (r1 item 9: a failed exchange must not print Done; GT's
+        // cleanup_and_fail never does), and as two prints so a --timestamps
+        // prefix lands on both lines like GT (item 10b).
+        let results = server_results.ok_or_else(|| {
             RiperfError::Protocol("missing server results in control exchange".into())
-        })
+        })?;
+        if !self.json_output && !self.json_stream {
+            vprintln!("");
+            vprintln!("iperf Done.");
+        }
+        Ok(results)
     }
 
     fn build_params(&self, blksize: usize) -> TestParams {
@@ -1475,7 +1583,13 @@ impl Client {
                 error,
             );
         } else {
-            self.print_results_text(streams, remote_cpu, blksize, test_duration);
+            self.print_results_text(
+                streams,
+                remote_cpu,
+                blksize,
+                test_duration,
+                cpu_start.map(|s| CpuSnapshot::now().utilization_since(s)),
+            );
         }
     }
 
@@ -1507,6 +1621,7 @@ impl Client {
         server_results: Option<&TestResultsJson>,
         blksize: usize,
         test_duration: f64,
+        local_cpu: Option<crate::cpu::CpuUtilization>,
     ) {
         crate::reporter::print_separator();
 
@@ -1621,10 +1736,52 @@ impl Client {
         // iperf3 reprints the column header above the final summaries, with
         // the Retr column only when a line actually carries a retransmit total.
         let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
+        // #222 (-V): iperf3 captions the final block and closes with the CPU
+        // and congestion-algorithm lines.
+        if self.verbose {
+            vprintln!("Test Complete. Summary Results:");
+        }
         crate::reporter::print_final_header(self.protocol, self.bidir, with_retr);
         // Per-stream lines plus aggregate [SUM] row(s) for parallel streams
         // (issue #4), via the shared path the server also uses.
         crate::reporter::print_final_summaries(&summaries, self.format_char);
+        if self.verbose {
+            // GT gates the CPU line on the SENDING side only
+            // (stream_must_be_sender, iperf_api.c:4563): a -R client prints
+            // none; the labels are fixed local/sender, remote/receiver.
+            if !self.reverse {
+                if let Some(local) = local_cpu {
+                    let (rt, ru, rs) = server_results
+                        .map(|r| (r.cpu_util_total, r.cpu_util_user, r.cpu_util_system))
+                        .unwrap_or((0.0, 0.0, 0.0));
+                    vprintln!(
+                        "CPU Utilization: local/sender {:.1}% ({:.1}%u/{:.1}%s), \
+                         remote/receiver {:.1}% ({:.1}%u/{:.1}%s)",
+                        local.host_total,
+                        local.host_user,
+                        local.host_system,
+                        rt,
+                        ru,
+                        rs
+                    );
+                }
+            }
+            if matches!(self.protocol, TransportProtocol::Tcp) {
+                let own = streams.iter().find_map(|s| s.congestion_used.clone());
+                let peer = server_results.and_then(|r| r.congestion_used.clone());
+                let (snd, rcv) = if self.reverse {
+                    (peer.clone(), own.clone())
+                } else {
+                    (own.clone(), peer.clone())
+                };
+                if let Some(c) = snd {
+                    vprintln!("snd_tcp_congestion {c}");
+                }
+                if let Some(c) = rcv {
+                    vprintln!("rcv_tcp_congestion {c}");
+                }
+            }
+        }
         self.print_server_output(server_results);
     }
 
