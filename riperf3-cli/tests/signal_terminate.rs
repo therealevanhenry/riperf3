@@ -161,3 +161,33 @@ fn server_json_doc_carries_the_terminate_error_key() {
         "the doc carries IECLIENTTERM: {doc}"
     );
 }
+
+/// #210 review r2 d: the server's json-stream emits the discrete `error`
+/// event BEFORE `end` on terminate (iperf_json_finish is role-agnostic);
+/// stderr stays empty.
+#[test]
+fn server_json_stream_emits_the_error_event_before_end() {
+    let ps = free_port().to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps, "--json-stream"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "10"]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let cpid = client.0.id() as i32;
+    unsafe {
+        libc::kill(cpid, libc::SIGTERM);
+    }
+    let _ = wait_with_output_bounded(client, Duration::from_secs(5), "client");
+
+    let (sout, serr, _) =
+        wait_with_output_bounded(server, Duration::from_secs(5), "server json-stream");
+    assert!(serr.trim().is_empty(), "stderr silent: {serr:?}");
+    let err_pos = sout
+        .find("{\"event\":\"error\",\"data\":\"the client has terminated\"}")
+        .expect("the error event must be emitted");
+    let end_pos = sout.find("{\"event\":\"end\"").expect("end event");
+    assert!(
+        err_pos < end_pos,
+        "error precedes end, like iperf_json_finish:\n{sout}"
+    );
+}

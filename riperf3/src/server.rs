@@ -936,6 +936,16 @@ impl Server {
             });
             self.print_results_json(&report);
         } else if self.json_stream {
+            // A terminated/interrupted run emits the discrete `error` event
+            // BEFORE `end`, like iperf_json_finish on both roles
+            // (iperf_api.c:5310-5323) — without this the r1 stderr gating
+            // left the message nowhere in server json-stream mode (#210
+            // review r2 d).
+            if let Some(e) = &report_error {
+                crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+                    "error", e,
+                ));
+            }
             // --json-stream: emit the `end` event (intervals already streamed; #62).
             self.emit_json_stream_end(
                 &streams,
