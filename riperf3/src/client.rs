@@ -47,6 +47,10 @@ pub struct Client {
     pub(crate) verbose: bool,
     pub(crate) json_output: bool,
     pub(crate) json_stream: bool,
+    /// #210: fired by the consumer (the CLI's first signal) with the
+    /// formatted interrupt message; the run dumps stats, sends
+    /// CLIENT_TERMINATE, and returns normally.
+    pub(crate) interrupt: Option<InterruptWatch>,
     pub(crate) json_stream_full_output: bool,
     pub(crate) bytes_to_send: Option<u64>,
     pub(crate) blocks_to_send: Option<u64>,
@@ -156,7 +160,34 @@ fn transferred_bytes(streams: &[DataStream]) -> u64 {
 }
 
 /// What the mid-test control watch observed (#170).
+/// The #210 interrupt receiver, newtyped so `Client`'s PartialEq derive (the
+/// CLI-glue test convention) keeps working: two wired watches compare equal —
+/// only PRESENCE is part of a config comparison.
+#[derive(Clone, Debug)]
+pub struct InterruptWatch(pub(crate) tokio::sync::watch::Receiver<Option<String>>);
+
+impl PartialEq for InterruptWatch {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+// The watch receiver is not UnwindSafe (its shared slot uses interior
+// mutability), which would strip the marker from Client/Server and their
+// builders — a semver break (CI's auto_trait_impl_removed). riperf3's usage
+// is panic-consistent: the receiver is only ever POLLED (changed +
+// borrow_and_update) and the channel's state is a version counter plus an
+// Arc'd value slot, so observing it across an unwind cannot expose a broken
+// invariant of ours.
+impl std::panic::UnwindSafe for InterruptWatch {}
+impl std::panic::RefUnwindSafe for InterruptWatch {}
+
+#[derive(Debug)]
 enum ControlEvent {
+    /// A local interrupt (the CLI's first signal, #210) carrying the
+    /// formatted iperf3 message ("interrupt - the client has terminated by
+    /// signal …"); the test dumps its stats and sends CLIENT_TERMINATE.
+    Interrupted(String),
     /// SERVER_TERMINATE arrived: stop, render a partial summary, error with
     /// iperf3's IESERVERTERM.
     Terminated,
@@ -170,6 +201,25 @@ enum ControlEvent {
 /// read). Any state OTHER than ServerTerminate is logged and ignored — iperf3
 /// treats e.g. a re-sent TEST_RUNNING as a no-op, and the old code's
 /// first-byte-ends-the-wait behavior turned stray bytes into a truncated test.
+/// Resolve when the library consumer fires the interrupt watch (#210);
+/// pends forever when no watch is wired, so it is select-safe everywhere.
+pub(crate) async fn wait_interrupt(
+    rx: Option<&mut tokio::sync::watch::Receiver<Option<String>>>,
+) -> String {
+    match rx {
+        Some(rx) => loop {
+            if rx.changed().await.is_err() {
+                // Sender dropped without firing: never resolve.
+                std::future::pending::<()>().await;
+            }
+            if let Some(msg) = rx.borrow_and_update().clone() {
+                return msg;
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
 async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
     loop {
         match protocol::recv_state(ctrl).await {
@@ -187,7 +237,15 @@ async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
 }
 
 impl Client {
+    /// Chainable form of [`ClientBuilder::interrupt`] for an already-built
+    /// client (#210).
+    pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(InterruptWatch(rx));
+        self
+    }
+
     pub async fn run(&self) -> Result<TestResultsJson> {
+        let mut interrupt = self.interrupt.clone().map(|w| w.0);
         // -T/--title: prefix every client text line with "<title>:  " (#34),
         // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
         // mode — `-J` and `--json-stream` emit machine JSON, which iperf3 never
@@ -348,7 +406,7 @@ impl Client {
                 }
 
                 TestState::TestRunning => {
-                    let (secs, terminated) = self
+                    let (secs, event) = self
                         .run_test(
                             &mut ctrl,
                             &streams,
@@ -356,34 +414,70 @@ impl Client {
                             blksize,
                             interval_data.clone(),
                             byte_budget.as_ref(),
+                            &mut interrupt,
                         )
                         .await?;
                     measured_secs = secs;
-                    if terminated {
-                        // SERVER_TERMINATE mid-test: iperf3 temporarily flips
-                        // to DISPLAY_RESULTS, renders a summary from the
-                        // PARTIAL local data (no peer half), then errexits
-                        // with IESERVERTERM (#170). A -J run carries the
-                        // message in the blob's "error" key, like
-                        // iperf_json_finish.
-                        self.print_results(
-                            &streams,
-                            cpu_start.as_ref(),
-                            None,
-                            blksize,
-                            &interval_data,
-                            &StartMeta {
-                                cookie: String::from_utf8_lossy(
-                                    &cookie[..protocol::COOKIE_SIZE - 1],
-                                )
-                                .into_owned(),
-                                tcp_mss_default: control_mss,
-                                start_time_millis: test_start_millis,
-                            },
-                            measured_secs,
-                            Some("the server has terminated"),
-                        );
-                        return Err(RiperfError::ServerTerminated);
+                    match event {
+                        Some(ControlEvent::Terminated) => {
+                            // SERVER_TERMINATE mid-test: iperf3 temporarily
+                            // flips to DISPLAY_RESULTS, renders a summary from
+                            // the PARTIAL local data (no peer half), then
+                            // errexits with IESERVERTERM (#170). A -J run
+                            // carries the message in the blob's "error" key,
+                            // like iperf_json_finish.
+                            self.print_results(
+                                &streams,
+                                cpu_start.as_ref(),
+                                None,
+                                blksize,
+                                &interval_data,
+                                &StartMeta {
+                                    cookie: String::from_utf8_lossy(
+                                        &cookie[..protocol::COOKIE_SIZE - 1],
+                                    )
+                                    .into_owned(),
+                                    tcp_mss_default: control_mss,
+                                    start_time_millis: test_start_millis,
+                                },
+                                measured_secs,
+                                Some("the server has terminated"),
+                            );
+                            return Err(RiperfError::ServerTerminated);
+                        }
+                        Some(ControlEvent::Interrupted(msg)) => {
+                            // iperf_got_sigend (#210): dump the accumulated
+                            // stats (the same DISPLAY_RESULTS flip), tell the
+                            // peer via CLIENT_TERMINATE, and return normally —
+                            // the signal-normal exit is the CALLER's business
+                            // (iperf3 exits 0 on TERM/INT/HUP).
+                            let _ =
+                                protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
+                            self.print_results(
+                                &streams,
+                                cpu_start.as_ref(),
+                                None,
+                                blksize,
+                                &interval_data,
+                                &StartMeta {
+                                    cookie: String::from_utf8_lossy(
+                                        &cookie[..protocol::COOKIE_SIZE - 1],
+                                    )
+                                    .into_owned(),
+                                    tcp_mss_default: control_mss,
+                                    start_time_millis: test_start_millis,
+                                },
+                                measured_secs,
+                                Some(&msg),
+                            );
+                            return Ok(self.build_results(
+                                &streams,
+                                cpu_start.as_ref(),
+                                blksize,
+                                measured_secs,
+                            ));
+                        }
+                        Some(ControlEvent::Closed) | None => {}
                     }
                     // Test finished — send TestEnd
                     protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
@@ -423,6 +517,31 @@ impl Client {
                 }
                 TestState::ServerError => {
                     return Err(RiperfError::Protocol("server error".into()));
+                }
+
+                // iperf_handle_message_client handles SERVER_TERMINATE in
+                // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
+                // server interrupt racing the client's TestEnd lands here
+                // (the ExchangeResults wait) — dump the partial summary and
+                // surface IESERVERTERM instead of dying later on a bare
+                // peer-disconnect with no dump.
+                TestState::ServerTerminate => {
+                    self.print_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        None,
+                        blksize,
+                        &interval_data,
+                        &StartMeta {
+                            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                                .into_owned(),
+                            tcp_mss_default: control_mss,
+                            start_time_millis: test_start_millis,
+                        },
+                        measured_secs,
+                        Some("the server has terminated"),
+                    );
+                    return Err(RiperfError::ServerTerminated);
                 }
 
                 other => {
@@ -915,7 +1034,8 @@ impl Client {
         blksize: usize,
         collector: Arc<Mutex<crate::reporter::CollectedIntervals>>,
         byte_budget: Option<&(Arc<AtomicI64>, i64)>,
-    ) -> Result<(f64, bool)> {
+        interrupt: &mut Option<tokio::sync::watch::Receiver<Option<String>>>,
+    ) -> Result<(f64, Option<ControlEvent>)> {
         // Run the interval reporter whenever intervals are enabled. It prints
         // live for text / json-stream; for plain -J it runs silently to collect
         // intervals for the final blob (#36 PR2).
@@ -1029,6 +1149,10 @@ impl Client {
                         control_event = Some(ev);
                         watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
+                    msg = wait_interrupt(interrupt.as_mut()) => {
+                        control_event = Some(ControlEvent::Interrupted(msg));
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
+                    }
                 }
             }
             EndCondition::Bytes(target) => {
@@ -1036,6 +1160,10 @@ impl Client {
                     secs = self.wait_byte_limit(streams, target, &report_start, omit_boundary.as_ref()) => secs,
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
+                    }
+                    msg = wait_interrupt(interrupt.as_mut()) => {
+                        control_event = Some(ControlEvent::Interrupted(msg));
                         watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
                 }
@@ -1051,6 +1179,10 @@ impl Client {
                     ) => secs,
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
+                        watch_end_secs(report_start.elapsed().as_secs_f64())
+                    }
+                    msg = wait_interrupt(interrupt.as_mut()) => {
+                        control_event = Some(ControlEvent::Interrupted(msg));
                         watch_end_secs(report_start.elapsed().as_secs_f64())
                     }
                 }
@@ -1076,18 +1208,18 @@ impl Client {
                 // iperf3 prints no summary on IECTRLCLOSE.
                 return Err(RiperfError::ControlSocketClosed);
             }
-            Some(ControlEvent::Terminated) => {
-                // The caller renders the partial summary, then errors with
-                // IESERVERTERM (iperf3 flips to DISPLAY_RESULTS first).
-                return Ok((end_secs, true));
-            }
+            // The caller renders the partial summary: Terminated errors with
+            // IESERVERTERM (iperf3 flips to DISPLAY_RESULTS first);
+            // Interrupted (#210) additionally sends CLIENT_TERMINATE and
+            // returns normally (iperf3's signal-normal exit).
+            Some(ev) => return Ok((end_secs, Some(ev))),
             None => {}
         }
 
         // The authoritative test duration: exactly `-t` for a duration run, the
         // measured elapsed for a byte/block-limited run. The summary window and
         // its derived bitrate use this, not the default `-t` (#103).
-        Ok((end_secs, false))
+        Ok((end_secs, None))
     }
 
     fn build_results(
@@ -1743,6 +1875,7 @@ pub struct ClientBuilder {
     verbose: bool,
     json_output: bool,
     json_stream: bool,
+    interrupt: Option<InterruptWatch>,
     json_stream_full_output: bool,
     bytes_to_send: Option<u64>,
     blocks_to_send: Option<u64>,
@@ -1802,6 +1935,7 @@ impl Default for ClientBuilder {
             verbose: false,
             json_output: false,
             json_stream: false,
+            interrupt: None,
             json_stream_full_output: false,
             bytes_to_send: None,
             blocks_to_send: None,
@@ -2019,6 +2153,17 @@ impl ClientBuilder {
     /// `--json-stream`: stream line-delimited interval JSON during the test.
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
+        self
+    }
+
+    /// Wire an interrupt watch (#210): when the consumer sends a message
+    /// (iperf3's "interrupt - the client has terminated by signal …"), a
+    /// running test dumps its accumulated stats like iperf_got_sigend,
+    /// notifies the peer via CLIENT_TERMINATE on the control socket, and
+    /// `run()` returns normally with the local results — the caller owns the
+    /// exit (iperf3 exits 0 on TERM/INT/HUP).
+    pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(InterruptWatch(rx));
         self
     }
 
@@ -2474,6 +2619,7 @@ impl ClientBuilder {
             verbose: self.verbose,
             json_output: self.json_output,
             json_stream: self.json_stream,
+            interrupt: self.interrupt.clone(),
             json_stream_full_output: self.json_stream_full_output,
             // 0 means "no limit" in iperf3 (`-n 0`/`-k 0` run a plain duration
             // test — its end-condition checks gate on the value), so normalize
@@ -2553,12 +2699,20 @@ mod tests {
         let collector = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
 
         let res = client
-            .run_test(&mut ctrl, &[], &done, 131072, collector.clone(), None)
+            .run_test(
+                &mut ctrl,
+                &[],
+                &done,
+                131072,
+                collector.clone(),
+                None,
+                &mut None,
+            )
             .await;
         // Since #170 run_test reports the termination as an outcome (the
         // caller renders the partial summary then errors with IESERVERTERM).
         assert!(
-            matches!(res, Ok((_, true))),
+            matches!(res, Ok((_, Some(ControlEvent::Terminated)))),
             "ServerTerminate must surface as the terminated outcome: {res:?}"
         );
         assert_eq!(

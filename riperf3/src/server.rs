@@ -165,6 +165,9 @@ pub struct Server {
     pub(crate) json_output: bool,
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub(crate) json_stream: bool,
+    /// #210: fired by the consumer (the CLI's first signal); a running test
+    /// dumps stats, sends SERVER_TERMINATE, and `run()` returns.
+    pub(crate) interrupt: Option<crate::client::InterruptWatch>,
     pub(crate) json_stream_full_output: bool,
 }
 
@@ -193,6 +196,13 @@ fn demux_local_addr_for(
 }
 
 impl Server {
+    /// Chainable form of [`ServerBuilder::interrupt`] for an already-built
+    /// server (#210).
+    pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(crate::client::InterruptWatch(rx));
+        self
+    }
+
     /// A non-report stdout line (the listening banner): iperf3 routes these
     /// through iperf_printf too, so they carry the `--timestamps` prefix
     /// (#216). Not tee'd into the --get-server-output capture — iperf3's
@@ -232,6 +242,7 @@ impl Server {
             Self::banner_line(sep);
         }
 
+        let mut interrupt_fired = self.interrupt.clone().map(|w| w.0);
         loop {
             match self.handle_one_test(&listener).await {
                 Ok(()) => {}
@@ -240,11 +251,30 @@ impl Server {
                         vprintln!("Client disconnected.");
                     }
                 }
+                Err(RiperfError::ClientTerminated) => {
+                    // iperf3 prints IECLIENTTERM WITHOUT the "error - "
+                    // prefix ("iperf3: the client has terminated",
+                    // live-captured) and keeps serving (#210). In the JSON
+                    // modes the doc/event carried it — stderr stays silent
+                    // like iperf_err (review r1 f1/f3).
+                    if !json {
+                        eprintln!("riperf3: {}", RiperfError::ClientTerminated);
+                    }
+                }
                 Err(e) => {
-                    eprintln!("iperf3: error - {e}");
+                    eprintln!("riperf3: error - {e}");
                 }
             }
 
+            // #210: an interrupted run stops serving — handle_one_test
+            // already dumped its stats and told the client; the caller owns
+            // the signal-normal exit.
+            if interrupt_fired
+                .as_mut()
+                .is_some_and(|rx| rx.borrow_and_update().is_some())
+            {
+                return Ok(());
+            }
             if self.one_off {
                 break;
             }
@@ -652,6 +682,11 @@ impl Server {
         rate_check.tick().await; // skip immediate tick
 
         let mut server_terminated = false;
+        // #210: a peer- or self-terminated test skips the results exchange
+        // (the peer is gone / told to stop) but still dumps local results.
+        let mut client_terminated = false;
+        let mut interrupted: Option<String> = None;
+        let mut interrupt_rx = self.interrupt.clone().map(|w| w.0);
 
         loop {
             tokio::select! {
@@ -659,10 +694,22 @@ impl Server {
                     match state? {
                         TestState::TestEnd => break,
                         TestState::ClientTerminate => {
-                            return Err(RiperfError::Aborted("client terminated".into()));
+                            // iperf_got_sigend's peer half (#210): dump the
+                            // partial results below (the old early return
+                            // leaked the reporter — the #147 class — and
+                            // skipped the dump iperf3 performs).
+                            client_terminated = true;
+                            break;
                         }
                         _ => {}
                     }
+                }
+                msg = crate::client::wait_interrupt(interrupt_rx.as_mut()) => {
+                    // iperf_got_sigend, server role mid-TEST_RUNNING (#210):
+                    // tell the client, then dump local results below.
+                    let _ = protocol::send_state(&mut ctrl, TestState::ServerTerminate).await;
+                    interrupted = Some(msg);
+                    break;
                 }
                 _ = rate_check.tick(), if bitrate_limit.is_some() => {
                     let elapsed = test_start.elapsed().as_secs_f64();
@@ -705,6 +752,16 @@ impl Server {
             let _ = handle.await;
         }
         let cpu_end = CpuSnapshot::now();
+        // The terminate/interrupt message every report sink shares (#210 r1
+        // f1): iperf3's iperf_exit/iperf_err put it in the -J doc's error
+        // key (and suppress stderr) on the server role too.
+        let report_error: Option<String> = if let Some(msg) = &interrupted {
+            Some(msg.clone())
+        } else if client_terminated {
+            Some("the client has terminated".to_string())
+        } else {
+            None
+        };
 
         // Wait briefly then join tasks (senders may be blocked on write)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -713,9 +770,16 @@ impl Server {
         // Summary window + bitrate: the measured elapsed for a byte/block-limited
         // run, exactly `-t` otherwise (#103, mirrors the client). The requested
         // `-t` is reported separately as the test_start `duration` parameter.
-        let test_duration = if params.num.is_some() || params.blockcount.is_some() {
+        let test_duration = if params.num.is_some()
+            || params.blockcount.is_some()
+            || client_terminated
+            || interrupted.is_some()
+        {
             // Rebase to the post-omit window (#31): the measured elapsed
-            // includes the warm-up the summary must exclude.
+            // includes the warm-up the summary must exclude. A terminated
+            // run (#210) reports the window it actually ran — iperf3's
+            // sigend dump stamps the partial elapsed, not `-t` (live:
+            // "[  5] 0.00-2.00 sec" for a -t 10 run killed at 2 s).
             (measured_elapsed - cfg.omit as f64).max(0.0)
         } else {
             cfg.duration as f64
@@ -806,6 +870,7 @@ impl Server {
                 accepted_port,
                 test_start_millis,
                 &interval_data,
+                report_error.as_deref(),
             );
             let value = serde_json::to_value(&report).ok();
             prebuilt_report = Some(report);
@@ -836,24 +901,32 @@ impl Server {
             streams: result_streams,
         };
 
-        protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
-        // iperf3 protocol: server reads client results first, then sends its own.
-        // The client's results are not used in the server's own report — iperf3's
-        // server reports only its own measured bytes and a 0 remote CPU (#50).
-        let _client_results = protocol::recv_results(&mut ctrl).await?;
-        protocol::send_results(&mut ctrl, &server_results).await?;
+        if !client_terminated && interrupted.is_none() {
+            protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
+            // iperf3 protocol: server reads client results first, then sends its
+            // own. The client's results are not used in the server's own report —
+            // iperf3's server reports only its own measured bytes and a 0 remote
+            // CPU (#50).
+            let _client_results = protocol::recv_results(&mut ctrl).await?;
+            protocol::send_results(&mut ctrl, &server_results).await?;
 
-        // ---- DisplayResults / IperfDone ----
-        protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;
+            // ---- DisplayResults / IperfDone ----
+            protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;
 
-        // Wait for client to send IperfDone
-        loop {
-            match protocol::recv_state(&mut ctrl).await {
-                Ok(TestState::IperfDone) => break,
-                Ok(_) => continue,
-                Err(RiperfError::PeerDisconnected) => break,
-                Err(e) => return Err(e),
+            // Wait for client to send IperfDone
+            loop {
+                match protocol::recv_state(&mut ctrl).await {
+                    Ok(TestState::IperfDone) => break,
+                    Ok(_) => continue,
+                    Err(RiperfError::PeerDisconnected) => break,
+                    Err(e) => return Err(e),
+                }
             }
+        } else {
+            // A terminated run still uses the built local results for the
+            // report below; the exchange is skipped (iperf3's sigend/peer-
+            // terminate paths never reach it).
+            let _ = &server_results;
         }
 
         if self.json_output {
@@ -871,10 +944,21 @@ impl Server {
                     accepted_port,
                     test_start_millis,
                     &interval_data,
+                    report_error.as_deref(),
                 )
             });
             self.print_results_json(&report);
         } else if self.json_stream {
+            // A terminated/interrupted run emits the discrete `error` event
+            // BEFORE `end`, like iperf_json_finish on both roles
+            // (iperf_api.c:5310-5323) — without this the r1 stderr gating
+            // left the message nowhere in server json-stream mode (#210
+            // review r2 d).
+            if let Some(e) = &report_error {
+                crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
+                    "error", e,
+                ));
+            }
             // --json-stream: emit the `end` event (intervals already streamed; #62).
             self.emit_json_stream_end(
                 &streams,
@@ -887,6 +971,7 @@ impl Server {
                 accepted_port,
                 test_start_millis,
                 &interval_data,
+                report_error.as_deref(),
             );
         } else if !was_captured {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
@@ -912,6 +997,11 @@ impl Server {
             let _ = h.await;
         }
 
+        if client_terminated {
+            // The dump above already rendered; the caller prints iperf3's
+            // "the client has terminated" (no "error - " prefix) (#210).
+            return Err(RiperfError::ClientTerminated);
+        }
         Ok(())
     }
 
@@ -1410,6 +1500,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
@@ -1506,7 +1597,9 @@ impl Server {
             .collect();
 
         let input = ReportInput {
-            error: None,
+            // iperf_exit puts the terminate/interrupt message in the doc's
+            // error key on the server too (#210 review r1 f1).
+            error: error.map(str::to_string),
             protocol: cfg.protocol,
             reverse: cfg.reverse,
             bidir: cfg.bidir,
@@ -1585,6 +1678,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) -> crate::json_report::Report {
         self.build_report_input(
             streams,
@@ -1597,6 +1691,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            error,
         )
         .build()
     }
@@ -1606,7 +1701,7 @@ impl Server {
     fn print_results_json(&self, report: &crate::json_report::Report) {
         match serde_json::to_string_pretty(report) {
             Ok(s) => println!("{s}"),
-            Err(e) => eprintln!("iperf3: error - failed to serialize JSON: {e}"),
+            Err(e) => eprintln!("riperf3: error - failed to serialize JSON: {e}"),
         }
     }
 
@@ -1625,6 +1720,7 @@ impl Server {
         accepted_port: u16,
         start_time_millis: u64,
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        error: Option<&str>,
     ) {
         let input = self.build_report_input(
             streams,
@@ -1637,6 +1733,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            error,
         );
         let report = input.build();
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
@@ -1676,6 +1773,7 @@ impl Server {
             accepted_port,
             start_time_millis,
             interval_data,
+            None,
         );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "start",
@@ -1707,6 +1805,7 @@ pub struct ServerBuilder {
     use_pkcs1_padding: bool,
     json_output: bool,
     json_stream: bool,
+    interrupt: Option<crate::client::InterruptWatch>,
     json_stream_full_output: bool,
 }
 
@@ -1731,6 +1830,7 @@ impl Default for ServerBuilder {
             use_pkcs1_padding: false,
             json_output: false,
             json_stream: false,
+            interrupt: None,
             json_stream_full_output: false,
         }
     }
@@ -1769,6 +1869,15 @@ impl ServerBuilder {
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
+        self
+    }
+
+    /// Wire an interrupt watch (#210): when the consumer sends a message, a
+    /// running test dumps its accumulated stats like iperf_got_sigend, sends
+    /// SERVER_TERMINATE to the client, and `run()` returns — the caller owns
+    /// the signal-normal exit.
+    pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(crate::client::InterruptWatch(rx));
         self
     }
 
@@ -1937,6 +2046,7 @@ impl ServerBuilder {
             use_pkcs1_padding: self.use_pkcs1_padding,
             json_output: self.json_output,
             json_stream: self.json_stream,
+            interrupt: self.interrupt.clone(),
             json_stream_full_output: self.json_stream_full_output,
         })
     }

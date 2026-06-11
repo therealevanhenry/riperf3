@@ -54,6 +54,13 @@ pub enum RiperfError {
     #[error("the server has terminated")]
     ServerTerminated,
 
+    /// iperf3's IECLIENTTERM: the client sent CLIENT_TERMINATE mid-test; the
+    /// server dumps its partial results before this surfaces (#210). iperf3
+    /// prints it WITHOUT the "error - " prefix ("iperf3: the client has
+    /// terminated").
+    #[error("the client has terminated")]
+    ClientTerminated,
+
     #[error("peer disconnected")]
     PeerDisconnected,
 }
