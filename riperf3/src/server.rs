@@ -999,11 +999,12 @@ impl Server {
                 let pt = cfg.pacing_timer; // #185: pace the UDP batch too
                 let u64bit = cfg.udp_counters_64bit;
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(
-                        std_sock, c, bs, d, rate, pt, bu, u64bit, st, md,
+                        std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
                 streams.push(DataStream {
@@ -1119,7 +1120,13 @@ impl Server {
             }
             let (n, src) =
                 match tokio::time::timeout(remaining, udp_sock.recv_from(&mut magic_buf)).await {
-                    Ok(r) => r?,
+                    Ok(Ok(r)) => r,
+                    // Reset-class noise: our own UDP_CONNECT_REPLY to a client
+                    // port that just closed (e.g. a retry on a fresh socket)
+                    // queues WSAECONNRESET on Windows — it must not abort setup
+                    // for EVERY stream; skip like the data-phase receivers (#180).
+                    Ok(Err(e)) if crate::stream::is_reset_class(&e) => continue,
+                    Ok(Err(e)) => return Err(e.into()),
                     Err(_) => {
                         return Err(RiperfError::Aborted(
                             "timed out waiting for UDP stream connect".into(),
@@ -1224,6 +1231,7 @@ impl Server {
                 let c = counters.clone();
                 let d = done.clone();
                 let bu = cfg.burst;
+                let uw = cfg.window.is_some();
                 let st = start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
@@ -1236,6 +1244,7 @@ impl Server {
                         rate,
                         pt,
                         bu,
+                        uw,
                         u64bit,
                         st,
                         md,
