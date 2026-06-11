@@ -1803,7 +1803,10 @@ mod unimplemented_flags {
         // The server side errors to ITS sink but run() is Ok - iperf3's
         // one-off exits 0 on self-terminate (live-verified, the #224 wart).
         let joined = server_task.await.expect("server task");
-        assert!(joined.is_ok(), "server self-terminate is not a run() error: {joined:?}");
+        assert!(
+            joined.is_ok(),
+            "server self-terminate is not a run() error: {joined:?}"
+        );
     }
 
     #[tokio::test]
@@ -1840,7 +1843,10 @@ mod unimplemented_flags {
             "{err:?}"
         );
         let joined = server_task.await.expect("server task");
-        assert!(joined.is_ok(), "server self-terminate is not a run() error: {joined:?}");
+        assert!(
+            joined.is_ok(),
+            "server self-terminate is not a run() error: {joined:?}"
+        );
     }
 
     #[tokio::test]

@@ -141,6 +141,32 @@ pub async fn send_state(stream: &mut TcpStream, state: TestState) -> Result<()> 
 }
 
 /// Read a state transition (single signed byte) from the control connection.
+/// Send SERVER_ERROR with iperf3's (i_errno, errno) u32-pair payload (#224):
+/// the state byte, then both words big-endian — iperf_server_api.c's Nwrite
+/// pair (the bitrate, duration-timer, and cleanup_server relay sites). The os
+/// errno is always 0 from riperf3: our self-terminate causes carry none.
+pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<()> {
+    send_state(stream, TestState::ServerError).await?;
+    stream.write_all(&i_errno.to_be_bytes()).await?;
+    stream.write_all(&0u32.to_be_bytes()).await?;
+    Ok(())
+}
+
+/// Read SERVER_ERROR's (i_errno, errno) payload. `None` when it never
+/// arrives (a peer that died mid-relay, or a bare -2 sender): the caller
+/// degrades to its generic message — a payloadless SERVER_ERROR must error
+/// cleanly, never hang or panic (tested in-crate).
+pub async fn read_server_error_payload(stream: &mut TcpStream) -> Option<(u32, u32)> {
+    let mut buf = [0u8; 8];
+    match stream.read_exact(&mut buf).await {
+        Ok(_) => Some((
+            u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+        )),
+        Err(_) => None,
+    }
+}
+
 pub async fn recv_state(stream: &mut TcpStream) -> Result<TestState> {
     let mut buf = [0u8; 1];
     let n = stream.read(&mut buf).await?;
@@ -1270,6 +1296,10 @@ mod protocol_error_tests {
 
     #[tokio::test]
     async fn client_handles_server_error() {
+        // #224: SERVER_ERROR carries an (i_errno, errno) u32-pair payload
+        // (iperf_server_api.c cleanup_server / the bitrate + duration-timer
+        // sites); the client adopts iperf_strerror(i_errno) as ITS error
+        // (iperf_client_api.c:392). Payload here: IETOTALRATE=27, errno=0.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1282,6 +1312,12 @@ mod protocol_error_tests {
             protocol::send_state(&mut stream, TestState::ServerError)
                 .await
                 .unwrap();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                &[27u32.to_be_bytes(), 0u32.to_be_bytes()].concat(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = crate::ClientBuilder::new("127.0.0.1")
@@ -1290,7 +1326,41 @@ mod protocol_error_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        assert!(result.is_err(), "client should error on ServerError");
+        let err = result.expect_err("client should error on ServerError");
+        assert_eq!(
+            err.to_string(),
+            "total required bandwidth is larger than server limit",
+            "the client adopts the relayed iperf_strerror(27): {err:?}"
+        );
+        let _ = server_task.await;
+    }
+
+    /// A SERVER_ERROR whose payload never arrives (peer died mid-relay, or a
+    /// pre-payload sender): still an error, never a hang or a panic.
+    #[tokio::test]
+    async fn client_handles_server_error_without_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            protocol::send_state(&mut stream, TestState::ServerError)
+                .await
+                .unwrap();
+            // close without the payload
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        assert!(result.is_err(), "bare SERVER_ERROR is still an error");
         let _ = server_task.await;
     }
 

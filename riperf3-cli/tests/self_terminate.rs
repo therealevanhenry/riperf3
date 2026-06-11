@@ -75,12 +75,16 @@ fn bitrate_limit_text_relays_server_error_no_summaries() {
     // Client: both iperf3 stderr lines, error exit, no summary block.
     assert_eq!(client.status.code(), Some(1), "client errexits like iperf3");
     assert!(
-        client.stderr.contains(&format!("riperf3: SERVER ERROR - {BITRATE_MSG}")),
+        client
+            .stderr
+            .contains(&format!("riperf3: SERVER ERROR - {BITRATE_MSG}")),
         "the relayed line (iperf_err on SERVER_ERROR receipt): {stderr}",
         stderr = client.stderr
     );
     assert!(
-        client.stderr.contains(&format!("riperf3: error - {BITRATE_MSG}")),
+        client
+            .stderr
+            .contains(&format!("riperf3: error - {BITRATE_MSG}")),
         "the errexit line with the ADOPTED i_errno: {stderr}",
         stderr = client.stderr
     );
@@ -97,7 +101,10 @@ fn bitrate_limit_text_relays_server_error_no_summaries() {
         serr.contains(&format!("riperf3: error - {BITRATE_MSG}")),
         "server reports the limit breach on stderr: {serr}"
     );
-    assert_eq!(scode, 0, "iperf3's one-off exits 0 on this path (live-verified)");
+    assert_eq!(
+        scode, 0,
+        "iperf3's one-off exits 0 on this path (live-verified)"
+    );
     assert!(
         !sout.contains("- - - - -"),
         "no final summary block on self-terminate: {sout}"
@@ -194,12 +201,16 @@ fn max_duration_timer_relays_expired() {
     );
     assert_eq!(client.status.code(), Some(1));
     assert!(
-        client.stderr.contains("riperf3: SERVER ERROR - server test duration expired"),
+        client
+            .stderr
+            .contains("riperf3: SERVER ERROR - server test duration expired"),
         "client adopts strerror(IESERVERTESTDURATIONEXPIRED): {stderr}",
         stderr = client.stderr
     );
     assert!(
-        client.stderr.contains("riperf3: error - server test duration expired"),
+        client
+            .stderr
+            .contains("riperf3: error - server test duration expired"),
         "the errexit line: {stderr}",
         stderr = client.stderr
     );

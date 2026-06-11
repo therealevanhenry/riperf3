@@ -63,6 +63,77 @@ pub enum RiperfError {
 
     #[error("peer disconnected")]
     PeerDisconnected,
+
+    /// iperf3's SERVER_ERROR relay (#224): the server failed mid-test and
+    /// sent its (i_errno, errno) pair on the control connection; the client
+    /// ADOPTS the mapped iperf_strerror text as its own error, exactly like
+    /// iperf_handle_message_client (iperf_client_api.c:392). The Display is
+    /// the mapped message alone — the CLI prefixes it ("riperf3: error - …"),
+    /// matching iperf3's errexit line.
+    #[error("{0}")]
+    ServerErrorRelayed(String),
+}
+
+/// iperf3's iperf_strerror, for the SERVER_ERROR relay codes a client can
+/// receive (#224). The bool is iperf3's `perr`: those codes append
+/// ", errno: <strerror>" when the relayed os errno is non-zero — rendered via
+/// io::Error, whose "(os error N)" suffix is the convention riperf3's raw os
+/// errors already carry (#151). Unknown codes mirror iperf3's literal
+/// "int_errno=%d" fallback (iperf_error.c default case).
+pub(crate) fn iperf3_strerror(i_errno: u32, os_errno: u32) -> String {
+    let (base, perr) = match i_errno {
+        // IETOTALRATE — the --server-bitrate-limit breach
+        27 => (
+            "total required bandwidth is larger than server limit".to_string(),
+            false,
+        ),
+        // IESERVERTERM — a server relaying its own terminate as an error
+        120 => ("the server has terminated".to_string(), false),
+        // IESERVERTESTDURATIONEXPIRED — the --server-max-duration timer
+        160 => ("server test duration expired".to_string(), true),
+        other => (format!("int_errno={other}"), true),
+    };
+    if perr && os_errno > 0 {
+        format!(
+            "{base}, errno: {}",
+            std::io::Error::from_raw_os_error(os_errno as i32)
+        )
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod strerror_tests {
+    use super::iperf3_strerror;
+
+    /// The #224 relay codes, pinned to iperf 3.21's iperf_error.c strings.
+    #[test]
+    fn maps_the_relay_codes() {
+        assert_eq!(
+            iperf3_strerror(27, 0),
+            "total required bandwidth is larger than server limit"
+        );
+        assert_eq!(iperf3_strerror(120, 0), "the server has terminated");
+        assert_eq!(iperf3_strerror(160, 0), "server test duration expired");
+    }
+
+    /// perr-class codes append the os strerror only when errno > 0; the
+    /// unknown-code fallback is iperf3's literal int_errno=%d.
+    #[test]
+    fn perr_append_and_fallback() {
+        assert_eq!(iperf3_strerror(9999, 0), "int_errno=9999");
+        let with_errno = iperf3_strerror(160, 104);
+        assert!(
+            with_errno.starts_with("server test duration expired, errno: "),
+            "{with_errno}"
+        );
+        // Non-perr codes never append, whatever the errno.
+        assert_eq!(
+            iperf3_strerror(27, 104),
+            "total required bandwidth is larger than server limit"
+        );
+    }
 }
 
 /// Result alias used throughout the library.

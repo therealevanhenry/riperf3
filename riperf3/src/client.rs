@@ -191,6 +191,11 @@ enum ControlEvent {
     /// SERVER_TERMINATE arrived: stop, render a partial summary, error with
     /// iperf3's IESERVERTERM.
     Terminated,
+    /// SERVER_ERROR arrived (#224): the server failed and is relaying its
+    /// (i_errno, errno) pair; the PAYLOAD is still on the socket — the
+    /// consumer reads it outside the select (watch_control must stay
+    /// cancel-safe: a single 1-byte read).
+    ServerError,
     /// The control connection died (EOF or I/O error): iperf3's select sees
     /// it immediately and errexits with IECTRLCLOSE.
     Closed,
@@ -224,6 +229,7 @@ async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
     loop {
         match protocol::recv_state(ctrl).await {
             Ok(TestState::ServerTerminate) => return ControlEvent::Terminated,
+            Ok(TestState::ServerError) => return ControlEvent::ServerError,
             Ok(other) => {
                 log::debug!("ignoring control state {other:?} during the data phase");
             }
@@ -477,6 +483,43 @@ impl Client {
                                 measured_secs,
                             ));
                         }
+                        Some(ControlEvent::ServerError) => {
+                            // #224: read the relay pair (safe here, outside
+                            // the select) and ADOPT the mapped error like
+                            // iperf_handle_message_client. NO text dump —
+                            // that is SERVER_TERMINATE's shape — but the
+                            // JSON sinks render the full document/events
+                            // with the error inside, like iperf3's json_top
+                            // (the CLI suppresses its generic re-render).
+                            let msg = match protocol::read_server_error_payload(&mut ctrl).await {
+                                Some((i_errno, os_errno)) => {
+                                    crate::error::iperf3_strerror(i_errno, os_errno)
+                                }
+                                None => "server error".to_string(),
+                            };
+                            if self.json_output || self.json_stream {
+                                self.print_results(
+                                    &streams,
+                                    cpu_start.as_ref(),
+                                    None,
+                                    blksize,
+                                    &interval_data,
+                                    &StartMeta {
+                                        cookie: String::from_utf8_lossy(
+                                            &cookie[..protocol::COOKIE_SIZE - 1],
+                                        )
+                                        .into_owned(),
+                                        tcp_mss_default: control_mss,
+                                        start_time_millis: test_start_millis,
+                                    },
+                                    measured_secs,
+                                    Some(&msg),
+                                );
+                            } else {
+                                eprintln!("riperf3: SERVER ERROR - {msg}");
+                            }
+                            return Err(RiperfError::ServerErrorRelayed(msg));
+                        }
                         Some(ControlEvent::Closed) | None => {}
                     }
                     // Test finished — send TestEnd
@@ -516,7 +559,41 @@ impl Client {
                     return Err(RiperfError::AccessDenied);
                 }
                 TestState::ServerError => {
-                    return Err(RiperfError::Protocol("server error".into()));
+                    // #224: read the (i_errno, errno) relay pair and ADOPT
+                    // the mapped error, like iperf_handle_message_client.
+                    // Text mode: the "SERVER ERROR - …" receipt line only
+                    // (iperf_err's shape; no summary dump — that is
+                    // SERVER_TERMINATE's). JSON sinks: render the full
+                    // document/events with the error inside, like iperf3's
+                    // json_top; the CLI suppresses its generic re-render.
+                    let msg = match protocol::read_server_error_payload(&mut ctrl).await {
+                        Some((i_errno, os_errno)) => {
+                            crate::error::iperf3_strerror(i_errno, os_errno)
+                        }
+                        None => "server error".to_string(),
+                    };
+                    if self.json_output || self.json_stream {
+                        self.print_results(
+                            &streams,
+                            cpu_start.as_ref(),
+                            None,
+                            blksize,
+                            &interval_data,
+                            &StartMeta {
+                                cookie: String::from_utf8_lossy(
+                                    &cookie[..protocol::COOKIE_SIZE - 1],
+                                )
+                                .into_owned(),
+                                tcp_mss_default: control_mss,
+                                start_time_millis: test_start_millis,
+                            },
+                            measured_secs,
+                            Some(&msg),
+                        );
+                    } else {
+                        eprintln!("riperf3: SERVER ERROR - {msg}");
+                    }
+                    return Err(RiperfError::ServerErrorRelayed(msg));
                 }
 
                 // iperf_handle_message_client handles SERVER_TERMINATE in

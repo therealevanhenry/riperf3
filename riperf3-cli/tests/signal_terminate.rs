@@ -187,9 +187,8 @@ fn server_sigterm_json_client_emits_exactly_one_doc() {
         cerr.trim().is_empty(),
         "-J keeps stderr empty (the error rides the doc): {cerr:?}"
     );
-    let doc: serde_json::Value = serde_json::from_str(cout.trim()).unwrap_or_else(|e| {
-        panic!("client -J stdout must be EXACTLY one document ({e}): {cout}")
-    });
+    let doc: serde_json::Value = serde_json::from_str(cout.trim())
+        .unwrap_or_else(|e| panic!("client -J stdout must be EXACTLY one document ({e}): {cout}"));
     assert_eq!(
         doc["error"].as_str(),
         Some("the server has terminated"),
@@ -210,7 +209,17 @@ fn server_sigterm_json_stream_client_single_error_end_pair() {
     let ps = free_port().to_string();
     let server = spawn(&["-s", "-1", "-p", &ps]);
     std::thread::sleep(Duration::from_millis(300));
-    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "10", "-i", "1", "--json-stream"]);
+    let client = spawn(&[
+        "-c",
+        "127.0.0.1",
+        "-p",
+        &ps,
+        "-t",
+        "10",
+        "-i",
+        "1",
+        "--json-stream",
+    ]);
     std::thread::sleep(Duration::from_secs(2));
 
     let spid = server.0.id() as i32;
