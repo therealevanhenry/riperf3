@@ -236,6 +236,10 @@ pub struct TestParams {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bandwidth: Option<u64>,
 
+    /// `-b rate/burst` block count; iperf3 sends it only when nonzero (#160).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub burst: Option<i32>,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fqrate: Option<u64>,
 

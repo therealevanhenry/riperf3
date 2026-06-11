@@ -325,6 +325,10 @@ pub struct RateLimiter {
     pacing: Duration,
     start: tokio::time::Instant,
     sent: u64,
+    /// `-b rate/burst` (#160): blocks allowed per green light (0 = per-block).
+    burst: u32,
+    /// Blocks remaining in the current burst window (skip the throttle check).
+    in_burst: u32,
 }
 
 impl RateLimiter {
@@ -343,7 +347,8 @@ impl RateLimiter {
     /// - `rate_bits_per_sec`: target send rate
     /// - `pacing_timer_us`: wakeup quantum when behind (`--pacing-timer`,
     ///   0 → iperf3's 1000 µs default)
-    pub fn new(rate_bits_per_sec: u64, pacing_timer_us: u32) -> Self {
+    /// - `burst`: `-b rate/burst` block count (0 = unset → per-block checks)
+    pub fn new(rate_bits_per_sec: u64, pacing_timer_us: u32, burst: u32) -> Self {
         let pacing_us = if pacing_timer_us == 0 {
             crate::utils::DEFAULT_PACING_TIMER_US
         } else {
@@ -355,12 +360,22 @@ impl RateLimiter {
             // tokio's Instant so the accuracy tests can run under start_paused.
             start: tokio::time::Instant::now(),
             sent: 0,
+            burst,
+            in_burst: 0,
         }
     }
 
     /// Wait until the cumulative average is at or below the target rate, then
-    /// account `bytes` as sent.
+    /// account `bytes` as sent. With a `-b rate/burst` count, blocks
+    /// 2..=burst of a batch skip the check entirely — iperf3's multisend
+    /// loop sends the whole burst per green light and only then re-checks
+    /// the throttle (#160).
     pub async fn acquire(&mut self, bytes: u64) {
+        if self.in_burst > 0 {
+            self.in_burst -= 1;
+            self.sent += bytes;
+            return;
+        }
         loop {
             let allowed = self.start.elapsed().as_secs_f64() * self.rate_bytes_per_sec;
             let behind = self.sent as f64 - allowed;
@@ -375,6 +390,7 @@ impl RateLimiter {
             tokio::time::sleep(to_green.max(self.pacing)).await;
         }
         self.sent += bytes;
+        self.in_burst = self.burst.saturating_sub(1);
     }
 }
 
@@ -490,6 +506,7 @@ pub async fn run_tcp_sender(
     file_path: Option<std::path::PathBuf>,
     rate: u64,
     pacing_timer_us: u32,
+    burst: u32,
     byte_budget: Option<Arc<AtomicI64>>,
 ) -> Result<()> {
     use std::io::Read;
@@ -497,8 +514,9 @@ pub async fn run_tcp_sender(
     // `-b` pacing: iperf3's cumulative-average throttle caps the application
     // send rate, waking on the `--pacing-timer` quantum (#32/#116). 0 =
     // unlimited → no limiter, so the default TCP path is unchanged (#102;
-    // mirrors UDP's `-b 0` per #17).
-    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, pacing_timer_us));
+    // mirrors UDP's `-b 0` per #17). A `-b rate/burst` count lets `burst`
+    // blocks through per green light (#160).
+    let mut limiter = (rate > 0).then(|| RateLimiter::new(rate, pacing_timer_us, burst));
 
     while !done.load(Ordering::Relaxed) {
         // `-n`/`-k` byte/block limit: claim this block from the shared budget and
@@ -545,6 +563,12 @@ pub async fn run_tcp_sender(
 
         if let Some(rl) = limiter.as_mut() {
             rl.acquire(buf.len() as u64).await;
+            // The green-light sleep can outlast the test at very low -b:
+            // re-check `done` after waking instead of writing one more block
+            // past the end, like modern iperf3's send worker (#160).
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
         }
 
         match stream.write_all(&buf).await {
@@ -2172,7 +2196,7 @@ mod tests {
     async fn rate_limiter_total_accuracy_low_rate_large_blocks() {
         let rate_bits: u64 = 1_000_000; // 1 Mbit/s
         let blk: u64 = 128 * 1024; // TCP default block
-        let mut limiter = RateLimiter::new(rate_bits, 0);
+        let mut limiter = RateLimiter::new(rate_bits, 0, 0);
         let start = Instant::now();
         let mut sent: u64 = 0;
         while start.elapsed() < Duration::from_millis(1000) {
@@ -2191,7 +2215,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_first_acquire_is_instant() {
-        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbit/s
+        let mut limiter = RateLimiter::new(1_000_000, 0, 0); // 1 Mbit/s
         let start = Instant::now();
         // Cumulative average: nothing sent yet → always green-lit.
         limiter.acquire(1000).await;
@@ -2203,7 +2227,7 @@ mod tests {
         // 80_000 bits/sec = 10_000 bytes/sec, 1000-byte blocks: after block 1
         // the average is 1000 bytes ahead of schedule, so block 2 waits ~100ms
         // — there is no up-front burst grant (#116).
-        let mut limiter = RateLimiter::new(80_000, 0);
+        let mut limiter = RateLimiter::new(80_000, 0, 0);
         limiter.acquire(1000).await; // instant
         let start = Instant::now();
         limiter.acquire(1000).await; // must wait ~100ms
@@ -2219,7 +2243,7 @@ mod tests {
         // after any oversleep keeps throughput within 50% of target.
         let rate = 10_000_000_000u64; // 10 Gbps
         let blksize = 1460u64;
-        let mut limiter = RateLimiter::new(rate, 0);
+        let mut limiter = RateLimiter::new(rate, 0, 0);
 
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
@@ -2239,7 +2263,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_low_rate_still_works() {
-        let mut limiter = RateLimiter::new(1_000_000, 0); // 1 Mbps
+        let mut limiter = RateLimiter::new(1_000_000, 0, 0); // 1 Mbps
         let start = Instant::now();
         let mut total_bytes: u64 = 0;
 
@@ -2253,6 +2277,71 @@ mod tests {
         assert!(total_bytes == 10_000);
         // Should complete in under 1 second (generously)
         assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limiter_burst_allows_burst_blocks_per_green_light() {
+        // -b 8K/4 → 1000 bytes/s, bursts of 4 (#160). iperf3's multisend loop
+        // sends `burst` blocks per throttle check: after the batch head is
+        // green-lit, the next 3 blocks pass with NO check even though the
+        // cumulative average is far ahead of schedule.
+        let mut limiter = RateLimiter::new(8_000, 0, 4);
+        let t0 = tokio::time::Instant::now();
+        for _ in 0..4 {
+            limiter.acquire(1000).await;
+        }
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "burst window must not sleep: blocks 2..=4 ride block 1's green light"
+        );
+        // Block 5 is the next batch head: 4000 B sent against a 1000 B/s
+        // schedule → it must wait to the green-light instant (~4 s).
+        limiter.acquire(1000).await;
+        assert!(
+            t0.elapsed() >= Duration::from_secs(4),
+            "next batch head waits to green light, got {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_sender_rechecks_done_after_pacing_sleep() {
+        // At very low -b the green-light sleep can outlast the test; the
+        // sender must re-check `done` after the throttle wakes instead of
+        // writing one more block past the end (#160; modern iperf3's worker
+        // re-checks before sending).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let blksize = 10_000u64;
+
+        let sc = counters.clone();
+        let d = done.clone();
+        let sender = tokio::spawn(async move {
+            let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            let buf = vec![0u8; blksize as usize];
+            // 8000 bits/s = 1000 bytes/s: block 1 is green-lit immediately,
+            // block 2's acquire sleeps ~10 virtual seconds.
+            run_tcp_sender(stream, sc, buf, d, None, 8_000, 0, 0, None).await
+        });
+        let (peer, _) = listener.accept().await.unwrap();
+
+        // Flip `done` mid-sleep (5 s < the ~10 s green-light instant).
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        done.store(true, Ordering::Relaxed);
+
+        sender.await.unwrap().unwrap();
+        drop(peer);
+        assert_eq!(
+            counters.bytes_sent(),
+            blksize,
+            "sender wrote a block after `done` despite the post-sleep re-check"
+        );
     }
 
     // -- TCP send/recv integration --
@@ -2273,7 +2362,7 @@ mod tests {
                 .await
                 .unwrap();
             let buf = vec![0u8; 1024];
-            run_tcp_sender(stream, sc, buf, d, None, 0, 1000, None).await
+            run_tcp_sender(stream, sc, buf, d, None, 0, 1000, 0, None).await
         });
 
         let rc = recv_counters.clone();
