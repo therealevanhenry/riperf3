@@ -14,6 +14,16 @@ use std::time::Duration;
 mod common;
 use common::ChildGuard;
 
+/// The two tests here each stage a multi-process saboteur dance against the
+/// SAME bounded retry window they exist to exercise; concurrently on a 2-core
+/// runner they contend the window away from each other (observed: the -J
+/// variant's real server spawned too late once under load, 1/13 rounds).
+/// Serialize within the binary, like #191's udp_serial.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The client's first two connects land on a saboteur listener that accepts,
 /// reads ONE byte of the cookie, and closes with the rest unread — closing a
 /// socket with undrained receive data sends RST on every platform, no
@@ -23,6 +33,7 @@ use common::ChildGuard;
 /// only retried REFUSED runs, so the first RST killed the test.
 #[test]
 fn pre_data_reset_is_retried_until_a_real_server_arrives() {
+    let _serial = serial();
     let port = common::free_port();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind saboteur");
@@ -73,16 +84,19 @@ fn pre_data_reset_is_retried_until_a_real_server_arrives() {
 /// quiet-host residual: 4/20 two-core rounds died exactly here pre-fix.
 #[test]
 fn pre_data_reset_is_retried_in_json_mode() {
+    let _serial = serial();
     let port = common::free_port();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind saboteur");
+    // ONE sabotaged connect here (the text test keeps two): this variant
+    // proves the JSON classifier path, and each sabotaged attempt spends
+    // real time from the bounded retry window — under 2-core load the
+    // two-RST version once starved the real server past the deadline.
     let saboteur = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (mut sock, _) = listener.accept().expect("accept");
-            let mut byte = [0u8; 1];
-            let _ = sock.read_exact(&mut byte);
-            drop(sock);
-        }
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut byte = [0u8; 1];
+        let _ = sock.read_exact(&mut byte);
+        drop(sock);
     });
     let server = std::thread::spawn(move || {
         saboteur.join().expect("saboteur thread");
