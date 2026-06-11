@@ -143,8 +143,13 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let is_server = cli.server;
     #[cfg(any(unix, windows))]
     let outcome = rt.block_on(async {
+        // Box::pin: select! polls its futures IN PLACE, and async_main's
+        // future is the entire client/server state machine — inline it
+        // overflows Windows' 1 MiB main-thread stack (unix's 8 MiB masked
+        // it). Heap-pin the big one; the signal future is tiny.
+        let mut app = Box::pin(async_main(cli));
         tokio::select! {
-            r = async_main(cli) => r,
+            r = &mut app => r,
             sig = sigend.recv() => Ok(Exit::Signal(sig)),
         }
     });
@@ -312,8 +317,8 @@ impl Sigend {
 /// the extra events are pidfile hygiene on paths where iperf3 dies dirty.
 /// Close/logoff/shutdown's grace window exists only while the handler runs —
 /// tokio < 1.44 returned from its HandlerRoutine immediately (losing the
-/// race to TerminateProcess); the lockfile pins >= 1.44, whose handler parks
-/// for those events (tokio #7122), so the clean unlink path holds.
+/// race to TerminateProcess); the manifest floors >= 1.44, whose handler
+/// parks for those events (tokio #7122), so the clean unlink path holds.
 #[cfg(windows)]
 struct Sigend {
     ctrl_c: tokio::signal::windows::CtrlC,

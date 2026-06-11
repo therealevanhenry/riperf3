@@ -40,7 +40,8 @@ thiserror = "2.0"
 # tokio >= 1.44: its Windows HandlerRoutine parks for close/logoff/shutdown
 # (tokio #7122) — earlier versions returned immediately and lost the clean
 # pidfile-unlink race (#158 review). libc is lockfile-held at 1.44's floor
-# (0.2.168): 0.2.186 breaks nix-0.29/mio-1.0.2 on NetBSD.
+# (0.2.168): 0.2.186 breaks nix-0.29/mio-1.0.2 on NetBSD (untied by a future
+# nix >= 0.30 bump).
 tokio = { version = "1.44", features = ["full"] }
 windows-sys = { version = "0.52", features = ["Win32_Networking_WinSock", "Win32_System_Threading"] }
 
