@@ -158,7 +158,12 @@ pub(crate) fn emit_json_stream_line(line: &str) {
 /// Print one interval line.
 pub fn print_interval(interval: &StreamInterval, format_char: char) {
     let id = fmt_id_role(interval.stream_id, interval.role_tag);
-    let transfer = units::format_bytes(interval.bytes as f64, format_char.to_ascii_uppercase());
+    // The Transfer column is ALWAYS adaptive — iperf3 hardcodes 'A' at every
+    // transfer site (iperf_api.c:4012/4252/4434/4705); -f drives only the
+    // Bitrate column (r1 review, live-verified: iperf3 -f m still prints
+    // "12.5 GBytes"). to_ascii_uppercase(format_char) was the last way to
+    // reproduce the #221 fixed-unit symptom.
+    let transfer = units::format_bytes(interval.bytes as f64, 'A');
     let seconds = interval.end - interval.start;
     let bits_per_sec = if seconds > 0.0 {
         interval.bytes as f64 * 8.0 / seconds
@@ -243,7 +248,7 @@ pub fn lost_percent(lost: i64, total: i64) -> f64 {
 /// rendered output can be unit-tested without capturing stdout.
 pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String {
     let id = fmt_id_role(summary.stream_id, summary.role_tag);
-    let transfer = units::format_bytes(summary.bytes as f64, format_char.to_ascii_uppercase());
+    let transfer = units::format_bytes(summary.bytes as f64, 'A');
     let seconds = summary.end - summary.start;
     let bits_per_sec = if seconds > 0.0 {
         summary.bytes as f64 * 8.0 / seconds
@@ -1564,7 +1569,9 @@ mod tests {
         // Pin the rendered aggregate value, not just the presence of a SUM
         // row: the SUM line must render the summed bytes (6000), so a
         // regression that printed a per-stream or zero value would be caught.
-        let expected_transfer = units::format_bytes(6_000.0, 'M');
+        // 'A': the Transfer column is always adaptive (#221) — -f drives
+        // only the Bitrate column, like iperf3.
+        let expected_transfer = units::format_bytes(6_000.0, 'A');
         assert!(
             sum_line.contains(&expected_transfer),
             "SUM must render summed transfer {expected_transfer:?}; got {sum_line:?}"

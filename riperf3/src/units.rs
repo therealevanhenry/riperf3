@@ -70,7 +70,7 @@ fn adaptive_bytes(bytes: f64) -> String {
     } else if bytes >= K {
         format!("{} KBytes", ladder(bytes / K))
     } else {
-        format!("{:.0} Bytes", bytes)
+        format!("{} Bytes", ladder(bytes))
     }
 }
 
@@ -89,7 +89,7 @@ fn adaptive_bits(bits: f64) -> String {
     } else if bits >= K {
         format!("{} Kbits", ladder(bits / K))
     } else {
-        format!("{:.0} bits", bits)
+        format!("{} bits", ladder(bits))
     }
 }
 
@@ -108,7 +108,7 @@ fn adaptive_rate(bits_per_sec: f64) -> String {
     } else if bits_per_sec >= K {
         format!("{} Kbits/sec", ladder(bits_per_sec / K))
     } else {
-        format!("{:.0} bits/sec", bits_per_sec)
+        format!("{} bits/sec", ladder(bits_per_sec))
     }
 }
 
@@ -118,6 +118,12 @@ mod tests {
 
     #[test]
     fn format_bytes_adaptive() {
+        // The ladder applies at the sub-unit floor too (r1 blocker —
+        // iperf3's canonical stall row is "0.00 Bytes  0.00 bits/sec").
+        assert_eq!(format_bytes(0.0, 'A'), "0.00 Bytes");
+        assert_eq!(format_bytes(16.0, 'A'), "16.0 Bytes");
+        assert_eq!(format_bytes(50.0, 'A'), "50.0 Bytes");
+        assert_eq!(format_rate(0.0, 'a'), "0.00 bits/sec");
         assert_eq!(format_bytes(500.0, 'A'), "500 Bytes");
         assert_eq!(format_bytes(1024.0, 'A'), "1.00 KBytes");
         assert_eq!(format_bytes(1024.0 * 1024.0 * 1.5, 'A'), "1.50 MBytes");

@@ -36,10 +36,11 @@ pub struct Cli {
     pub port: Option<u16>,
 
     /// Format to report: Kbits, Mbits, Gbits, Tbits
+    // iperf3 has NO default -f: absent, every figure auto-scales
+    // (unit_snprintf 'a'/'A'). The old forced "m" default printed
+    // 12120.88 MBytes where iperf3 prints 11.8 GBytes (#221). NB: a ///
+    // here would leak into clap's --help text (r1 blocker).
     #[arg(short, long, ignore_case = true, value_enum, value_name = "format")]
-    /// iperf3 has NO default -f: absent, every figure auto-scales
-    /// (unit_snprintf 'a'/'A'). The old forced "m" default printed
-    /// 12120.88 MBytes where iperf3 prints 11.8 GBytes (#221).
     pub format: Option<Format>,
 
     /// Seconds between periodic throughput reports
