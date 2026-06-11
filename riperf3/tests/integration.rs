@@ -1555,8 +1555,8 @@ mod unimplemented_flags {
 
     // --bind-dev is implemented on Linux (SO_BINDTODEVICE) and macOS (IP_BOUND_IF),
     // each with its own loopback interface name (`lo` vs `lo0`). The test runs on
-    // both; other platforms (Windows/BSD) don't implement it (set_bind_dev is a
-    // no-op there) so there's nothing to exercise (#72).
+    // both; other platforms reject --bind-dev at build() since #149 (the old
+    // fallback silently no-opped), so the cli rejection tests cover them (#72).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     const LOOPBACK_DEV: &str = if cfg!(target_os = "macos") {
         "lo0"

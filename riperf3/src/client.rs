@@ -1930,9 +1930,10 @@ impl ClientBuilder {
         self
     }
 
-    /// `--bind-dev`: bind to a network interface — `SO_BINDTODEVICE` on Linux,
-    /// `IP_BOUND_IF`/`IPV6_BOUND_IF` on macOS; a silent no-op elsewhere on
-    /// unix, rejected at `build()` on non-unix.
+    /// `--bind-dev`: bind data sockets to a network device. Linux
+    /// (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`/`IPV6_BOUND_IF`) only;
+    /// rejected at `build()` everywhere else (#149) — matching iperf3, whose
+    /// client-side IP_BOUND_IF fallback covers exactly these two.
     pub fn bind_dev(mut self, dev: &str) -> Self {
         self.bind_dev = Some(dev.to_string());
         self
