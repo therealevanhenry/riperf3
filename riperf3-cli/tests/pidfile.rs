@@ -136,12 +136,13 @@ fn pidfile_unlinked_after_one_off_run() {
     );
 }
 
-/// #158: a SECOND signal during teardown exits immediately. A UDP peer
-/// blasting at unlimited rate holds the server's shared receiver drain (up to
-/// 10 s) after the first SIGTERM; the second must escape it via the raw libc
-/// handler. Race guard: if teardown won before the second signal landed
-/// (fast machine), the run exits cleanly on the FIRST signal — the hard
-/// assertions (bounded exit, pidfile gone) hold either way.
+/// #158: a SECOND signal during teardown exits immediately, dying BY the
+/// signal. Teardown after the first SIGTERM has a hard ~500 ms floor here
+/// (the blasting client aborts on the dropped control conn, then the drain
+/// needs one SO_RCVTIMEO silence window), so the second SIGTERM at +300 ms
+/// reliably lands while alive — the death-by-SIGTERM status is the
+/// discriminator (review r2 f1: a bounded-exit-only assertion false-passed
+/// against a reverted handler, since plain teardown also beats the bound).
 #[cfg(unix)]
 #[test]
 fn second_signal_during_teardown_exits_immediately() {
@@ -186,13 +187,20 @@ fn second_signal_during_teardown_exits_immediately() {
         libc::kill(pid, libc::SIGTERM);
     }
 
-    // Bounded exit: well under the 10 s drain either way (second-signal
-    // escape, or the teardown simply won the race).
+    // Bounded exit AND death-by-SIGTERM: the bound alone is satisfied by a
+    // plain teardown; the signal status is what only the hard-exit handler
+    // produces (SIG_DFL + raise + unblock).
     let exited = common::wait_bounded(&mut server.0, Duration::from_secs(4));
-    assert!(
-        exited.is_some(),
-        "server must exit promptly after the second signal, not ride out the drain"
-    );
+    let status =
+        exited.expect("server must exit promptly after the second signal, not ride out the drain");
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the second signal must kill BY the signal (got {status:?})"
+        );
+    }
     wait_for(
         || !pf.exists(),
         Duration::from_secs(2),

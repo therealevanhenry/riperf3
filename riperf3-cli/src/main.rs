@@ -222,7 +222,8 @@ fn second_signal_exits_immediately(pidfile: Option<&str>) {
     static PIDFILE: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
 
     extern "C" fn hard_exit(sig: libc::c_int) {
-        // SAFETY: async-signal-safe calls only (write/unlink/signal/raise/_exit).
+        // SAFETY: async-signal-safe calls only (write/unlink/signal/raise/
+        // pthread_sigmask/_exit; sigemptyset/sigaddset are pure memory ops).
         unsafe {
             let msg = b"riperf3: interrupt - second signal, exiting immediately\n";
             let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
@@ -231,10 +232,17 @@ fn second_signal_exits_immediately(pidfile: Option<&str>) {
                 let _ = libc::unlink(p);
             }
             // Die BY the signal (supervisors distinguish signal-death from
-            // exit-1; a pre-#150 second Ctrl-C read as 130 in shells).
+            // exit-1; a pre-#150 second Ctrl-C read as 130 in shells). The
+            // kernel BLOCKS the handled signal for the handler's duration,
+            // so the re-raise goes pending until it is unblocked — without
+            // the sigmask step the _exit fallback always won (r2 finding 2).
             libc::signal(sig, libc::SIG_DFL);
             let _ = libc::raise(sig);
-            libc::_exit(1); // unreachable fallback
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, sig);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::_exit(1); // now genuinely a fallback
         }
     }
 
