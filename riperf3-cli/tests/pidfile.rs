@@ -135,3 +135,76 @@ fn pidfile_unlinked_after_one_off_run() {
         "pidfile must be unlinked when a one-off server exits normally (#105)"
     );
 }
+
+/// #158: a SECOND signal during teardown exits immediately, dying BY the
+/// signal. Teardown after the first SIGTERM has a hard ~500 ms floor here
+/// (the blasting client aborts on the dropped control conn, then the drain
+/// needs one SO_RCVTIMEO silence window), so the second SIGTERM at +300 ms
+/// reliably lands while alive — the death-by-SIGTERM status is the
+/// discriminator (review r2 f1: a bounded-exit-only assertion false-passed
+/// against a reverted handler, since plain teardown also beats the bound).
+#[cfg(unix)]
+#[test]
+fn second_signal_during_teardown_exits_immediately() {
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let dir = std::env::temp_dir();
+    let pf = dir.join(format!("riperf3-2sig-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pf);
+    let port = free_port().to_string();
+
+    let server = Command::new(bin)
+        .args(["-s", "-I"])
+        .arg(&pf)
+        .args(["-p", &port])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+    wait_for(
+        || pf.exists(),
+        Duration::from_secs(5),
+        "server pidfile written",
+    );
+
+    // A blasting UDP client makes the post-signal drain non-trivial.
+    let client = Command::new(bin)
+        .args(["-c", "127.0.0.1", "-p", &port, "-u", "-b", "0", "-t", "8"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn client");
+    let mut client = ChildGuard(client);
+    std::thread::sleep(Duration::from_secs(2)); // mid-test
+
+    let pid = server.0.id() as i32;
+    // SAFETY: plain kill(2) on our own child.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+
+    // Bounded exit AND death-by-SIGTERM: the bound alone is satisfied by a
+    // plain teardown; the signal status is what only the hard-exit handler
+    // produces (SIG_DFL + raise + unblock).
+    let exited = common::wait_bounded(&mut server.0, Duration::from_secs(4));
+    let status =
+        exited.expect("server must exit promptly after the second signal, not ride out the drain");
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the second signal must kill BY the signal (got {status:?})"
+        );
+    }
+    wait_for(
+        || !pf.exists(),
+        Duration::from_secs(2),
+        "pidfile unlinked on the signal path",
+    );
+    let _ = client.0.kill();
+}

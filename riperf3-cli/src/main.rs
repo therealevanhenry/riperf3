@@ -123,7 +123,7 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // clean unlink path — there is no startup window where it gets default
     // disposition and strands a fresh pidfile (#105 review). Stream creation
     // registers the OS sigactions immediately; it needs the runtime context.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut sigend = Sigend::install(&rt).map_err(|e| format!("signal handler setup: {e}"))?;
 
     // Write the PID file LAST before entering the runtime: after daemonizing
@@ -135,23 +135,65 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     // The pidfile must be unlinked on EVERY exit path — normal completion,
-    // error, or termination signal — like iperf3, which deletes it after the
-    // server/client loop and in its sigend path (#105). One cleanup point,
-    // after the runtime returns.
+    // error, termination signal, or a panic unwinding through run() (#158):
+    // an RAII guard replaces the single post-runtime unlink, so panic=unwind
+    // can no longer strand the file (iperf3 leaks on crash; strictly better).
+    let _pidfile_guard = PidfileGuard(cli.pidfile.clone().map(std::path::PathBuf::from));
     let pidfile = cli.pidfile.clone();
     let is_server = cli.server;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let outcome = rt.block_on(async {
+        // Box::pin: select! polls its futures IN PLACE, and async_main's
+        // future is the entire client/server state machine — inline it
+        // overflows Windows' 1 MiB main-thread stack (unix's 8 MiB masked
+        // it). Heap-pin the big one; the signal future is tiny.
+        let mut app = Box::pin(async_main(cli));
         tokio::select! {
-            r = async_main(cli) => r,
+            r = &mut app => r,
             sig = sigend.recv() => Ok(Exit::Signal(sig)),
         }
     });
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let outcome = rt.block_on(async_main(cli));
-    if let Some(ref path) = pidfile {
-        let _ = std::fs::remove_file(path);
+
+    // A SECOND signal during teardown exits immediately (#158): the first
+    // one resolved the select, but a still-blasting UDP peer can hold the
+    // shared drain (and thus runtime shutdown) for up to its 10 s timeout —
+    // pre-#150 a second Ctrl-C always killed the process, and most daemons
+    // treat repeat signals as "now means now".
+    //
+    // Unix: re-register the raw libc handlers — a runtime-spawned watcher
+    // would be cancelled at the start of the very rt-drop hang it exists to
+    // escape. The handler is async-signal-safe (write + unlink + _exit
+    // only); Drop doesn't run under _exit, so it unlinks the pidfile itself.
+    #[cfg(unix)]
+    if matches!(outcome, Ok(Exit::Signal(_))) {
+        // tokio never unregisters its libc sigaction (dropping the streams
+        // only detaches listeners) — the libc::signal overwrite below is the
+        // operative action and wins regardless; the drop just tidies.
+        drop(sigend);
+        second_signal_exits_immediately(pidfile.as_deref());
     }
+    // Windows: best-effort runtime watcher. Once rt-drop cancels it, every
+    // listener is gone, tokio's console handler returns 0 ("run the next
+    // handler"), and the DEFAULT handler terminates the process — so a
+    // second Ctrl+C during a drain hang still exits immediately by
+    // fall-through, just without the notice; the pidfile was already
+    // unlinked by the guard (drop order: guard before rt).
+    #[cfg(windows)]
+    if matches!(outcome, Ok(Exit::Signal(_))) {
+        let pf = pidfile.clone();
+        rt.spawn(async move {
+            let _ = sigend.recv().await;
+            if let Some(ref path) = pf {
+                let _ = std::fs::remove_file(path);
+            }
+            eprintln!("riperf3: interrupt - second signal, exiting immediately");
+            std::process::exit(1);
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = &pidfile;
     match outcome {
         // iperf3 treats SIGTERM/SIGINT/SIGHUP as a NORMAL exit
         // (iperf_got_sigend → iperf_signormalexit → exit 0), printing an
@@ -170,8 +212,71 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
 /// signal (which iperf3 reports and treats as a clean exit — see `main`).
 enum Exit {
     Normal,
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     Signal(&'static str),
+}
+
+/// Second-signal hard exit (#158): once the orderly shutdown is underway, a
+/// repeat SIGTERM/SIGINT/SIGHUP must not be swallowed by tokio's (now
+/// shutting-down) signal machinery. Registers plain libc handlers whose body
+/// is async-signal-safe only: write(2) a notice, unlink(2) the pidfile,
+/// _exit(1).
+#[cfg(unix)]
+fn second_signal_exits_immediately(pidfile: Option<&str>) {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static PIDFILE: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
+
+    extern "C" fn hard_exit(sig: libc::c_int) {
+        // SAFETY: async-signal-safe calls only (write/unlink/signal/raise/
+        // pthread_sigmask/_exit; sigemptyset/sigaddset are pure memory ops).
+        unsafe {
+            let msg = b"riperf3: interrupt - second signal, exiting immediately\n";
+            let _ = libc::write(2, msg.as_ptr().cast(), msg.len());
+            let p = PIDFILE.load(Ordering::Acquire);
+            if !p.is_null() {
+                let _ = libc::unlink(p);
+            }
+            // Die BY the signal (supervisors distinguish signal-death from
+            // exit-1; a pre-#150 second Ctrl-C read as 130 in shells). The
+            // kernel BLOCKS the handled signal for the handler's duration,
+            // so the re-raise goes pending until it is unblocked — without
+            // the sigmask step the _exit fallback always won (r2 finding 2).
+            libc::signal(sig, libc::SIG_DFL);
+            let _ = libc::raise(sig);
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, sig);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::_exit(1); // now genuinely a fallback
+        }
+    }
+
+    if let Some(path) = pidfile {
+        if let Ok(c) = std::ffi::CString::new(path) {
+            // Leaked deliberately: the process exits via _exit shortly; the
+            // handler needs a stable pointer.
+            PIDFILE.store(c.into_raw(), Ordering::Release);
+        }
+    }
+    // SAFETY: replacing the dispositions with our handler; tokio's streams
+    // were dropped by the caller.
+    let handler = hard_exit as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+/// Unlinks the pidfile on drop — every exit path, panics included (#158).
+struct PidfileGuard(Option<std::path::PathBuf>);
+
+impl Drop for PidfileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// The termination-signal set iperf3 catches in `iperf_catch_sigend`
@@ -203,6 +308,47 @@ impl Sigend {
             _ = self.term.recv() => "Terminated(15)",
             _ = self.int.recv() => "Interrupt(2)",
             _ = self.hup.recv() => "Hangup(1)",
+        }
+    }
+}
+
+/// Windows console-event analog of the unix set (#158): iperf3's CRT
+/// signal() only ever yields Ctrl+C there (SIGTERM is never OS-delivered);
+/// the extra events are pidfile hygiene on paths where iperf3 dies dirty.
+/// Close/logoff/shutdown's grace window exists only while the handler runs —
+/// tokio < 1.44 returned from its HandlerRoutine immediately (losing the
+/// race to TerminateProcess); the manifest floors >= 1.44, whose handler
+/// parks for those events (tokio #7122), so the clean unlink path holds.
+#[cfg(windows)]
+struct Sigend {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    ctrl_close: tokio::signal::windows::CtrlClose,
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl Sigend {
+    fn install(rt: &tokio::runtime::Runtime) -> std::io::Result<Self> {
+        use tokio::signal::windows;
+        let _guard = rt.enter();
+        Ok(Self {
+            ctrl_c: windows::ctrl_c()?,
+            ctrl_break: windows::ctrl_break()?,
+            ctrl_close: windows::ctrl_close()?,
+            ctrl_logoff: windows::ctrl_logoff()?,
+            ctrl_shutdown: windows::ctrl_shutdown()?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => "Interrupt(2)",
+            _ = self.ctrl_break.recv() => "Break",
+            _ = self.ctrl_close.recv() => "Close",
+            _ = self.ctrl_logoff.recv() => "Logoff",
+            _ = self.ctrl_shutdown.recv() => "Shutdown",
         }
     }
 }
