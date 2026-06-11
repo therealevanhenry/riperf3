@@ -67,7 +67,8 @@ impl Drop for OutputCaptureGuard {
 /// active, `titled` prepends the rendered prefix to EVERY report line, so the
 /// console and the --get-server-output capture both carry it — iperf3 buffers
 /// the PREFIXED linebuffer. (Same one-run-at-a-time process-global caveat.)
-static OUTPUT_TIMESTAMPS: RwLock<bool> = RwLock::new(false);
+/// Holds the strftime FORMAT string (#202); iperf3's default is "%c ".
+static OUTPUT_TIMESTAMPS: RwLock<Option<String>> = RwLock::new(None);
 
 pub(crate) struct OutputTimestampGuard;
 
@@ -78,9 +79,9 @@ impl OutputTimestampGuard {
     /// the exact server-clobbers-client topology of the lib's
     /// `timestamps_runs` test (#168 review r1 n3). Mirrors OutputTitleGuard,
     /// whose construct-only-when-titled shape has no such mode.
-    pub(crate) fn set() -> Self {
+    pub(crate) fn set(format: &str) -> Self {
         if let Ok(mut g) = OUTPUT_TIMESTAMPS.write() {
-            *g = true;
+            *g = Some(format.to_string());
         }
         OutputTimestampGuard
     }
@@ -89,7 +90,7 @@ impl OutputTimestampGuard {
 impl Drop for OutputTimestampGuard {
     fn drop(&mut self) {
         if let Ok(mut g) = OUTPUT_TIMESTAMPS.write() {
-            *g = false;
+            *g = None;
         }
     }
 }
@@ -98,10 +99,44 @@ impl Drop for OutputTimestampGuard {
 /// HH:MM:SS (UTC) — the custom strftime FORMAT argument is a recorded
 /// fidelity gap, tracked separately from #168.
 pub(crate) fn output_timestamp_prefix() -> String {
-    let on = OUTPUT_TIMESTAMPS.read().map(|g| *g).unwrap_or(false);
-    if !on {
+    let fmt = match OUTPUT_TIMESTAMPS.read() {
+        Ok(g) => match g.as_deref() {
+            Some(f) => f.to_string(),
+            None => return String::new(),
+        },
+        Err(_) => return String::new(),
+    };
+    render_timestamp(&fmt)
+}
+
+/// Unix: localtime + strftime with the stored FORMAT, exactly iperf3's
+/// iperf_printf (default "%c " — the trailing space lives in the format;
+/// user formats are used verbatim) (#202).
+#[cfg(unix)]
+fn render_timestamp(fmt: &str) -> String {
+    let Ok(cfmt) = std::ffi::CString::new(fmt) else {
         return String::new();
+    };
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r fills `tm` from a valid time_t; strftime writes at
+    // most buf.len()-1 bytes plus NUL and returns the byte count (0 = didn't
+    // fit or empty result — both render as no prefix).
+    unsafe {
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return String::new();
+        }
+        let mut buf = [0u8; 128];
+        let n = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), cfmt.as_ptr(), &tm);
+        String::from_utf8_lossy(&buf[..n]).into_owned()
     }
+}
+
+/// Windows fallback: libc's msvc surface has no strftime/localtime_r, and
+/// native Windows has no iperf3 ground truth to match — keep the simple
+/// HH:MM:SS UTC shape (#202).
+#[cfg(not(unix))]
+fn render_timestamp(_fmt: &str) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -167,6 +202,26 @@ macro_rules! vprintln {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #202: the prefix renders the STORED strftime format (was hardcoded
+    /// HH:MM:SS UTC ignoring the argument).
+    #[cfg(unix)]
+    #[test]
+    fn timestamp_prefix_honors_the_format() {
+        let _g = OutputTimestampGuard::set("%Y ");
+        let p = output_timestamp_prefix();
+        assert!(
+            p.len() == 5 && p[..4].bytes().all(|b| b.is_ascii_digit()) && p.ends_with(' '),
+            "%Y must render the 4-digit year: {p:?}"
+        );
+        drop(_g);
+        assert_eq!(output_timestamp_prefix(), "", "cleared on drop");
+        let _g = OutputTimestampGuard::set("%c ");
+        assert!(
+            !output_timestamp_prefix().is_empty(),
+            "the %c default renders non-empty"
+        );
+    }
 
     // #34: iperf3 prefixes client lines with "<title>:  " (colon + two spaces),
     // and the prefix must be cleared when the run ends so it can't leak.

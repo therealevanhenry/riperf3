@@ -288,7 +288,9 @@ fn json_stream_client_emits_server_output_event_before_end() {
 fn timestamped_server_capture_carries_prefixes() {
     let port = free_port();
     let ps = port.to_string();
-    let server = spawn_server_capturing(&["--timestamps"], &ps);
+    // Explicit format: the faithful default is "%c " (locale datetime, e.g.
+    // "Wed Jun 11 ..."), which has no stable shape to assert (#202).
+    let server = spawn_server_capturing(&["--timestamps=%H:%M:%S "], &ps);
     let out = run_capturing(
         &[
             "-c",

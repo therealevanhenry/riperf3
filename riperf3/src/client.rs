@@ -165,8 +165,12 @@ impl Client {
             .then(|| crate::macros::OutputTitleGuard::set(self.title.clone()));
         // --timestamps prefixes every text report line, run-scoped like the
         // title; never in the machine-JSON modes (#168).
-        let _ts_guard = (self.timestamps.is_some() && !self.json_output && !self.json_stream)
-            .then(crate::macros::OutputTimestampGuard::set);
+        let _ts_guard =
+            (self.timestamps.is_some() && !self.json_output && !self.json_stream).then(|| {
+                crate::macros::OutputTimestampGuard::set(
+                    self.timestamps.as_deref().unwrap_or("%c "),
+                )
+            });
 
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
