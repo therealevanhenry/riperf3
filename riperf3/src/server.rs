@@ -599,12 +599,13 @@ impl Server {
                     protocol: cfg.protocol,
                     format_char: 'a',
                     omit_secs: cfg.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
+                    bidir: cfg.bidir,
+                    is_server: true,
                 },
                 stream_refs,
                 done.clone(),
@@ -1345,7 +1346,7 @@ impl Server {
                     // Bidir tags every line with the stream's direction (#184).
                     role_tag: cfg
                         .bidir
-                        .then_some(if s.is_sender { "TX-S" } else { "RX-S" }),
+                        .then_some(crate::reporter::bidir_role_tag(true, s.is_sender)),
                 }
             })
             .collect()

@@ -885,12 +885,13 @@ impl Client {
                     protocol: self.protocol,
                     format_char: self.format_char,
                     omit_secs: self.omit,
-                    num_streams: streams.len(),
                     forceflush: self.forceflush,
                     timestamp_format: self.timestamps.clone(),
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize,
+                    bidir: self.bidir,
+                    is_server: false,
                 },
                 stream_refs,
                 done.clone(),
@@ -1170,7 +1171,7 @@ impl Client {
             // Bidir tags every line with the STREAM's direction (#184).
             let role_tag = self
                 .bidir
-                .then_some(if s.is_sender { "TX-C" } else { "RX-C" });
+                .then_some(crate::reporter::bidir_role_tag(false, s.is_sender));
             let bytes = if s.is_sender {
                 s.counters.bytes_sent_net()
             } else {
