@@ -112,7 +112,15 @@ pub fn run_client(args: &[&str], timeout: Duration, who: &str) -> ClientRun {
             .unwrap();
 
         if !status.success()
-            && stderr.contains("ConnectionRefused")
+            && (stderr.contains("ConnectionRefused")
+                || stderr.contains("Connection refused")
+                // Windows WSAECONNREFUSED renders as "No connection could be
+                // made because the target machine actively refused it.
+                // (os error 10061)" — neither other token matches, and this
+                // retry is the ONLY server-readiness mechanism (the doc
+                // above): dropping it reopens the bind-race flake on the
+                // required windows-latest check (review r2).
+                || stderr.contains("(os error 10061)"))
             && Instant::now() < retry_deadline
         {
             // Server not listening yet — give it a beat and go again.

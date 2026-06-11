@@ -1395,6 +1395,7 @@ impl Server {
                     .find(|e| e.stream_id == s.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
+                    max_snd_wnd: e.max_snd_wnd,
                     max_rtt: e.max_rtt,
                     min_rtt: e.min_rtt,
                     mean_rtt: e.mean_rtt(),

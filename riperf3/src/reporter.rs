@@ -382,6 +382,7 @@ pub struct IntervalReporterConfig {
 #[derive(Clone, Copy)]
 struct TcpSample {
     snd_cwnd: u64,
+    snd_wnd: u64,
     rtt: u32,
     rttvar: u32,
     pmtu: u32,
@@ -394,6 +395,7 @@ struct TcpSample {
 pub struct StreamExtremes {
     pub stream_id: i32,
     pub max_snd_cwnd: u64,
+    pub max_snd_wnd: u64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub reorder: u32,
@@ -722,7 +724,7 @@ pub fn spawn_interval_reporter(
                     };
 
                     // TCP_INFO for the interval detail and the end extremes.
-                    let (retransmits, snd_cwnd, rtt, rttvar, pmtu, reorder_iv) =
+                    let (retransmits, snd_cwnd, snd_wnd, rtt, rttvar, pmtu, reorder_iv) =
                         if has_retransmits && stream.is_sender {
                             if let Some(fd) = stream.raw_fd {
                                 if let Some(info) = tcp_info::get_tcp_info(fd) {
@@ -732,6 +734,7 @@ pub fn spawn_interval_reporter(
                                     // Accumulate sender-side extremes for the end report.
                                     let e = &mut acc_extremes[i];
                                     e.max_snd_cwnd = e.max_snd_cwnd.max(info.snd_cwnd);
+                                    e.max_snd_wnd = e.max_snd_wnd.max(info.snd_wnd);
                                     e.reorder = e.reorder.max(info.reorder);
                                     if info.rtt > 0 {
                                         e.max_rtt = e.max_rtt.max(info.rtt);
@@ -742,6 +745,7 @@ pub fn spawn_interval_reporter(
                                     e.total_retransmits = Some(info.total_retransmits);
                                     last_tcp[i] = Some(TcpSample {
                                         snd_cwnd: info.snd_cwnd,
+                                        snd_wnd: info.snd_wnd,
                                         rtt: info.rtt,
                                         rttvar: info.rttvar,
                                         pmtu: info.pmtu,
@@ -750,6 +754,7 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(delta as i64),
                                         Some(info.snd_cwnd),
+                                        Some(info.snd_wnd),
                                         Some(info.rtt),
                                         Some(info.rttvar),
                                         Some(info.pmtu),
@@ -763,19 +768,20 @@ pub fn spawn_interval_reporter(
                                     (
                                         Some(0),
                                         Some(s.snd_cwnd),
+                                        Some(s.snd_wnd),
                                         Some(s.rtt),
                                         Some(s.rttvar),
                                         Some(s.pmtu),
                                         Some(s.reorder),
                                     )
                                 } else {
-                                    (None, None, None, None, None, None)
+                                    (None, None, None, None, None, None, None)
                                 }
                             } else {
-                                (None, None, None, None, None, None)
+                                (None, None, None, None, None, None, None)
                             }
                         } else {
-                            (None, None, None, None, None, None)
+                            (None, None, None, None, None, None, None)
                         };
 
                     // UDP stats (compute deltas for loss/packets)
@@ -847,9 +853,10 @@ pub fn spawn_interval_reporter(
                             bits_per_second: bps_val,
                             retransmits,
                             snd_cwnd,
-                            // snd_wnd is unavailable via libc (see TcpStreamSide); emit
-                            // 0 alongside the other TCP detail, like iperf3.
-                            snd_wnd: snd_cwnd.map(|_| 0u64),
+                            // The live tcpi_snd_wnd where the platform reader
+                            // captures it (Linux UAPI mirror / FreeBSD), like
+                            // iperf3's get_snd_wnd (#161).
+                            snd_wnd,
                             rtt,
                             rttvar,
                             pmtu,
