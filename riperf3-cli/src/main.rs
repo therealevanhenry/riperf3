@@ -8,22 +8,74 @@ mod cli;
 use cli::Cli;
 
 fn main() -> std::process::ExitCode {
-    match run() {
+    // iperf3's getopt path exits 1 on usage errors (clap defaults to 2), and
+    // a bare invocation raises its exact parameter-error sentence (#198).
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            match e.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    let _ = e.print();
+                    return std::process::ExitCode::SUCCESS;
+                }
+                ErrorKind::MissingRequiredArgument
+                    if e.to_string().contains("--server") && e.to_string().contains("--client") =>
+                {
+                    eprintln!(
+                        "riperf3: parameter error - must either be a client (-c) or server (-s)"
+                    );
+                    return std::process::ExitCode::FAILURE;
+                }
+                _ => {
+                    let _ = e.print();
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    // The error SINK is chosen by mode, like iperf_errexit (#198): -J puts
+    // the message in a JSON document on stdout (nothing on stderr),
+    // --json-stream emits an error event + empty end event, --logfile gets
+    // the text line when set, plain text goes to stderr (#151).
+    let json = cli.json;
+    let json_stream = cli.json_stream;
+    let logfile = cli.logfile.clone();
+    match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            // iperf3's iperf_errexit shape ("iperf3: error - <text>", exit 1)
-            // instead of Rust's Debug rendering; ours carries the actual
-            // binary name. The Display strings already mirror iperf3's IE*
-            // wording where riperf3 implements the same rejections (#151).
-            eprintln!("riperf3: error - {e}");
+            if json {
+                println!("{}", riperf3::json_report::error_document(&e.to_string()));
+            } else if json_stream {
+                println!(
+                    "{}",
+                    riperf3::json_report::error_stream_events(&e.to_string())
+                );
+            } else {
+                let line = format!("riperf3: error - {e}");
+                let logged = logfile.as_deref().and_then(|path| {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut f| writeln!(f, "{line}"))
+                        .ok()
+                });
+                if logged.is_none() {
+                    // iperf3's iperf_errexit shape ("iperf3: error - <text>",
+                    // exit 1) instead of Rust's Debug rendering; the Display
+                    // strings mirror iperf3's IE* wording (#151). Also the
+                    // fallback when the logfile cannot be opened.
+                    eprintln!("{line}");
+                }
+            }
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
     configure_log4rs(cli.debug.unwrap_or(0));
 
     // Reject client-only options on the server (#65) before any side effects

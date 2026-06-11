@@ -75,11 +75,11 @@ pub struct ClientRun {
 /// drop any one and the refused-retry silently dies on that platform,
 /// reopening the #176 bind-race flake class (#194 review r2 found exactly
 /// that on windows-latest).
-pub fn refused(status: &ExitStatus, stderr: &str) -> bool {
+pub fn refused(status: &ExitStatus, output: &str) -> bool {
     !status.success()
-        && (stderr.contains("ConnectionRefused")
-            || stderr.contains("Connection refused")
-            || stderr.contains("(os error 10061)"))
+        && (output.contains("ConnectionRefused")
+            || output.contains("Connection refused")
+            || output.contains("(os error 10061)"))
 }
 
 /// Run a riperf3 CLI binary to completion with a hard timeout, retrying while
@@ -147,7 +147,11 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
             .read_to_string(&mut stderr)
             .unwrap();
 
-        if refused(&status, &stderr) && Instant::now() < retry_deadline {
+        // #198 moved -J/--json-stream error text into STDOUT (the document /
+        // the error event) with stderr empty — scan both sinks for the
+        // refused tokens.
+        let combined = format!("{stderr}\n{stdout}");
+        if refused(&status, &combined) && Instant::now() < retry_deadline {
             // Server not listening yet — give it a beat and go again.
             std::thread::sleep(Duration::from_millis(100));
             continue;

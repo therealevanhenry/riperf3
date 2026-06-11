@@ -59,7 +59,9 @@ fn json_mode_errors_emit_the_document_not_stderr() {
     assert!(doc["error"]
         .as_str()
         .is_some_and(|e| e.contains("unable to connect")));
-    assert!(doc["start"]["connected"].as_array().is_some_and(Vec::is_empty));
+    assert!(doc["start"]["connected"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
     assert!(doc["intervals"].as_array().is_some_and(Vec::is_empty));
     assert!(doc["end"].is_object());
 }
@@ -142,7 +144,10 @@ fn usage_errors_exit_one() {
         "iperf3's exact no-mode sentence: {stderr:?}"
     );
     // --help / --version still exit 0.
-    let out = std::process::Command::new(bin).arg("--help").output().unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--help")
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(0));
     let out = std::process::Command::new(bin)
         .arg("--version")
