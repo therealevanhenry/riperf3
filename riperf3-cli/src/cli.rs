@@ -478,8 +478,9 @@ impl Cli {
 
         let mut builder = riperf3::ClientBuilder::new(host);
 
-        // Format: K/M/G/T → lowercase char for bits, uppercase for bytes;
-        // absent → the library's adaptive default ('a'), like iperf3 (#221).
+        // Format: each letter maps to its bit-rate char (#241 tracks the
+        // uppercase byte-rate meanings); absent → the library's adaptive
+        // default ('a'), like iperf3 (#221).
         if let Some(f) = &self.format {
             builder = builder.format_char(match f {
                 Format::K => 'k',
