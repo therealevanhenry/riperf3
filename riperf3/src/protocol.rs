@@ -140,7 +140,6 @@ pub async fn send_state(stream: &mut TcpStream, state: TestState) -> Result<()> 
     Ok(())
 }
 
-/// Read a state transition (single signed byte) from the control connection.
 /// Send SERVER_ERROR with iperf3's (i_errno, errno) u32-pair payload (#224):
 /// the state byte, then both words big-endian — iperf_server_api.c's Nwrite
 /// pair (the bitrate, duration-timer, and cleanup_server relay sites). The os
