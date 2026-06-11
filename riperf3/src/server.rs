@@ -623,8 +623,6 @@ impl Server {
                     json_stream: self.json_stream,
                     print: print_intervals,
                     blksize: cfg.blksize,
-                    // iperf3's discard_json: a json-stream server RETAINS the
-                    // interval objects when the client asked for output (#168).
                     // iperf3's discard_json: a json-stream run RETAINS the
                     // interval objects when the client asked for output OR
                     // under --json-stream-full-output (#168, #213).
