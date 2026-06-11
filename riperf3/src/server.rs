@@ -165,6 +165,9 @@ pub struct Server {
     pub(crate) json_output: bool,
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub(crate) json_stream: bool,
+    /// #210: fired by the consumer (the CLI's first signal); a running test
+    /// dumps stats, sends SERVER_TERMINATE, and `run()` returns.
+    pub(crate) interrupt: Option<crate::client::InterruptWatch>,
 }
 
 /// Best-effort source IP the kernel would use to reach `client_addr`, paired
@@ -192,6 +195,13 @@ fn demux_local_addr_for(
 }
 
 impl Server {
+    /// Chainable form of [`ServerBuilder::interrupt`] for an already-built
+    /// server (#210).
+    pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(crate::client::InterruptWatch(rx));
+        self
+    }
+
     pub async fn run(&self) -> Result<()> {
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
@@ -215,6 +225,7 @@ impl Server {
             println!("{sep}");
         }
 
+        let mut interrupt_fired = self.interrupt.clone().map(|w| w.0);
         loop {
             match self.handle_one_test(&listener).await {
                 Ok(()) => {}
@@ -223,11 +234,26 @@ impl Server {
                         vprintln!("Client disconnected.");
                     }
                 }
+                Err(RiperfError::ClientTerminated) => {
+                    // iperf3 prints IECLIENTTERM WITHOUT the "error - "
+                    // prefix ("iperf3: the client has terminated",
+                    // live-captured) and keeps serving (#210).
+                    eprintln!("riperf3: {}", RiperfError::ClientTerminated);
+                }
                 Err(e) => {
-                    eprintln!("iperf3: error - {e}");
+                    eprintln!("riperf3: error - {e}");
                 }
             }
 
+            // #210: an interrupted run stops serving — handle_one_test
+            // already dumped its stats and told the client; the caller owns
+            // the signal-normal exit.
+            if interrupt_fired
+                .as_mut()
+                .is_some_and(|rx| rx.borrow_and_update().is_some())
+            {
+                return Ok(());
+            }
             if self.one_off {
                 break;
             }
@@ -639,6 +665,11 @@ impl Server {
         rate_check.tick().await; // skip immediate tick
 
         let mut server_terminated = false;
+        // #210: a peer- or self-terminated test skips the results exchange
+        // (the peer is gone / told to stop) but still dumps local results.
+        let mut client_terminated = false;
+        let mut interrupted: Option<String> = None;
+        let mut interrupt_rx = self.interrupt.clone().map(|w| w.0);
 
         loop {
             tokio::select! {
@@ -646,10 +677,22 @@ impl Server {
                     match state? {
                         TestState::TestEnd => break,
                         TestState::ClientTerminate => {
-                            return Err(RiperfError::Aborted("client terminated".into()));
+                            // iperf_got_sigend's peer half (#210): dump the
+                            // partial results below (the old early return
+                            // leaked the reporter — the #147 class — and
+                            // skipped the dump iperf3 performs).
+                            client_terminated = true;
+                            break;
                         }
                         _ => {}
                     }
+                }
+                msg = crate::client::wait_interrupt(interrupt_rx.as_mut()) => {
+                    // iperf_got_sigend, server role mid-TEST_RUNNING (#210):
+                    // tell the client, then dump local results below.
+                    let _ = protocol::send_state(&mut ctrl, TestState::ServerTerminate).await;
+                    interrupted = Some(msg);
+                    break;
                 }
                 _ = rate_check.tick(), if bitrate_limit.is_some() => {
                     let elapsed = test_start.elapsed().as_secs_f64();
@@ -700,9 +743,16 @@ impl Server {
         // Summary window + bitrate: the measured elapsed for a byte/block-limited
         // run, exactly `-t` otherwise (#103, mirrors the client). The requested
         // `-t` is reported separately as the test_start `duration` parameter.
-        let test_duration = if params.num.is_some() || params.blockcount.is_some() {
+        let test_duration = if params.num.is_some()
+            || params.blockcount.is_some()
+            || client_terminated
+            || interrupted.is_some()
+        {
             // Rebase to the post-omit window (#31): the measured elapsed
-            // includes the warm-up the summary must exclude.
+            // includes the warm-up the summary must exclude. A terminated
+            // run (#210) reports the window it actually ran — iperf3's
+            // sigend dump stamps the partial elapsed, not `-t` (live:
+            // "[  5] 0.00-2.00 sec" for a -t 10 run killed at 2 s).
             (measured_elapsed - cfg.omit as f64).max(0.0)
         } else {
             cfg.duration as f64
@@ -823,24 +873,32 @@ impl Server {
             streams: result_streams,
         };
 
-        protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
-        // iperf3 protocol: server reads client results first, then sends its own.
-        // The client's results are not used in the server's own report — iperf3's
-        // server reports only its own measured bytes and a 0 remote CPU (#50).
-        let _client_results = protocol::recv_results(&mut ctrl).await?;
-        protocol::send_results(&mut ctrl, &server_results).await?;
+        if !client_terminated && interrupted.is_none() {
+            protocol::send_state(&mut ctrl, TestState::ExchangeResults).await?;
+            // iperf3 protocol: server reads client results first, then sends its
+            // own. The client's results are not used in the server's own report —
+            // iperf3's server reports only its own measured bytes and a 0 remote
+            // CPU (#50).
+            let _client_results = protocol::recv_results(&mut ctrl).await?;
+            protocol::send_results(&mut ctrl, &server_results).await?;
 
-        // ---- DisplayResults / IperfDone ----
-        protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;
+            // ---- DisplayResults / IperfDone ----
+            protocol::send_state(&mut ctrl, TestState::DisplayResults).await?;
 
-        // Wait for client to send IperfDone
-        loop {
-            match protocol::recv_state(&mut ctrl).await {
-                Ok(TestState::IperfDone) => break,
-                Ok(_) => continue,
-                Err(RiperfError::PeerDisconnected) => break,
-                Err(e) => return Err(e),
+            // Wait for client to send IperfDone
+            loop {
+                match protocol::recv_state(&mut ctrl).await {
+                    Ok(TestState::IperfDone) => break,
+                    Ok(_) => continue,
+                    Err(RiperfError::PeerDisconnected) => break,
+                    Err(e) => return Err(e),
+                }
             }
+        } else {
+            // A terminated run still uses the built local results for the
+            // report below; the exchange is skipped (iperf3's sigend/peer-
+            // terminate paths never reach it).
+            let _ = &server_results;
         }
 
         if self.json_output {
@@ -899,6 +957,11 @@ impl Server {
             let _ = h.await;
         }
 
+        if client_terminated {
+            // The dump above already rendered; the caller prints iperf3's
+            // "the client has terminated" (no "error - " prefix) (#210).
+            return Err(RiperfError::ClientTerminated);
+        }
         Ok(())
     }
 
@@ -1688,6 +1751,7 @@ pub struct ServerBuilder {
     use_pkcs1_padding: bool,
     json_output: bool,
     json_stream: bool,
+    interrupt: Option<crate::client::InterruptWatch>,
 }
 
 impl Default for ServerBuilder {
@@ -1711,6 +1775,7 @@ impl Default for ServerBuilder {
             use_pkcs1_padding: false,
             json_output: false,
             json_stream: false,
+            interrupt: None,
         }
     }
 }
@@ -1748,6 +1813,15 @@ impl ServerBuilder {
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub fn json_stream(mut self, enabled: bool) -> Self {
         self.json_stream = enabled;
+        self
+    }
+
+    /// Wire an interrupt watch (#210): when the consumer sends a message, a
+    /// running test dumps its accumulated stats like iperf_got_sigend, sends
+    /// SERVER_TERMINATE to the client, and `run()` returns — the caller owns
+    /// the signal-normal exit.
+    pub fn interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(crate::client::InterruptWatch(rx));
         self
     }
 
@@ -1908,6 +1982,7 @@ impl ServerBuilder {
             use_pkcs1_padding: self.use_pkcs1_padding,
             json_output: self.json_output,
             json_stream: self.json_stream,
+            interrupt: self.interrupt.clone(),
         })
     }
 }

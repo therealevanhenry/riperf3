@@ -141,20 +141,57 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _pidfile_guard = PidfileGuard(cli.pidfile.clone().map(std::path::PathBuf::from));
     let pidfile = cli.pidfile.clone();
     let is_server = cli.server;
+    // #210: the first signal no longer cancels the run outright — it fires
+    // this watch with iperf3's formatted message, and the lib dumps the
+    // accumulated stats + tells the peer (CLIENT_TERMINATE /
+    // SERVER_TERMINATE) like iperf_got_sigend, then returns. The bounded
+    // wait below keeps a wedged teardown from hanging the exit; the
+    // second-signal hard path remains underneath.
+    let (interrupt_tx, interrupt_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     #[cfg(any(unix, windows))]
     let outcome = rt.block_on(async {
         // Box::pin: select! polls its futures IN PLACE, and async_main's
         // future is the entire client/server state machine — inline it
         // overflows Windows' 1 MiB main-thread stack (unix's 8 MiB masked
         // it). Heap-pin the big one; the signal future is tiny.
-        let mut app = Box::pin(async_main(cli));
+        let mut app = Box::pin(async_main(cli, interrupt_rx));
         tokio::select! {
             r = &mut app => r,
-            sig = sigend.recv() => Ok(Exit::Signal(sig)),
+            sig = sigend.recv() => {
+                // The SECOND-signal hard exit (#158) must cover the dump
+                // window below, not just rt-drop — register the raw handler
+                // BEFORE awaiting the dump (the libc overwrite wins over
+                // tokio's still-registered sigaction). Windows: the
+                // best-effort watcher, spawned for the same window.
+                #[cfg(unix)]
+                second_signal_exits_immediately(pidfile.as_deref());
+                #[cfg(windows)]
+                {
+                    let pf = pidfile.clone();
+                    tokio::spawn(async move {
+                        let _ = sigend.recv().await;
+                        if let Some(ref path) = pf {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        eprintln!("riperf3: interrupt - second signal, exiting immediately");
+                        std::process::exit(1);
+                    });
+                }
+                let role = if is_server { "server" } else { "client" };
+                let msg =
+                    format!("interrupt - the {role} has terminated by signal {sig}");
+                let _ = interrupt_tx.send(Some(msg));
+                // Give the run loop a bounded window to dump stats and
+                // notify the peer (iperf_got_sigend, #210); a run that is
+                // wedged — or idle outside any interrupt-aware await —
+                // falls back to the plain signal teardown.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut app).await;
+                Ok(Exit::Signal(sig))
+            }
         }
     });
     #[cfg(not(any(unix, windows)))]
-    let outcome = rt.block_on(async_main(cli));
+    let outcome = rt.block_on(async_main(cli, interrupt_rx));
 
     // A SECOND signal during teardown exits immediately (#158): the first
     // one resolved the select, but a still-blasting UDP peer can hold the
@@ -166,32 +203,15 @@ fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // would be cancelled at the start of the very rt-drop hang it exists to
     // escape. The handler is async-signal-safe (write + unlink + _exit
     // only); Drop doesn't run under _exit, so it unlinks the pidfile itself.
-    #[cfg(unix)]
-    if matches!(outcome, Ok(Exit::Signal(_))) {
-        // tokio never unregisters its libc sigaction (dropping the streams
-        // only detaches listeners) — the libc::signal overwrite below is the
-        // operative action and wins regardless; the drop just tidies.
-        drop(sigend);
-        second_signal_exits_immediately(pidfile.as_deref());
-    }
+    // (#158/#210) The hard second-signal handler was registered INSIDE the
+    // signal arm above, before the dump window — it stays armed through
+    // rt-drop; nothing further to do here on unix.
     // Windows: best-effort runtime watcher. Once rt-drop cancels it, every
     // listener is gone, tokio's console handler returns 0 ("run the next
     // handler"), and the DEFAULT handler terminates the process — so a
     // second Ctrl+C during a drain hang still exits immediately by
     // fall-through, just without the notice; the pidfile was already
     // unlinked by the guard (drop order: guard before rt).
-    #[cfg(windows)]
-    if matches!(outcome, Ok(Exit::Signal(_))) {
-        let pf = pidfile.clone();
-        rt.spawn(async move {
-            let _ = sigend.recv().await;
-            if let Some(ref path) = pf {
-                let _ = std::fs::remove_file(path);
-            }
-            eprintln!("riperf3: interrupt - second signal, exiting immediately");
-            std::process::exit(1);
-        });
-    }
     #[cfg(not(any(unix, windows)))]
     let _ = &pidfile;
     match outcome {
@@ -353,17 +373,20 @@ impl Sigend {
     }
 }
 
-async fn async_main(cli: Cli) -> std::result::Result<Exit, Box<dyn std::error::Error>> {
+async fn async_main(
+    cli: Cli,
+    interrupt: tokio::sync::watch::Receiver<Option<String>>,
+) -> std::result::Result<Exit, Box<dyn std::error::Error>> {
     if cli.client.is_some() {
         // Client mode. Client-only options on a server and server-only options
         // on a client are both rejected up front in `main` (#65/#100), before
         // any side effects. The arg→builder mapping lives in `Cli::build_client`
         // (cli.rs) so the wiring tests exercise the same code path (#124).
-        cli.build_client()?.run().await?;
+        cli.build_client()?.with_interrupt(interrupt).run().await?;
     } else if cli.server {
         // Server mode. See `Cli::build_server` (cli.rs). `-D`/`--daemon` is
         // handled before the runtime is built (daemonize block in `main`).
-        cli.build_server()?.run().await?;
+        cli.build_server()?.with_interrupt(interrupt).run().await?;
     } else {
         eprintln!("No mode specified. Use -s for server or -c <host> for client.");
     }

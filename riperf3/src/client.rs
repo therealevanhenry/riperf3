@@ -171,6 +171,7 @@ impl PartialEq for InterruptWatch {
     }
 }
 
+#[derive(Debug)]
 enum ControlEvent {
     /// A local interrupt (the CLI's first signal, #210) carrying the
     /// formatted iperf3 message ("interrupt - the client has terminated by
@@ -225,6 +226,13 @@ async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
 }
 
 impl Client {
+    /// Chainable form of [`ClientBuilder::interrupt`] for an already-built
+    /// client (#210).
+    pub fn with_interrupt(mut self, rx: tokio::sync::watch::Receiver<Option<String>>) -> Self {
+        self.interrupt = Some(InterruptWatch(rx));
+        self
+    }
+
     pub async fn run(&self) -> Result<TestResultsJson> {
         let mut interrupt = self.interrupt.clone().map(|w| w.0);
         // -T/--title: prefix every client text line with "<title>:  " (#34),
@@ -2634,12 +2642,20 @@ mod tests {
         let collector = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
 
         let res = client
-            .run_test(&mut ctrl, &[], &done, 131072, collector.clone(), None)
+            .run_test(
+                &mut ctrl,
+                &[],
+                &done,
+                131072,
+                collector.clone(),
+                None,
+                &mut None,
+            )
             .await;
         // Since #170 run_test reports the termination as an outcome (the
         // caller renders the partial summary then errors with IESERVERTERM).
         assert!(
-            matches!(res, Ok((_, true))),
+            matches!(res, Ok((_, Some(ControlEvent::Terminated)))),
             "ServerTerminate must surface as the terminated outcome: {res:?}"
         );
         assert_eq!(

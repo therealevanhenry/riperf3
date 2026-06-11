@@ -136,13 +136,13 @@ fn pidfile_unlinked_after_one_off_run() {
     );
 }
 
-/// #158: a SECOND signal during teardown exits immediately, dying BY the
-/// signal. Teardown after the first SIGTERM has a hard ~500 ms floor here
-/// (the blasting client aborts on the dropped control conn, then the drain
-/// needs one SO_RCVTIMEO silence window), so the second SIGTERM at +300 ms
-/// reliably lands while alive — the death-by-SIGTERM status is the
-/// discriminator (review r2 f1: a bounded-exit-only assertion false-passed
-/// against a reverted handler, since plain teardown also beats the bound).
+/// #158/#210: a SECOND signal exits immediately, dying BY the signal. The
+/// first signal now takes the graceful sigend path (#210: dump + terminate
+/// the peer), so the old blasting-UDP wedge converges too fast to race.
+/// Instead a half-open control connection wedges the server in the param
+/// exchange — a phase with no interrupt-aware await — so the first signal's
+/// bounded dump window (5 s) holds deterministically while the second signal
+/// hits the pre-armed raw handler.
 #[cfg(unix)]
 #[test]
 fn second_signal_during_teardown_exits_immediately() {
@@ -150,12 +150,13 @@ fn second_signal_during_teardown_exits_immediately() {
     let dir = std::env::temp_dir();
     let pf = dir.join(format!("riperf3-2sig-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pf);
-    let port = free_port().to_string();
+    let port = free_port();
+    let ps = port.to_string();
 
     let server = Command::new(bin)
-        .args(["-s", "-I"])
+        .args(["-s", "-1", "-I"])
         .arg(&pf)
-        .args(["-p", &port])
+        .args(["-p", &ps])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -167,15 +168,10 @@ fn second_signal_during_teardown_exits_immediately() {
         "server pidfile written",
     );
 
-    // A blasting UDP client makes the post-signal drain non-trivial.
-    let client = Command::new(bin)
-        .args(["-c", "127.0.0.1", "-p", &port, "-u", "-b", "0", "-t", "8"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn client");
-    let mut client = ChildGuard(client);
-    std::thread::sleep(Duration::from_secs(2)); // mid-test
+    // The wedge: connect to the control port and send nothing — the server
+    // sits in the cookie/param read, which no interrupt arm covers.
+    let _wedge = std::net::TcpStream::connect(("127.0.0.1", port)).expect("wedge connect");
+    std::thread::sleep(Duration::from_millis(300)); // let the accept land
 
     let pid = server.0.id() as i32;
     // SAFETY: plain kill(2) on our own child.
@@ -187,12 +183,12 @@ fn second_signal_during_teardown_exits_immediately() {
         libc::kill(pid, libc::SIGTERM);
     }
 
-    // Bounded exit AND death-by-SIGTERM: the bound alone is satisfied by a
-    // plain teardown; the signal status is what only the hard-exit handler
-    // produces (SIG_DFL + raise + unblock).
+    // Bounded exit AND death-by-SIGTERM: the wedged run cannot finish its
+    // dump (it would otherwise hold the full 5 s window), so only the
+    // hard-exit handler (SIG_DFL + raise + unblock) produces this status.
     let exited = common::wait_bounded(&mut server.0, Duration::from_secs(4));
     let status =
-        exited.expect("server must exit promptly after the second signal, not ride out the drain");
+        exited.expect("server must exit promptly on the second signal, not ride out the window");
     {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
@@ -204,7 +200,6 @@ fn second_signal_during_teardown_exits_immediately() {
     wait_for(
         || !pf.exists(),
         Duration::from_secs(2),
-        "pidfile unlinked on the signal path",
+        "pidfile unlinked on the hard path",
     );
-    let _ = client.0.kill();
 }
