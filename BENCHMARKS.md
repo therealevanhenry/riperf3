@@ -15,27 +15,30 @@ matrix below were measured on our two-VM sandbox with internal tooling (the
 environment-specific.
 
 > **0.7.4 status.** Fully re-measured at the `0.7.4` patch: the compatibility
-> matrix is all-PASS (**52/52**, run as eight per-merge smokes plus a closing
-> run on the release commit — every one clean) and a fresh full N=30 campaign
+> matrix is all-PASS (**52/52** on the closing run at the release commit; the wave's
+> eight per-merge smokes each read 52/52 in session records) and a fresh full N=30 campaign
 > lands **12 riperf3 / 4 parity / 0 slower** — riperf3 is significantly faster
 > in every UDP cell (+8.7% to +13.9%) and every TCP `-P8` cell (+4.1% to
-> +10.2%), with TCP single-stream one parity noise band, as in every campaign
-> since 0.7.0. Cross-campaign absolutes moved DOWN ~3% vs the stored 0.7.3
+> +10.2%), with TCP single-stream one parity noise band (all four P1 cells
+> n.s. this run; the wandering single-stream residual has read parity or a
+> ±3% one-cell wobble in every campaign since 0.7.0). Cross-campaign absolutes moved DOWN ~3% vs the stored 0.7.3
 > baseline — for **both tools in lockstep** (iperf3, an unchanged binary, reads
 > 0 faster / 9 parity / 7 slower against its own 0.7.3-campaign numbers), the
-> environment-shift signature, third campaign running. The one riperf3 cell
-> exceeding iperf3's shift (UDP rev P1 v6, −7.4% cross-campaign) was settled by
+> environment-shift signature, third campaign running. The cell with the
+> largest riperf3 shift (UDP rev P1 v6, −7.4% cross-campaign) was settled by
 > a controlled same-environment **v0.7.3-vs-v0.7.4 A/B** (30v30
 > ABBA-interleaved in that exact cell): **parity** (−1.51%, p=0.34). New
-> honesty note this edition: the campaign recorded **108/960 failed runs**
-> (prior campaigns: 0) — uniformly distributed across tools (57 iperf3 / 51
-> riperf3), cells, and time, the harness's fixed 0.4 s server-start sleep
-> racing under host load (connect-refused class, direction-unbiased; a
-> retry-on-refused hardening is queued). Per-cell n is 22–30; verdicts are
-> unaffected. 0.7.4's throughput-relevant changes are the terminate-path and
+> honesty note this edition: the campaign recorded **108/960 failed runs**,
+> uniformly distributed across tools (57 iperf3 / 51 riperf3), cells, and
+> time — the harness's fixed 0.4 s server-start sleep racing under host load,
+> not a tool signal. Auditing the stored baselines shows this is the recent
+> norm, not an anomaly: the 0.7.3 campaign's own CSV contains 101 such rows
+> (its edition's "0 failed runs" line was wrong), while 0.7.2's has none. A
+> retry-on-refused start would eliminate the class. Per-cell n is 22–30;
+> the drops are throughput-independent, so verdicts are unaffected. 0.7.4's throughput-relevant changes are the terminate-path and
 > reporter end-race redesigns
-> ([#159](https://github.com/therealevanhenry/riperf3/issues/159),
-> [#230](https://github.com/therealevanhenry/riperf3/issues/230)) — control
+> ([#230](https://github.com/therealevanhenry/riperf3/issues/230),
+> [#159](https://github.com/therealevanhenry/riperf3/issues/159)) — control
 > plane, not the data path — and the campaign confirms the data path held.
 >
 > **0.7.3 status.** Fully re-measured at the `0.7.3` patch: the compatibility
@@ -108,11 +111,11 @@ environment-specific.
 
 | | |
 |---|---|
-| Date | 2026-06-11 |
+| Date | 2026-06-12 (compat closing run 2026-06-11) |
 | Host | Intel i9-13900K, Linux 7.0.11-arch1-1 (Arch), KVM |
 | Guests | 2× Debian 13 (Trixie), Linux 6.12.90+deb13.1-cloud-amd64, 8 vCPU, 8 GB RAM each |
 | NIC | virtio-net (vhost=on), bridged, MTU 9000; IPv4 `172.20.0.0/24` + IPv6 `fd00:20::/64` |
-| riperf3 | 0.7.3 |
+| riperf3 | 0.7.4 |
 | iperf3 | 3.20+ (cJSON 1.7.15), built from source |
 
 ## Compatibility matrix (iperf3 interop)
@@ -162,12 +165,13 @@ cell (`-t 5` s each), **960 runs attempted**, run in **randomized order** across
 all (cell, tool, iteration) tuples so host/thermal drift can't systematically
 favor either tool. 2 warm-ups per cell discarded; fresh `-s -1` server per run
 on a unique port; hard `timeout` wrappers; VMs confirmed idle and isolated for
-the duration. **This campaign recorded 108 failed runs (11%; prior campaigns
-0)** — uniformly distributed across tools (57 iperf3 / 51 riperf3), protocols,
-directions, and time, i.e. the harness's fixed 0.4 s server-start sleep racing
-under host load (connect-refused class), not a tool signal; the drops are
-throughput-independent so the comparison is unbiased. Retained n = 22–30 per
-cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
+the duration. **This campaign recorded 108 failed runs (11%)** — uniformly
+distributed across tools (57 iperf3 / 51 riperf3), protocols, directions, and
+time, i.e. the harness's fixed 0.4 s server-start sleep racing under host
+load, not a tool signal; the drops are throughput-independent so the
+comparison is unbiased. (The 0.7.3 campaign's stored CSV shows the same class
+at 101/960 — that edition's "0 failed runs" line was wrong; 0.7.2's baseline
+is genuinely failure-free.) Retained n = 22–30 per cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
 t (two-sided, normal approx); "parity" = not significant at p<0.05.
 
 ### Throughput: riperf3 vs iperf3 (mean Gbps [95% CI])
@@ -202,13 +206,14 @@ binary between the two campaigns, so its shift measures the environment:
 | iperf3 vs its own 0.7.3-campaign numbers | 0 | 9 | 7 | −0.7% to −5.2% |
 
 The lockstep movement is the environment-shift signature (third campaign
-running; the stored-baseline lesson from 0.7.2). The one riperf3 cell whose
-shift exceeded iperf3's by more than noise — UDP rev P1 v6, −7.4% vs iperf3's
-−3.7% — was settled by a controlled same-environment **v0.7.3-vs-v0.7.4 A/B**
+running; the stored-baseline lesson from 0.7.2). The cell with the largest
+riperf3 shift — UDP rev P1 v6, −7.4% vs iperf3's −3.7% in the same cell — was
+settled by a controlled same-environment **v0.7.3-vs-v0.7.4 A/B**
 (both tags built from source on the VMs, 30v30 ABBA-interleaved in that exact
 cell): **parity** — v0.7.3 33.91 Gbps vs v0.7.4 33.40 Gbps, −1.51%, p=0.34.
-(Both A/B means sit well above either campaign's reading of that cell — more
-environment evidence.) The same-run head-to-head table above is the controlled
+(Both A/B means sit above either campaign's reading of that cell — the
+v0.7.4 A/B mean is +9.7% over its own campaign reading — more environment
+evidence.) The same-run head-to-head table above is the controlled
 comparison; the cross-campaign absolutes are not.
 
 **Findings.**
@@ -238,8 +243,9 @@ kernel `RcvbufErrors` on the receiving host, while sender `SndbufErrors` stay 0
 because it pushes ~9–14% more throughput, so it overruns the receiver's buffer
 harder — higher goodput, higher loss, a characteristic rather than a regression
 (the 0.6.3-vs-0.7.0 control measured the same loss in both versions). Note both
-tools' absolute loss moved vs the 0.7.1-era tables (iperf3's forward mean tripled
-too) — environment shift between campaigns, same as the throughput absolutes.
+tools' absolute loss keeps moving between campaigns (iperf3's forward mean:
+~0.4 in the 0.7.1 era, 2.1 at 0.7.3, 1.0 now) — environment shift, same as the
+throughput absolutes.
 
 > **Correction (0.5.4).** Earlier editions reported forward as "0.00 / loss-free"
 > and attributed the gap to a `sendmmsg`-vs-per-packet sender split. Both were
