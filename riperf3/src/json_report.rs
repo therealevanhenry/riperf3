@@ -561,6 +561,10 @@ pub struct StreamReport {
     pub local_bytes: u64,
     /// Bytes the peer reports for the opposite side of this stream, if known.
     pub remote_bytes: Option<u64>,
+    /// Sender-side retransmit total: the LOCAL TCP_INFO cumulative for
+    /// streams this host sent, the PEER's exchanged per-stream figure for
+    /// streams it received (gated on the peer's sender_has_retransmits
+    /// flag; None when ungated) — #236.
     pub retransmits: Option<i64>,
     /// Sender-side TCP_INFO extremes for the `end.streams[].sender` object (PR2).
     /// Only set for streams this host sent (local TCP_INFO); `None` otherwise.
@@ -884,8 +888,10 @@ impl ReportInput {
                 // Two flows: forward (client→server, server receives → sender=false)
                 // in sum_sent/sum_received; reverse (server→client, server sends →
                 // sender=true) in the *_bidir_reverse pair. Retransmits, measured on
-                // the server's send path, attach to the reverse (sent) side.
-                sum_sent_bidir_reverse = Some(self.tcp_sum(local_sent, true, retransmits));
+                // the server's send path, attach to the reverse (sent) side —
+                // direction-filtered like GT's per-pass accumulator (#236).
+                sum_sent_bidir_reverse =
+                    Some(self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))));
                 sum_received_bidir_reverse = Some(self.tcp_sum(0, true, None));
                 (
                     self.tcp_sum(0, false, None),
@@ -1052,10 +1058,15 @@ impl ReportInput {
                 (_, true) => 0,
                 _ => local_recv,
             };
-            sum_sent_bidir_reverse = Some(self.tcp_sum(rev_sent, false, None));
+            // #236: per-direction retransmit totals, like GT's per-pass
+            // accumulator — the reverse-sent aggregate carries the PEER's
+            // exchanged counts (riding this host's receiving streams;
+            // live-observed 2), the forward one ONLY the local senders'.
+            sum_sent_bidir_reverse =
+                Some(self.tcp_sum(rev_sent, false, self.retransmits_for(Some(false))));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
-                self.tcp_sum(local_sent, true, retransmits),
+                self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))),
                 self.tcp_sum(fwd_recv, true, None),
             )
         } else if is_udp {
@@ -1434,11 +1445,28 @@ impl ReportInput {
         }
     }
 
-    /// Sender-side retransmit total. Collapses the -1 "unavailable" sentinel
-    /// rather than summing it (summing N sentinels would emit a nonsensical -N
-    /// that iperf3 never produces). Real per-stream values arrive with PR2.
+    /// Sender-side retransmit total over every stream. Correct for
+    /// single-direction runs (one direction exists, local or exchanged);
+    /// bidir aggregates must use [`Self::retransmits_for`] — GT's results
+    /// loop runs once per direction with a per-pass total_retransmits
+    /// (iperf_api.c:4138/4235), so the two sent-aggregates never mix (#236).
     fn sender_retransmits(&self) -> Option<i64> {
-        let vals: Vec<i64> = self.streams.iter().filter_map(|s| s.retransmits).collect();
+        self.retransmits_for(None)
+    }
+
+    /// Retransmit total over the streams of one direction (`Some(true)` =
+    /// this host's senders, `Some(false)` = its receiving streams, whose
+    /// `retransmits` carry the PEER's exchanged per-stream counts; `None` =
+    /// every stream). Collapses the -1 "unavailable" sentinel rather than
+    /// summing it (summing N sentinels would emit a nonsensical -N that
+    /// iperf3 never produces).
+    fn retransmits_for(&self, want_sender: Option<bool>) -> Option<i64> {
+        let vals: Vec<i64> = self
+            .streams
+            .iter()
+            .filter(|s| want_sender.is_none_or(|w| s.is_sender == w))
+            .filter_map(|s| s.retransmits)
+            .collect();
         if vals.is_empty() {
             None
         } else if vals.iter().all(|&r| r < 0) {
@@ -2200,6 +2228,16 @@ mod tests {
     }
 
     fn tcp_stream(id: i32, is_sender: bool, local: u64, remote: u64) -> StreamReport {
+        tcp_stream_retr(id, is_sender, local, remote, Some(3))
+    }
+
+    fn tcp_stream_retr(
+        id: i32,
+        is_sender: bool,
+        local: u64,
+        remote: u64,
+        retransmits: Option<i64>,
+    ) -> StreamReport {
         StreamReport {
             id,
             local_host: "127.0.0.1".into(),
@@ -2209,11 +2247,82 @@ mod tests {
             is_sender,
             local_bytes: local,
             remote_bytes: Some(remote),
-            retransmits: Some(3),
+            retransmits,
             tcp_end: None,
             remote_packets: None,
             udp: None,
         }
+    }
+
+    /// #236: in TCP bidir, GT's results loop runs once per direction with a
+    /// PER-PASS total_retransmits (iperf_api.c:4138 reset, :4235 accumulate)
+    /// — `sum_sent` carries the local senders' total; `sum_sent_bidir_
+    /// reverse` carries the peer's exchanged per-stream counts riding the
+    /// receiving streams (live-observed: 2, the #233 r1 capture). riperf3
+    /// passed None on the reverse-sent aggregate and, with receiving streams
+    /// now carrying the exchanged figure, an unfiltered sum would mix both
+    /// directions into the forward aggregate.
+    #[test]
+    fn tcp_bidir_reverse_sent_carries_peer_retransmits() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.num_streams = 1;
+        input.streams = vec![
+            // local sender: 3 local retransmits (forward direction)
+            tcp_stream_retr(1, true, 131_072, 131_072, Some(3)),
+            // receiving stream: the peer exchanged 2 for its send side
+            tcp_stream_retr(2, false, 131_072, 131_072, Some(2)),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let end = &v["end"];
+        assert_eq!(
+            end["sum_sent"]["retransmits"],
+            serde_json::json!(3i64),
+            "forward = LOCAL senders only, never mixed with the peer's: {end}"
+        );
+        assert_eq!(
+            end["sum_sent_bidir_reverse"]["retransmits"],
+            serde_json::json!(2i64),
+            "the peer's exchanged reverse count (#236): {end}"
+        );
+        for key in ["sum_received", "sum_received_bidir_reverse"] {
+            assert!(
+                end[key].get("retransmits").is_none_or(|r| r.is_null()),
+                "received aggregates carry no retransmits (GT): {end}"
+            );
+        }
+    }
+
+    /// The server-role twin (a green pin guarding the direction-filter
+    /// refactor): the server's reverse channel is what IT sends — local
+    /// retransmits — and the forward pair carries none. NOT because the
+    /// client withholds them (the exchange is symmetric, iperf_api.c:2764/
+    /// 2944): GT's server PRINTS before it exchanges (reporter_callback at
+    /// iperf_server_api.c:277 vs iperf_exchange_results at :280), so the
+    /// peer's figures never reach its report (r1 item 4).
+    #[test]
+    fn tcp_bidir_server_reverse_sent_uses_local_retransmits() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.is_server = true;
+        input.num_streams = 1;
+        input.streams = vec![
+            tcp_stream_retr(1, true, 131_072, 0, Some(4)),
+            tcp_stream_retr(2, false, 131_072, 0, None),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let end = &v["end"];
+        assert_eq!(
+            end["sum_sent_bidir_reverse"]["retransmits"],
+            serde_json::json!(4i64),
+            "the server's reverse = its own send path: {end}"
+        );
+        assert!(
+            end["sum_sent"]
+                .get("retransmits")
+                .is_none_or(|r| r.is_null()),
+            "the fwd (client->server) sent aggregate has no figure server-side: {end}"
+        );
     }
 
     /// #170 r3: the terminated-run shapes only existed in live matrices —
@@ -3015,7 +3124,7 @@ mod tests {
         input.reverse = true;
         let mut s = tcp_stream(1, false, 2_000_000, 2_000_000);
         s.tcp_end = None; // reverse: no local sender TCP_INFO
-        s.retransmits = Some(0); // iperf3 emits 0 here on a retransmit-capable OS
+        s.retransmits = Some(0); // the peer's exchanged count of 0 (flag on)
         input.streams = vec![s];
         let snd =
             serde_json::to_value(input.build()).unwrap()["end"]["streams"][0]["sender"].clone();

@@ -310,27 +310,77 @@ pub fn print_summary(summary: &StreamSummary, format_char: char) {
     ));
 }
 
-/// Build the full set of final-report lines for a set of per-stream summaries:
-/// the per-stream lines followed by aggregate `[SUM]` rows. Pure and testable.
-/// Both the client and the server route their final report through this so the
-/// two sides stay consistent: issue #4 was the final `[SUM]` row being omitted
-/// for `-P > 1` (the client fix landed first, then the server), and a single
-/// shared path keeps either side from regressing independently.
+/// The final report's row set for a set of per-stream summaries: the
+/// per-stream rows followed by aggregate `[SUM]` rows. BOTH printers (the
+/// client's and the server's) consume this single source so the two sides
+/// stay consistent: issue #4 was the final `[SUM]` row being omitted for
+/// `-P > 1` (the client fix landed first, then the server), and a shared
+/// row source keeps either side from regressing independently (r1 item 3).
+fn final_summary_rows(per_stream: &[StreamSummary]) -> Vec<StreamSummary> {
+    let mut rows = per_stream.to_vec();
+    rows.extend(sum_summaries(per_stream));
+    rows
+}
+
+/// Build the full set of final-report lines. Pure and testable.
 pub fn final_report_lines(per_stream: &[StreamSummary], format_char: char) -> Vec<String> {
-    let mut lines: Vec<String> = per_stream
+    final_summary_rows(per_stream)
         .iter()
         .map(|s| format_summary_line(s, format_char))
-        .collect();
-    for sum in sum_summaries(per_stream) {
-        lines.push(format_summary_line(&sum, format_char));
-    }
-    lines
+        .collect()
 }
 
 /// Print the final report (per-stream summaries + aggregate `[SUM]` rows).
 pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
     for line in final_report_lines(per_stream, format_char) {
         titled(format_args!("{line}"));
+    }
+}
+
+/// The server's `-V` placeholder for the unmeasured half of a summary row
+/// (#246): GT's report_*_not_available formats (iperf_locale.c:468-471) —
+/// a plain `[%3d]`/`[SUM]` prefix with NO bidir role tag, gated on verbose
+/// at every GT site (per-stream: iperf_api.c:4268/4280/4324/4371/4395;
+/// SUM, TCP-only: :4451/:4463 sender, :4483 receiver).
+fn not_available_line(stream_id: i32, half: &str) -> String {
+    format!("[{}] ({half} statistics not available)", fmt_id(stream_id))
+}
+
+/// Server-role final report (#246): like [`print_final_summaries`], but
+/// under `-V` each row's unmeasured half renders GT's placeholder in that
+/// half's canonical slot — "(sender ...)" BEFORE a receiver row (the sender
+/// row prints first in iperf3's pair), "(receiver ...)" AFTER a sender row.
+/// `[SUM]` rows get the twin ONLY for TCP: GT's UDP summary-sum block
+/// (iperf_api.c:4517-4538) has no placeholder branch and silently skips the
+/// unmeasured half (r1 blocker — live-verified: a UDP -P 2 -V GT server
+/// prints per-stream placeholders but never a [SUM] one). The client never
+/// prints placeholders: it measures or exchanges both halves.
+pub fn print_final_summaries_server(
+    per_stream: &[StreamSummary],
+    format_char: char,
+    verbose: bool,
+    protocol: crate::TransportProtocol,
+) {
+    let is_udp = matches!(protocol, crate::TransportProtocol::Udp);
+    for s in final_summary_rows(per_stream) {
+        // r2 item 2: the protocol arrives explicitly — shape-sniffing the
+        // row (total_packets presence) was sound but fragile against a
+        // poisoned-stats fallback flipping a UDP SUM into the TCP arm.
+        let udp_sum = s.stream_id < 0 && is_udp;
+        let placeholder = verbose && !udp_sum;
+        if placeholder && !s.is_sender {
+            titled(format_args!(
+                "{}",
+                not_available_line(s.stream_id, "sender")
+            ));
+        }
+        titled(format_args!("{}", format_summary_line(&s, format_char)));
+        if placeholder && s.is_sender {
+            titled(format_args!(
+                "{}",
+                not_available_line(s.stream_id, "receiver")
+            ));
+        }
     }
 }
 

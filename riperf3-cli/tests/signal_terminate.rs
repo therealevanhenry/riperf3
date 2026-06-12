@@ -270,3 +270,179 @@ fn server_json_stream_emits_the_error_event_before_end() {
         "error precedes end, like iperf_json_finish:\n{sout}"
     );
 }
+
+/// #231: a SIGTERM while the client waits BETWEEN states (here: a raw server
+/// that accepts the control connection, reads the cookie, then goes silent —
+/// the client parks in its central recv_state wait, pre-ParamExchange) must
+/// take the same iperf_got_sigend path as a mid-test signal: dump, attempt
+/// CLIENT_TERMINATE, print the signal-normal line, exit 0. GT's
+/// iperf_catch_sigend is armed for the whole run with no phase gate
+/// (iperf_api.c: the client condition in iperf_got_sigend). Pre-#231 the
+/// unarmed wait ignored the first signal entirely (only #211's second-signal
+/// hard exit, which skips the dump, ever fired).
+#[test]
+fn client_sigterm_in_setup_wait_exits_promptly() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let hold = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut cookie = [0u8; 37];
+            let _ = s.read_exact(&mut cookie);
+            // Stay silent; the socket drops when the thread ends.
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-t", "5"]);
+    // Enough for connect + cookie write + parking in the state wait, even on
+    // a loaded runner; well inside the mock's 15 s silence.
+    std::thread::sleep(Duration::from_millis(700));
+    let cpid = client.0.id() as i32;
+    let killed_at = Instant::now();
+    unsafe {
+        libc::kill(cpid, libc::SIGTERM);
+    }
+
+    let (cout, cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client in setup wait");
+    // PROMPTNESS is the pin: the CLI's #211 fallback produces the same exit
+    // shape after its 5 s dump-window timeout, so only the latency separates
+    // "the lib honored the watch" from "the fallback fired".
+    let reacted_in = killed_at.elapsed();
+    assert!(
+        reacted_in < Duration::from_secs(3),
+        "the signal must be honored AT the wait, not via the CLI's 5 s \
+         fallback window (#231): took {reacted_in:?}"
+    );
+    // And the DUMP is the other pin: iperf_got_sigend dumps for clients in
+    // EVERY phase (no phase gate); the fallback path prints no summary.
+    assert!(
+        cout.contains("- - - - -"),
+        "the accumulated-stats dump (empty rows pre-data, like GT): {cout}"
+    );
+    assert!(
+        cerr.contains("interrupt - the client has terminated by signal"),
+        "the signal-normal line from the setup-phase wait: {cerr:?}"
+    );
+    assert_eq!(ccode, 0, "TERM takes the exit-normal path: {cerr:?}");
+    drop(hold); // detached; the spawned thread dies with the process
+}
+
+/// #231 r2 pin (mutation A): a dump for a test that never STARTED reports a
+/// ZERO-second window — GT's pre-data sigend dump says 0/0/0 where the old
+/// code asserted the requested -t that never ran.
+#[test]
+fn pre_data_interrupt_dump_reports_a_zero_window() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _hold = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut cookie = [0u8; 37];
+            let _ = s.read_exact(&mut cookie);
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-t", "5", "-J"]);
+    std::thread::sleep(Duration::from_millis(700));
+    unsafe {
+        libc::kill(client.0.id() as i32, libc::SIGTERM);
+    }
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client -J pre-data");
+    assert_eq!(ccode, 0);
+    let doc: serde_json::Value =
+        serde_json::from_str(cout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {cout}"));
+    for key in ["sum_sent", "sum_received"] {
+        assert_eq!(
+            doc["end"][key]["seconds"].as_f64(),
+            Some(0.0),
+            "a never-started test reports a zero window (GT 0/0/0), not the \
+             requested -t: {doc}"
+        );
+    }
+}
+
+/// #231 r2 pin (mutation B): an interrupt AFTER ExchangeResults keeps the
+/// already-exchanged peer halves in the dump, like GT's merged sigend dump.
+/// The mock speaks the full protocol through the exchange (crafted peer
+/// bytes 424242), then stalls before DisplayResults.
+#[test]
+fn post_exchange_interrupt_dump_keeps_the_peer_halves() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let exchanged = Arc::new(AtomicBool::new(false));
+    let exchanged_w = exchanged.clone();
+
+    let _mock = std::thread::spawn(move || {
+        let read_exact = |s: &mut std::net::TcpStream, n: usize| -> Vec<u8> {
+            let mut b = vec![0u8; n];
+            s.read_exact(&mut b).expect("mock read");
+            b
+        };
+        let read_json = |s: &mut std::net::TcpStream| {
+            let len = u32::from_be_bytes(read_exact(s, 4).try_into().unwrap()) as usize;
+            read_exact(s, len)
+        };
+        let write_json = |s: &mut std::net::TcpStream, payload: &str| {
+            s.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+            s.write_all(payload.as_bytes()).unwrap();
+        };
+
+        let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+        read_exact(&mut ctrl, 37); // cookie
+        ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+        read_json(&mut ctrl); // params
+        ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
+        let (mut data, _) = listener.accept().expect("data accept");
+        read_exact(&mut data, 37); // data-stream cookie
+        ctrl.write_all(&[1u8]).unwrap(); // TestStart
+        ctrl.write_all(&[2u8]).unwrap(); // TestRunning
+                                         // Drain the -n payload so the sender never blocks, until TestEnd(4)
+                                         // arrives on ctrl.
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while data.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 4, "TestEnd");
+        ctrl.write_all(&[13u8]).unwrap(); // ExchangeResults
+        read_json(&mut ctrl); // the client's results
+        write_json(
+            &mut ctrl,
+            r#"{"cpu_util_total":1.5,"cpu_util_user":1.0,"cpu_util_system":0.5,"sender_has_retransmits":0,"streams":[{"id":1,"bytes":424242,"retransmits":0,"jitter":0,"errors":0,"packets":0,"start_time":0,"end_time":1}]}"#,
+        );
+        exchanged_w.store(true, Ordering::SeqCst);
+        // Stall before DisplayResults: the client parks in the state wait.
+        std::thread::sleep(Duration::from_secs(15));
+        drop(drain);
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-n", "100K", "-J"]);
+    let t0 = Instant::now();
+    while !exchanged.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "mock never reached the exchange"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(300)); // park in the state wait
+    unsafe {
+        libc::kill(client.0.id() as i32, libc::SIGTERM);
+    }
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client post-exchange");
+    assert_eq!(ccode, 0);
+    let doc: serde_json::Value =
+        serde_json::from_str(cout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {cout}"));
+    assert_eq!(
+        doc["end"]["sum_received"]["bytes"].as_i64(),
+        Some(424242),
+        "the exchanged peer half must survive into the interrupt dump \
+         (GT merges exchanged data before its sigend dump): {doc}"
+    );
+}

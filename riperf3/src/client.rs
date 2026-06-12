@@ -208,6 +208,43 @@ enum ControlEvent {
 /// first-byte-ends-the-wait behavior turned stray bytes into a truncated test.
 /// Resolve when the library consumer fires the interrupt watch (#210);
 /// pends forever when no watch is wired, so it is select-safe everywhere.
+/// The per-stream retransmit figure for a `StreamReport` (#236 r1 blocker):
+/// a stream WE sent carries the local TCP_INFO cumulative total (with
+/// iperf3's platform defaults — 0 where retransmit info exists, -1 where it
+/// doesn't); a stream we RECEIVED carries the PEER's exchanged per-stream
+/// total — GT parses it into sp->result->stream_retrans (iperf_api.c:2944)
+/// and its reverse bidir pass sums exactly those — gated on the peer's
+/// sender_has_retransmits flag like GT's RX-pass gate
+/// (other_side_has_retransmits, :4169-4171). Ungated, GT omits the key;
+/// None feeds the same omission through the aggregate sentinel collapse.
+/// The old local-platform default fabricated a 0 on receiving streams where
+/// GT shows the peer's real count.
+fn stream_report_retransmits(
+    is_udp: bool,
+    is_sender: bool,
+    local_total: Option<u32>,
+    peer_has_retransmits: bool,
+    peer_stream_retransmits: Option<i64>,
+) -> Option<i64> {
+    if is_udp {
+        None
+    } else if !is_sender {
+        if peer_has_retransmits {
+            peer_stream_retransmits
+        } else {
+            None
+        }
+    } else {
+        local_total
+            .map(|r| r as i64)
+            .or(Some(if crate::tcp_info::has_retransmit_info() {
+                0
+            } else {
+                -1
+            }))
+    }
+}
+
 pub(crate) async fn wait_interrupt(
     rx: Option<&mut tokio::sync::watch::Receiver<Option<String>>>,
 ) -> String {
@@ -388,7 +425,58 @@ impl Client {
 
         // ---- State machine: react to server-driven transitions ----
         loop {
-            let state = protocol::recv_state(&mut ctrl).await?;
+            // #231: iperf_catch_sigend is armed for the WHOLE run, so the
+            // central state wait polls the interrupt watch like the
+            // TEST_RUNNING selects — covering the setup phases AND the
+            // post-test ExchangeResults/DisplayResults waits, which
+            // previously ignored a signal until the control read returned
+            // (against a wedged server: forever, with only the CLI's #211
+            // second-signal hard exit as the way out). iperf_got_sigend's
+            // client arm has NO phase gate: it dumps the accumulated stats
+            // from any phase (empty rows pre-data), tells the peer via
+            // CLIENT_TERMINATE, and exits signal-normal — the same shape as
+            // the run_test arm. recv_state is a single 1-byte read, so the
+            // select is cancel-safe.
+            let state = tokio::select! {
+                s = protocol::recv_state(&mut ctrl) => s?,
+                msg = wait_interrupt(interrupt.as_mut()) => {
+                    let _ = protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
+                    // r1 item 5: a test that never STARTED reports a zero
+                    // window (GT's pre-data dump says 0/0/0), not the
+                    // requested -t default measured_secs still holds.
+                    let dump_secs = if test_start_millis > 0 {
+                        measured_secs
+                    } else {
+                        0.0
+                    };
+                    self.print_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        // r1 item 7: post-ExchangeResults interrupts keep the
+                        // peer halves GT would show (its sigend dump merges
+                        // already-exchanged data); None only pre-exchange.
+                        server_results.as_ref(),
+                        blksize,
+                        &interval_data,
+                        &StartMeta {
+                            cookie: String::from_utf8_lossy(
+                                &cookie[..protocol::COOKIE_SIZE - 1],
+                            )
+                            .into_owned(),
+                            tcp_mss_default: control_mss,
+                            start_time_millis: test_start_millis,
+                        },
+                        dump_secs,
+                        Some(&msg),
+                    );
+                    return Ok(self.build_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        blksize,
+                        dump_secs,
+                    ));
+                }
+            };
 
             match state {
                 TestState::ParamExchange => {
@@ -1900,21 +1988,13 @@ impl Client {
                     mean_rtt: e.mean_rtt(),
                     reorder: e.reorder,
                 });
-                let retransmits = if is_udp {
-                    None
-                } else {
-                    // Real cumulative total when TCP_INFO gave us one (forward
-                    // sender). Otherwise (reverse, or a stream we didn't send) use
-                    // iperf3's defaults: 0 on a platform that supports retransmit
-                    // info, -1 where it doesn't.
-                    ext.and_then(|e| e.total_retransmits)
-                        .map(|r| r as i64)
-                        .or(Some(if crate::tcp_info::has_retransmit_info() {
-                            0
-                        } else {
-                            -1
-                        }))
-                };
+                let retransmits = stream_report_retransmits(
+                    is_udp,
+                    s.is_sender,
+                    ext.and_then(|e| e.total_retransmits),
+                    remote_cpu.is_some_and(|r| r.sender_has_retransmits == 1),
+                    server_stream.map(|x| x.retransmits),
+                );
 
                 StreamReport {
                     id: s.id,
@@ -2940,6 +3020,60 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    mod stream_report_retransmits_quadrants {
+        use crate::client::stream_report_retransmits;
+
+        /// #236 (r1 blocker): the provenance decision the StreamReport build
+        /// feeds from — pinned per quadrant so the attach can't silently
+        /// revert to the local-platform default on receiving streams.
+        #[test]
+        fn receiving_stream_takes_the_peer_exchanged_figure_when_flagged() {
+            assert_eq!(
+                stream_report_retransmits(false, false, None, true, Some(2)),
+                Some(2),
+                "the #236 live shape: peer flag on, exchanged per-stream total"
+            );
+        }
+
+        #[test]
+        fn receiving_stream_is_none_without_the_peer_flag() {
+            // GT's RX-pass gate (other_side_has_retransmits) off -> the key
+            // is omitted; a fabricated 0 here was the r1 blocker.
+            assert_eq!(
+                stream_report_retransmits(false, false, None, false, Some(2)),
+                None
+            );
+            // Flag on but the peer skipped this stream id: nothing to show.
+            assert_eq!(
+                stream_report_retransmits(false, false, None, true, None),
+                None
+            );
+        }
+
+        #[test]
+        fn sending_stream_keeps_the_local_total_and_platform_default() {
+            assert_eq!(
+                stream_report_retransmits(false, true, Some(5), true, Some(2)),
+                Some(5),
+                "a local sender's figure is never clobbered by the peer's"
+            );
+            let default = stream_report_retransmits(false, true, None, false, None);
+            if crate::tcp_info::has_retransmit_info() {
+                assert_eq!(default, Some(0));
+            } else {
+                assert_eq!(default, Some(-1));
+            }
+        }
+
+        #[test]
+        fn udp_streams_carry_none() {
+            assert_eq!(
+                stream_report_retransmits(true, false, Some(5), true, Some(2)),
+                None
+            );
+        }
+    }
+
     // #147 (review r1): the discriminating leak test. The e2e mock below can't
     // pin the fix — run()'s DoneOnDrop guard already stops the SENDERS on any
     // exit, pre-fix included. The real pre-fix leak was the REPORTER task:
