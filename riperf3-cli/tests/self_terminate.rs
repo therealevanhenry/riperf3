@@ -175,109 +175,425 @@ fn bitrate_limit_json_server_doc_carries_prefixed_error() {
     );
 }
 
-/// #237: the duration timer must be ONE absolute deadline. With
-/// --server-bitrate-limit also set, the 1 Hz under-limit rate ticks re-enter
-/// the select loop; a sleep() recreated per iteration restarts from zero on
-/// every tick, so any max duration > ~1s never fires and a -t 10 run goes
-/// the full 10 s. A 1T limit never trips, even on fast loopback (100G
-/// does); the 1 s max duration must still cut the run at ~1 s with the
-/// same SERVER_ERROR(160) shapes as the plain timer path. NOTE: shares #230's test interplay —
-/// the upfront requested-duration check will reject `-t 10` vs a 1 s limit
-/// at param exchange when it lands; this test then needs the within-limit
-/// wall-clock-overrun trigger too (noted on #230).
+// ---------------------------------------------------------------------------
+// #230 — the upfront requested-duration check (iperf 3.21 GT, live-captured
+// 2026-06-11): with --server-max-duration set, the SERVER rejects at param
+// exchange when (time + omit) > max OR time == 0 (iperf_api.c:2666) — and a
+// -n/-k client sends time 0 (iperf_api.c:1981), so EVERY byte/block-limited
+// run is "unbounded" and rejected. The relay is cleanup_server's
+// SERVER_ERROR + (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair; the test
+// never starts (no Accepted line, no streams, no summaries).
+//
+//   client (text): stdout ONLY "Connecting to host...", stderr
+//                  `iperf3: SERVER ERROR - <strerror(37)>` +
+//                  `iperf3: error - <strerror(37)>`, exit 1
+//   server (text): stderr `iperf3: error - <strerror(37)>`, one-off exit 0,
+//                  stdout has NO "Accepted connection" line
+//   client (-J):   single doc, error key = strerror(37), stderr empty
+//   server (-J):   the SKELETON doc — start {connected:[], version,
+//                  system_info} only, intervals [], end {}, error key with
+//                  iperf_err's "error - " prefix
+//   server (--json-stream): {"event":"error","data":"error - <msg>"} then
+//                  {"event":"end","data":{}} — no start event
+// ---------------------------------------------------------------------------
+
+const MAXDUR_MSG: &str = "client's requested duration exceeds the server's maximum permitted limit";
+
+/// The headline text shapes, both roles: -t 6 vs max 2 is refused at param
+/// exchange — instantly, with no test start on either side.
 #[test]
-fn max_duration_timer_survives_rate_ticks() {
+fn upfront_reject_text_shapes() {
     let ps = common::free_port().to_string();
-    let server = spawn_server(
-        &["--server-bitrate-limit", "1T", "--server-max-duration", "1"],
-        &ps,
-    );
+    let server = spawn_server(&["--server-max-duration", "2"], &ps);
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
     let client = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "10"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "6"],
         Duration::from_secs(40),
-        "client -t 10",
+        "client -t 6",
     );
     let elapsed = start.elapsed();
-    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    let (sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
 
     assert!(
-        elapsed < Duration::from_secs(6),
-        "rate ticks must not reset the duration timer (#237) — a 1 s max \
-         duration left this -t 10 run running for {elapsed:?}"
+        elapsed < Duration::from_secs(4),
+        "the upfront check refuses BEFORE the test starts (GT: instantaneous), \
+         not via any timer: {elapsed:?}"
     );
-    // Lower bound (r2): tokio timers never fire early, so this is
-    // structurally flake-safe — and it catches an instant-fire deadline
-    // (e.g. an unguarded already-past sleep_until) the upper bound can't.
+    assert_eq!(client.status.code(), Some(1), "client errexits like iperf3");
     assert!(
-        elapsed >= Duration::from_secs(1),
-        "the timer must not fire BEFORE the 1 s max duration: {elapsed:?}"
+        client
+            .stderr
+            .contains(&format!("riperf3: SERVER ERROR - {MAXDUR_MSG}")),
+        "the relayed strerror(37) line: {stderr}",
+        stderr = client.stderr
     );
+    assert!(
+        client
+            .stderr
+            .contains(&format!("riperf3: error - {MAXDUR_MSG}")),
+        "the errexit line with the adopted i_errno: {stderr}",
+        stderr = client.stderr
+    );
+    assert!(
+        client.stdout.contains("Connecting to host")
+            && !client.stdout.contains("- - - - -")
+            && !client.stdout.contains("connected to"),
+        "client stdout is ONLY the Connecting line (GT capture): {out}",
+        out = client.stdout
+    );
+
+    assert!(
+        serr.contains(&format!("riperf3: error - {MAXDUR_MSG}")),
+        "server reports the refusal on stderr: {serr}"
+    );
+    assert_eq!(scode, 0, "iperf3's one-off exits 0 on the refusal path");
+    assert!(
+        !sout.contains("Accepted connection"),
+        "GT skips on_connect on the refusal path — no Accepted line: {sout}"
+    );
+    assert!(
+        !sout.contains("- - - - -"),
+        "no summary block — the test never ran: {sout}"
+    );
+}
+
+/// -t 0 means an unbounded request: GT's `duration == 0` clause refuses it
+/// against ANY max (live-verified vs max 5).
+#[test]
+fn upfront_reject_time_zero() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "5"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "0"],
+        Duration::from_secs(40),
+        "client -t 0",
+    );
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+
     assert_eq!(client.status.code(), Some(1));
     assert!(
         client
             .stderr
-            .contains("riperf3: SERVER ERROR - server test duration expired"),
-        "client adopts strerror(IESERVERTESTDURATIONEXPIRED): {stderr}",
+            .contains(&format!("riperf3: SERVER ERROR - {MAXDUR_MSG}")),
+        "-t 0 is rejected by the duration==0 clause: {stderr}",
         stderr = client.stderr
     );
-    assert!(
-        serr.contains(
-            "riperf3: error - server test duration expired - test is terminated by the server"
-        ),
-        "the server's literal timer line: {serr}"
-    );
+    assert!(serr.contains(&format!("riperf3: error - {MAXDUR_MSG}")));
     assert_eq!(scode, 0);
 }
 
-/// --server-max-duration via the wall-clock timer: the literal server line
-/// vs the client's strerror, the same SERVER_ERROR shapes. NOTE (r1 review,
-/// live-verified): iperf3's upfront check rejects `-n` runs too (it tests
-/// the default `-t 10` sent alongside, iperf_api.c:2666) — so when #230
-/// lands faithfully, this test's `-n` run gets rejected at param exchange
-/// and the TIMER arm needs a new trigger (e.g. a `-t`-within-limit run that
-/// overruns on wall clock). Revisit this test in #230; noted there.
+/// A -n run sends `time: 0` on the wire (iperf_api.c:1981) and is refused by
+/// the `duration == 0` clause — even against max 11, which the old
+/// "tests the default -t 10" theory would let pass. Pins BOTH the client's
+/// time-zeroing and the server's 0-clause.
 #[test]
-fn max_duration_timer_relays_expired() {
+fn upfront_reject_n_run_via_zero_duration_clause() {
     let ps = common::free_port().to_string();
-    let server = spawn_server(&["--server-max-duration", "1"], &ps);
+    let server = spawn_server(&["--server-max-duration", "11"], &ps);
     std::thread::sleep(Duration::from_millis(300));
 
     let start = Instant::now();
     let client = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-n", "1T"],
+        &["-c", "127.0.0.1", "-p", &ps, "-n", "100M"],
         Duration::from_secs(40),
-        "client -n",
+        "client -n 100M",
     );
     let elapsed = start.elapsed();
     let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
 
     assert!(
-        elapsed < Duration::from_secs(20),
-        "the server timer must cut an unbounded -n run: {elapsed:?}"
+        elapsed < Duration::from_secs(4),
+        "refused upfront, not after a transfer: {elapsed:?}"
     );
     assert_eq!(client.status.code(), Some(1));
     assert!(
         client
             .stderr
-            .contains("riperf3: SERVER ERROR - server test duration expired"),
-        "client adopts strerror(IESERVERTESTDURATIONEXPIRED): {stderr}",
+            .contains(&format!("riperf3: SERVER ERROR - {MAXDUR_MSG}")),
+        "a byte-limited run is unbounded-duration and must be refused \
+         (GT live: -n vs max 11 rejects): {stderr}",
+        stderr = client.stderr
+    );
+    assert!(serr.contains(&format!("riperf3: error - {MAXDUR_MSG}")));
+    assert_eq!(scode, 0);
+}
+
+/// The boundary is `(time + omit) > max`, strictly: -t 2 -O 2 vs max 3 is
+/// refused (4 > 3), while -t 2 -O 1 vs max 3 runs to completion (3 <= 3) —
+/// the within-limit survival case, which also pins that the refusal logic
+/// doesn't fire on requests it must allow.
+#[test]
+fn upfront_reject_omit_counts_and_boundary_is_strict() {
+    // 2 + 2 > 3: refused.
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "3"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-O", "2"],
+        Duration::from_secs(40),
+        "client -t 2 -O 2",
+    );
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(
+        client.status.code(),
+        Some(1),
+        "omit counts toward the requested duration (GT: (time+omit) > max): {stderr}",
+        stderr = client.stderr
+    );
+    assert!(client
+        .stderr
+        .contains(&format!("riperf3: SERVER ERROR - {MAXDUR_MSG}")));
+    assert!(serr.contains(&format!("riperf3: error - {MAXDUR_MSG}")));
+    assert_eq!(scode, 0);
+
+    // 2 + 1 <= 3: runs to completion with a normal summary.
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "3"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+    let start = Instant::now();
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "2", "-O", "1"],
+        Duration::from_secs(40),
+        "client -t 2 -O 1",
+    );
+    let elapsed = start.elapsed();
+    let (sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(
+        client.status.code(),
+        Some(0),
+        "within-limit requests must run (boundary is >, not >=): {stderr}",
         stderr = client.stderr
     );
     assert!(
-        client
-            .stderr
-            .contains("riperf3: error - server test duration expired"),
-        "the errexit line: {stderr}",
+        elapsed >= Duration::from_secs(3),
+        "the within-limit run really ran its 2s + 1s omit: {elapsed:?}"
+    );
+    assert!(
+        client.stdout.contains("- - - - -"),
+        "normal summary block: {out}",
+        out = client.stdout
+    );
+    assert!(
+        serr.trim().is_empty(),
+        "no refusal line for a within-limit run: {serr}"
+    );
+    assert_eq!(scode, 0);
+    assert!(sout.contains("Accepted connection"));
+}
+
+/// -J shapes, both roles (GT capture 2026-06-11): single docs; the client's
+/// error key carries the bare strerror; the server emits the SKELETON doc —
+/// start has only connected/version/system_info (no accepted_connection, no
+/// cookie, no test_start), intervals [], end {}, and the "error - " prefix.
+#[test]
+fn upfront_reject_json_doc_shapes() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "2", "-J"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "6", "-J"],
+        Duration::from_secs(40),
+        "client -J",
+    );
+    let (sout, serr, scode) = finish(server, Duration::from_secs(10), "server -J");
+
+    // Client doc.
+    assert_eq!(client.status.code(), Some(1));
+    assert!(
+        client.stderr.trim().is_empty(),
+        "-J keeps the client's stderr empty: {stderr}",
         stderr = client.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(client.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "client -J stdout must be one document ({e}): {out}",
+            out = client.stdout
+        )
+    });
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(MAXDUR_MSG),
+        "client doc adopts the relayed strerror: {doc}"
+    );
+
+    // Server skeleton doc.
+    assert!(serr.trim().is_empty(), "server -J stderr empty: {serr}");
+    assert_eq!(scode, 0);
+    let doc: serde_json::Value = serde_json::from_str(sout.trim())
+        .unwrap_or_else(|e| panic!("server -J stdout must be one document ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {MAXDUR_MSG}").as_str()),
+        "iperf_err's in-doc prefix wart: {doc}"
+    );
+    assert_eq!(
+        doc["intervals"].as_array().map(Vec::len),
+        Some(0),
+        "no intervals — the test never ran: {doc}"
+    );
+    assert_eq!(
+        doc["end"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "end is an EMPTY object on the refusal skeleton (GT): {doc}"
+    );
+    let start_obj = doc["start"].as_object().expect("start object");
+    assert_eq!(
+        start_obj["connected"].as_array().map(Vec::len),
+        Some(0),
+        "start.connected is empty: {doc}"
+    );
+    assert!(
+        start_obj.contains_key("version") && start_obj.contains_key("system_info"),
+        "skeleton start keeps version/system_info: {doc}"
+    );
+    for absent in ["accepted_connection", "cookie", "test_start", "timestamp"] {
+        assert!(
+            !start_obj.contains_key(absent),
+            "GT's refusal skeleton has NO {absent} key: {doc}"
+        );
+    }
+}
+
+/// --json-stream refuse shape (GT capture): exactly two events — the
+/// prefixed error, then `end` with an EMPTY data object. No start event.
+#[test]
+fn upfront_reject_json_stream_events() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "2", "--json-stream"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let _client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "6"],
+        Duration::from_secs(40),
+        "client",
+    );
+    let (sout, serr, scode) = finish(server, Duration::from_secs(10), "server --json-stream");
+
+    assert!(serr.trim().is_empty(), "json-stream stderr empty: {serr}");
+    assert_eq!(scode, 0);
+    let lines: Vec<&str> = sout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "exactly error + end events (GT: no start event on refusal): {sout}"
+    );
+    let ev0: serde_json::Value = serde_json::from_str(lines[0]).expect("error event parses");
+    assert_eq!(ev0["event"].as_str(), Some("error"));
+    assert_eq!(
+        ev0["data"].as_str(),
+        Some(format!("error - {MAXDUR_MSG}").as_str())
+    );
+    let ev1: serde_json::Value = serde_json::from_str(lines[1]).expect("end event parses");
+    assert_eq!(ev1["event"].as_str(), Some("end"));
+    assert_eq!(
+        ev1["data"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "end data is an empty object: {sout}"
+    );
+}
+
+/// A persistent (non-one-off) server refuses test #1 and serves test #2
+/// normally (GT live: the refusal doesn't poison the accept loop).
+#[test]
+fn upfront_reject_persistent_server_serves_next_test() {
+    let ps = common::free_port().to_string();
+    // No -1: spawn the persistent shape by hand.
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps, "--server-max-duration", "3"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn persistent server"),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let refused = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "6"],
+        Duration::from_secs(40),
+        "refused client",
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused
+        .stderr
+        .contains(&format!("riperf3: SERVER ERROR - {MAXDUR_MSG}")));
+
+    let served = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "1"],
+        Duration::from_secs(40),
+        "served client",
+    );
+    assert_eq!(
+        served.status.code(),
+        Some(0),
+        "the server must serve the next test after a refusal: {stderr}",
+        stderr = served.stderr
+    );
+    assert!(served.stdout.contains("- - - - -"), "normal summary");
+
+    let _ = server.0.kill();
+    let _ = server.0.wait();
+}
+
+/// The in-flight 160-watchdog, post-#230: GT arms it for EVERY duration test
+/// at (time + omit + 40s grace), flag-independent (create_server_timers,
+/// iperf_server_api.c:380-395) — --server-max-duration arms NOTHING. A
+/// wedged client (SIGSTOP mid-test) must trip it at ~duration+40, the server
+/// must print server_timer_proc's literal line, CLOSE its streams (GT does;
+/// a plain join hangs forever on the silent socket — the PR #247 r1 probe
+/// measured 169 s), and one-off exit 0. --server-bitrate-limit 1T keeps the
+/// 1 Hz rate ticks live the whole wait: the #237 tick-immunity pin at the
+/// new anchor (a per-iteration recreated sleep would never fire).
+#[cfg(unix)]
+#[test]
+fn watchdog_fires_at_duration_plus_grace_despite_rate_ticks() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-bitrate-limit", "1T"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", &ps, "-t", "5"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn client"),
+    );
+    let start = Instant::now();
+    // Wedge the client mid-TEST_RUNNING: well past stream setup (~0.3s even
+    // on loaded 2-core runners), well before its own 5s end.
+    std::thread::sleep(Duration::from_millis(1500));
+    let stop = Command::new("kill")
+        .args(["-STOP", &client.0.id().to_string()])
+        .status()
+        .expect("send SIGSTOP");
+    assert!(stop.success(), "SIGSTOP delivered");
+
+    // The watchdog deadline is 5 + 0 + 40 = 45s from test start. Allow
+    // scheduling slack above; the lower bound is structural (tokio timers
+    // never fire early).
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(60), "server");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(44),
+        "the watchdog must not fire before duration+grace (45s): {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(58),
+        "the watchdog must fire at ~45s and the server must EXIT (a hung \
+         stream join means the GT socket-close mirror is missing): {elapsed:?}"
     );
     assert!(
         serr.contains(
             "riperf3: error - server test duration expired - test is terminated by the server"
         ),
-        "the server's literal timer line (iperf_err in server_timer_proc): {serr}"
+        "server_timer_proc's literal line: {serr}"
     );
-    assert_eq!(scode, 0);
+    assert_eq!(scode, 0, "one-off exits 0 on self-terminate");
+    // ChildGuard SIGKILLs the wedged client on drop.
 }

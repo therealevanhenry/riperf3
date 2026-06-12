@@ -45,12 +45,29 @@ fn ladder(n: f64) -> String {
 }
 
 /// Format a bits-per-second rate for display.
+///
+/// Same char table as [`format_bytes`] (#241): lowercase = bit-rates with
+/// 1000 divisors, UPPERCASE = byte-rates with 1024 divisors — GT's
+/// unit_snprintf takes bytes and only multiplies by 8 for the lowercase
+/// set (units.c:299-302), so `-f K` means KBytes/sec, never Kbits.
 pub fn format_rate(bits_per_sec: f64, format_char: char) -> String {
+    let bytes_per_sec = bits_per_sec / 8.0;
     match format_char {
-        'k' | 'K' => format!("{} Kbits/sec", ladder(bits_per_sec / 1000.0)),
-        'm' | 'M' => format!("{} Mbits/sec", ladder(bits_per_sec / 1_000_000.0)),
-        'g' | 'G' => format!("{} Gbits/sec", ladder(bits_per_sec / 1_000_000_000.0)),
-        't' | 'T' => format!("{} Tbits/sec", ladder(bits_per_sec / 1_000_000_000_000.0)),
+        'k' => format!("{} Kbits/sec", ladder(bits_per_sec / 1000.0)),
+        'm' => format!("{} Mbits/sec", ladder(bits_per_sec / 1_000_000.0)),
+        'g' => format!("{} Gbits/sec", ladder(bits_per_sec / 1_000_000_000.0)),
+        't' => format!("{} Tbits/sec", ladder(bits_per_sec / 1_000_000_000_000.0)),
+        'K' => format!("{} KBytes/sec", ladder(bytes_per_sec / 1024.0)),
+        'M' => format!("{} MBytes/sec", ladder(bytes_per_sec / (1024.0 * 1024.0))),
+        'G' => format!(
+            "{} GBytes/sec",
+            ladder(bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
+        ),
+        'T' => format!(
+            "{} TBytes/sec",
+            ladder(bytes_per_sec / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+        ),
+        'A' => adaptive_rate_bytes(bytes_per_sec),
         _ => adaptive_rate(bits_per_sec),
     }
 }
@@ -90,6 +107,27 @@ fn adaptive_bits(bits: f64) -> String {
         format!("{} Kbits", ladder(bits / K))
     } else {
         format!("{} bits", ladder(bits))
+    }
+}
+
+/// The byte-rate twin of [`adaptive_rate`]: unit_snprintf's uppercase
+/// adaptive arm, 1024-stepped (#241).
+fn adaptive_rate_bytes(bytes_per_sec: f64) -> String {
+    const K: f64 = 1024.0;
+    const M: f64 = K * 1024.0;
+    const G: f64 = M * 1024.0;
+    const T: f64 = G * 1024.0;
+
+    if bytes_per_sec >= T {
+        format!("{} TBytes/sec", ladder(bytes_per_sec / T))
+    } else if bytes_per_sec >= G {
+        format!("{} GBytes/sec", ladder(bytes_per_sec / G))
+    } else if bytes_per_sec >= M {
+        format!("{} MBytes/sec", ladder(bytes_per_sec / M))
+    } else if bytes_per_sec >= K {
+        format!("{} KBytes/sec", ladder(bytes_per_sec / K))
+    } else {
+        format!("{} Bytes/sec", ladder(bytes_per_sec))
     }
 }
 
@@ -195,6 +233,42 @@ mod tests {
         assert_eq!(format_rate(1_000_000_000.0, 'g'), "1.00 Gbits/sec");
         // ladder: 1000 >= 999.5 -> %.0f
         assert_eq!(format_rate(1_000_000_000.0, 'm'), "1000 Mbits/sec");
+    }
+
+    /// #241: uppercase = BYTE-rates — GT's unit_snprintf takes bytes and
+    /// only multiplies by 8 for lowercase (units.c:299-302), with 1024
+    /// divisors for the byte side. Live GT pin (2026-06-11): a 10 Mbit/s
+    /// run under `-f K` prints "1278 KBytes/sec", NOT Kbits.
+    #[test]
+    fn format_rate_uppercase_byte_rates() {
+        assert_eq!(format_rate(8.0 * 1024.0, 'K'), "1.00 KBytes/sec");
+        assert_eq!(format_rate(8.0 * 1024.0 * 1024.0, 'M'), "1.00 MBytes/sec");
+        assert_eq!(
+            format_rate(8.0 * 1024.0 * 1024.0 * 1024.0, 'G'),
+            "1.00 GBytes/sec"
+        );
+        assert_eq!(
+            format_rate(8.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0, 'T'),
+            "1.00 TBytes/sec"
+        );
+        // The precision ladder applies to byte-rates too: 10 Mbit/s ->
+        // 1,310,720 bytes/s -> 1280 KiB/s -> %.0f.
+        assert_eq!(format_rate(10_485_760.0, 'K'), "1280 KBytes/sec");
+        // Case is semantic, not cosmetic.
+        assert_eq!(format_rate(10_485_760.0, 'k'), "10486 Kbits/sec");
+    }
+
+    /// 'A' as a rate format = adaptive BYTE-rate (unit_snprintf's uppercase
+    /// adaptive arm, 1024-stepped). Unreachable from the CLI (GT rejects
+    /// -f A with IEBADFORMAT) but part of the lib's format_char surface.
+    #[test]
+    fn format_rate_adaptive_bytes() {
+        assert_eq!(format_rate(16_384.0, 'A'), "2.00 KBytes/sec");
+        assert_eq!(
+            format_rate(8.0 * 1024.0 * 1024.0 * 1.5, 'A'),
+            "1.50 MBytes/sec"
+        );
+        assert_eq!(format_rate(800.0, 'A'), "100 Bytes/sec");
     }
 
     #[test]
