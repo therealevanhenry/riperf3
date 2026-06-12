@@ -364,6 +364,24 @@ impl Server {
         // speak, and real iperf3 clients never send these values — dropping
         // the control connection is the safe shape for a hostile peer.
         let cfg = TestConfig::from_params(&params)?;
+
+        // #230: GT's upfront requested-duration check — the tail of
+        // get_parameters (iperf_api.c:2666): with --server-max-duration set,
+        // refuse at param exchange when (time + omit) > max, or when the
+        // request is unbounded (time == 0 — which is every -n/-k run, since
+        // the client zeroes the wire duration, iperf_api.c:1981, and -t 0).
+        // GT runs this BEFORE auth and skips on_connect entirely (the goto
+        // error_handling path), so it sits ahead of the connect block and
+        // the capture guard. cfg.duration already mirrors GT's server-side
+        // default (absent time → 10). The flag arms NO timer — the in-flight
+        // watchdog below is duration-anchored and flag-independent, like
+        // GT's create_server_timers.
+        if let Some(max) = self.server_max_duration.filter(|&m| m > 0) {
+            if cfg.duration.saturating_add(cfg.omit) > max || cfg.duration == 0 {
+                return self.refuse_max_duration(&mut ctrl).await;
+            }
+        }
+
         // --get-server-output (#33): when the client asks and this server is
         // in text mode, TEE the console report into the exchange buffer
         // (iperf3's iperf_printf dual-write — the console stays live).
@@ -780,10 +798,21 @@ impl Server {
             )
         };
 
-        // ---- Wait for TEST_END (with optional max duration and bitrate limit) ----
+        // ---- Wait for TEST_END (with the duration watchdog and bitrate limit) ----
         let bitrate_limit = self.server_bitrate_limit;
         let test_start = report_start;
-        let max_dur_secs = self.server_max_duration.unwrap_or(0) as u64;
+        // #230: GT's in-flight 160-watchdog (create_server_timers,
+        // iperf_server_api.c:380-395) arms for EVERY test with a nonzero
+        // requested duration, at (time + omit + grace) where grace =
+        // max_rtt(4) × state_transitions(10) = 40 s — flag-independent.
+        // --server-max-duration arms nothing here; it only drives the
+        // upfront param-exchange check. Unbounded (-n/-k/-t 0) requests get
+        // no watchdog, exactly like GT's `if (test->duration != 0)` gate.
+        const WATCHDOG_GRACE_SECS: u64 = 40;
+        let watchdog_secs = match cfg.duration {
+            0 => 0,
+            d => (d as u64).saturating_add(cfg.omit as u64) + WATCHDOG_GRACE_SECS,
+        };
 
         let mut rate_check = tokio::time::interval(std::time::Duration::from_secs(1));
         rate_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -791,13 +820,13 @@ impl Server {
 
         // #237: ONE absolute deadline, pinned before the loop. A sleep()
         // recreated inside select! restarts from zero every time another arm
-        // (the 1 Hz rate ticks) re-enters the loop, so a max duration > ~1 s
+        // (the 1 Hz rate ticks) re-enters the loop, so a deadline > ~1 s
         // could never fire. Guarded below, so the 0-when-unset deadline
         // (already in the past) is never polled.
-        let max_dur_deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
-            test_start + std::time::Duration::from_secs(max_dur_secs),
+        let watchdog_deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
+            test_start + std::time::Duration::from_secs(watchdog_secs),
         ));
-        tokio::pin!(max_dur_deadline);
+        tokio::pin!(watchdog_deadline);
 
         // #224 (iperf 3.21 ground truth): a SELF-terminated test (bitrate
         // limit / max duration) relays SERVER_ERROR + i_errno and skips BOTH
@@ -856,7 +885,7 @@ impl Server {
                         }
                     }
                 }
-                _ = &mut max_dur_deadline, if max_dur_secs > 0 => {
+                _ = &mut watchdog_deadline, if watchdog_secs > 0 => {
                     // #224: iperf3's server_timer_proc — SERVER_ERROR +
                     // IESERVERTESTDURATIONEXPIRED(160) on the wire.
                     protocol::send_server_error(&mut ctrl, 160).await?;
@@ -867,6 +896,24 @@ impl Server {
         }
 
         // ---- Shut down streams ----
+        // GT mirror (#230): a self-terminated test CLOSES its data sockets at
+        // once — server_timer_proc frees every stream + ctrl_sck on the 160
+        // path, cleanup_server pthread_cancels on the rate path — so a
+        // wedged/silent peer cannot hold the post-loop joins hostage (a
+        // receiver parked in stream.read() never re-checks `done`; the
+        // PR #247 r1 probe measured a 169 s hang against a SIGSTOP'd client).
+        // The real work is on the TCP async tasks (abort drops the socket at
+        // the next await); the UDP runners are spawn_blocking, where abort
+        // is a no-op once running — their joins stay bounded anyway by the
+        // 500 ms read-timeout + `done` polling in the blocking loops.
+        if server_error.is_some() {
+            for s in &streams {
+                s.task.abort();
+            }
+            if let Some(h) = &udp_demux_handle {
+                h.abort();
+            }
+        }
         // #55 window, #159 order: stop the streams, let the catch-up land,
         // then hand the reporter the authoritative end time for the flush.
         let measured_elapsed = report_start.elapsed().as_secs_f64();
@@ -1907,6 +1954,37 @@ impl Server {
         }
     }
 
+    /// #230: refuse a test at param exchange (GT's upfront requested-duration
+    /// check). Sends cleanup_server's relay — SERVER_ERROR + the
+    /// (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair — then renders GT's
+    /// refusal shapes per output mode (live-captured, iperf 3.21): text gets
+    /// the one stderr line; -J gets the skeleton error document (no
+    /// accepted_connection/cookie — GT skips on_connect on this path); a
+    /// --json-stream server gets the error + empty-end event pair with no
+    /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
+    /// persistent server goes on to serve the next test.
+    async fn refuse_max_duration(&self, ctrl: &mut tokio::net::TcpStream) -> Result<()> {
+        const MSG: &str =
+            "client's requested duration exceeds the server's maximum permitted limit";
+        protocol::send_server_error(ctrl, 37).await?;
+        if self.json_stream {
+            // #198's pre-test error tail (error event + empty end event) is
+            // byte-identical to GT's refusal events — reuse it (r1 item 8),
+            // routed through the stream emitter for its flush.
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
+                &format!("error - {MSG}"),
+            ));
+        } else if self.json_output {
+            println!(
+                "{}",
+                crate::json_report::error_document(&format!("error - {MSG}"))
+            );
+        } else {
+            eprintln!("riperf3: error - {MSG}");
+        }
+        Ok(())
+    }
+
     /// `--json-stream`: emit the server's `end` event (#62). The interval events
     /// were already streamed live by the reporter.
     #[allow(clippy::too_many_arguments)]
@@ -2111,8 +2189,11 @@ impl ServerBuilder {
         self
     }
 
-    /// `--server-max-duration`: abort any test that runs longer than `secs`
-    /// seconds (unset: no limit).
+    /// `--server-max-duration`: refuse, at param exchange, any test whose
+    /// requested duration + omit exceeds `secs` — or whose duration is
+    /// unbounded (`-n`/`-k`/`-t 0`) — exactly like iperf3's upfront check
+    /// (#230). It arms no timer; the in-flight watchdog is duration-anchored
+    /// and independent of this flag. Unset (or 0): no limit.
     pub fn server_max_duration(mut self, secs: u32) -> Self {
         self.server_max_duration = Some(secs);
         self

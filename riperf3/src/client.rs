@@ -760,7 +760,18 @@ impl Client {
             TransportProtocol::Tcp => p.tcp = Some(true),
             TransportProtocol::Udp => p.udp = Some(true),
         }
-        p.time = Some(self.duration as i32);
+        // GT zeroes the wire `time` for byte/block-limited runs
+        // (iperf_api.c:1981: -n/-k without -t → duration 0), and its server's
+        // upfront max-duration check treats 0 as "unbounded request" (#230).
+        // Mirror the lib's own end-condition priority — bytes/blocks win, so
+        // duration is not the end condition and must not go on the wire.
+        p.time = Some(
+            if self.bytes_to_send.is_some() || self.blocks_to_send.is_some() {
+                0
+            } else {
+                self.duration as i32
+            },
+        );
         p.omit = Some(self.omit as i32);
         p.parallel = Some(self.num_streams as i32);
         p.len = Some(blksize as i32);
