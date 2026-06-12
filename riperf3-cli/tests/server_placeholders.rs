@@ -144,3 +144,56 @@ fn placeholders_are_verbose_only_and_server_only() {
         "the client never prints placeholders: {cout}"
     );
 }
+
+/// r1 blocker: GT's UDP summary-sum block has NO placeholder branch
+/// (iperf_api.c:4517-4538 silently skips the unmeasured half's SUM row;
+/// only the TCP/SCTP block has the [SUM] twins at :4451/:4463/:4483) — a
+/// UDP -P 2 -V server prints per-stream placeholders but NEVER a [SUM] one.
+#[test]
+fn verbose_udp_parallel_server_prints_no_sum_placeholder() {
+    let (sout, _) = run(&["-V"], &["-u", "-P", "2"]);
+    let block = final_block(&sout);
+    assert_eq!(
+        block.matches(SENDER_NA).count(),
+        2,
+        "per-stream UDP placeholders only — GT prints no UDP [SUM] twin: {block}"
+    );
+    assert!(
+        !block.contains(&format!("[SUM{SENDER_NA}")),
+        "no [SUM] placeholder on UDP (GT's UDP sum block has no such branch): {block}"
+    );
+    assert!(
+        block.lines().any(|l| l.starts_with("[SUM]") && l.contains("receiver")),
+        "the measured UDP SUM receiver row still prints: {block}"
+    );
+}
+
+/// Bidir -V: both placeholder kinds appear, each adjacent to its stream's
+/// measured row, and placeholder lines carry NO bidir role tag — GT prints
+/// a plain `[  5] (sender statistics not available)`, never `[  5][RX-S]`
+/// (live capture; r1 mutation (c) survived without this pin).
+#[test]
+fn verbose_bidir_server_placeholders_carry_no_role_tag() {
+    let (sout, _) = run(&["-V"], &["--bidir"]);
+    let block = final_block(&sout);
+    let phs: Vec<&str> = block
+        .lines()
+        .filter(|l| l.contains("statistics not available"))
+        .collect();
+    assert_eq!(
+        phs.len(),
+        2,
+        "one placeholder per direction (sender twin for the RX stream, \
+         receiver twin for the TX stream): {block}"
+    );
+    for ph in &phs {
+        assert!(
+            !ph.contains("][") && !ph.contains("-S]"),
+            "placeholder rows carry NO role tag (GT shape): {ph}"
+        );
+    }
+    assert!(
+        block.contains(SENDER_NA) && block.contains(RECEIVER_NA),
+        "both directions get their twin: {block}"
+    );
+}
