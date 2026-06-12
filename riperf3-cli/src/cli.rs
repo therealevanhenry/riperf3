@@ -40,7 +40,10 @@ pub struct Cli {
     // (unit_snprintf 'a'/'A'). The old forced "m" default printed
     // 12120.88 MBytes where iperf3 prints 11.8 GBytes (#221). NB: a ///
     // here would leak into clap's --help text (r1 blocker).
-    #[arg(short, long, ignore_case = true, value_enum, value_name = "format")]
+    // Case-sensitive like iperf3's [kmgtKMGT] (#241): lowercase = bit-rates,
+    // UPPERCASE = byte-rates — ignore_case used to collapse `-f K` into
+    // Kbits, silently a different unit.
+    #[arg(short, long, value_enum, value_name = "format")]
     pub format: Option<Format>,
 
     /// Seconds between periodic throughput reports
@@ -478,16 +481,10 @@ impl Cli {
 
         let mut builder = riperf3::ClientBuilder::new(host);
 
-        // Format: each letter maps to its bit-rate char (#241 tracks the
-        // uppercase byte-rate meanings); absent → the library's adaptive
-        // default ('a'), like iperf3 (#221).
+        // Format (#241): case-sensitive [kmgtKMGT], uppercase = byte-rates;
+        // absent → the library's adaptive default ('a'), like iperf3 (#221).
         if let Some(f) = &self.format {
-            builder = builder.format_char(match f {
-                Format::K => 'k',
-                Format::M => 'm',
-                Format::G => 'g',
-                Format::T => 't',
-            });
+            builder = builder.format_char(f.as_char());
         }
 
         if let Some(port) = self.port {
@@ -657,6 +654,12 @@ impl Cli {
     pub fn build_server(&self) -> std::result::Result<riperf3::Server, Box<dyn std::error::Error>> {
         let mut builder = riperf3::ServerBuilder::new();
 
+        // Format (#242): the server-side -f was silently dropped — never
+        // wired through the builder, every render site hardcoded adaptive.
+        // Same case-sensitive mapping as the client (#241).
+        if let Some(f) = &self.format {
+            builder = builder.format_char(f.as_char());
+        }
         if let Some(port) = self.port {
             builder = builder.port(Some(port));
         }
@@ -721,10 +724,46 @@ impl Cli {
 
 #[derive(Debug, Clone, PartialEq, ValueEnum)]
 pub enum Format {
-    K,
-    M,
-    G,
-    T,
+    /// Kbits/sec
+    #[value(name = "k")]
+    Kbits,
+    /// Mbits/sec
+    #[value(name = "m")]
+    Mbits,
+    /// Gbits/sec
+    #[value(name = "g")]
+    Gbits,
+    /// Tbits/sec
+    #[value(name = "t")]
+    Tbits,
+    /// KBytes/sec
+    #[value(name = "K")]
+    KBytes,
+    /// MBytes/sec
+    #[value(name = "M")]
+    MBytes,
+    /// GBytes/sec
+    #[value(name = "G")]
+    GBytes,
+    /// TBytes/sec
+    #[value(name = "T")]
+    TBytes,
+}
+
+impl Format {
+    /// The unit_snprintf-style char the lib's `format_char` expects.
+    fn as_char(&self) -> char {
+        match self {
+            Format::Kbits => 'k',
+            Format::Mbits => 'm',
+            Format::Gbits => 'g',
+            Format::Tbits => 't',
+            Format::KBytes => 'K',
+            Format::MBytes => 'M',
+            Format::GBytes => 'G',
+            Format::TBytes => 'T',
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -774,29 +813,43 @@ mod cli_tests {
 
         #[test]
         fn test_common_format() {
-            let cli = Cli::parse_from(["riperf3", "--server", "--format", "k"]);
-            assert_eq!(cli.format, Some(Format::K));
+            // #241: case is semantic — all 8 of iperf3's [kmgtKMGT], each to
+            // its own variant, on both roles.
+            for (letter, want) in [
+                ("k", Format::Kbits),
+                ("m", Format::Mbits),
+                ("g", Format::Gbits),
+                ("t", Format::Tbits),
+                ("K", Format::KBytes),
+                ("M", Format::MBytes),
+                ("G", Format::GBytes),
+                ("T", Format::TBytes),
+            ] {
+                let cli = Cli::parse_from(["riperf3", "--server", "--format", letter]);
+                assert_eq!(cli.format, Some(want.clone()), "-f {letter} (server)");
+                let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", letter]);
+                assert_eq!(cli.format, Some(want), "-f {letter} (client)");
+            }
+        }
 
-            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "g"]);
-            assert_eq!(cli.format, Some(Format::G));
-
-            let cli = Cli::parse_from(["riperf3", "--server", "--format", "t"]);
-            assert_eq!(cli.format, Some(Format::T));
-
-            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "m"]);
-            assert_eq!(cli.format, Some(Format::M));
-
-            let cli = Cli::parse_from(["riperf3", "--server", "--format", "M"]);
-            assert_eq!(cli.format, Some(Format::M));
-
-            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "T"]);
-            assert_eq!(cli.format, Some(Format::T));
-
-            let cli = Cli::parse_from(["riperf3", "--server", "--format", "G"]);
-            assert_eq!(cli.format, Some(Format::G));
-
-            let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", "K"]);
-            assert_eq!(cli.format, Some(Format::K));
+        #[test]
+        fn test_format_chars_match_unit_snprintf() {
+            // The CLI→lib glue: each variant maps to the exact unit_snprintf
+            // char; uppercase survives (the old ignore_case + 4-variant enum
+            // collapsed K to 'k').
+            for (letter, ch) in [
+                ("k", 'k'),
+                ("m", 'm'),
+                ("g", 'g'),
+                ("t", 't'),
+                ("K", 'K'),
+                ("M", 'M'),
+                ("G", 'G'),
+                ("T", 'T'),
+            ] {
+                let cli = Cli::parse_from(["riperf3", "--server", "--format", letter]);
+                assert_eq!(cli.format.unwrap().as_char(), ch, "-f {letter}");
+            }
         }
     }
 
