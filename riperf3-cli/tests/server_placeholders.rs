@@ -126,6 +126,26 @@ fn verbose_parallel_server_prints_per_stream_and_sum_placeholders() {
         sum_lines[0].contains(SENDER_NA) && sum_lines[1].contains("receiver"),
         "the SUM placeholder precedes the SUM receiver row (GT order): {block}"
     );
+    // r2 mutation (d): the server's row ORDER itself — per-stream rows
+    // first, [SUM] rows after — was unpinned (a SUMs-first re-inline
+    // survived the whole suite while producing grossly un-GT output).
+    let last_stream_row = block
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("[  ") && l.contains("sec"))
+        .map(|(i, _)| i)
+        .last()
+        .expect("per-stream rows");
+    let first_sum_row = block
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.starts_with("[SUM]"))
+        .map(|(i, _)| i)
+        .expect("SUM rows");
+    assert!(
+        last_stream_row < first_sum_row,
+        "per-stream rows precede every [SUM] row (GT order): {block}"
+    );
 }
 
 /// The verbose gate: a PLAIN server prints no placeholder (GT same), and a

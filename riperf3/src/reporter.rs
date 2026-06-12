@@ -359,10 +359,14 @@ pub fn print_final_summaries_server(
     per_stream: &[StreamSummary],
     format_char: char,
     verbose: bool,
+    protocol: crate::TransportProtocol,
 ) {
+    let is_udp = matches!(protocol, crate::TransportProtocol::Udp);
     for s in final_summary_rows(per_stream) {
-        // UDP SUM rows carry datagram stats; that's GT's no-placeholder arm.
-        let udp_sum = s.stream_id < 0 && s.total_packets.is_some();
+        // r2 item 2: the protocol arrives explicitly — shape-sniffing the
+        // row (total_packets presence) was sound but fragile against a
+        // poisoned-stats fallback flipping a UDP SUM into the TCP arm.
+        let udp_sum = s.stream_id < 0 && is_udp;
         let placeholder = verbose && !udp_sum;
         if placeholder && !s.is_sender {
             titled(format_args!(

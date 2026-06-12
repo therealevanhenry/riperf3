@@ -997,7 +997,12 @@ impl Server {
                 vprintln!("Test Complete. Summary Results:");
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
-            crate::reporter::print_final_summaries_server(&summaries, 'a', self.verbose);
+            crate::reporter::print_final_summaries_server(
+                &summaries,
+                'a',
+                self.verbose,
+                cfg.protocol,
+            );
             if self.verbose && streams.iter().any(|s| s.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
@@ -1161,7 +1166,12 @@ impl Server {
                 vprintln!("Test Complete. Summary Results:");
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
-            crate::reporter::print_final_summaries_server(&summaries, 'a', self.verbose);
+            crate::reporter::print_final_summaries_server(
+                &summaries,
+                'a',
+                self.verbose,
+                cfg.protocol,
+            );
             if self.verbose && streams.iter().any(|s| s.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
