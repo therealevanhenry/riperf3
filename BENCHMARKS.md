@@ -16,7 +16,7 @@ environment-specific.
 
 > **0.7.4 status.** Fully re-measured at the `0.7.4` patch: the compatibility
 > matrix is all-PASS (**52/52** on the closing run at the final code commit `49d803b`
-> — the release commit adds only the version bump; wave 2's eight per-merge
+> — the release commit adds only release metadata — version, lockfile, changelog; wave 2's eight per-merge
 > smokes each read 52/52 in session records) and a fresh full N=30 campaign
 > lands **12 riperf3 / 4 parity / 0 slower** — riperf3 is significantly faster
 > in every UDP cell (+8.7% to +13.9%) and every TCP `-P8` cell (+4.1% to
@@ -171,8 +171,9 @@ comparison is defensible rather than anecdotal.
 cell (`-t 5` s each), **960 runs attempted**, run in **randomized order** across
 all (cell, tool, iteration) tuples so host/thermal drift can't systematically
 favor either tool. 2 warm-ups per cell discarded; fresh `-s -1` server per run
-on a unique port (see the failed-runs note for the two campaigns where the
-port uniqueness was silently broken); hard `timeout` wrappers; VMs confirmed idle and isolated for
+on a unique port (see the failed-runs note — every stored campaign ran with
+the broken increment; 0.7.3/0.7.4 are the two whose CSVs record collisions,
+0.7.2's escaped clean); hard `timeout` wrappers; VMs confirmed idle and isolated for
 the duration. **This campaign recorded 108 failed runs (11%)** — uniformly
 distributed across tools (57 iperf3 / 51 riperf3), protocols, directions, and
 time. Post-campaign diagnosis found a harness bug: the per-run port increment
@@ -181,8 +182,9 @@ CSV shows 101 such rows, making that edition's "0 failed runs" line wrong;
 0.7.2's is clean) actually shared ONE port, and a connect occasionally raced
 the previous server's teardown on it. Not a tool signal, and the drops are
 throughput-independent, so the comparison is unbiased — but "unique port per
-run" below describes the intent and the FIXED harness, not these two
-campaigns as run. Retained n = 22–30 per cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
+run" below describes the intent and the FIXED harness — every stored
+campaign ran with the broken increment (the harness shipped that way);
+0.7.3 and 0.7.4 are simply the two whose CSVs record collisions. Retained n = 22–30 per cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
 t (two-sided, normal approx); "parity" = not significant at p<0.05.
 
 ### Throughput: riperf3 vs iperf3 (mean Gbps [95% CI])
@@ -322,8 +324,8 @@ isolation. That orchestration assumes our sandbox, so it isn't shipped as a
 turnkey script. The method is, so the results stay auditable and the campaign is
 replicable on any two hosts: N=30 randomized iterations/cell, 2 warm-ups
 discarded, a fresh `-s -1` server per run on a unique port (true of the FIXED
-harness; see the failed-runs note — the 0.7.3/0.7.4 campaigns as run shared
-one port), UDP at `-b 0`, and a
+harness; see the failed-runs note — every stored campaign as run shared one
+port, with collisions recorded in the 0.7.3/0.7.4 CSVs), UDP at `-b 0`, and a
 direction-aware parse (forward → client `sum_sent`, reverse → `sum_received`,
 UDP → `sum`; `-P>1` aggregates already summed in `-J`). Cross-version regression
 checks (e.g. 0.6.3-vs-0.7.0, 0.7.1-vs-0.7.2) reuse the campaign by pointing the
