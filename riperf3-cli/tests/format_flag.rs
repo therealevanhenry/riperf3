@@ -91,14 +91,71 @@ fn server_and_client_each_honor_their_own_format() {
         sout.contains(" KBytes/sec"),
         "server -f K renders KBytes/sec rows (#242 wiring + #241 case): {sout}"
     );
-    assert!(
-        !sout.contains(" Kbits/sec") && !sout.contains(" Gbits/sec"),
-        "no bit-rate rows on a -f K server: {sout}"
-    );
+    // The full bit-rate unit family (r1 blocker: " Mbits/sec" — exactly
+    // what the adaptive default renders at -b 10M — was missing, so a
+    // reverted render site slipped past with the OTHER site satisfying
+    // the positive assert).
+    for reject in [
+        " Kbits/sec",
+        " Mbits/sec",
+        " Gbits/sec",
+        " Tbits/sec",
+        " bits/sec",
+    ] {
+        assert!(
+            !sout.contains(reject),
+            "bit-rate row ({reject}) on a -f K server: {sout}"
+        );
+    }
     assert!(
         sout.contains("MBytes  ") || sout.contains("KBytes  "),
         "the Transfer column stays adaptive bytes (#221's always-'A' rule): {sout}"
     );
+}
+
+/// --get-server-output relays the SERVER's own format in the captured block
+/// (GT live, r1: a -f K server's relayed rows say KBytes/sec even for a
+/// plain client) — pins the capture-path render site, which the two-sided
+/// test above cannot see (r1 mutation c1 survived without this).
+#[test]
+fn get_server_output_carries_the_server_format() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["-f", "K"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = common::run_client(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "-b",
+            "10M",
+            "--get-server-output",
+        ],
+        Duration::from_secs(30),
+        "client --get-server-output",
+    );
+    let _ = collect(server, "server -f K");
+
+    assert_eq!(client.status.code(), Some(0), "{}", client.stderr);
+    let block = client
+        .stdout
+        .split("Server output:")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no Server output block: {}", client.stdout));
+    assert!(
+        block.contains(" KBytes/sec"),
+        "the captured server block renders the SERVER's -f K: {block}"
+    );
+    for reject in [" Kbits/sec", " Mbits/sec", " Gbits/sec", " bits/sec"] {
+        assert!(
+            !block.contains(reject),
+            "bit-rate leak ({reject}) in the captured block: {block}"
+        );
+    }
 }
 
 /// Case is semantic end-to-end: `-f k` (bits) and `-f K` (bytes) produce
