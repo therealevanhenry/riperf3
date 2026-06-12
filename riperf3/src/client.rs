@@ -1925,11 +1925,14 @@ impl Client {
                     is_sender: s.is_sender,
                     local_bytes,
                     remote_bytes: server_stream.map(|x| x.bytes),
-                    // #235: the peer's exchanged SENT datagram count, net of
-                    // its omitted baseline — GT's peer_packet_count. Exact
-                    // where the bytes-derived figure loses the tail partial
-                    // datagram.
-                    remote_packets: server_stream.map(|x| x.packets - x.omitted_packets),
+                    // #235: the peer's exchanged SENT datagram count, net
+                    // of its omitted baseline — exact when the peer keeps
+                    // true counters (iperf3); riperf3 peers exchange
+                    // bytes-derived figures until #235's counter half.
+                    // saturating: the #24 sentinel-hardening posture for
+                    // adversarial gross/omitted pairs.
+                    remote_packets: server_stream
+                        .map(|x| x.packets.saturating_sub(x.omitted_packets)),
                     retransmits,
                     tcp_end,
                     udp,
