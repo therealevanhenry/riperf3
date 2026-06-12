@@ -163,7 +163,9 @@ fn verbose_udp_parallel_server_prints_no_sum_placeholder() {
         "no [SUM] placeholder on UDP (GT's UDP sum block has no such branch): {block}"
     );
     assert!(
-        block.lines().any(|l| l.starts_with("[SUM]") && l.contains("receiver")),
+        block
+            .lines()
+            .any(|l| l.starts_with("[SUM]") && l.contains("receiver")),
         "the measured UDP SUM receiver row still prints: {block}"
     );
 }
