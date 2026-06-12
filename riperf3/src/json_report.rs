@@ -1905,8 +1905,11 @@ mod tests {
 
     /// The server-role twin (a green pin guarding the direction-filter
     /// refactor): the server's reverse channel is what IT sends — local
-    /// retransmits — and the forward pair carries none (the client's
-    /// per-stream retransmits are never exchanged to the server).
+    /// retransmits — and the forward pair carries none. NOT because the
+    /// client withholds them (the exchange is symmetric, iperf_api.c:2764/
+    /// 2944): GT's server PRINTS before it exchanges (reporter_callback at
+    /// iperf_server_api.c:277 vs iperf_exchange_results at :280), so the
+    /// peer's figures never reach its report (r1 item 4).
     #[test]
     fn tcp_bidir_server_reverse_sent_uses_local_retransmits() {
         let mut input = base_input();
