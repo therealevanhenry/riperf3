@@ -169,6 +169,9 @@ pub struct Server {
     /// dumps stats, sends SERVER_TERMINATE, and `run()` returns.
     pub(crate) interrupt: Option<crate::client::InterruptWatch>,
     pub(crate) json_stream_full_output: bool,
+    /// `-f` unit format for the text report (#242): the server-side flag was
+    /// silently ignored — every render site hardcoded the adaptive default.
+    pub(crate) format_char: char,
 }
 
 /// Best-effort source IP the kernel would use to reach `client_addr`, paired
@@ -240,7 +243,6 @@ impl Server {
             // -V reprints version/uname EVERY accept round, like GT's
             // iperf_run_server loop (r1 item 12; #222).
             if self.verbose {
-                // (Already inside the !json gate.)
                 vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
                 vprintln!("{}", crate::utils::system_info());
             }
@@ -752,7 +754,8 @@ impl Server {
                 crate::reporter::IntervalReporterConfig {
                     interval_secs: 1.0,
                     protocol: cfg.protocol,
-                    format_char: 'a',
+                    // #242: the wired -f (was a hardcoded adaptive default).
+                    format_char: self.format_char,
                     omit_secs: cfg.omit,
                     forceflush: self.forceflush,
                     json_stream: self.json_stream,
@@ -997,7 +1000,7 @@ impl Server {
                 vprintln!("Test Complete. Summary Results:");
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
-            crate::reporter::print_final_summaries(&summaries, 'a');
+            crate::reporter::print_final_summaries(&summaries, self.format_char);
             if self.verbose && streams.iter().any(|s| s.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
@@ -1161,7 +1164,7 @@ impl Server {
                 vprintln!("Test Complete. Summary Results:");
             }
             crate::reporter::print_final_header(cfg.protocol, cfg.bidir, with_retr);
-            crate::reporter::print_final_summaries(&summaries, 'a');
+            crate::reporter::print_final_summaries(&summaries, self.format_char);
             if self.verbose && streams.iter().any(|s| s.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
@@ -2006,6 +2009,7 @@ pub struct ServerBuilder {
     json_stream: bool,
     interrupt: Option<crate::client::InterruptWatch>,
     json_stream_full_output: bool,
+    format_char: char,
 }
 
 impl Default for ServerBuilder {
@@ -2031,6 +2035,8 @@ impl Default for ServerBuilder {
             json_stream: false,
             interrupt: None,
             json_stream_full_output: false,
+            // iperf3 has NO default -f: every figure auto-scales (#221).
+            format_char: 'a',
         }
     }
 }
@@ -2109,6 +2115,15 @@ impl ServerBuilder {
     /// seconds (unset: no limit).
     pub fn server_max_duration(mut self, secs: u32) -> Self {
         self.server_max_duration = Some(secs);
+        self
+    }
+
+    /// `-f` unit format for the text report (#242), unit_snprintf chars:
+    /// lowercase `kmgt` = bit-rates, UPPERCASE `KMGT` = byte-rates (#241),
+    /// `'a'`/`'A'` adaptive. The Transfer column is always adaptive bytes,
+    /// like iperf3 (#221); this drives the Bitrate column.
+    pub fn format_char(mut self, c: char) -> Self {
+        self.format_char = c;
         self
     }
 
@@ -2250,6 +2265,7 @@ impl ServerBuilder {
             json_stream: self.json_stream,
             interrupt: self.interrupt.clone(),
             json_stream_full_output: self.json_stream_full_output,
+            format_char: self.format_char,
         })
     }
 }
@@ -2496,6 +2512,17 @@ mod tests {
         fn server_builder_verbose() {
             let s = ServerBuilder::new().verbose(true).build().unwrap();
             assert!(s.verbose);
+        }
+
+        #[test]
+        fn server_builder_format_char() {
+            // #242: -f is wired to Server.format_char (the render sites used
+            // to hardcode 'a'); uppercase byte-rate chars survive (#241).
+            let s = ServerBuilder::new().format_char('K').build().unwrap();
+            assert_eq!(s.format_char, 'K');
+            // iperf3 has no default -f: adaptive.
+            let s = ServerBuilder::new().build().unwrap();
+            assert_eq!(s.format_char, 'a');
         }
 
         #[test]
