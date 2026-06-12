@@ -561,6 +561,10 @@ pub struct StreamReport {
     pub local_bytes: u64,
     /// Bytes the peer reports for the opposite side of this stream, if known.
     pub remote_bytes: Option<u64>,
+    /// Sender-side retransmit total: the LOCAL TCP_INFO cumulative for
+    /// streams this host sent, the PEER's exchanged per-stream figure for
+    /// streams it received (gated on the peer's sender_has_retransmits
+    /// flag; None when ungated) — #236.
     pub retransmits: Option<i64>,
     /// Sender-side TCP_INFO extremes for the `end.streams[].sender` object (PR2).
     /// Only set for streams this host sent (local TCP_INFO); `None` otherwise.
@@ -2734,7 +2738,7 @@ mod tests {
         input.reverse = true;
         let mut s = tcp_stream(1, false, 2_000_000, 2_000_000);
         s.tcp_end = None; // reverse: no local sender TCP_INFO
-        s.retransmits = Some(0); // iperf3 emits 0 here on a retransmit-capable OS
+        s.retransmits = Some(0); // the peer's exchanged count of 0 (flag on)
         input.streams = vec![s];
         let snd =
             serde_json::to_value(input.build()).unwrap()["end"]["streams"][0]["sender"].clone();
