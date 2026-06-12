@@ -1925,6 +1925,11 @@ impl Client {
                     is_sender: s.is_sender,
                     local_bytes,
                     remote_bytes: server_stream.map(|x| x.bytes),
+                    // #235: the peer's exchanged SENT datagram count, net of
+                    // its omitted baseline — GT's peer_packet_count. Exact
+                    // where the bytes-derived figure loses the tail partial
+                    // datagram.
+                    remote_packets: server_stream.map(|x| x.packets - x.omitted_packets),
                     retransmits,
                     tcp_end,
                     udp,

@@ -1838,6 +1838,9 @@ impl Server {
                     // The server never learns the peer's per-stream bytes; build()
                     // zeroes the un-measured side for is_server reports.
                     remote_bytes: None,
+                    // #235: never available server-side — the server prints
+                    // before the exchange (iperf_server_api.c:277 vs :280).
+                    remote_packets: None,
                     retransmits,
                     tcp_end,
                     udp,
