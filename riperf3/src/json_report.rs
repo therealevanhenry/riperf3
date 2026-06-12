@@ -1925,7 +1925,9 @@ mod tests {
             "the server's reverse = its own send path: {end}"
         );
         assert!(
-            end["sum_sent"].get("retransmits").is_none_or(|r| r.is_null()),
+            end["sum_sent"]
+                .get("retransmits")
+                .is_none_or(|r| r.is_null()),
             "the fwd (client->server) sent aggregate has no figure server-side: {end}"
         );
     }
