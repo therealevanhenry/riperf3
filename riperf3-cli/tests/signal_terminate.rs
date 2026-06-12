@@ -270,3 +270,60 @@ fn server_json_stream_emits_the_error_event_before_end() {
         "error precedes end, like iperf_json_finish:\n{sout}"
     );
 }
+
+/// #231: a SIGTERM while the client waits BETWEEN states (here: a raw server
+/// that accepts the control connection, reads the cookie, then goes silent —
+/// the client parks in its central recv_state wait, pre-ParamExchange) must
+/// take the same iperf_got_sigend path as a mid-test signal: dump, attempt
+/// CLIENT_TERMINATE, print the signal-normal line, exit 0. GT's
+/// iperf_catch_sigend is armed for the whole run with no phase gate
+/// (iperf_api.c: the client condition in iperf_got_sigend). Pre-#231 the
+/// unarmed wait ignored the first signal entirely (only #211's second-signal
+/// hard exit, which skips the dump, ever fired).
+#[test]
+fn client_sigterm_in_setup_wait_exits_promptly() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let hold = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut cookie = [0u8; 37];
+            let _ = s.read_exact(&mut cookie);
+            // Stay silent; the socket drops when the thread ends.
+            std::thread::sleep(Duration::from_secs(15));
+        }
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-t", "5"]);
+    // Enough for connect + cookie write + parking in the state wait, even on
+    // a loaded runner; well inside the mock's 15 s silence.
+    std::thread::sleep(Duration::from_millis(700));
+    let cpid = client.0.id() as i32;
+    let killed_at = Instant::now();
+    unsafe {
+        libc::kill(cpid, libc::SIGTERM);
+    }
+
+    let (cout, cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client in setup wait");
+    // PROMPTNESS is the pin: the CLI's #211 fallback produces the same exit
+    // shape after its 5 s dump-window timeout, so only the latency separates
+    // "the lib honored the watch" from "the fallback fired".
+    let reacted_in = killed_at.elapsed();
+    assert!(
+        reacted_in < Duration::from_secs(3),
+        "the signal must be honored AT the wait, not via the CLI's 5 s \
+         fallback window (#231): took {reacted_in:?}"
+    );
+    // And the DUMP is the other pin: iperf_got_sigend dumps for clients in
+    // EVERY phase (no phase gate); the fallback path prints no summary.
+    assert!(
+        cout.contains("- - - - -"),
+        "the accumulated-stats dump (empty rows pre-data, like GT): {cout}"
+    );
+    assert!(
+        cerr.contains("interrupt - the client has terminated by signal"),
+        "the signal-normal line from the setup-phase wait: {cerr:?}"
+    );
+    assert_eq!(ccode, 0, "TERM takes the exit-normal path: {cerr:?}");
+    drop(hold); // detached; the spawned thread dies with the process
+}

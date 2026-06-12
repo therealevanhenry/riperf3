@@ -388,7 +388,47 @@ impl Client {
 
         // ---- State machine: react to server-driven transitions ----
         loop {
-            let state = protocol::recv_state(&mut ctrl).await?;
+            // #231: iperf_catch_sigend is armed for the WHOLE run, so the
+            // central state wait polls the interrupt watch like the
+            // TEST_RUNNING selects — covering the setup phases AND the
+            // post-test ExchangeResults/DisplayResults waits, which
+            // previously ignored a signal until the control read returned
+            // (against a wedged server: forever, with only the CLI's #211
+            // second-signal hard exit as the way out). iperf_got_sigend's
+            // client arm has NO phase gate: it dumps the accumulated stats
+            // from any phase (empty rows pre-data), tells the peer via
+            // CLIENT_TERMINATE, and exits signal-normal — the same shape as
+            // the run_test arm. recv_state is a single 1-byte read, so the
+            // select is cancel-safe.
+            let state = tokio::select! {
+                s = protocol::recv_state(&mut ctrl) => s?,
+                msg = wait_interrupt(interrupt.as_mut()) => {
+                    let _ = protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
+                    self.print_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        None,
+                        blksize,
+                        &interval_data,
+                        &StartMeta {
+                            cookie: String::from_utf8_lossy(
+                                &cookie[..protocol::COOKIE_SIZE - 1],
+                            )
+                            .into_owned(),
+                            tcp_mss_default: control_mss,
+                            start_time_millis: test_start_millis,
+                        },
+                        measured_secs,
+                        Some(&msg),
+                    );
+                    return Ok(self.build_results(
+                        &streams,
+                        cpu_start.as_ref(),
+                        blksize,
+                        measured_secs,
+                    ));
+                }
+            };
 
             match state {
                 TestState::ParamExchange => {
