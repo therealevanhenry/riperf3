@@ -404,10 +404,21 @@ impl Client {
                 s = protocol::recv_state(&mut ctrl) => s?,
                 msg = wait_interrupt(interrupt.as_mut()) => {
                     let _ = protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
+                    // r1 item 5: a test that never STARTED reports a zero
+                    // window (GT's pre-data dump says 0/0/0), not the
+                    // requested -t default measured_secs still holds.
+                    let dump_secs = if test_start_millis > 0 {
+                        measured_secs
+                    } else {
+                        0.0
+                    };
                     self.print_results(
                         &streams,
                         cpu_start.as_ref(),
-                        None,
+                        // r1 item 7: post-ExchangeResults interrupts keep the
+                        // peer halves GT would show (its sigend dump merges
+                        // already-exchanged data); None only pre-exchange.
+                        server_results.as_ref(),
                         blksize,
                         &interval_data,
                         &StartMeta {
@@ -418,14 +429,14 @@ impl Client {
                             tcp_mss_default: control_mss,
                             start_time_millis: test_start_millis,
                         },
-                        measured_secs,
+                        dump_secs,
                         Some(&msg),
                     );
                     return Ok(self.build_results(
                         &streams,
                         cpu_start.as_ref(),
                         blksize,
-                        measured_secs,
+                        dump_secs,
                     ));
                 }
             };
