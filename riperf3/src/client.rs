@@ -2589,8 +2589,11 @@ impl ClientBuilder {
         self
     }
 
-    /// `-f/--format`: report units — `k`/`m`/`g`/`t` for bits, uppercase for
-    /// bytes; the default `'a'` picks adaptively.
+    /// `-f/--format`: report units — `k`/`m`/`g`/`t` for bit-rates, uppercase
+    /// `K`/`M`/`G`/`T` for byte-rates (#241); the default `'a'` picks
+    /// adaptively, and any other char falls back to adaptive. The Transfer
+    /// column is always adaptive bytes, like iperf3 (#221); this drives the
+    /// Bitrate column.
     pub fn format_char(mut self, c: char) -> Self {
         self.format_char = c;
         self
