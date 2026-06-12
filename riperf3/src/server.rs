@@ -899,7 +899,10 @@ impl Server {
         // wedged/silent peer cannot hold the post-loop joins hostage (a
         // receiver parked in stream.read() never re-checks `done`; the
         // PR #247 r1 probe measured a 169 s hang against a SIGSTOP'd client).
-        // Abort drops each task's socket at its next await point.
+        // The real work is on the TCP async tasks (abort drops the socket at
+        // the next await); the UDP runners are spawn_blocking, where abort
+        // is a no-op once running — their joins stay bounded anyway by the
+        // 500 ms read-timeout + `done` polling in the blocking loops.
         if server_error.is_some() {
             for s in &streams {
                 s.task.abort();
@@ -1962,13 +1965,11 @@ impl Server {
             "client's requested duration exceeds the server's maximum permitted limit";
         protocol::send_server_error(ctrl, 37).await?;
         if self.json_stream {
-            crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
-                "error",
+            // #198's pre-test error tail (error event + empty end event) is
+            // byte-identical to GT's refusal events — reuse it (r1 item 8),
+            // routed through the stream emitter for its flush.
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
                 &format!("error - {MSG}"),
-            ));
-            crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
-                "end",
-                &serde_json::Map::<String, serde_json::Value>::new(),
             ));
         } else if self.json_output {
             println!(
@@ -2182,8 +2183,11 @@ impl ServerBuilder {
         self
     }
 
-    /// `--server-max-duration`: abort any test that runs longer than `secs`
-    /// seconds (unset: no limit).
+    /// `--server-max-duration`: refuse, at param exchange, any test whose
+    /// requested duration + omit exceeds `secs` — or whose duration is
+    /// unbounded (`-n`/`-k`/`-t 0`) — exactly like iperf3's upfront check
+    /// (#230). It arms no timer; the in-flight watchdog is duration-anchored
+    /// and independent of this flag. Unset (or 0): no limit.
     pub fn server_max_duration(mut self, secs: u32) -> Self {
         self.server_max_duration = Some(secs);
         self
