@@ -561,6 +561,10 @@ pub struct StreamReport {
     pub local_bytes: u64,
     /// Bytes the peer reports for the opposite side of this stream, if known.
     pub remote_bytes: Option<u64>,
+    /// Sender-side retransmit total: the LOCAL TCP_INFO cumulative for
+    /// streams this host sent, the PEER's exchanged per-stream figure for
+    /// streams it received (gated on the peer's sender_has_retransmits
+    /// flag; None when ungated) — #236.
     pub retransmits: Option<i64>,
     /// Sender-side TCP_INFO extremes for the `end.streams[].sender` object (PR2).
     /// Only set for streams this host sent (local TCP_INFO); `None` otherwise.
@@ -874,8 +878,10 @@ impl ReportInput {
                 // Two flows: forward (client→server, server receives → sender=false)
                 // in sum_sent/sum_received; reverse (server→client, server sends →
                 // sender=true) in the *_bidir_reverse pair. Retransmits, measured on
-                // the server's send path, attach to the reverse (sent) side.
-                sum_sent_bidir_reverse = Some(self.tcp_sum(local_sent, true, retransmits));
+                // the server's send path, attach to the reverse (sent) side —
+                // direction-filtered like GT's per-pass accumulator (#236).
+                sum_sent_bidir_reverse =
+                    Some(self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))));
                 sum_received_bidir_reverse = Some(self.tcp_sum(0, true, None));
                 (
                     self.tcp_sum(0, false, None),
@@ -1038,10 +1044,15 @@ impl ReportInput {
                 (_, true) => 0,
                 _ => local_recv,
             };
-            sum_sent_bidir_reverse = Some(self.tcp_sum(rev_sent, false, None));
+            // #236: per-direction retransmit totals, like GT's per-pass
+            // accumulator — the reverse-sent aggregate carries the PEER's
+            // exchanged counts (riding this host's receiving streams;
+            // live-observed 2), the forward one ONLY the local senders'.
+            sum_sent_bidir_reverse =
+                Some(self.tcp_sum(rev_sent, false, self.retransmits_for(Some(false))));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
-                self.tcp_sum(local_sent, true, retransmits),
+                self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))),
                 self.tcp_sum(fwd_recv, true, None),
             )
         } else if is_udp {
@@ -1243,23 +1254,37 @@ impl ReportInput {
             // parity) while still carrying the packet/loss/jitter it measured. A
             // stream the server sent has no receiver stats, so its sent packet
             // count is derived from the bytes it pushed.
-            let (bytes, packets) = if self.is_server {
+            // The third element says whether `packets` carries SENDER-side
+            // provenance: iperf3's pct denominator is strictly the sender
+            // count, and the two figures have ASYMMETRIC fallbacks when it's
+            // absent — `packets` falls back to the measured receiver count
+            // (iperf_api.c:4311), lost_percent goes to 0.0 (:4288-4293
+            // else-branch), never the measured pct (#238; live-proven on a
+            // terminated bidir probe — iperf3 0 vs riperf3's old 14.75).
+            let (bytes, packets, has_sender_count) = if self.is_server {
                 if s.is_sender {
                     let blk = self.blksize.max(1) as u64;
-                    (s.local_bytes, (s.local_bytes / blk) as i64)
+                    (s.local_bytes, (s.local_bytes / blk) as i64, true)
                 } else {
-                    (0, u.packets)
+                    // Sender count absent on EVERY server run, not just
+                    // terminated ones (#238): GT's server does receive the
+                    // client's per-stream figures (get_results,
+                    // iperf_api.c:2942) but PRINTS first — reporter_callback
+                    // at iperf_server_api.c:277 runs before the exchange at
+                    // :280 — so they never reach its report. Plain
+                    // forward-UDP server docs included, not just bidir.
+                    (0, u.packets, false)
                 }
             } else if s.is_sender && s.udp.is_none() && self.error.is_some() {
                 // Terminated before the exchange (#170): no peer-measured
                 // stats — iperf3 reports the sender's LOCAL packet count.
                 let blk = self.blksize.max(1) as u64;
-                (s.local_bytes, (s.local_bytes / blk) as i64)
+                (s.local_bytes, (s.local_bytes / blk) as i64, true)
             } else if !s.is_sender && self.error.is_some() {
                 // Terminated receiver stream (-R): `bytes` is a SENDER-side
                 // count the dead peer never reported — iperf3 emits 0 while
                 // keeping the locally measured packets (#170 r2 f2).
-                (0, u.packets)
+                (0, u.packets, false)
             } else if !s.is_sender {
                 // #214 (3): `bytes` is a SENDER-side count — a stream this
                 // client RECEIVED reports the peer's exchanged sent figure
@@ -1267,17 +1292,24 @@ impl ReportInput {
                 // local only when the peer never reported one. `packets`
                 // follows the same provenance (r2 review): derive from the
                 // sender-side bytes like the server arm, with the measured
-                // count as the zero-bytes fallback.
+                // count as the zero-bytes fallback — for `packets` ONLY;
+                // the pct has no such fallback in iperf3 (#238).
                 let bytes = s.remote_bytes.unwrap_or(s.local_bytes);
                 let blk = self.blksize.max(1) as u64;
-                let packets = if bytes > 0 {
-                    (bytes / blk) as i64
+                if bytes > 0 {
+                    (bytes, (bytes / blk) as i64, true)
                 } else {
-                    u.packets
-                };
-                (bytes, packets)
+                    (bytes, u.packets, false)
+                }
             } else {
-                (s.local_bytes, u.packets)
+                // #239: a client SENDER stream reports its LOCAL sent count
+                // (sender_packet_count = sp->packet_count, iperf_api.c:
+                // 4220-4221), not the peer-measured #182 figure — they
+                // diverge under forward trailing loss. The peer-measured
+                // jitter/lost VALUES stay on the entry below; exact tail-
+                // partial-datagram counts are #235's residue.
+                let blk = self.blksize.max(1) as u64;
+                (s.local_bytes, (s.local_bytes / blk) as i64, true)
             };
             return EndStream {
                 sender: None,
@@ -1292,12 +1324,18 @@ impl ReportInput {
                     jitter_ms: u.jitter_secs * 1000.0,
                     lost_packets: u.lost_packets,
                     packets,
-                    // r3 review (F1): the denominator follows the same
-                    // sender-side provenance as `packets` — iperf3's
-                    // per-stream pct divides by the sender count
-                    // (iperf_api.c:4288-4293). `packets` already holds the
-                    // arm-appropriate figure (derived, or measured fallback).
-                    lost_percent: pct_lost(u.lost_packets, packets),
+                    // #238: the pct exists only over a sender-side
+                    // denominator; absent sender count -> 0.0 (GT's
+                    // `if (sender_packet_count - sender_omitted_packet_count
+                    // > 0)` else-branch at :4288; the bare-truthiness form is
+                    // the PACKETS fallback at :4311 — equivalent here at
+                    // omit=0, the per-stream omit subtraction being #31/#214
+                    // scope).
+                    lost_percent: if has_sender_count {
+                        pct_lost(u.lost_packets, packets)
+                    } else {
+                        0.0
+                    },
                     out_of_order: u.out_of_order,
                     sender: s.is_sender,
                 }),
@@ -1378,11 +1416,28 @@ impl ReportInput {
         }
     }
 
-    /// Sender-side retransmit total. Collapses the -1 "unavailable" sentinel
-    /// rather than summing it (summing N sentinels would emit a nonsensical -N
-    /// that iperf3 never produces). Real per-stream values arrive with PR2.
+    /// Sender-side retransmit total over every stream. Correct for
+    /// single-direction runs (one direction exists, local or exchanged);
+    /// bidir aggregates must use [`Self::retransmits_for`] — GT's results
+    /// loop runs once per direction with a per-pass total_retransmits
+    /// (iperf_api.c:4138/4235), so the two sent-aggregates never mix (#236).
     fn sender_retransmits(&self) -> Option<i64> {
-        let vals: Vec<i64> = self.streams.iter().filter_map(|s| s.retransmits).collect();
+        self.retransmits_for(None)
+    }
+
+    /// Retransmit total over the streams of one direction (`Some(true)` =
+    /// this host's senders, `Some(false)` = its receiving streams, whose
+    /// `retransmits` carry the PEER's exchanged per-stream counts; `None` =
+    /// every stream). Collapses the -1 "unavailable" sentinel rather than
+    /// summing it (summing N sentinels would emit a nonsensical -N that
+    /// iperf3 never produces).
+    fn retransmits_for(&self, want_sender: Option<bool>) -> Option<i64> {
+        let vals: Vec<i64> = self
+            .streams
+            .iter()
+            .filter(|s| want_sender.is_none_or(|w| s.is_sender == w))
+            .filter_map(|s| s.retransmits)
+            .collect();
         if vals.is_empty() {
             None
         } else if vals.iter().all(|&r| r < 0) {
@@ -1569,6 +1624,117 @@ mod tests {
             intervals: vec![],
             streams: vec![],
         }
+    }
+
+    /// #238: iperf3's per-stream lost_percent denominator is STRICTLY the
+    /// sender-side count; when that count is absent it emits 0.0
+    /// (iperf_api.c:4288-4293 else-branch) — NEVER the receiver-measured
+    /// count, even though `packets` DOES fall back to it (:4311). Live-proven
+    /// on a terminated bidir probe (#233 r4: iperf3 `lost_percent: 0` where
+    /// riperf3 said 14.75). The three sender-count-absent arms:
+    #[test]
+    fn udp_lost_percent_zero_when_sender_count_absent() {
+        let blk = 131_072u64;
+
+        // (1) SERVER receiving stream — sender count absent pre-exchange
+        // (plain forward-UDP server docs included, not just bidir).
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.is_server = true;
+        input.streams = vec![udp_stream(1, false, blk * 96, None, 0.001, 4, 96)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let u = &v["end"]["streams"][0]["udp"];
+        assert_eq!(
+            u["packets"],
+            serde_json::json!(96i64),
+            "packets keeps the measured fallback (:4311): {u}"
+        );
+        assert_eq!(
+            u["lost_percent"].as_f64(),
+            Some(0.0),
+            "sender count absent -> 0.0, never the measured pct: {u}"
+        );
+
+        // (2) client receiver on a TERMINATED run (#170) — the peer's sent
+        // figure never arrived.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.error = Some("error - the server has terminated".into());
+        input.streams = vec![udp_stream(
+            1,
+            false,
+            blk * 96,
+            Some(blk * 100),
+            0.001,
+            4,
+            96,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let u = &v["end"]["streams"][0]["udp"];
+        assert_eq!(u["packets"], serde_json::json!(96i64));
+        assert_eq!(
+            u["lost_percent"].as_f64(),
+            Some(0.0),
+            "the #233 r4 live shape — iperf3 emits 0 on terminated streams: {u}"
+        );
+
+        // (3) client receiver whose peer reported ZERO sender bytes — the
+        // measured-packets fallback engages for `packets`, but the pct
+        // denominator is gone (GT's pct gate at :4288 — the
+        // `sender_packet_count - sender_omitted_packet_count > 0` test —
+        // fails on zero).
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.streams = vec![udp_stream(1, false, blk * 96, Some(0), 0.001, 4, 96)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let u = &v["end"]["streams"][0]["udp"];
+        assert_eq!(u["packets"], serde_json::json!(96i64));
+        assert_eq!(u["lost_percent"].as_f64(), Some(0.0), "{u}");
+    }
+
+    /// #239: a client SENDER stream's packets/lost_percent use the LOCAL
+    /// sent count (sender_packet_count = sp->packet_count,
+    /// iperf_api.c:4220-4221), not the peer-measured #182 figure — they
+    /// diverge under forward trailing loss (the receiver's highest-seq view
+    /// trails what was sent). The peer-measured jitter/lost VALUES stay on
+    /// the entry; only the packets/pct provenance changes. Exact-count
+    /// (tail partial datagrams) is #235's residue.
+    #[test]
+    fn udp_client_sender_packets_use_local_count() {
+        let blk = 131_072u64;
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        // Sent 100 blocks; the receiver measured highest-seq 99 with 2 lost.
+        input.streams = vec![udp_stream(
+            1,
+            true,
+            blk * 100,
+            Some(blk * 99),
+            0.0015,
+            2,
+            99,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let u = &v["end"]["streams"][0]["udp"];
+        assert_eq!(
+            u["packets"],
+            serde_json::json!(100i64),
+            "the LOCAL sent count, not the peer-measured 99: {u}"
+        );
+        assert!(
+            (u["lost_percent"].as_f64().unwrap() - 2.0).abs() < 1e-9,
+            "2/100 on the sender denominator (not 2/99): {u}"
+        );
+        assert!(
+            (u["jitter_ms"].as_f64().unwrap() - 1.5).abs() < 1e-9,
+            "peer-measured jitter VALUE stays (#182): {u}"
+        );
+        assert_eq!(
+            u["lost_packets"],
+            serde_json::json!(2i64),
+            "peer-measured loss VALUE stays: {u}"
+        );
+        assert_eq!(u["bytes"], serde_json::json!(blk * 100));
     }
 
     fn udp_stream(
@@ -1815,6 +1981,16 @@ mod tests {
     }
 
     fn tcp_stream(id: i32, is_sender: bool, local: u64, remote: u64) -> StreamReport {
+        tcp_stream_retr(id, is_sender, local, remote, Some(3))
+    }
+
+    fn tcp_stream_retr(
+        id: i32,
+        is_sender: bool,
+        local: u64,
+        remote: u64,
+        retransmits: Option<i64>,
+    ) -> StreamReport {
         StreamReport {
             id,
             local_host: "127.0.0.1".into(),
@@ -1824,10 +2000,81 @@ mod tests {
             is_sender,
             local_bytes: local,
             remote_bytes: Some(remote),
-            retransmits: Some(3),
+            retransmits,
             tcp_end: None,
             udp: None,
         }
+    }
+
+    /// #236: in TCP bidir, GT's results loop runs once per direction with a
+    /// PER-PASS total_retransmits (iperf_api.c:4138 reset, :4235 accumulate)
+    /// — `sum_sent` carries the local senders' total; `sum_sent_bidir_
+    /// reverse` carries the peer's exchanged per-stream counts riding the
+    /// receiving streams (live-observed: 2, the #233 r1 capture). riperf3
+    /// passed None on the reverse-sent aggregate and, with receiving streams
+    /// now carrying the exchanged figure, an unfiltered sum would mix both
+    /// directions into the forward aggregate.
+    #[test]
+    fn tcp_bidir_reverse_sent_carries_peer_retransmits() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.num_streams = 1;
+        input.streams = vec![
+            // local sender: 3 local retransmits (forward direction)
+            tcp_stream_retr(1, true, 131_072, 131_072, Some(3)),
+            // receiving stream: the peer exchanged 2 for its send side
+            tcp_stream_retr(2, false, 131_072, 131_072, Some(2)),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let end = &v["end"];
+        assert_eq!(
+            end["sum_sent"]["retransmits"],
+            serde_json::json!(3i64),
+            "forward = LOCAL senders only, never mixed with the peer's: {end}"
+        );
+        assert_eq!(
+            end["sum_sent_bidir_reverse"]["retransmits"],
+            serde_json::json!(2i64),
+            "the peer's exchanged reverse count (#236): {end}"
+        );
+        for key in ["sum_received", "sum_received_bidir_reverse"] {
+            assert!(
+                end[key].get("retransmits").is_none_or(|r| r.is_null()),
+                "received aggregates carry no retransmits (GT): {end}"
+            );
+        }
+    }
+
+    /// The server-role twin (a green pin guarding the direction-filter
+    /// refactor): the server's reverse channel is what IT sends — local
+    /// retransmits — and the forward pair carries none. NOT because the
+    /// client withholds them (the exchange is symmetric, iperf_api.c:2764/
+    /// 2944): GT's server PRINTS before it exchanges (reporter_callback at
+    /// iperf_server_api.c:277 vs iperf_exchange_results at :280), so the
+    /// peer's figures never reach its report (r1 item 4).
+    #[test]
+    fn tcp_bidir_server_reverse_sent_uses_local_retransmits() {
+        let mut input = base_input();
+        input.bidir = true;
+        input.is_server = true;
+        input.num_streams = 1;
+        input.streams = vec![
+            tcp_stream_retr(1, true, 131_072, 0, Some(4)),
+            tcp_stream_retr(2, false, 131_072, 0, None),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let end = &v["end"];
+        assert_eq!(
+            end["sum_sent_bidir_reverse"]["retransmits"],
+            serde_json::json!(4i64),
+            "the server's reverse = its own send path: {end}"
+        );
+        assert!(
+            end["sum_sent"]
+                .get("retransmits")
+                .is_none_or(|r| r.is_null()),
+            "the fwd (client->server) sent aggregate has no figure server-side: {end}"
+        );
     }
 
     /// #170 r3: the terminated-run shapes only existed in live matrices —
@@ -2629,7 +2876,7 @@ mod tests {
         input.reverse = true;
         let mut s = tcp_stream(1, false, 2_000_000, 2_000_000);
         s.tcp_end = None; // reverse: no local sender TCP_INFO
-        s.retransmits = Some(0); // iperf3 emits 0 here on a retransmit-capable OS
+        s.retransmits = Some(0); // the peer's exchanged count of 0 (flag on)
         input.streams = vec![s];
         let snd =
             serde_json::to_value(input.build()).unwrap()["end"]["streams"][0]["sender"].clone();
