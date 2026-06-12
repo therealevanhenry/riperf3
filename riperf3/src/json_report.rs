@@ -572,6 +572,21 @@ pub struct StreamReport {
     /// UDP receiver stats (jitter seconds, lost, total packets, out-of-order),
     /// from whichever side measured them. `None` for TCP.
     pub udp: Option<UdpStreamStats>,
+    /// The peer's exchanged per-stream SENT datagram count, NETTED of the
+    /// peer's omitted baseline at attach time (#235) — GT keeps the
+    /// gross/omitted split (`peer_packet_count` is gross, iperf_api.c:2942/
+    /// 2948) and nets at consumption (:4245); a future per-stream omit
+    /// rework (#31/#214) will need a `remote_omitted_packets` sibling or a
+    /// shape change here. Set ONLY on streams this host received (a sent
+    /// stream's peer figure is the peer's RECEIVE counter — r2 item 1).
+    /// Exact when the peer keeps true counters (iperf3); riperf3 peers
+    /// exchange bytes-derived figures until #235's counter half. `None`
+    /// when the peer never reported (terminated runs) or for sent streams;
+    /// a 3.12-class peer omitting only `omitted_*` yields Some(gross) —
+    /// the #24 default-0 posture, NOT GT's all-omitted zeroing
+    /// (iperf_api.c:2945-2949), a documented faithfulness gap. Consumers
+    /// fall back to the bytes-derived figure on None/non-positive.
+    pub remote_packets: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -973,7 +988,13 @@ impl ReportInput {
             // figure is absent (iperf_api.c ~4242, the same fallback the
             // single-direction arm already uses).
             let fwd_sent_packets = (local_sent / blk) as i64;
-            let rev_sent_packets = (rev_sent / blk) as i64;
+            // #235: the reverse (peer-sent) figure prefers the exchanged
+            // true counts; bytes-derived only as the fallback. (GT's
+            // sum-class nets LOCAL omitted, :4243 — peer-netted here;
+            // identical at omit=0, ppm-scale under -O, #31/#214 scope.)
+            let rev_sent_packets = self
+                .exchanged_sent_packets(false)
+                .unwrap_or((rev_sent / blk) as i64);
             let sum_fwd_packets = if fwd_sent_packets > 0 {
                 fwd_sent_packets
             } else {
@@ -1069,7 +1090,13 @@ impl ReportInput {
             } else {
                 peer_recv
             };
-            let sent_packets = (sent_bytes / blk) as i64;
+            // #235: when the sent side is the PEER's (-R), prefer its
+            // exchanged true counts over the bytes-derived figure (same
+            // local-vs-peer omit-netting hedge as the bidir arm).
+            let sent_packets = (!fwd_sender)
+                .then(|| self.exchanged_sent_packets(false))
+                .flatten()
+                .unwrap_or((sent_bytes / blk) as i64);
             // iperf3's `sum` packet count falls back to the RECEIVER count
             // when the sender count is absent (iperf_api.c:4242, the
             // `packet_count = sender ? sender : receiver` running total) —
@@ -1296,7 +1323,17 @@ impl ReportInput {
                 // the pct has no such fallback in iperf3 (#238).
                 let bytes = s.remote_bytes.unwrap_or(s.local_bytes);
                 let blk = self.blksize.max(1) as u64;
-                if bytes > 0 {
+                if let Some(rp) = s.remote_packets.filter(|&p| p > 0) {
+                    // #235: the peer's exchanged sent count — exact when the
+                    // peer keeps true counters (iperf3); our own senders
+                    // exchange bytes-derived figures until #235's counter
+                    // half. The >0 filter is load-bearing: a pre-#184
+                    // riperf3 server exchanges packets:0 with real bytes,
+                    // which must fall back, not zero the entry. (Per-stream
+                    // emission is iperf_api.c:4312; the netting nuance vs
+                    // GT's local-omit subtraction is #31/#214 scope.)
+                    (bytes, rp, true)
+                } else if bytes > 0 {
                     (bytes, (bytes / blk) as i64, true)
                 } else {
                     (bytes, u.packets, false)
@@ -1462,6 +1499,24 @@ impl ReportInput {
             lost_percent: None,
             sender,
         }
+    }
+
+    /// #235: the sum of the peers' exchanged per-stream SENT counts for one
+    /// direction, when EVERY stream of that direction reported one — GT's
+    /// sender_total_packets running total over peer_packet_count
+    /// (iperf_api.c:4227/4245). All-or-nothing: a partial set (unreachable
+    /// with real peers — results carry every stream or none) falls back to
+    /// the caller's bytes-derived figure, preserving the #170 terminated
+    /// and odd-peer graft rules unchanged.
+    fn exchanged_sent_packets(&self, want_sender: bool) -> Option<i64> {
+        let counts: Vec<Option<i64>> = self
+            .streams
+            .iter()
+            .filter(|s| s.is_sender == want_sender)
+            .map(|s| s.remote_packets.filter(|&p| p > 0))
+            .collect();
+        (!counts.is_empty() && counts.iter().all(Option::is_some))
+            .then(|| counts.into_iter().flatten().sum())
     }
 
     /// `pct_packets` is the lost_percent DENOMINATOR — iperf3 computes one
@@ -1757,6 +1812,7 @@ mod tests {
             remote_bytes: remote,
             retransmits: None,
             tcp_end: None,
+            remote_packets: None,
             udp: Some(UdpStreamStats {
                 jitter_secs,
                 lost_packets: lost,
@@ -1980,6 +2036,205 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // fixture mirror of udp_stream + one
+    fn udp_stream_rp(
+        id: i32,
+        is_sender: bool,
+        local: u64,
+        remote: Option<u64>,
+        remote_packets: Option<i64>,
+        jitter_secs: f64,
+        lost: i64,
+        packets: i64,
+    ) -> StreamReport {
+        let mut s = udp_stream(id, is_sender, local, remote, jitter_secs, lost, packets);
+        s.remote_packets = remote_packets;
+        s
+    }
+
+    /// #235: where the peer's exchanged SENT count is present, it wins over
+    /// the bytes-derived figure — which is off by the tail partial datagram
+    /// (GT: sender_packet_count = peer_packet_count for receiving streams,
+    /// iperf_api.c:4227, a true counter, never bytes/blksize).
+    #[test]
+    fn udp_receiving_entries_prefer_the_exchanged_sender_count() {
+        let blk = 131_072u64;
+        // The peer sent 100 datagrams: 99 full blocks + a 500-byte tail.
+        let sent_bytes = blk * 99 + 500;
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.streams = vec![udp_stream_rp(
+            1,
+            false,
+            blk * 96,
+            Some(sent_bytes),
+            Some(100),
+            0.001,
+            4,
+            96,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let u = &v["end"]["streams"][0]["udp"];
+        assert_eq!(
+            u["packets"],
+            serde_json::json!(100i64),
+            "the exchanged count, not bytes/blk's 99: {u}"
+        );
+        assert!(
+            (u["lost_percent"].as_f64().unwrap() - 4.0).abs() < 1e-9,
+            "4/100 on the exchanged denominator: {u}"
+        );
+
+        // Absent (a terminated run / an odd peer): the derived figure stays.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.streams = vec![udp_stream_rp(
+            1,
+            false,
+            blk * 96,
+            Some(sent_bytes),
+            None,
+            0.001,
+            4,
+            96,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["streams"][0]["udp"]["packets"],
+            serde_json::json!(99i64),
+            "bytes-derived fallback when the peer never reported: {v}"
+        );
+    }
+
+    /// r1 item 5c: the >0 filter is load-bearing — a pre-#184 riperf3
+    /// server exchanges packets:0 alongside real bytes, and a hostile peer
+    /// can send negatives; both must take the bytes-derived fallback, not
+    /// zero (or poison) the entry and the aggregates.
+    #[test]
+    fn udp_zero_or_negative_exchanged_counts_force_the_fallback() {
+        let blk = 131_072u64;
+        for bad in [Some(0i64), Some(-3i64)] {
+            // Per-stream entry.
+            let mut input = base_input();
+            input.protocol = TransportProtocol::Udp;
+            input.streams = vec![udp_stream_rp(
+                1,
+                false,
+                blk * 96,
+                Some(blk * 99),
+                bad,
+                0.001,
+                4,
+                96,
+            )];
+            let v = serde_json::to_value(input.build()).unwrap();
+            assert_eq!(
+                v["end"]["streams"][0]["udp"]["packets"],
+                serde_json::json!(99i64),
+                "exchanged {bad:?} must fall back to bytes/blk: {v}"
+            );
+
+            // -R aggregates.
+            let mut input = base_input();
+            input.protocol = TransportProtocol::Udp;
+            input.reverse = true;
+            input.streams = vec![udp_stream_rp(
+                1,
+                false,
+                blk * 96,
+                Some(blk * 99),
+                bad,
+                0.001,
+                4,
+                96,
+            )];
+            let v = serde_json::to_value(input.build()).unwrap();
+            assert_eq!(
+                v["end"]["sum_sent"]["packets"],
+                serde_json::json!(99i64),
+                "aggregates must not zero on exchanged {bad:?}: {v}"
+            );
+        }
+    }
+
+    /// r1 item 5b: the all-or-nothing aggregate rule — a MIXED set (one
+    /// stream reported, one didn't; unreachable from conforming peers but
+    /// the documented contract) falls back wholesale rather than summing a
+    /// partial.
+    #[test]
+    fn udp_mixed_exchanged_sets_fall_back_wholesale() {
+        let blk = 131_072u64;
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true;
+        input.num_streams = 2;
+        input.streams = vec![
+            udp_stream_rp(1, false, blk * 96, Some(blk * 99), Some(100), 0.001, 4, 96),
+            udp_stream_rp(2, false, blk * 96, Some(blk * 99), None, 0.001, 4, 96),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["sum_sent"]["packets"],
+            serde_json::json!(198i64),
+            "mixed set -> wholesale bytes-derived fallback (99+99), never a \
+             partial 100+99 or 100+0 sum: {v}"
+        );
+    }
+
+    /// #235, the aggregate analog: the reverse-direction sent figures sum
+    /// the per-stream exchanged counts (GT's sender_total_packets running
+    /// total over peer_packet_count) with the bytes-derived per-stream
+    /// fallback.
+    #[test]
+    fn udp_reverse_aggregates_sum_the_exchanged_counts() {
+        let blk = 131_072u64;
+        let tail = blk * 99 + 500; // 100 true datagrams, 99 derived
+
+        // Bidir: two receiving streams with exchanged counts.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.bidir = true;
+        input.num_streams = 2;
+        input.streams = vec![
+            udp_stream(1, true, blk * 100, Some(blk * 99), 0.001, 2, 99),
+            udp_stream(2, true, blk * 100, Some(blk * 99), 0.003, 2, 99),
+            udp_stream_rp(3, false, blk * 95, Some(tail), Some(100), 0.002, 4, 96),
+            udp_stream_rp(4, false, blk * 95, Some(tail), Some(100), 0.006, 4, 96),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let end = &v["end"];
+        for key in ["sum_bidir_reverse", "sum_sent_bidir_reverse"] {
+            assert_eq!(
+                end[key]["packets"],
+                serde_json::json!(200i64),
+                "{key} sums the exchanged 100s, not the derived 99s: {end}"
+            );
+        }
+
+        // Single-direction -R: same rule on sum/sum_sent.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.reverse = true;
+        input.streams = vec![udp_stream_rp(
+            1,
+            false,
+            blk * 96,
+            Some(tail),
+            Some(100),
+            0.001,
+            4,
+            96,
+        )];
+        let v = serde_json::to_value(input.build()).unwrap();
+        for key in ["sum", "sum_sent"] {
+            assert_eq!(
+                v["end"][key]["packets"],
+                serde_json::json!(100i64),
+                "-R {key} carries the exchanged count: {v}"
+            );
+        }
+    }
+
     fn tcp_stream(id: i32, is_sender: bool, local: u64, remote: u64) -> StreamReport {
         tcp_stream_retr(id, is_sender, local, remote, Some(3))
     }
@@ -2002,6 +2257,7 @@ mod tests {
             remote_bytes: Some(remote),
             retransmits,
             tcp_end: None,
+            remote_packets: None,
             udp: None,
         }
     }
