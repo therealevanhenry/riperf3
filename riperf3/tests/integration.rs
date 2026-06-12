@@ -1771,7 +1771,10 @@ mod unimplemented_flags {
 
     #[tokio::test]
     async fn server_max_duration() {
-        // Server with max_duration=2 should terminate a test that runs longer
+        // #230: --server-max-duration is an UPFRONT param-exchange check in
+        // iperf3 (iperf_api.c:2666), not a timer — a -t 10 request against
+        // max 2 is refused before the test starts, with the strerror of
+        // IEMAXSERVERTESTDURATIONEXCEEDED(37) relayed to the client.
         let port = next_port();
         let server = ServerBuilder::new()
             .port(Some(port))
@@ -1781,7 +1784,6 @@ mod unimplemented_flags {
             .unwrap();
         let server_task = tokio::spawn(async move { server.run().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
-        // Client tries to run 10 seconds but server should cut it at 2
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
             .duration(10)
@@ -1791,21 +1793,21 @@ mod unimplemented_flags {
         let result = client.run().await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed.as_secs() < 5,
-            "server-max-duration didn't cut test: {elapsed:?}"
+            elapsed.as_secs() < 4,
+            "the refusal is upfront — no transfer, no timer wait: {elapsed:?}"
         );
-        // #224 ground truth (iperf 3.21): the timer relays SERVER_ERROR with
-        // IESERVERTESTDURATIONEXPIRED; the client adopts its strerror. (When
-        // the upfront requested-duration check lands, this -t run will be
-        // rejected at param exchange instead - revisit then.)
         let err = result.expect_err("the relayed SERVER_ERROR is the client's error");
-        assert_eq!(err.to_string(), "server test duration expired", "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "client's requested duration exceeds the server's maximum permitted limit",
+            "{err:?}"
+        );
         // The server side errors to ITS sink but run() is Ok - iperf3's
-        // one-off exits 0 on self-terminate (live-verified, the #224 wart).
+        // one-off exits 0 on the refusal path (live-verified, the #224 wart).
         let joined = server_task.await.expect("server task");
         assert!(
             joined.is_ok(),
-            "server self-terminate is not a run() error: {joined:?}"
+            "server refusal is not a run() error: {joined:?}"
         );
     }
 

@@ -107,7 +107,7 @@ General:
   -s, --server                       Run in server mode
   -c, --client <host>                Run in client mode
   -p, --port <PORT>                  Server port (default: 5201)
-  -f, --format <k|m|g|t>            Report format (default: adaptive, like iperf3)
+  -f, --format <kmgtKMGT>           Report format, case-sensitive: lowercase bit-rates, uppercase byte-rates (default: adaptive, like iperf3)
   -i, --interval <secs>             Seconds between periodic reports
   -V, --verbose                      Verbose output
   -J, --json                         JSON output
