@@ -1255,7 +1255,12 @@ impl ReportInput {
                     let blk = self.blksize.max(1) as u64;
                     (s.local_bytes, (s.local_bytes / blk) as i64, true)
                 } else {
-                    // Sender count absent pre-exchange (#238) — plain
+                    // Sender count absent on EVERY server run, not just
+                    // terminated ones (#238): GT's server does receive the
+                    // client's per-stream figures (get_results,
+                    // iperf_api.c:2942) but PRINTS first — reporter_callback
+                    // at iperf_server_api.c:277 runs before the exchange at
+                    // :280 — so they never reach its report. Plain
                     // forward-UDP server docs included, not just bidir.
                     (0, u.packets, false)
                 }
