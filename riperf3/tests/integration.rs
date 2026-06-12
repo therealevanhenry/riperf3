@@ -1770,6 +1770,53 @@ mod unimplemented_flags {
     }
 
     #[tokio::test]
+    async fn interrupt_honored_in_setup_phase_wait() {
+        // #231: iperf_catch_sigend is armed for the WHOLE run — a client
+        // whose interrupt watch fires while it waits on the control channel
+        // between states (here: a mock that accepts + reads the cookie, then
+        // goes silent pre-ParamExchange) must dump and return promptly,
+        // exactly like the TEST_RUNNING arm. Pre-#231 the central recv_state
+        // wait never polled the watch and run() blocked until the read
+        // returned.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let mock = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut cookie = [0u8; 37];
+                let _ = sock.read_exact(&mut cookie).await;
+                // Silent hold, outliving the test body.
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+        });
+
+        let (tx, rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(5)
+            .interrupt(rx)
+            .build()
+            .unwrap();
+        let run = tokio::spawn(async move { client.run().await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tx.send(Some(
+            "interrupt - the client has terminated by signal Terminated(15)".into(),
+        ))
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("the interrupt must be honored in the setup-phase wait (#231)")
+            .expect("join");
+        // GT dumps + returns normally (iperf_got_sigend's client arm has no
+        // phase gate); the signal-normal EXIT is the CLI's business.
+        assert!(res.is_ok(), "{res:?}");
+        mock.abort();
+    }
+
+    #[tokio::test]
     async fn server_max_duration() {
         // #230: --server-max-duration is an UPFRONT param-exchange check in
         // iperf3 (iperf_api.c:2666), not a timer — a -t 10 request against
