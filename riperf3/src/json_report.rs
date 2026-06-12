@@ -577,10 +577,15 @@ pub struct StreamReport {
     /// gross/omitted split (`peer_packet_count` is gross, iperf_api.c:2942/
     /// 2948) and nets at consumption (:4245); a future per-stream omit
     /// rework (#31/#214) will need a `remote_omitted_packets` sibling or a
-    /// shape change here. Exact when the peer keeps true counters (iperf3);
-    /// riperf3 peers exchange bytes-derived figures until #235's counter
-    /// half. `None` when the peer never reported (terminated runs, odd
-    /// peers); consumers fall back to the bytes-derived figure.
+    /// shape change here. Set ONLY on streams this host received (a sent
+    /// stream's peer figure is the peer's RECEIVE counter — r2 item 1).
+    /// Exact when the peer keeps true counters (iperf3); riperf3 peers
+    /// exchange bytes-derived figures until #235's counter half. `None`
+    /// when the peer never reported (terminated runs) or for sent streams;
+    /// a 3.12-class peer omitting only `omitted_*` yields Some(gross) —
+    /// the #24 default-0 posture, NOT GT's all-omitted zeroing
+    /// (iperf_api.c:2945-2949), a documented faithfulness gap. Consumers
+    /// fall back to the bytes-derived figure on None/non-positive.
     pub remote_packets: Option<i64>,
 }
 
@@ -984,7 +989,9 @@ impl ReportInput {
             // single-direction arm already uses).
             let fwd_sent_packets = (local_sent / blk) as i64;
             // #235: the reverse (peer-sent) figure prefers the exchanged
-            // true counts; bytes-derived only as the fallback.
+            // true counts; bytes-derived only as the fallback. (GT's
+            // sum-class nets LOCAL omitted, :4243 — peer-netted here;
+            // identical at omit=0, ppm-scale under -O, #31/#214 scope.)
             let rev_sent_packets = self
                 .exchanged_sent_packets(false)
                 .unwrap_or((rev_sent / blk) as i64);
@@ -1084,7 +1091,8 @@ impl ReportInput {
                 peer_recv
             };
             // #235: when the sent side is the PEER's (-R), prefer its
-            // exchanged true counts over the bytes-derived figure.
+            // exchanged true counts over the bytes-derived figure (same
+            // local-vs-peer omit-netting hedge as the bidir arm).
             let sent_packets = (!fwd_sender)
                 .then(|| self.exchanged_sent_packets(false))
                 .flatten()

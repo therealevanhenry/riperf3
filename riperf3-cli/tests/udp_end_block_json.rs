@@ -146,3 +146,62 @@ fn udp_bidir_server_end_no_graft_zeros() {
         "but measured packets are real: {recv}"
     );
 }
+
+/// #235 r2 pin (mutation c): the attach NETS the peer's omitted baseline.
+/// Under -O the riperf3 server exchanges gross counts + a nonzero omitted
+/// baseline; the client's reverse sent figures must land on the NET count —
+/// which equals net bytes / blksize exactly for full-block riperf3 senders —
+/// where an un-netted attach reports the gross figure (larger by the omit
+/// window's datagrams).
+#[test]
+fn udp_reverse_omit_run_consumes_the_netted_exchanged_count() {
+    let _serial = common::udp_serial();
+    let ps = common::free_port().to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let out = common::run_client_ok(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-u",
+            "-R",
+            "-O",
+            "1",
+            "-t",
+            "1",
+            "-b",
+            "5M",
+            "-J",
+        ],
+        Duration::from_secs(40),
+        "client -u -R -O 1",
+    )
+    .stdout;
+    let _ = server.0.wait();
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("client doc parses");
+    let blksize = v["start"]["test_start"]["blksize"]
+        .as_i64()
+        .expect("blksize");
+    for key in ["sum", "sum_sent"] {
+        let bytes = v["end"][key]["bytes"].as_i64().expect("bytes");
+        let packets = v["end"][key]["packets"].as_i64().expect("packets");
+        assert_eq!(
+            packets,
+            bytes / blksize,
+            "{key}: the exchanged figure must be the NET count (net bytes/blk \
+             for a full-block riperf3 sender) — gross would exceed it by the \
+             omit window: {v}"
+        );
+        assert!(packets > 0, "{key}: a real transfer happened: {v}");
+    }
+}
