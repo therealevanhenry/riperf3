@@ -11,6 +11,87 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.7.4] - 2026-06-12
+
+A non-breaking faithfulness patch in two waves: 18 issues closed across 17
+PRs, every fix pinned red-first against live iperf 3.21 ground truth (the
+pinned d39cf41 build) and through at least two adversarial cold-review
+rounds; every merge gated on the 52-cell cross-tool compat matrix (incl.
+iperf3 3.12 cross-pairs), all clean. The release campaign (N=30 per cell)
+puts riperf3 at parity-or-faster in every cell: TCP -P1 at parity, TCP -P8
++4-10%, UDP +9-14% (Welch's t, p<0.05; baseline saved).
+
+Two user-visible behavior corrections to note: `-f` uppercase letters now
+mean BYTE-rates as in iperf3 (`-f K` previously printed Kbits/sec), and
+`--server-max-duration` now refuses over-limit requests upfront at param
+exchange like iperf3 (previously an unfaithful mid-test timer; the in-flight
+watchdog is now iperf3's duration+omit+40s grace, flag-independent).
+
+### Fixed
+
+- **The setup-starvation flake family's root cause** (#195): `udp_connect_client` died on the first transient ICMP bounce (the server's per-stream listener rebind gap) with ~29 s of handshake budget unused — it now rides through transient reset/refused feedback within its unchanged 30 s deadline, with distinct exhaustion diagnoses. Test-harness layers: deadlines above the client's own, a bounded pre-data retry with mode-aware classifiers, `udp_serial` coverage, diagnosable panics. Verified 20/20 quiet-host 2-core rounds and 24/24 on the new cloud hammer.
+- **Server self-terminate is wire-faithful** (#224): `--server-bitrate-limit` and the `--server-max-duration` timer relay `SERVER_ERROR(-2)` + the `(i_errno, errno)` pair — not `SERVER_TERMINATE` — with no summary dump and the one-off exiting 0, exactly like iperf 3.21 (live-verified both directions, including real-iperf3 peers and 3.12). The client adopts the relayed `iperf_strerror` (codes 27/37/120/160 mapped; `int_errno=%d` fallback; unconditional errno append).
+- **Exactly one JSON render on terminate paths** (#225): the CLI no longer appends a second document (`-J`) or a second error+end event pair (`--json-stream`) after the library already rendered the error into the active sink.
+- **UDP bidir `-J` end block matches iperf3's shape exactly** (#214): six UDP-shaped aggregates (TCP bidir keeps four; pinned negative), `sum` ordered first, sender-figure bytes/packets/lost_percent provenance (live-proven on lossy and terminated runs), per-direction jitter averaged over `num_streams`, the server's strict no-graft zeros, and the per-stream sender-figure rule.
+- **`--json-stream` wins the mode dispatch over `-J`** on both roles (#220): the hybrid is stream mode (full event stream incl. `end`; the document only under `--json-stream-full-output`), matching `OPT_JSON_STREAM`'s implies-`-J` rule.
+- **Adaptive unit auto-scaling** (#221): no more forced `-f m` default — absent `-f`, every figure auto-scales like iperf3, with the `unit_snprintf` precision ladder (<10 → 2 dp, <100 → 1 dp, else 0 dp, round-aware boundaries) in adaptive and fixed modes, down to the `0.00 Bytes` stall rows; the Transfer column is always adaptive (`-f` drives only Bitrate).
+- **The missing text lines** (#222): unconditional connect banners (`Connecting to host …` / `Accepted connection from <host>, port <p>` with v4-mapped addresses unmapped), the `Reverse mode … is sending` banner, per-stream preambles on both roles, `iperf Done.` closing clean client runs, and the full `-V` detail block in iperf3's order and timing (version/uname, `Control connection MSS`, defaulted-UDP block size, `Time:`, Cookie/TCP MSS/`Target Bitrate`, `Starting Test:` with the bytes/blocks/time variants, `Test Complete. Summary Results:`, sender-side CPU utilization, snd/rcv congestion) — printed post-param-exchange so `--get-server-output` relays carry them.
+- **The reporter end-race** (#159): the final interval flush now runs after the senders stop (done → grace → finish), so intervals always cover what the END block accounts — the windows-latest dropped-tick/empty-intervals family's mechanism. The flush-after-stop invariant is debug-asserted and mutation-pinned; the resulting intervals==END property is stricter than iperf 3.21's own behavior.
+- **The max-duration timer could never fire alongside a bitrate limit**
+  (#237): the select loop recreated the sleep every iteration, so 1 Hz rate
+  ticks reset it; one absolute pinned deadline now survives any loop
+  re-entry.
+- **`--server-max-duration` is the upfront param-exchange check** (#230):
+  `(time + omit) > max` or an unbounded request (`-n`/`-k`/`-t 0`) refuses
+  with `SERVER_ERROR` + errno 37 before the test starts — text/`-J`/
+  `--json-stream` refusal shapes live-matched to iperf3, persistent servers
+  serve the next test. Byte/block-limited clients now send `time: 0` on the
+  wire like iperf3, so the unbounded rule works cross-tool. The 160-watchdog
+  arms at iperf3's `duration + omit + 40s` for every bounded test, and
+  self-terminate now closes stream tasks like `server_timer_proc` — a wedged
+  peer can no longer hang the server's shutdown (previously: forever).
+- **`-f` uppercase = byte-rates, and the server's `-f` works at all** (#241,
+  #242): eight case-sensitive format letters with iperf3's 1024-divisor
+  byte-rate ladder; the server-side flag — previously silently ignored — is
+  wired at the interval reporter and both summary paths. The Transfer column
+  stays always-adaptive, like iperf3.
+- **Per-stream UDP packets/lost_percent provenance** (#238, #239): the pct
+  denominator is strictly the sender-side count with iperf3's asymmetric
+  fallbacks (packets falls back to the measured count; lost_percent goes to
+  0.0, never the measured pct — live-proven on terminated runs), and client
+  sender entries report the LOCAL sent count rather than the peer-measured
+  figure.
+- **TCP bidir retransmit aggregates** (#236): per-direction totals like
+  iperf3's per-pass accumulator — the reverse-sent aggregate now carries the
+  peer's exchanged per-stream counts (previously a fabricated 0; live-proven
+  exact cross-tool), the forward aggregate can no longer mix directions, and
+  single-direction `-R` docs show the peer's real totals.
+- **Receiving-side packet figures consume the peer's exchanged counts**
+  (#235, consume half): exact against true-counter (iperf3) peers where
+  bytes-derived figures lose the tail partial datagram; netted of the peer's
+  omitted baseline with hardened fallbacks (zero/negative/mixed exchanged
+  sets). The counter half for riperf3's own senders is #256 (0.8.0).
+- **Signals are honored at the client's central state wait** (#231): a
+  SIGTERM/SIGINT landing in the setup phases or the post-test waits now
+  dumps and exits signal-normal like `iperf_catch_sigend` (previously it
+  hung until the control read returned — against a wedged server, forever);
+  pre-data dumps report a zero-second window and post-exchange dumps keep
+  the peer halves, both like iperf3.
+
+### Added
+
+- `hammer.yml`: a permanent `workflow_dispatch` flake hammer (N shard runners × M suite iterations, validated inputs, red-baseline caching) for statistical pre-merge verification.
+- `timeout-minutes` on every CI job and `permissions: contents: read` on ci.yml.
+- **The server's `-V` placeholder rows** (#246): `[ N] (sender/receiver
+  statistics not available)` for the unmeasured half, verbose-gated and
+  TCP-`[SUM]`-only, exactly matching iperf3's emission sites and row slots.
+
+### Deferred to 0.8.0
+
+#245 (live TCP_INFO through the final flush), #256 (true datagram counters
+in the UDP senders — #235's exactness half), #248 (the perr `: ` suffix on
+relayed duration-expired lines).
+
 ## [0.7.3] - 2026-06-11
 
 A non-breaking patch continuing 0.7.2's faithfulness campaign: 18 PRs closing
