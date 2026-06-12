@@ -15,13 +15,14 @@ matrix below were measured on our two-VM sandbox with internal tooling (the
 environment-specific.
 
 > **0.7.4 status.** Fully re-measured at the `0.7.4` patch: the compatibility
-> matrix is all-PASS (**52/52** on the closing run at the release commit; the wave's
-> eight per-merge smokes each read 52/52 in session records) and a fresh full N=30 campaign
+> matrix is all-PASS (**52/52** on the closing run at the final code commit `49d803b`
+> — the release commit adds only the version bump; wave 2's eight per-merge
+> smokes each read 52/52 in session records) and a fresh full N=30 campaign
 > lands **12 riperf3 / 4 parity / 0 slower** — riperf3 is significantly faster
 > in every UDP cell (+8.7% to +13.9%) and every TCP `-P8` cell (+4.1% to
 > +10.2%), with TCP single-stream one parity noise band (all four P1 cells
 > n.s. this run; the wandering single-stream residual has read parity or a
-> ±3% one-cell wobble in every campaign since 0.7.0). Cross-campaign absolutes moved DOWN ~3% vs the stored 0.7.3
+> ±3% one-cell wobble in every campaign since 0.7.0). Cross-campaign absolutes moved DOWN ~3–4% vs the stored 0.7.3
 > baseline — for **both tools in lockstep** (iperf3, an unchanged binary, reads
 > 0 faster / 9 parity / 7 slower against its own 0.7.3-campaign numbers), the
 > environment-shift signature, third campaign running. The cell with the
@@ -30,15 +31,21 @@ environment-specific.
 > ABBA-interleaved in that exact cell): **parity** (−1.51%, p=0.34). New
 > honesty note this edition: the campaign recorded **108/960 failed runs**,
 > uniformly distributed across tools (57 iperf3 / 51 riperf3), cells, and
-> time — the harness's fixed 0.4 s server-start sleep racing under host load,
-> not a tool signal. Auditing the stored baselines shows this is the recent
-> norm, not an anomaly: the 0.7.3 campaign's own CSV contains 101 such rows
-> (its edition's "0 failed runs" line was wrong), while 0.7.2's has none. A
-> retry-on-refused start would eliminate the class. Per-cell n is 22–30;
-> the drops are throughput-independent, so verdicts are unaffected. 0.7.4's throughput-relevant changes are the terminate-path and
+> time — post-campaign diagnosis (a failure log added to the harness) found
+> a harness bug, not a tool signal: a subshell variable scoping error made
+> every measured run share ONE port, so a connect occasionally raced the
+> previous server's teardown on it (connection-reset class). The 0.7.3
+> campaign's stored CSV contains 101 such rows from the same bug (its
+> edition's "0 failed runs" line was wrong); 0.7.2's baseline has none. The
+> harness is fixed (genuinely unique ports + a listen-poll start + FAIL-run
+> output capture); post-fix re-probes of the worst cells read 0/36. Per-cell
+> n is 22–30; the drops are throughput-independent, so verdicts are
+> unaffected. 0.7.4's throughput-relevant changes are the terminate-path and
 > reporter end-race redesigns
-> ([#230](https://github.com/therealevanhenry/riperf3/issues/230),
-> [#159](https://github.com/therealevanhenry/riperf3/issues/159)) — control
+> ([#230](https://github.com/therealevanhenry/riperf3/issues/230) via PR
+> [#249](https://github.com/therealevanhenry/riperf3/pull/249),
+> [#159](https://github.com/therealevanhenry/riperf3/issues/159) via PR
+> [#244](https://github.com/therealevanhenry/riperf3/pull/244)) — control
 > plane, not the data path — and the campaign confirms the data path held.
 >
 > **0.7.3 status.** Fully re-measured at the `0.7.3` patch: the compatibility
@@ -164,14 +171,18 @@ comparison is defensible rather than anecdotal.
 cell (`-t 5` s each), **960 runs attempted**, run in **randomized order** across
 all (cell, tool, iteration) tuples so host/thermal drift can't systematically
 favor either tool. 2 warm-ups per cell discarded; fresh `-s -1` server per run
-on a unique port; hard `timeout` wrappers; VMs confirmed idle and isolated for
+on a unique port (see the failed-runs note for the two campaigns where the
+port uniqueness was silently broken); hard `timeout` wrappers; VMs confirmed idle and isolated for
 the duration. **This campaign recorded 108 failed runs (11%)** — uniformly
 distributed across tools (57 iperf3 / 51 riperf3), protocols, directions, and
-time, i.e. the harness's fixed 0.4 s server-start sleep racing under host
-load, not a tool signal; the drops are throughput-independent so the
-comparison is unbiased. (The 0.7.3 campaign's stored CSV shows the same class
-at 101/960 — that edition's "0 failed runs" line was wrong; 0.7.2's baseline
-is genuinely failure-free.) Retained n = 22–30 per cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
+time. Post-campaign diagnosis found a harness bug: the per-run port increment
+ran in a subshell, so every measured run in this campaign (and 0.7.3's — its
+CSV shows 101 such rows, making that edition's "0 failed runs" line wrong;
+0.7.2's is clean) actually shared ONE port, and a connect occasionally raced
+the previous server's teardown on it. Not a tool signal, and the drops are
+throughput-independent, so the comparison is unbiased — but "unique port per
+run" below describes the intent and the FIXED harness, not these two
+campaigns as run. Retained n = 22–30 per cell; per-cell coefficient of variation was 3.6–10.1%. Significance is Welch's
 t (two-sided, normal approx); "parity" = not significant at p<0.05.
 
 ### Throughput: riperf3 vs iperf3 (mean Gbps [95% CI])
@@ -206,7 +217,11 @@ binary between the two campaigns, so its shift measures the environment:
 | iperf3 vs its own 0.7.3-campaign numbers | 0 | 9 | 7 | −0.7% to −5.2% |
 
 The lockstep movement is the environment-shift signature (third campaign
-running; the stored-baseline lesson from 0.7.2). The cell with the largest
+running; the stored-baseline lesson from 0.7.2). The same audit run backward
+corrects the 0.7.3 edition's framing too: its "9 cells significantly faster"
+cross-campaign gains were also lockstep — the unchanged iperf3 binary read 11
+faster / 5 parity / 0 slower (up to +6.7%) between those same two campaigns,
+so those gains were environment, not 0.7.3's data-path work. The cell with the largest
 riperf3 shift — UDP rev P1 v6, −7.4% vs iperf3's −3.7% in the same cell — was
 settled by a controlled same-environment **v0.7.3-vs-v0.7.4 A/B**
 (both tags built from source on the VMs, 30v30 ABBA-interleaved in that exact
@@ -306,7 +321,9 @@ randomized N=30 campaign (per-cell 95% CIs + Welch's-t) under VM-fleet
 isolation. That orchestration assumes our sandbox, so it isn't shipped as a
 turnkey script. The method is, so the results stay auditable and the campaign is
 replicable on any two hosts: N=30 randomized iterations/cell, 2 warm-ups
-discarded, a fresh `-s -1` server per run on a unique port, UDP at `-b 0`, and a
+discarded, a fresh `-s -1` server per run on a unique port (true of the FIXED
+harness; see the failed-runs note — the 0.7.3/0.7.4 campaigns as run shared
+one port), UDP at `-b 0`, and a
 direction-aware parse (forward → client `sum_sent`, reverse → `sum_received`,
 UDP → `sum`; `-P>1` aggregates already summed in `-J`). Cross-version regression
 checks (e.g. 0.6.3-vs-0.7.0, 0.7.1-vs-0.7.2) reuse the campaign by pointing the
