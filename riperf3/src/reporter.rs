@@ -334,6 +334,43 @@ pub fn print_final_summaries(per_stream: &[StreamSummary], format_char: char) {
     }
 }
 
+/// The server's `-V` placeholder for the unmeasured half of a summary row
+/// (#246): GT's report_*_not_available formats (iperf_locale.c:468-471) —
+/// a plain `[%3d]`/`[SUM]` prefix with NO bidir role tag, gated on verbose
+/// at every GT site (iperf_api.c:4280/4324/4371/4395, SUM at :4451).
+fn not_available_line(stream_id: i32, half: &str) -> String {
+    format!("[{}] ({half} statistics not available)", fmt_id(stream_id))
+}
+
+/// Server-role final report (#246): like [`print_final_summaries`], but
+/// under `-V` each row's unmeasured half renders GT's placeholder in that
+/// half's canonical slot — "(sender ...)" BEFORE a receiver row (the sender
+/// row prints first in iperf3's pair), "(receiver ...)" AFTER a sender row,
+/// `[SUM]` rows included. The client never prints placeholders: it measures
+/// or exchanges both halves of every stream.
+pub fn print_final_summaries_server(
+    per_stream: &[StreamSummary],
+    format_char: char,
+    verbose: bool,
+) {
+    let sums = sum_summaries(per_stream);
+    for s in per_stream.iter().chain(sums.iter()) {
+        if verbose && !s.is_sender {
+            titled(format_args!(
+                "{}",
+                not_available_line(s.stream_id, "sender")
+            ));
+        }
+        titled(format_args!("{}", format_summary_line(s, format_char)));
+        if verbose && s.is_sender {
+            titled(format_args!(
+                "{}",
+                not_available_line(s.stream_id, "receiver")
+            ));
+        }
+    }
+}
+
 /// Derive the aggregate `[SUM]` rows for the final report from the per-stream
 /// summaries. Returns one SUM per (role, line-direction) group that has more
 /// than one stream — matching iperf3, which prints a `[SUM]` for parallel
