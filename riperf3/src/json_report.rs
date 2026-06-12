@@ -1315,7 +1315,11 @@ impl ReportInput {
                     packets,
                     // #238: the pct exists only over a sender-side
                     // denominator; absent sender count -> 0.0 (GT's
-                    // `if (sender_packet_count)` else-branch).
+                    // `if (sender_packet_count - sender_omitted_packet_count
+                    // > 0)` else-branch at :4288; the bare-truthiness form is
+                    // the PACKETS fallback at :4311 — equivalent here at
+                    // omit=0, the per-stream omit subtraction being #31/#214
+                    // scope).
                     lost_percent: if has_sender_count {
                         pct_lost(u.lost_packets, packets)
                     } else {
@@ -1648,7 +1652,9 @@ mod tests {
 
         // (3) client receiver whose peer reported ZERO sender bytes — the
         // measured-packets fallback engages for `packets`, but the pct
-        // denominator is gone (GT's `if (sender_packet_count)` is falsy).
+        // denominator is gone (GT's pct gate at :4288 — the
+        // `sender_packet_count - sender_omitted_packet_count > 0` test —
+        // fails on zero).
         let mut input = base_input();
         input.protocol = TransportProtocol::Udp;
         input.streams = vec![udp_stream(1, false, blk * 96, Some(0), 0.001, 4, 96)];
