@@ -945,15 +945,17 @@ async fn run_tcp_receiver_normal(
 // Blocking UDP send / recv (high-performance, no async overhead)
 // ---------------------------------------------------------------------------
 //
-// DESIGN DECISION (#146, supersedes the #125 async exploration) — DO NOT
+// DESIGN DECISION (#146) — DO NOT
 // re-litigate without a perf campaign: the UDP data path deliberately runs on
 // `tokio::task::spawn_blocking` with *blocking* sockets, not the async runtime
 // that the TCP path uses. This is the benchmark-winning design, and the split
 // is intentional:
 //
 //   * Backpressure: a blocking `send()` on a full SO_SNDBUF parks the thread in
-//     the kernel until space frees, giving exact rate/SO_SNDBUF backpressure for
-//     free. The async equivalent (`writable()` + nonblocking `try_send`) surfaces
+//     the kernel until space frees (bounded by the ~1s `SO_SNDTIMEO` that
+//     configure_udp_sender sets, so a wedged link can't hang the sender), giving
+//     exact rate/SO_SNDBUF backpressure for free. The async equivalent
+//     (`writable()` + nonblocking `try_send`) surfaces
 //     WouldBlock mid-batch, truncating sendmmsg batches and forcing a busy
 //     re-arm — measurably slower on the high-rate path.
 //   * Self-stop: a CPU-bound sender can't be relied on to observe `done` under a
@@ -966,7 +968,7 @@ async fn run_tcp_receiver_normal(
 //     under winsock (#80); the blocking model encodes that constraint.
 //
 // The earlier `#[allow(dead_code)]` async `run_udp_sender` / `run_udp_receiver`
-// variants (the #125 exploration) were removed in #146 — unwired,
+// variants — kept under the #125 dead-code triage — are removed here: unwired,
 // maintained-for-parity dead weight that invited exactly this re-litigation.
 // ---------------------------------------------------------------------------
 
