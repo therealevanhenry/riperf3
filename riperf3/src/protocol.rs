@@ -113,9 +113,11 @@ pub(crate) enum Role {
 /// sequence: iperf3 itself is loose here, and a stricter riperf3 would break
 /// interop. Default-tolerant by design (#145).
 ///
-/// `ServerTerminate`/`ServerError`/`AccessDenied` are handled by the client in
-/// ANY state (it adopts them anywhere), so the consult site treats them as
-/// always-legal rather than bloating every row here.
+/// `ServerTerminate`/`ServerError` can arrive in any client state (the client
+/// adopts them via their own dispatch arms, and `watch_control` returns on
+/// them), so they appear in every applicable row to avoid false out-of-sequence
+/// logs. `AccessDenied` is sent only in the early param/cookie phase, so it
+/// lives in the `IperfStart` row alone and never reaches a data-phase consult.
 pub(crate) fn legal_next(current: TestState, role: Role) -> &'static [TestState] {
     use TestState::*;
     match role {
