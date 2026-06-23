@@ -1667,6 +1667,47 @@ mod protocol_error_tests {
         let _ = server_task.await;
     }
 
+    /// #248: a SERVER_ERROR(160) — the --server-max-duration timer relay — is
+    /// adopted as iperf_strerror(160), which is perr-class, so GT (and now
+    /// riperf3) dangles a trailing ": ". The fast end-to-end pin for the suffix
+    /// (the real watchdog fires at duration+omit+40s, too slow to drive live).
+    #[tokio::test]
+    async fn client_handles_server_error_duration_expired() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            protocol::send_state(&mut stream, TestState::ServerError)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                &[160u32.to_be_bytes(), 0u32.to_be_bytes()].concat(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let result = client.run().await;
+        let err = result.expect_err("client should error on ServerError");
+        assert_eq!(
+            err.to_string(),
+            "server test duration expired: ",
+            "the client adopts the relayed perr-class strerror(160) with GT's dangling ': ' (#248): {err:?}"
+        );
+        let _ = server_task.await;
+    }
+
     /// A SERVER_ERROR whose payload never arrives (peer died mid-relay, or a
     /// pre-payload sender): still an error, never a hang or a panic.
     #[tokio::test]

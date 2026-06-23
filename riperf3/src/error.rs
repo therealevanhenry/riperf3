@@ -81,32 +81,47 @@ pub enum RiperfError {
 /// iperf3 servers relay stale/live errno from the bitrate and
 /// cleanup_server sites). Rendered via io::Error, whose "(os error N)"
 /// suffix is the convention riperf3's raw os errors already carry (#151).
-/// CONSCIOUS DEVIATION: iperf_strerror's perr codes emit a dangling ": "
-/// even at errno==0 (live: "server test duration expired: ") — an artifact
-/// we do not mirror. Unknown codes use iperf3's literal "int_errno=%d"
-/// fallback (iperf_error.c default case).
+/// PERR SUFFIX (#248): iperf_strerror's perr-class codes emit a dangling ": "
+/// even at errno==0 (live: "server test duration expired: "). Mirrored per-code
+/// from the d39cf41 iperf_error.c switch — 160 and the int_errno default are
+/// perr=1 (they get the suffix); 27/37/120 are perr=0 (snprintf-only, stay
+/// bare). Unknown codes use iperf3's literal "int_errno=%d" fallback (the
+/// default case, which is perr=1).
 pub(crate) fn iperf3_strerror(i_errno: u32, os_errno: u32) -> String {
-    let base = match i_errno {
-        // IETOTALRATE — the --server-bitrate-limit breach
-        27 => "total required bandwidth is larger than server limit".to_string(),
+    // `perr` is iperf_error.c's per-code flag: when set, GT dangles a trailing
+    // ": " even at errno==0.
+    let (base, perr) = match i_errno {
+        // IETOTALRATE — the --server-bitrate-limit breach (perr=0)
+        27 => (
+            "total required bandwidth is larger than server limit".to_string(),
+            false,
+        ),
         // IEMAXSERVERTESTDURATIONEXCEEDED — the upfront param-exchange
         // reject modern iperf3 servers send for over-limit or unbounded
         // requests. riperf3's own upfront check is #230, but a real iperf3
-        // server can relay this TODAY, so the client must render it.
-        37 => {
-            "client's requested duration exceeds the server's maximum permitted limit".to_string()
-        }
-        // IESERVERTERM — a server relaying its own terminate as an error
-        120 => "the server has terminated".to_string(),
-        // IESERVERTESTDURATIONEXPIRED — the --server-max-duration timer
-        160 => "server test duration expired".to_string(),
-        other => format!("int_errno={other}"),
+        // server can relay this TODAY, so the client must render it. (perr=0)
+        37 => (
+            "client's requested duration exceeds the server's maximum permitted limit".to_string(),
+            false,
+        ),
+        // IESERVERTERM — a server relaying its own terminate as an error (perr=0)
+        120 => ("the server has terminated".to_string(), false),
+        // IESERVERTESTDURATIONEXPIRED — the --server-max-duration timer (perr=1)
+        160 => ("server test duration expired".to_string(), true),
+        // iperf3's default case is perr=1.
+        other => (format!("int_errno={other}"), true),
     };
     if os_errno > 0 {
+        // Unchanged r1 decision (#248 out of scope): append ", errno: <strerror>"
+        // for any code at errno>0. Unreachable from a riperf3 server, which
+        // always relays errno 0.
         format!(
             "{base}, errno: {}",
             std::io::Error::from_raw_os_error(os_errno as i32)
         )
+    } else if perr {
+        // GT's dangling ": " for the perr-class codes at errno==0 (#248).
+        format!("{base}: ")
     } else {
         base
     }
@@ -124,17 +139,20 @@ mod strerror_tests {
             "total required bandwidth is larger than server limit"
         );
         assert_eq!(iperf3_strerror(120, 0), "the server has terminated");
-        assert_eq!(iperf3_strerror(160, 0), "server test duration expired");
+        // #248: 160 is perr=1, so GT dangles a trailing ": " even at errno==0;
+        // 27/120 above are perr=0 and stay bare.
+        assert_eq!(iperf3_strerror(160, 0), "server test duration expired: ");
     }
 
     /// The errno append is UNCONDITIONAL on errno > 0 for every code
     /// (iperf_client_api.c:403-404 — the r1 review corrected the earlier
-    /// perr-gated model with a live probe); errno == 0 appends nothing (the
-    /// dangling-": " iperf_strerror artifact is a documented conscious
-    /// deviation). Unknown codes fall back to iperf3's literal int_errno=%d.
+    /// perr-gated model with a live probe). At errno == 0, perr-class codes
+    /// (160 and the int_errno default) get GT's dangling ": " (#248); perr=0
+    /// codes (27/37/120) stay bare. Unknown codes fall back to int_errno=%d.
     #[test]
     fn errno_append_and_fallback() {
-        assert_eq!(iperf3_strerror(9999, 0), "int_errno=9999");
+        // #248: the int_errno default is perr=1 → trailing ": " at errno==0.
+        assert_eq!(iperf3_strerror(9999, 0), "int_errno=9999: ");
         for (code, base) in [
             (160u32, "server test duration expired"),
             (
