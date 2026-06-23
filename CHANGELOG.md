@@ -11,6 +11,42 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
+## [0.8.0] - unreleased
+
+The architecture-and-API release the 0.7.x faithfulness train deferred. Per the
+SemVer 0.x convention, this minor bump carries breaking **library API** changes
+(below); the wire protocol, CLI flags, and `-J`/text output are unchanged — the
+faithful iperf3 drop-in behavior is preserved.
+
+### Breaking
+
+- **`Client::run` now returns `riperf3::Report`** (#137) — the rich
+  iperf3-schema report, the same object `-J`/`--json` serializes — instead of
+  the lean control-channel `TestResultsJson`. Library consumers get start
+  metadata, interval arrays, per-direction aggregates, and richer end summaries
+  directly. Migration: total bytes
+  `result.streams.iter().map(|s| s.bytes).sum()` → `result.end.sum_sent.bytes`
+  (forward) / `result.end.sum_received.bytes` (reverse); CPU
+  `result.cpu_util_total` → `result.end.cpu_utilization_percent.host_total`.
+- **`TestResultsJson` / `StreamResultJson` are no longer re-exported** from the
+  crate root (#137): they are the internal control-channel exchange model. The
+  public result type is now `Report`.
+
+### Added
+
+- **`Server::run_once() -> Result<Report>`** (#137) — serves exactly one test and
+  returns its rich report, the server-side analog of `Client::run`.
+  `Server::run` remains the long-lived accept loop (`Result<()>`).
+- **`riperf3::json_report` is a documented public module** (#137); its top-level
+  `Report` is re-exported at the crate root.
+
+### Changed
+
+- Removed the unwired `#[allow(dead_code)]` async UDP sender/receiver variants and
+  documented why the UDP data path deliberately uses `spawn_blocking` with
+  blocking sockets — SO_SNDBUF backpressure, the sendmmsg batch path, the winsock
+  demux constraint (#146). No behavior change.
+
 ## [0.7.4] - 2026-06-12
 
 A non-breaking faithfulness patch in two waves: 18 issues closed across 17

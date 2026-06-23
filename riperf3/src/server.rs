@@ -254,7 +254,9 @@ impl Server {
         let mut interrupt_fired = self.interrupt.clone().map(|w| w.0);
         loop {
             match self.handle_one_test(&listener).await {
-                Ok(()) => {}
+                // #137: the daemon loop discards each test's Report; library
+                // users who want it call `run_once`.
+                Ok(_) => {}
                 Err(RiperfError::PeerDisconnected) => {
                     if self.verbose {
                         vprintln!("Client disconnected.");
@@ -300,7 +302,37 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_one_test(&self, listener: &tokio::net::TcpListener) -> Result<()> {
+    /// Serve exactly one test and return its rich JSON [`Report`](crate::Report) — the same
+    /// object [`Client::run`](crate::Client::run) returns and `-s -J` prints.
+    ///
+    /// Binds its own listener, accepts one client, runs the test to completion,
+    /// and returns. This is the one-shot building block, mirroring
+    /// `tokio::net::TcpListener::accept`; use [`Server::run`] for the long-lived
+    /// accept loop. Unlike `run`, it does not print the "Server listening"
+    /// banner — it is a library entry point, not the daemon. The test report is
+    /// still printed to stdout in `-J` / text mode, like `Client::run`.
+    pub async fn run_once(&self) -> Result<crate::json_report::Report> {
+        let listener = net::tcp_listen(
+            self.bind_address.as_deref(),
+            self.port,
+            self.ip_version,
+            self.bind_dev.as_deref(),
+        )
+        .await?;
+        match self.handle_one_test(&listener).await? {
+            Some(report) => Ok(report),
+            // Reachable only with an interrupt watch set (e.g. the CLI's signal
+            // handling): interrupted while idle, before any client connected.
+            None => Err(RiperfError::Aborted(
+                "interrupted before a test started".into(),
+            )),
+        }
+    }
+
+    async fn handle_one_test(
+        &self,
+        listener: &tokio::net::TcpListener,
+    ) -> Result<Option<crate::json_report::Report>> {
         // ---- Accept control connection (with optional idle timeout) ----
         // The IDLE wait races the interrupt watch (#210 follow-through): an
         // idle server's first signal must exit promptly — without this arm
@@ -331,7 +363,8 @@ impl Server {
         };
         let (mut ctrl, peer_addr) = match accepted {
             Some(r) => r?,
-            None => return Ok(()),
+            // Interrupted while idle (no client): no test ran, so no report.
+            None => return Ok(None),
         };
         // (#222 r1 item 6: the Time/banner/Cookie/MSS block prints AFTER the
         // param exchange — GT's iperf_on_connect fires there — so a
@@ -378,7 +411,8 @@ impl Server {
         // GT's create_server_timers.
         if let Some(max) = self.server_max_duration.filter(|&m| m > 0) {
             if cfg.duration.saturating_add(cfg.omit) > max || cfg.duration == 0 {
-                return self.refuse_max_duration(&mut ctrl).await;
+                // Refused before any test ran → no report.
+                return self.refuse_max_duration(&mut ctrl).await.map(|()| None);
             }
         }
 
@@ -1149,6 +1183,27 @@ impl Server {
             }
         }
 
+        // #137: build the rich report ONCE — handle_one_test returns it (run
+        // discards it; run_once hands it back to the library caller). build_report
+        // drains the collected intervals via mem::take, so it must be built
+        // exactly once; reuse the pre-exchange build when --get-server-output
+        // already attached it (#33).
+        let report = prebuilt_report.unwrap_or_else(|| {
+            self.build_report(
+                &streams,
+                &cfg,
+                &params,
+                &cpu_util,
+                test_duration,
+                &cookie,
+                &accepted_host,
+                accepted_port,
+                test_start_millis,
+                &interval_data,
+                report_error.as_deref(),
+            )
+        });
+
         // #220: stream mode WINS when both flags are set — iperf3's
         // OPT_JSON_STREAM implies -J, so `-s -J --json-stream` IS stream
         // mode (the client-side dispatch and the CLI error sinks already
@@ -1165,37 +1220,9 @@ impl Server {
                 ));
             }
             // --json-stream: emit the `end` event (intervals already streamed; #62).
-            self.emit_json_stream_end(
-                &streams,
-                &cfg,
-                &params,
-                &cpu_util,
-                test_duration,
-                &cookie,
-                &accepted_host,
-                accepted_port,
-                test_start_millis,
-                &interval_data,
-                report_error.as_deref(),
-            );
+            self.emit_json_stream_end(&report);
         } else if self.json_output {
-            // Emit the iperf3-schema JSON report on stdout (#50); reuse the
-            // pre-exchange build when --get-server-output attached it (#33).
-            let report = prebuilt_report.unwrap_or_else(|| {
-                self.build_report(
-                    &streams,
-                    &cfg,
-                    &params,
-                    &cpu_util,
-                    test_duration,
-                    &cookie,
-                    &accepted_host,
-                    accepted_port,
-                    test_start_millis,
-                    &interval_data,
-                    report_error.as_deref(),
-                )
-            });
+            // Emit the iperf3-schema JSON report on stdout (#50).
             self.print_results_json(&report);
         } else if !was_captured && server_error.is_none() {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
@@ -1261,7 +1288,7 @@ impl Server {
             // "the client has terminated" (no "error - " prefix) (#210).
             return Err(RiperfError::ClientTerminated);
         }
-        Ok(())
+        Ok(Some(report))
     }
 
     /// iperf3's UDP server design (the default on Unix): one connected data
@@ -2000,35 +2027,10 @@ impl Server {
 
     /// `--json-stream`: emit the server's `end` event (#62). The interval events
     /// were already streamed live by the reporter.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_json_stream_end(
-        &self,
-        streams: &[DataStream],
-        cfg: &TestConfig,
-        params: &TestParams,
-        cpu_util: &crate::cpu::CpuUtilization,
-        test_duration: f64,
-        cookie: &[u8; protocol::COOKIE_SIZE],
-        accepted_host: &str,
-        accepted_port: u16,
-        start_time_millis: u64,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
-        error: Option<&str>,
-    ) {
-        let input = self.build_report_input(
-            streams,
-            cfg,
-            params,
-            cpu_util,
-            test_duration,
-            cookie,
-            accepted_host,
-            accepted_port,
-            start_time_millis,
-            interval_data,
-            error,
-        );
-        let report = input.build();
+    // Takes the already-built `Report` (#137: handle_one_test builds it once and
+    // returns it) so the report isn't reassembled — build_report_input drains the
+    // collected intervals via mem::take, so a second build would lose them.
+    fn emit_json_stream_end(&self, report: &crate::json_report::Report) {
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
             &report.end,
@@ -2036,7 +2038,7 @@ impl Server {
         // --json-stream-full-output: the monolithic document follows the
         // stream, like iperf_json_finish under the flag (#213).
         if self.json_stream_full_output {
-            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            println!("{}", serde_json::to_string_pretty(report).unwrap());
         }
     }
 
