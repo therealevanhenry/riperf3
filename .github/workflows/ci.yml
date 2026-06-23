@@ -52,6 +52,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
 
+  # Rustdoc gate for the published library API. -D warnings turns broken
+  # intra-doc links and malformed doc HTML into a build failure — cheap insurance
+  # for the public result model (Report and friends) that #137 documents.
+  #
+  # Lib-only (-p riperf3): riperf3-cli is a binary with no published rustdoc, and
+  # its doc comments are clap --help text where `<host>`-style angle brackets are
+  # intentional (they would trip rustdoc::invalid_html_tags).
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p riperf3
+
   semver:
     name: SemVer
     runs-on: ubuntu-latest
@@ -72,10 +89,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
+      # fail-fast off so one target's break doesn't mask another's (cf.
+      # native-test): a NetBSD-only and a Windows-only regression should both
+      # surface in one run.
+      fail-fast: false
       matrix:
+        # The platforms riperf3 cfg-gates for, kept in sync with the canonical
+        # set in scripts/xcheck.sh. `cargo check --target` type-checks per-target
+        # cfg code without linking or running — runtime divergence (winsock, the
+        # macOS tcp_connection path, FreeBSD sendmmsg) is covered by the
+        # native-test / freebsd-test jobs and the local VMs. These four targets
+        # have NO native runner anywhere, so the compile check is their ONLY CI
+        # coverage: NetBSD is the "other-Unix" canary (#78), Intel macOS exists
+        # because native-test's macos-latest is arm64, and ARM Linux is the
+        # container deploy target (Graviton / Apple-silicon).
         target:
           - x86_64-pc-windows-msvc
           - aarch64-apple-darwin
+          - x86_64-apple-darwin
+          - x86_64-unknown-netbsd
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
