@@ -2369,7 +2369,12 @@ mod client_run_return_value {
 
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
-            .bytes(1024 * 1024)
+            // JSON mode + a duration run so the reporter KEEPS interval samples:
+            // iperf3's discard_json keeps them only under -J (text mode prints
+            // then discards), and a duration run crosses an interval boundary.
+            // The build-once guard below needs `report.intervals` non-empty.
+            .json_output(true)
+            .duration(2)
             .build()
             .unwrap();
 
@@ -2402,6 +2407,15 @@ mod client_run_return_value {
             cpu.is_finite() && cpu >= 0.0,
             "cpu host_total not a sane non-negative number: {cpu}"
         );
+        // intervals is built from the reporter's collected samples, which
+        // build_report_input drains via mem::take — a non-empty array here guards
+        // the #137 build-once invariant at the LIB layer (a double build would
+        // empty it; previously only the CLI golden tests caught that). Even a
+        // byte-limited run yields the final partial interval (#159).
+        assert!(
+            !report.intervals.is_empty(),
+            "report.intervals empty — build-once / final-flush regression"
+        );
 
         let _ = server_task.await;
     }
@@ -2411,13 +2425,21 @@ mod client_run_return_value {
     #[tokio::test]
     async fn server_run_once_returns_rich_report() {
         let port = next_port();
-        let server = ServerBuilder::new().port(Some(port)).build().unwrap();
+        let server = ServerBuilder::new()
+            .port(Some(port))
+            // JSON mode so the server KEEPS interval samples (discard_json),
+            // making the build-once intervals guard below meaningful.
+            .json_output(true)
+            .build()
+            .unwrap();
         let server_task = tokio::spawn(async move { server.run_once().await });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let client = ClientBuilder::new("127.0.0.1")
             .port(Some(port))
-            .bytes(1024 * 1024)
+            // Duration run so the server's reporter collects intervals (the
+            // build-once guard on the returned report needs them non-empty).
+            .duration(2)
             .build()
             .unwrap();
         let _ = client.run().await.expect("client run failed");
@@ -2435,6 +2457,11 @@ mod client_run_return_value {
             report.end.sum_received.bytes > 0,
             "server expected non-zero received bytes, got {}",
             report.end.sum_received.bytes
+        );
+        // Guards the build-once invariant on the server path too (#137).
+        assert!(
+            !report.intervals.is_empty(),
+            "server report.intervals empty — build-once / final-flush regression"
         );
     }
     // run_errors_when_server_skips_results_exchange migrated in-crate to src/client.rs (#67).
