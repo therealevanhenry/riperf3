@@ -5,7 +5,7 @@ use crate::cpu::CpuSnapshot;
 use crate::error::{ConfigError, Result, RiperfError};
 use crate::net;
 use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportProtocol};
-use crate::stream::{self, DataStream, StreamCounters, UdpRecvStats};
+use crate::stream::{self, DataStream, StreamCounters, StreamMeta, UdpRecvStats};
 use crate::utils::*;
 
 /// Shared test configuration derived from the client's parameter JSON.
@@ -602,16 +602,17 @@ impl Server {
                     let raw_fd: Option<i32> = None;
                     let fp = self.file.as_ref().map(std::path::PathBuf::from);
 
-                    // Real socket addresses + kernel buffer sizes for the server's
-                    // `-J` `connected[]` / `sndbuf_actual` / `rcvbuf_actual` (#50),
-                    // captured before the stream moves into its task.
-                    let local_addr = data_stream.local_addr().ok();
-                    let peer_addr_s = data_stream.peer_addr().ok();
-                    let sock = socket2::SockRef::from(&data_stream);
-                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
-                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
-                    // #97: abort if the kernel clamped -w below the request (iperf3 IESETBUF2).
-                    net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+                    // Real socket addresses + kernel buffer sizes + the #97
+                    // window-clamp check for the server's `-J` `connected[]` /
+                    // `sndbuf_actual` / `rcvbuf_actual` (#50), captured before the
+                    // stream moves into its task. TCP applied -w earlier in
+                    // configure_tcp_stream_full, so apply_window is false (#144).
+                    let (local_addr, peer_addr_s, sndbuf_actual, rcvbuf_actual) =
+                        net::capture_stream_meta(
+                            socket2::SockRef::from(&data_stream),
+                            cfg.window,
+                            false,
+                        )?;
                     // #37: congestion algorithm actually in effect on this stream.
                     let congestion_used = net::tcp_congestion_used(&data_stream);
 
@@ -639,19 +640,21 @@ impl Server {
                         })
                     };
 
-                    streams.push(DataStream {
-                        id: stream_id,
-                        is_sender,
-                        counters,
-                        udp_recv_stats: None,
+                    streams.push(DataStream::from_meta(
+                        StreamMeta {
+                            id: stream_id,
+                            is_sender,
+                            counters,
+                            raw_fd,
+                            local_addr,
+                            peer_addr: peer_addr_s,
+                            sndbuf_actual,
+                            rcvbuf_actual,
+                            congestion_used,
+                        },
                         task,
-                        raw_fd,
-                        local_addr,
-                        peer_addr: peer_addr_s,
-                        sndbuf_actual,
-                        rcvbuf_actual,
-                        congestion_used,
-                    });
+                        None,
+                    ));
                 }
             }
             TransportProtocol::Udp => {
@@ -1355,31 +1358,22 @@ impl Server {
             let is_sender = i >= recv_count;
             let counters = Arc::new(StreamCounters::new());
 
-            // Socket addresses + buffer sizes for the `-J` blob (#50),
-            // captured before the socket is converted to std + moved.
-            let local_addr = data_sock.local_addr().ok();
-            let peer_addr_s = data_sock.peer_addr().ok();
-            let (sndbuf_actual, rcvbuf_actual) = {
-                let sock = socket2::SockRef::from(&data_sock);
-                // Honor -w/--window on the server's UDP data socket too
-                // (#59) so reverse/bidir UDP matches iperf3; set before the
-                // read-back below.
-                net::apply_socket_window(&sock, cfg.window);
-                (
-                    sock.send_buffer_size().ok().map(|v| v as u64),
-                    sock.recv_buffer_size().ok().map(|v| v as u64),
-                )
-            };
             // iperf3 runs iperf_common_sockopts (IP_TOS/IPV6_TCLASS) on UDP
             // stream sockets on BOTH roles — it matters for reverse/bidir,
             // where the server marks egress. Fatal like every other set_tos
             // site (#45). The TCP accept loop has had this since #45; the
-            // UDP paths never did (#154).
+            // UDP paths never did (#154). IP_TOS is independent of SO_SND/RCVBUF,
+            // so setting it before the window-apply/capture below is equivalent.
             if cfg.tos != 0 {
                 net::set_tos(&data_sock, cfg.tos as u32)?;
             }
-            // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
-            net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+            // Socket addresses + buffer sizes + the #97 window-clamp check for
+            // the `-J` blob (#50), captured before the socket is converted to
+            // std + moved. apply_window=true: honor -w/--window on the server's
+            // UDP data socket too (#59) so reverse/bidir UDP matches iperf3,
+            // before the read-back (#144).
+            let (local_addr, peer_addr_s, sndbuf_actual, rcvbuf_actual) =
+                net::capture_stream_meta(socket2::SockRef::from(&data_sock), cfg.window, true)?;
 
             let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
 
@@ -1400,19 +1394,21 @@ impl Server {
                         std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
-                streams.push(DataStream {
-                    id: stream_id,
-                    is_sender,
-                    counters,
-                    udp_recv_stats: None,
+                streams.push(DataStream::from_meta(
+                    StreamMeta {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        raw_fd: None,
+                        local_addr,
+                        peer_addr: peer_addr_s,
+                        sndbuf_actual,
+                        rcvbuf_actual,
+                        congestion_used: None,
+                    },
                     task,
-                    raw_fd: None,
-                    local_addr,
-                    peer_addr: peer_addr_s,
-                    sndbuf_actual,
-                    rcvbuf_actual,
-                    congestion_used: None,
-                });
+                    None,
+                ));
             } else {
                 let c = counters.clone();
                 let d = done.clone();
@@ -1423,19 +1419,21 @@ impl Server {
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
-                streams.push(DataStream {
-                    id: stream_id,
-                    is_sender,
-                    counters,
-                    udp_recv_stats: Some(stats),
+                streams.push(DataStream::from_meta(
+                    StreamMeta {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        raw_fd: None,
+                        local_addr,
+                        peer_addr: peer_addr_s,
+                        sndbuf_actual,
+                        rcvbuf_actual,
+                        congestion_used: None,
+                    },
                     task,
-                    raw_fd: None,
-                    local_addr,
-                    peer_addr: peer_addr_s,
-                    sndbuf_actual,
-                    rcvbuf_actual,
-                    congestion_used: None,
-                });
+                    Some(stats),
+                ));
             }
         }
         // #178: hold TestStart (sent by the caller right after this returns)
@@ -1643,19 +1641,21 @@ impl Server {
                         md,
                     )
                 });
-                streams.push(DataStream {
-                    id: stream_id,
-                    is_sender,
-                    counters,
-                    udp_recv_stats: None,
+                streams.push(DataStream::from_meta(
+                    StreamMeta {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        raw_fd: None,
+                        local_addr,
+                        peer_addr: Some(client_addr),
+                        sndbuf_actual,
+                        rcvbuf_actual,
+                        congestion_used: None,
+                    },
                     task,
-                    raw_fd: None,
-                    local_addr,
-                    peer_addr: Some(client_addr),
-                    sndbuf_actual,
-                    rcvbuf_actual,
-                    congestion_used: None,
-                });
+                    None,
+                ));
             } else {
                 let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                 routes.insert(
@@ -1669,19 +1669,21 @@ impl Server {
                 // below; give each a resolved placeholder task so the per-stream
                 // join at teardown stays uniform. The real handle is `demux_handle`.
                 let task = tokio::spawn(async { Ok::<(), RiperfError>(()) });
-                streams.push(DataStream {
-                    id: stream_id,
-                    is_sender,
-                    counters,
-                    udp_recv_stats: Some(stats),
+                streams.push(DataStream::from_meta(
+                    StreamMeta {
+                        id: stream_id,
+                        is_sender,
+                        counters,
+                        raw_fd: None,
+                        local_addr,
+                        peer_addr: Some(client_addr),
+                        sndbuf_actual,
+                        rcvbuf_actual,
+                        congestion_used: None,
+                    },
                     task,
-                    raw_fd: None,
-                    local_addr,
-                    peer_addr: Some(client_addr),
-                    sndbuf_actual,
-                    rcvbuf_actual,
-                    congestion_used: None,
-                });
+                    Some(stats),
+                ));
             }
         }
 

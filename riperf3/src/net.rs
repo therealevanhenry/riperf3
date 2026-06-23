@@ -405,6 +405,41 @@ pub(crate) fn check_socket_window(
     Ok(())
 }
 
+/// Capture a data stream's local/peer addr + realized SO_SNDBUF/SO_RCVBUF and
+/// enforce the #97 window-clamp check, in one place so no create-streams path
+/// forgets the check. `apply_window` applies the window first (UDP applies it
+/// here; TCP applied it earlier in `configure_tcp_stream_full`). The aggregate
+/// demux site sizes its recv buffer uniquely and stays inline; every regular
+/// (per-stream-socket) site routes through here so the capture + clamp check is
+/// a single source of truth.
+///
+/// Addresses come from the same socket via `SockRef`; `as_socket()` yields the
+/// identical `std::net::SocketAddr` the data socket's own `local_addr()` does
+/// (verified for IPv4 and IPv6 against `TcpStream::local_addr()`), so a stream
+/// whose socket is not AF_INET/AF_INET6 — which a TCP/UDP data socket never is —
+/// is the only case that would differ, and there it would yield `None`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn capture_stream_meta(
+    sock: socket2::SockRef,
+    window: Option<i32>,
+    apply_window: bool,
+) -> Result<(
+    Option<SocketAddr>,
+    Option<SocketAddr>,
+    Option<u64>,
+    Option<u64>,
+)> {
+    if apply_window {
+        apply_socket_window(&sock, window);
+    }
+    let local_addr = sock.local_addr().ok().and_then(|a| a.as_socket());
+    let peer_addr = sock.peer_addr().ok().and_then(|a| a.as_socket());
+    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
+    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
+    check_socket_window(window, sndbuf_actual, rcvbuf_actual)?;
+    Ok((local_addr, peer_addr, sndbuf_actual, rcvbuf_actual))
+}
+
 /// Read the TCP congestion-control algorithm actually in effect on a connected
 /// stream, via `getsockopt(TCP_CONGESTION)`, for the `congestion_used` report
 /// (#37). Returns the algorithm name (e.g. "cubic", "bbr"); iperf3 reports the

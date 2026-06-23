@@ -8,7 +8,7 @@ use crate::cpu::CpuSnapshot;
 use crate::error::{ConfigError, Result, RiperfError};
 use crate::net;
 use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportProtocol};
-use crate::stream::{self, DataStream, StreamCounters, UdpRecvStats};
+use crate::stream::{self, DataStream, StreamCounters, StreamMeta, UdpRecvStats};
 use crate::utils::*;
 
 // ---------------------------------------------------------------------------
@@ -1034,16 +1034,17 @@ impl Client {
                     #[cfg(not(unix))]
                     let raw_fd: Option<i32> = None;
 
-                    // Capture the real socket addresses before the stream moves
+                    // Capture the real socket addresses + realized buffers and
+                    // run the #97 window-clamp check, before the stream moves
                     // into its task, for the `-J` start.connected block (#36).
-                    let local_addr = data_stream.local_addr().ok();
-                    let peer_addr = data_stream.peer_addr().ok();
-                    let sock = socket2::SockRef::from(&data_stream);
-                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
-                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
-                    // #97: abort if the kernel clamped -w below the request, like
-                    // iperf3 (IESETBUF2). Before the stream moves into its task.
-                    net::check_socket_window(self.window, sndbuf_actual, rcvbuf_actual)?;
+                    // TCP applied -w earlier in configure_tcp_stream_full, so
+                    // apply_window is false here (#144).
+                    let (local_addr, peer_addr, sndbuf_actual, rcvbuf_actual) =
+                        net::capture_stream_meta(
+                            socket2::SockRef::from(&data_stream),
+                            self.window,
+                            false,
+                        )?;
                     // #37: the congestion algorithm actually in effect (the kernel
                     // default when -C is unset), for `congestion_used`.
                     let congestion_used = net::tcp_congestion_used(&data_stream);
@@ -1118,19 +1119,21 @@ impl Client {
                         })
                     };
 
-                    streams.push(DataStream {
-                        id: stream_id,
-                        is_sender,
-                        counters,
-                        udp_recv_stats: None,
+                    streams.push(DataStream::from_meta(
+                        StreamMeta {
+                            id: stream_id,
+                            is_sender,
+                            counters,
+                            raw_fd,
+                            local_addr,
+                            peer_addr,
+                            sndbuf_actual,
+                            rcvbuf_actual,
+                            congestion_used,
+                        },
                         task,
-                        raw_fd,
-                        local_addr,
-                        peer_addr,
-                        sndbuf_actual,
-                        rcvbuf_actual,
-                        congestion_used,
-                    });
+                        None,
+                    ));
                 }
             }
             TransportProtocol::Udp => {
@@ -1180,19 +1183,18 @@ impl Client {
                     let is_sender = i < send_count;
                     let counters = Arc::new(StreamCounters::new());
 
-                    // Capture real addresses for the `-J` start.connected block
-                    // (#36) before the socket moves into its task.
-                    let local_addr = udp_sock.local_addr().ok();
-                    let peer_addr = udp_sock.peer_addr().ok();
-                    let sock = socket2::SockRef::from(&udp_sock);
-                    // Honor -w/--window on the UDP socket too (#59); iperf3 applies
-                    // it to UDP via iperf_udp_buffercheck. Set before the read-back
-                    // so sndbuf_actual/rcvbuf_actual report the realized size.
-                    net::apply_socket_window(&sock, self.window);
-                    let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
-                    let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
-                    // #97: abort if -w was clamped below the request (iperf3 IESETBUF2).
-                    net::check_socket_window(self.window, sndbuf_actual, rcvbuf_actual)?;
+                    // Capture real addresses + realized buffers and run the #97
+                    // window-clamp check for the `-J` start.connected block (#36)
+                    // before the socket moves into its task. apply_window=true:
+                    // honor -w/--window on the UDP socket too (#59); iperf3
+                    // applies it to UDP via iperf_udp_buffercheck, before the
+                    // read-back, so sndbuf/rcvbuf report the realized size (#144).
+                    let (local_addr, peer_addr, sndbuf_actual, rcvbuf_actual) =
+                        net::capture_stream_meta(
+                            socket2::SockRef::from(&udp_sock),
+                            self.window,
+                            true,
+                        )?;
 
                     // Convert tokio UdpSocket to std for blocking I/O
                     let std_sock = udp_sock.into_std().map_err(RiperfError::Io)?;
@@ -1234,35 +1236,39 @@ impl Client {
                         let task = thread_gate.spawn(move || {
                             stream::run_udp_receiver_blocking(std_sock, c, sc, bs, d, u64bit)
                         });
-                        streams.push(DataStream {
+                        streams.push(DataStream::from_meta(
+                            StreamMeta {
+                                id: stream_id,
+                                is_sender,
+                                counters,
+                                raw_fd: None,
+                                local_addr,
+                                peer_addr,
+                                sndbuf_actual,
+                                rcvbuf_actual,
+                                congestion_used: None,
+                            },
+                            task,
+                            Some(stats),
+                        ));
+                        continue;
+                    };
+
+                    streams.push(DataStream::from_meta(
+                        StreamMeta {
                             id: stream_id,
                             is_sender,
                             counters,
-                            udp_recv_stats: Some(stats),
-                            task,
                             raw_fd: None,
                             local_addr,
                             peer_addr,
                             sndbuf_actual,
                             rcvbuf_actual,
                             congestion_used: None,
-                        });
-                        continue;
-                    };
-
-                    streams.push(DataStream {
-                        id: stream_id,
-                        is_sender,
-                        counters,
-                        udp_recv_stats: None,
+                        },
                         task,
-                        raw_fd: None,
-                        local_addr,
-                        peer_addr,
-                        sndbuf_actual,
-                        rcvbuf_actual,
-                        congestion_used: None,
-                    });
+                        None,
+                    ));
                 }
                 // #178: hold CreateStreams until every data thread is running
                 // (parked at its start gate). This gates the CLIENT's side
