@@ -521,7 +521,8 @@ pub struct IntervalReporterConfig {
 #[derive(Clone, Copy)]
 struct TcpSample {
     snd_cwnd: u64,
-    snd_wnd: u64,
+    /// Signed to carry macOS's faithful -1 (#161); Linux/FreeBSD non-negative.
+    snd_wnd: i64,
     rtt: u32,
     rttvar: u32,
     pmtu: u32,
@@ -534,7 +535,10 @@ struct TcpSample {
 pub struct StreamExtremes {
     pub stream_id: i32,
     pub max_snd_cwnd: u64,
-    pub max_snd_wnd: u64,
+    /// Signed i64 so the SIGNED max accumulation (`max(0i64, -1i64) == 0`)
+    /// keeps macOS's faithful -1 out of the peak; a u64 max would read -1 as
+    /// u64::MAX and inflate this catastrophically (#161).
+    pub max_snd_wnd: i64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub reorder: u32,
@@ -1734,6 +1738,33 @@ mod tests {
         let line = format_summary_line(&s, 'm');
         assert!(line.contains(" 12 "), "Retr value should appear: {line}");
         assert!(line.ends_with("sender"));
+    }
+
+    // #161 (the load-bearing macOS-inflation guard, runs on every platform incl.
+    // Linux CI): the snd_wnd extremes accumulator is the EXACT expression the
+    // reporter runs (`e.max_snd_wnd = e.max_snd_wnd.max(info.snd_wnd)`) on i64
+    // operands. macOS's get_snd_wnd is a faithful -1; feeding that into the
+    // accumulator alongside the 0 start must yield max_snd_wnd == 0 (matching
+    // GT's macOS end), NOT u64::MAX / a huge number — which is precisely what
+    // an unsigned `(-1 as u64).max(0)` would have produced. This pins the
+    // signed-max contract that lets the faithful -1 flow without inflation.
+    #[test]
+    fn snd_wnd_signed_max_keeps_macos_minus_one_at_zero() {
+        let mut e = StreamExtremes::default();
+        assert_eq!(e.max_snd_wnd, 0i64, "extremes init to 0i64");
+        // The reporter's accumulator, verbatim, with macOS's -1.
+        let macos_snd_wnd: i64 = -1;
+        e.max_snd_wnd = e.max_snd_wnd.max(macos_snd_wnd);
+        assert_eq!(
+            e.max_snd_wnd, 0i64,
+            "signed max(0, -1) must be 0 — a u64 max would inflate to u64::MAX"
+        );
+        // A subsequent real (positive) sample still wins, unaffected.
+        e.max_snd_wnd = e.max_snd_wnd.max(1_500_000i64);
+        assert_eq!(e.max_snd_wnd, 1_500_000i64);
+        // And another -1 can't pull the established peak back down.
+        e.max_snd_wnd = e.max_snd_wnd.max(macos_snd_wnd);
+        assert_eq!(e.max_snd_wnd, 1_500_000i64);
     }
 }
 
