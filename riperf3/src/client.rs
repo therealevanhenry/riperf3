@@ -268,7 +268,19 @@ async fn watch_control(ctrl: &mut tokio::net::TcpStream) -> ControlEvent {
             Ok(TestState::ServerTerminate) => return ControlEvent::Terminated,
             Ok(TestState::ServerError) => return ControlEvent::ServerError,
             Ok(other) => {
-                log::debug!("ignoring control state {other:?} during the data phase");
+                // #145: AUDITABILITY ONLY — diagnostics, behavior unchanged
+                // (still ignored, default-tolerant). ServerTerminate/
+                // ServerError are handled above, so `other` here is a
+                // non-terminal byte; note whether it is out-of-table for the
+                // client's data phase.
+                if protocol::is_legal_next(TestState::TestRunning, other, protocol::Role::Client) {
+                    log::debug!("ignoring control state {other:?} during the data phase");
+                } else {
+                    log::debug!(
+                        "ignoring out-of-sequence control state {other:?} \
+                         during the data phase"
+                    );
+                }
             }
             // Recorded deviation (r1 n3): iperf3 splits EOF (IECTRLCLOSE) /
             // read error (IERECVMESSAGE) / unknown state byte (IEMESSAGE);
@@ -426,6 +438,13 @@ impl Client {
         let mut measured_secs = self.duration as f64;
         // Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
         let mut test_start_millis = 0u64;
+
+        // #145: AUDITABILITY ONLY — the last state this side processed, threaded
+        // through the dispatch loop so an unexpected byte can be diagnosed against
+        // the transition table. Seeded at IperfStart (the first state the client
+        // legally receives is the server's first send). Updated at the bottom of
+        // each loop iteration, before the next recv. Never used to reject.
+        let mut prev_state = TestState::IperfStart;
 
         // ---- State machine: react to server-driven transitions ----
         loop {
@@ -817,8 +836,22 @@ impl Client {
                     if self.verbose {
                         vprintln!("Unexpected state: {other:?}");
                     }
+                    // #145: AUDITABILITY ONLY — diagnose the unexpected byte
+                    // against the transition table (off by default; the -V
+                    // line above is unchanged). ServerTerminate/ServerError
+                    // are handled by their own arms above, so they never reach
+                    // here. Behavior unchanged: the loop continues (tolerant).
+                    log::debug!(
+                        "client: unexpected control state {other:?} after \
+                         {prev_state:?} (legal_next={:?})",
+                        protocol::legal_next(prev_state, protocol::Role::Client)
+                    );
                 }
             }
+            // #145: AUDITABILITY ONLY — advance the table cursor to the state
+            // just handled, before the next recv. Reached only by the arms that
+            // fall through (the break/return arms end the run anyway).
+            prev_state = state;
         }
 
         // ---- Clean up ----

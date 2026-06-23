@@ -88,6 +88,67 @@ impl TestState {
 }
 
 // ---------------------------------------------------------------------------
+// Control-state transition table (#145) — AUDITABILITY ONLY
+// ---------------------------------------------------------------------------
+
+/// Which side of the control connection a peer is, for the transition table.
+///
+/// The legal-next set depends on the role because the client and the server
+/// read peer state in different phases (#145).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Client,
+    Server,
+}
+
+/// The states it is LEGAL to RECEIVE next, given the last state this side
+/// processed and which `role` it plays.
+///
+/// AUDITABILITY TABLE, NOT AN IDEALIZED PROTOCOL. This deliberately matches
+/// iperf3's *actual* tolerances — derived from the server's send sequence plus
+/// the two documented loosenesses (a re-sent `TEST_RUNNING` is a no-op on the
+/// client; the server's end-of-test loop tolerates intervening bytes) — rather
+/// than a stricter ideal. It is consulted ONLY to emit diagnostics
+/// (`log::debug!`, off by default). It is NEVER used to reject or error on a
+/// sequence: iperf3 itself is loose here, and a stricter riperf3 would break
+/// interop. Default-tolerant by design (#145).
+///
+/// `ServerTerminate`/`ServerError`/`AccessDenied` are handled by the client in
+/// ANY state (it adopts them anywhere), so the consult site treats them as
+/// always-legal rather than bloating every row here.
+pub(crate) fn legal_next(current: TestState, role: Role) -> &'static [TestState] {
+    use TestState::*;
+    match role {
+        Role::Client => match current {
+            IperfStart => &[ParamExchange, AccessDenied, ServerError, ServerTerminate],
+            ParamExchange => &[CreateStreams, ServerError, ServerTerminate],
+            CreateStreams => &[TestStart, ServerError, ServerTerminate],
+            TestStart => &[TestRunning, ServerError, ServerTerminate],
+            // re-sent TEST_RUNNING = iperf3 no-op tolerance.
+            TestRunning => &[TestRunning, ExchangeResults, ServerError, ServerTerminate],
+            ExchangeResults => &[DisplayResults, ServerError, ServerTerminate],
+            DisplayResults => &[IperfDone, ServerError, ServerTerminate],
+            // Terminal — the client adopts these and stops.
+            ServerTerminate | ServerError | AccessDenied => &[],
+            _ => &[],
+        },
+        Role::Server => match current {
+            // The server only READS peer state in two phases.
+            TestRunning => &[TestEnd, ClientTerminate], // data phase
+            DisplayResults => &[IperfDone, ClientTerminate], // end-of-test loop
+            _ => &[],
+        },
+    }
+}
+
+/// Membership test over [`legal_next`]: is `got` a legal state to receive next,
+/// given `current` and `role`? Diagnostics-only, like [`legal_next`] — never
+/// consulted to reject a sequence (#145).
+pub(crate) fn is_legal_next(current: TestState, got: TestState, role: Role) -> bool {
+    legal_next(current, role).contains(&got)
+}
+
+// ---------------------------------------------------------------------------
 // Transport protocol
 // ---------------------------------------------------------------------------
 
@@ -1310,6 +1371,177 @@ mod protocol_tests {
         assert_eq!(v["streams"][0]["id"], 1);
         assert_eq!(v["streams"][0]["bytes"], 10_000_000_000u64);
         assert_eq!(v["streams"][0]["retransmits"], 5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control-state transition table tests (#145) — AUDITABILITY ONLY
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod transition_table_tests {
+    use crate::protocol::{is_legal_next, legal_next, Role, TestState::*};
+
+    // -- Role::Client: exact legal sets per the #145 canonical table --
+
+    #[test]
+    fn client_legal_sets_are_exact() {
+        assert_eq!(
+            legal_next(IperfStart, Role::Client),
+            &[ParamExchange, AccessDenied, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(ParamExchange, Role::Client),
+            &[CreateStreams, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(CreateStreams, Role::Client),
+            &[TestStart, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(TestStart, Role::Client),
+            &[TestRunning, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(TestRunning, Role::Client),
+            &[TestRunning, ExchangeResults, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(ExchangeResults, Role::Client),
+            &[DisplayResults, ServerError, ServerTerminate]
+        );
+        assert_eq!(
+            legal_next(DisplayResults, Role::Client),
+            &[IperfDone, ServerError, ServerTerminate]
+        );
+    }
+
+    #[test]
+    fn client_terminal_states_have_no_successors() {
+        // The client adopts these and stops — no legal next.
+        assert_eq!(legal_next(ServerTerminate, Role::Client), &[]);
+        assert_eq!(legal_next(ServerError, Role::Client), &[]);
+        assert_eq!(legal_next(AccessDenied, Role::Client), &[]);
+    }
+
+    #[test]
+    fn client_other_currents_have_no_successors() {
+        // States the client never PROCESSES as a "current" (server-only or
+        // peer-only states) map to the empty set.
+        assert_eq!(legal_next(TestEnd, Role::Client), &[]);
+        assert_eq!(legal_next(ClientTerminate, Role::Client), &[]);
+        assert_eq!(legal_next(IperfDone, Role::Client), &[]);
+    }
+
+    // -- Role::Server: the server only reads peer state in two phases --
+
+    #[test]
+    fn server_legal_sets_are_exact() {
+        assert_eq!(
+            legal_next(TestRunning, Role::Server),
+            &[TestEnd, ClientTerminate]
+        );
+        assert_eq!(
+            legal_next(DisplayResults, Role::Server),
+            &[IperfDone, ClientTerminate]
+        );
+    }
+
+    #[test]
+    fn server_other_currents_have_no_successors() {
+        // Exhaustive over the remaining variants — the server consults the
+        // table only in the data phase (TestRunning) and the end loop
+        // (DisplayResults); everything else is the empty set.
+        for current in [
+            TestStart,
+            TestEnd,
+            ParamExchange,
+            CreateStreams,
+            ServerTerminate,
+            ClientTerminate,
+            ExchangeResults,
+            IperfStart,
+            IperfDone,
+            AccessDenied,
+            ServerError,
+        ] {
+            assert_eq!(
+                legal_next(current, Role::Server),
+                &[],
+                "server legal_next({current:?}) must be empty"
+            );
+        }
+    }
+
+    // -- is_legal_next membership: documented loosenesses + sample rejects --
+
+    #[test]
+    fn resent_test_running_is_legal_for_client() {
+        // iperf3 no-op tolerance: a re-sent TEST_RUNNING is legal to receive.
+        assert!(is_legal_next(TestRunning, TestRunning, Role::Client));
+    }
+
+    #[test]
+    fn server_end_loop_tolerates_client_terminate() {
+        // The server's end-of-test loop tolerates intervening bytes; the
+        // table reflects CLIENT_TERMINATE as legal there.
+        assert!(is_legal_next(DisplayResults, ClientTerminate, Role::Server));
+        assert!(is_legal_next(TestRunning, ClientTerminate, Role::Server));
+    }
+
+    #[test]
+    fn sampled_illegal_transitions_are_rejected() {
+        // A scattering of out-of-sequence transitions must report false.
+        // Client side:
+        assert!(!is_legal_next(IperfStart, TestRunning, Role::Client));
+        assert!(!is_legal_next(ParamExchange, DisplayResults, Role::Client));
+        assert!(!is_legal_next(CreateStreams, IperfDone, Role::Client));
+        assert!(!is_legal_next(TestStart, ExchangeResults, Role::Client));
+        assert!(!is_legal_next(TestRunning, DisplayResults, Role::Client));
+        assert!(!is_legal_next(ExchangeResults, IperfDone, Role::Client));
+        assert!(!is_legal_next(DisplayResults, TestRunning, Role::Client));
+        // The client never receives a client/server-internal byte as "next":
+        assert!(!is_legal_next(TestRunning, TestEnd, Role::Client));
+        assert!(!is_legal_next(TestRunning, ClientTerminate, Role::Client));
+        // Server side:
+        assert!(!is_legal_next(TestRunning, IperfDone, Role::Server));
+        assert!(!is_legal_next(DisplayResults, TestEnd, Role::Server));
+        assert!(!is_legal_next(ParamExchange, CreateStreams, Role::Server));
+        assert!(!is_legal_next(IperfStart, ParamExchange, Role::Server));
+    }
+
+    #[test]
+    fn is_legal_next_agrees_with_legal_next() {
+        // Membership is exactly slice containment over legal_next, for every
+        // (current, role, got) triple — guards the two from drifting apart.
+        let all = [
+            TestStart,
+            TestRunning,
+            TestEnd,
+            ParamExchange,
+            CreateStreams,
+            ServerTerminate,
+            ClientTerminate,
+            ExchangeResults,
+            DisplayResults,
+            IperfStart,
+            IperfDone,
+            AccessDenied,
+            ServerError,
+        ];
+        for role in [Role::Client, Role::Server] {
+            for current in all {
+                let legal = legal_next(current, role);
+                for got in all {
+                    assert_eq!(
+                        is_legal_next(current, got, role),
+                        legal.contains(&got),
+                        "is_legal_next disagrees with legal_next at \
+                         ({current:?}, {got:?}, {role:?})"
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -894,7 +894,21 @@ impl Server {
                             client_terminated = true;
                             break;
                         }
-                        _ => {}
+                        // #145: AUDITABILITY ONLY — log an out-of-sequence
+                        // control byte during the data phase, then STILL
+                        // swallow it (behavior unchanged, default-tolerant).
+                        other => {
+                            if !protocol::is_legal_next(
+                                TestState::TestRunning,
+                                other,
+                                protocol::Role::Server,
+                            ) {
+                                log::debug!(
+                                    "server: out-of-sequence control state {other:?} \
+                                     during the data phase (ignored)"
+                                );
+                            }
+                        }
                     }
                 }
                 msg = crate::client::wait_interrupt(interrupt_rx.as_mut()) => {
@@ -1179,7 +1193,23 @@ impl Server {
             loop {
                 match protocol::recv_state(&mut ctrl).await {
                     Ok(TestState::IperfDone) => break,
-                    Ok(_) => continue,
+                    // #145: AUDITABILITY ONLY — log an out-of-table control
+                    // byte in the end-of-test loop, then STILL continue
+                    // (behavior unchanged, default-tolerant; iperf3's
+                    // end-loop tolerates intervening bytes).
+                    Ok(other) => {
+                        if !protocol::is_legal_next(
+                            TestState::DisplayResults,
+                            other,
+                            protocol::Role::Server,
+                        ) {
+                            log::debug!(
+                                "server: out-of-sequence control state {other:?} \
+                                 in the end-of-test loop (ignored)"
+                            );
+                        }
+                        continue;
+                    }
                     Err(RiperfError::PeerDisconnected) => break,
                     Err(e) => return Err(e),
                 }
