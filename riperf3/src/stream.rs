@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use crate::error::Result;
@@ -185,18 +185,6 @@ impl UdpHeader {
             UDP_HEADER_SIZE_64
         } else {
             UDP_HEADER_SIZE_32
-        }
-    }
-
-    /// Create a header stamped with the current time and the given sequence.
-    pub fn new(seq: u64) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Self {
-            sec: now.as_secs() as u32,
-            usec: now.subsec_micros(),
-            seq,
         }
     }
 
@@ -954,115 +942,34 @@ async fn run_tcp_receiver_normal(
 }
 
 // ---------------------------------------------------------------------------
-// UDP send / recv loops
-// ---------------------------------------------------------------------------
-
-/// UDP sender: sends datagrams with a timestamp+sequence header, paced by the
-/// rate limiter if present.
-// Unwired async variant (prod uses the blocking/sendmmsg senders); kept in
-// parity with run_udp_receiver. Retract/gate decision tracked in #125.
-#[allow(dead_code)]
-pub async fn run_udp_sender(
-    socket: UdpSocket,
-    counters: Arc<StreamCounters>,
-    blksize: usize,
-    done: Arc<AtomicBool>,
-    mut rate_limiter: Option<RateLimiter>,
-    use_64bit: bool,
-) -> Result<()> {
-    let mut buf = vec![0u8; blksize];
-    let mut seq: u64 = 0;
-
-    while !done.load(Ordering::Relaxed) {
-        if let Some(ref mut limiter) = rate_limiter {
-            limiter.acquire(blksize as u64, &done).await;
-            // Test may have ended during the green-light wait (#160 r2).
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-        }
-
-        seq += 1;
-        UdpHeader::new(seq).write_to(&mut buf, use_64bit);
-
-        match socket.send(&buf).await {
-            Ok(n) => counters.record_sent(n as u64),
-            Err(e) => {
-                log::debug!("UDP send error: {e}");
-                seq -= 1; // allow retry with the same sequence
-            }
-        }
-    }
-    Ok(())
-}
-
-/// UDP receiver: receives datagrams, counts bytes, and tracks jitter/loss/OOO.
-// Unwired async variant (see the parity note in its drain block); kept
-// alongside run_udp_sender. Retract/gate decision tracked in #125.
-#[allow(dead_code)]
-pub async fn run_udp_receiver(
-    socket: UdpSocket,
-    counters: Arc<StreamCounters>,
-    udp_stats: Arc<Mutex<UdpRecvStats>>,
-    blksize: usize,
-    done: Arc<AtomicBool>,
-    use_64bit: bool,
-) -> Result<()> {
-    // Buffer large enough for the negotiated block size or a jumbo datagram
-    let mut buf = vec![0u8; blksize.max(65536)];
-
-    let mut drain = false;
-    loop {
-        if done.load(Ordering::Relaxed) {
-            drain = true;
-            break;
-        }
-
-        // Short timeout so we can periodically re-check the done flag.
-        let recv = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf)).await;
-
-        match recv {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => {
-                counters.record_received(n as u64);
-
-                if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {
-                    let arrival = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-
-                    if let Ok(mut stats) = udp_stats.lock() {
-                        stats.update(&header, arrival);
-                    }
-                }
-            }
-            Ok(Err(e)) => log::debug!("UDP recv error: {e}"),
-            Err(_) => { /* timeout — re-check done flag */ }
-        }
-    }
-    // Hold the socket open and drain late datagrams until the peer goes quiet, so
-    // a still-sending iperf3 <=3.12 peer isn't reset at teardown (issue #48). The
-    // async sibling of the blocking receiver's drain; a recv that times out with
-    // no datagram means the peer has stopped. (This async variant is currently
-    // unwired — the client/server use run_udp_receiver_blocking — but kept in
-    // parity so the two don't diverge.)
-    if drain {
-        let deadline = tokio::time::Instant::now() + UDP_RECEIVER_DRAIN_TIMEOUT;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf)).await {
-                // any datagram (incl. 0-byte — UDP has no EOF): discard, keep open
-                Ok(Ok(_)) => continue,
-                Ok(Err(_)) => break,
-                Err(_) => break, // silence: the peer has stopped
-            }
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Blocking UDP send / recv (high-performance, no async overhead)
+// ---------------------------------------------------------------------------
+//
+// DESIGN DECISION (#146) — DO NOT
+// re-litigate without a perf campaign: the UDP data path deliberately runs on
+// `tokio::task::spawn_blocking` with *blocking* sockets, not the async runtime
+// that the TCP path uses. This is the benchmark-winning design, and the split
+// is intentional:
+//
+//   * Backpressure: a blocking `send()` on a full SO_SNDBUF parks the thread in
+//     the kernel until space frees (bounded by the ~1s `SO_SNDTIMEO` that
+//     configure_udp_sender sets, so a wedged link can't hang the sender), giving
+//     exact rate/SO_SNDBUF backpressure for free. The async equivalent
+//     (`writable()` + nonblocking `try_send`) surfaces
+//     WouldBlock mid-batch, truncating sendmmsg batches and forcing a busy
+//     re-arm — measurably slower on the high-rate path.
+//   * Self-stop: a CPU-bound sender can't be relied on to observe `done` under a
+//     starved runtime, so the blocking loops stop on the duration deadline; an
+//     async task sharing the runtime with a saturated sender starves worse.
+//   * sendmmsg: the batch syscall path (Linux/FreeBSD/NetBSD) has no clean async
+//     analog.
+//   * Windows: the demux server path (one wildcard socket, route by source)
+//     exists because a connected + wildcard UDP socket silently drops new sources
+//     under winsock (#80); the blocking model encodes that constraint.
+//
+// The earlier `#[allow(dead_code)]` async `run_udp_sender` / `run_udp_receiver`
+// variants — kept under the #125 dead-code triage — are removed here: unwired,
+// maintained-for-parity dead weight that invited exactly this re-litigation.
 // ---------------------------------------------------------------------------
 
 /// Block until the start barrier is released so a UDP sender does not transmit
