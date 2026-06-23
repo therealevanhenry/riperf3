@@ -287,7 +287,7 @@ impl Client {
         self
     }
 
-    pub async fn run(&self) -> Result<TestResultsJson> {
+    pub async fn run(&self) -> Result<crate::json_report::Report> {
         let mut interrupt = self.interrupt.clone().map(|w| w.0);
         // -T/--title: prefix every client text line with "<title>:  " (#34),
         // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
@@ -417,6 +417,10 @@ impl Client {
         let mut byte_budget: Option<(Arc<AtomicI64>, i64)> = None;
         let mut cpu_start: Option<CpuSnapshot> = None;
         let mut server_results: Option<TestResultsJson> = None;
+        // The rich report `run` returns to the library caller (#137): captured
+        // from the DisplayResults print so the returned value IS what `-J`/text
+        // printed (built once). The interrupt path returns its own local report.
+        let mut final_report: Option<crate::json_report::Report> = None;
         // Authoritative test duration captured from run_test: `-t` for a duration
         // run, the measured elapsed for `-n`/`-k`. Drives the summary window (#103).
         let mut measured_secs = self.duration as f64;
@@ -449,7 +453,8 @@ impl Client {
                     } else {
                         0.0
                     };
-                    self.print_results(
+                    // #137: return the rich report we just dumped.
+                    let report = self.print_results(
                         &streams,
                         cpu_start.as_ref(),
                         // r1 item 7: post-ExchangeResults interrupts keep the
@@ -469,12 +474,7 @@ impl Client {
                         dump_secs,
                         Some(&msg),
                     );
-                    return Ok(self.build_results(
-                        &streams,
-                        cpu_start.as_ref(),
-                        blksize,
-                        dump_secs,
-                    ));
+                    return Ok(report);
                 }
             };
 
@@ -645,7 +645,9 @@ impl Client {
                             // (iperf3 exits 0 on TERM/INT/HUP).
                             let _ =
                                 protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
-                            self.print_results(
+                            // #137: return the rich report we just dumped (the
+                            // local-only partial — no peer half on a signal exit).
+                            let report = self.print_results(
                                 &streams,
                                 cpu_start.as_ref(),
                                 None,
@@ -662,12 +664,7 @@ impl Client {
                                 measured_secs,
                                 Some(&msg),
                             );
-                            return Ok(self.build_results(
-                                &streams,
-                                cpu_start.as_ref(),
-                                blksize,
-                                measured_secs,
-                            ));
+                            return Ok(report);
                         }
                         Some(ControlEvent::ServerError) => {
                             // #224: read the relay pair (safe here, outside
@@ -725,20 +722,24 @@ impl Client {
                 }
 
                 TestState::DisplayResults => {
-                    self.print_results(
-                        &streams,
-                        cpu_start.as_ref(),
-                        server_results.as_ref(),
-                        blksize,
-                        &interval_data,
-                        &StartMeta {
-                            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
+                    final_report = Some(
+                        self.print_results(
+                            &streams,
+                            cpu_start.as_ref(),
+                            server_results.as_ref(),
+                            blksize,
+                            &interval_data,
+                            &StartMeta {
+                                cookie: String::from_utf8_lossy(
+                                    &cookie[..protocol::COOKIE_SIZE - 1],
+                                )
                                 .into_owned(),
-                            tcp_mss_default: control_mss,
-                            start_time_millis: test_start_millis,
-                        },
-                        measured_secs,
-                        None,
+                                tcp_mss_default: control_mss,
+                                start_time_millis: test_start_millis,
+                            },
+                            measured_secs,
+                            None,
+                        ),
                     );
                     protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
                     break; // test complete — server will close the connection
@@ -832,14 +833,20 @@ impl Client {
         // (r1 item 9: a failed exchange must not print Done; GT's
         // cleanup_and_fail never does), and as two prints so a --timestamps
         // prefix lands on both lines like GT (item 10b).
-        let results = server_results.ok_or_else(|| {
-            RiperfError::Protocol("missing server results in control exchange".into())
-        })?;
+        // Protocol-correctness guard kept: a clean run must have completed the
+        // results exchange. The RETURNED value is the rich report captured at
+        // DisplayResults (#137), not the lean wire struct.
+        if server_results.is_none() {
+            return Err(RiperfError::Protocol(
+                "missing server results in control exchange".into(),
+            ));
+        }
         if !self.json_output && !self.json_stream {
             vprintln!("");
             vprintln!("iperf Done.");
         }
-        Ok(results)
+        final_report
+            .ok_or_else(|| RiperfError::Protocol("results not displayed before IPERF_DONE".into()))
     }
 
     fn build_params(&self, blksize: usize) -> TestParams {
@@ -1625,7 +1632,7 @@ impl Client {
         start_meta: &StartMeta,
         test_duration: f64,
         error: Option<&str>,
-    ) {
+    ) -> crate::json_report::Report {
         // #220: stream mode WINS when both flags are set — iperf3's
         // OPT_JSON_STREAM implies -J (iperf_api.c:1280-1282), so `-J
         // --json-stream` IS stream mode (full event stream incl. `end`; the
@@ -1633,6 +1640,10 @@ impl Client {
         // stream arm already honors). The old json_output-first dispatch
         // emitted a truncated stream (no end event) followed by the doc.
         // The CLI's error-sink dispatch has always been stream-first (#198).
+        //
+        // Every arm returns the same rich `Report` it emits/prints — `run`
+        // hands it back to the library caller (#137), so "what run returns" is
+        // byte-for-byte "what `-J` prints" (built once via build_report_input).
         if self.json_stream {
             // iperf3's NDJSON tail order is: error?, server_output_json,
             // server_output_text, end (iperf_api.c:5310-5323) (#170 + #168).
@@ -1661,7 +1672,7 @@ impl Client {
             }
             // --json-stream: emit the `end` event. (Previously this fell through
             // to print_results_text, printing text banners into the NDJSON — #62.)
-            self.emit_json_stream_end(
+            let mut report = self.emit_json_stream_end(
                 streams,
                 cpu_start,
                 remote_cpu,
@@ -1670,6 +1681,10 @@ impl Client {
                 start_meta,
                 test_duration,
             );
+            // The error went out as a discrete stream event above; also carry it
+            // on the returned Report (return-value only — no effect on output).
+            report.error = error.map(str::to_owned);
+            report
         } else if self.json_output {
             self.print_results_json(
                 streams,
@@ -1680,7 +1695,7 @@ impl Client {
                 start_meta,
                 test_duration,
                 error,
-            );
+            )
         } else {
             self.print_results_text(
                 streams,
@@ -1689,6 +1704,20 @@ impl Client {
                 test_duration,
                 cpu_start.map(|s| CpuSnapshot::now().utilization_since(s)),
             );
+            // Text mode prints the live summary but builds no Report; build it
+            // for the return value via the same path `-J` uses, then attach any
+            // run error (matching print_results_json's iperf_json_finish step).
+            let mut input = self.build_report_input(
+                streams,
+                cpu_start,
+                remote_cpu,
+                blksize,
+                interval_data,
+                start_meta,
+                test_duration,
+            );
+            input.error = error.map(str::to_owned);
+            input.build()
         }
     }
 
@@ -2102,7 +2131,7 @@ impl Client {
         start_meta: &StartMeta,
         test_duration: f64,
         error: Option<&str>,
-    ) {
+    ) -> crate::json_report::Report {
         let mut input = self.build_report_input(
             streams,
             cpu_start,
@@ -2114,7 +2143,9 @@ impl Client {
         );
         // iperf3's iperf_json_finish attaches the run error to the blob (#170).
         input.error = error.map(str::to_owned);
-        println!("{}", serde_json::to_string_pretty(&input.build()).unwrap());
+        let report = input.build();
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        report
     }
 
     /// `--json-stream`: emit the `start` event (#62). Called at TestStart, before
@@ -2158,7 +2189,7 @@ impl Client {
         interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
         test_duration: f64,
-    ) {
+    ) -> crate::json_report::Report {
         let input = self.build_report_input(
             streams,
             cpu_start,
@@ -2179,6 +2210,7 @@ impl Client {
         if self.json_stream_full_output {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
+        report
     }
 }
 

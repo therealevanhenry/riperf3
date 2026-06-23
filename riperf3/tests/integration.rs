@@ -397,7 +397,7 @@ async fn tcp_reverse_bytes_limit_terminates() {
     // rate the 100ms end-condition poll overshoots the target (a pre-existing
     // characteristic shared with forward `-n`), so this guards termination +
     // floor, not an exact byte count.
-    let transferred: u64 = res.streams.iter().map(|s| s.bytes).sum();
+    let transferred: u64 = res.end.sum_sent.bytes;
     assert!(
         transferred >= target,
         "transferred {transferred} < requested {target}"
@@ -433,7 +433,7 @@ async fn tcp_reverse_blocks_limit_terminates() {
     let result = tokio::time::timeout(Duration::from_secs(15), client.run()).await;
     assert!(result.is_ok(), "-R -k hung — issue #60 regression");
     let res = result.unwrap().expect("-R -k errored");
-    let transferred: u64 = res.streams.iter().map(|s| s.bytes).sum();
+    let transferred: u64 = res.end.sum_sent.bytes;
     assert!(
         transferred >= blocks * blksize as u64,
         "transferred {transferred} < requested {blocks} blocks"
@@ -470,7 +470,7 @@ async fn tcp_byte_limit_overshoot_bounded_forward() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let bytes: u64 = result.end.sum_received.bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -505,7 +505,7 @@ async fn tcp_byte_limit_overshoot_bounded_reverse() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let bytes: u64 = result.end.sum_sent.bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -547,8 +547,8 @@ async fn tcp_bitrate_is_paced() {
         .await
         .expect("client hung")
         .expect("client errored");
-    // run() returns the server's results; forward → server received ≈ what we sent.
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    // run() returns the rich report; forward → server received ≈ what we sent.
+    let bytes: u64 = result.end.sum_received.bytes;
     let achieved = bytes * 8 / secs;
     // Unpaced this is line rate (tens of Gbit/s, >100x target). Paced lands near
     // target; allow a generous band for burst/timing slack.
@@ -591,7 +591,7 @@ async fn tcp_low_bitrate_no_overshoot() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let bytes: u64 = result.end.sum_received.bytes;
     let budget = (target / 8 * secs) as f64; // 250 KB
     let bound = budget * 1.25 + (128 * 1024) as f64;
     assert!(
@@ -623,7 +623,7 @@ async fn tcp_unlimited_is_not_paced() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let bytes: u64 = result.end.sum_received.bytes;
     // A 200 Mbit cap would yield ~25 MB in 1 s; unthrottled loopback moves far
     // more. >200 MB confirms pacing didn't leak into the rate-0 path.
     assert!(
@@ -661,7 +661,7 @@ async fn tcp_bitrate_reverse_is_paced() {
         .expect("client hung")
         .expect("client errored");
     // Reverse: the server sends; its reported bytes ≈ what it paced out.
-    let bytes: u64 = result.streams.iter().map(|s| s.bytes).sum();
+    let bytes: u64 = result.end.sum_sent.bytes;
     let achieved = bytes * 8 / secs;
     assert!(
         achieved < target * 2,
@@ -2348,16 +2348,16 @@ async fn udp_sendmmsg_with_64bit_counters() {
 }
 
 // ---------------------------------------------------------------------------
-// Client::run return-value tests (added with the Result<TestResultsJson> change)
+// Client::run / Server::run_once return-value tests (#137: the rich Report API)
 // ---------------------------------------------------------------------------
 
 mod client_run_return_value {
     use super::*;
 
-    /// Happy path: a normal TCP exchange yields a populated `TestResultsJson`,
-    /// proving the library now exposes what `print_results` used to consume internally.
+    /// #137: a normal TCP exchange makes `Client::run` return a populated rich
+    /// `Report` (the same object `-J` serializes), not the lean wire struct.
     #[tokio::test]
-    async fn run_returns_populated_results() {
+    async fn run_returns_rich_report() {
         let port = next_port();
         let server = ServerBuilder::new()
             .port(Some(port))
@@ -2373,24 +2373,69 @@ mod client_run_return_value {
             .build()
             .unwrap();
 
-        let results = client.run().await.expect("client run failed");
+        let report = client.run().await.expect("client run failed");
 
+        // The end block carries both halves on a forward run.
         assert!(
-            !results.streams.is_empty(),
-            "expected at least one stream in returned results"
-        );
-        let total_bytes: i64 = results.streams.iter().map(|s| s.bytes as i64).sum();
-        assert!(
-            total_bytes > 0,
-            "expected non-zero bytes across streams, got {total_bytes}"
+            !report.end.streams.is_empty(),
+            "expected at least one stream in report.end"
         );
         assert!(
-            results.cpu_util_total.is_finite() && results.cpu_util_total >= 0.0,
-            "cpu_util_total not a sane non-negative number: {}",
-            results.cpu_util_total
+            report.end.sum_sent.bytes > 0,
+            "expected non-zero sent bytes, got {}",
+            report.end.sum_sent.bytes
+        );
+        assert!(
+            report.end.sum_received.bytes > 0,
+            "expected non-zero received bytes, got {}",
+            report.end.sum_received.bytes
+        );
+        // start metadata is populated …
+        assert!(
+            report.start.version.starts_with("riperf"),
+            "start.version should name the tool: {:?}",
+            report.start.version
+        );
+        // … and the host CPU figure is a sane number.
+        let cpu = report.end.cpu_utilization_percent.host_total;
+        assert!(
+            cpu.is_finite() && cpu >= 0.0,
+            "cpu host_total not a sane non-negative number: {cpu}"
         );
 
         let _ = server_task.await;
+    }
+
+    /// #137: the `Server::run_once` analog returns the same rich `Report` for the
+    /// single test it serves — symmetric with `Client::run`.
+    #[tokio::test]
+    async fn server_run_once_returns_rich_report() {
+        let port = next_port();
+        let server = ServerBuilder::new().port(Some(port)).build().unwrap();
+        let server_task = tokio::spawn(async move { server.run_once().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .bytes(1024 * 1024)
+            .build()
+            .unwrap();
+        let _ = client.run().await.expect("client run failed");
+
+        let report = server_task
+            .await
+            .expect("server task panicked")
+            .expect("server run_once failed");
+        assert!(
+            !report.end.streams.is_empty(),
+            "server report.end should carry the served test's streams"
+        );
+        // Forward run: the server is the receiver, so its received aggregate moved.
+        assert!(
+            report.end.sum_received.bytes > 0,
+            "server expected non-zero received bytes, got {}",
+            report.end.sum_received.bytes
+        );
     }
     // run_errors_when_server_skips_results_exchange migrated in-crate to src/client.rs (#67).
 }

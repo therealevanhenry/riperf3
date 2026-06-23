@@ -39,21 +39,26 @@ mod server;
 // any public signature); it stays crate-private rather than a public type (#67).
 pub use server::{Server, ServerBuilder};
 
-// The wire protocol enum and the result model returned by `Client::run()`.
-pub use protocol::{StreamResultJson, TestResultsJson, TransportProtocol};
+// The transport enum used across the public builder API. `TestResultsJson` /
+// `StreamResultJson` are the internal control-channel exchange model and are no
+// longer re-exported (0.8.0 breaking, #137) — `Client::run` now returns `Report`.
+pub use protocol::TransportProtocol;
+
+// The rich iperf3-schema result model returned by `Client::run` and
+// `Server::run_once` — the same object `-J` / `--json` serializes (#137).
+pub use json_report::Report;
 
 pub use net::set_cpu_affinity;
 
 // --- Internal modules: implementation detail, NOT part of the public API. ---
 // Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
 // few genuinely-public types are re-exported at the crate root above (#67).
-// `json_report` is the exception — it is the iperf3-schema result model and
-// stays publicly accessible (kept `#[doc(hidden)]` to keep its ~25 structs out
-// of the rendered API surface).
+// `json_report` is the exception — it is the iperf3-schema result model that
+// `Client::run` / `Server::run_once` return, so it is a documented public
+// module (#137); its top-level `Report` is re-exported at the crate root above.
 
 pub(crate) mod auth;
 pub(crate) mod cpu;
-#[doc(hidden)]
 pub mod json_report;
 pub(crate) mod net;
 pub(crate) mod protocol;

@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "riperf3"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "base64",
  "libc",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "riperf3-cli"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "clap",
  "libc",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "riperf3-test-support"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "serde_json",
 ]

@@ -86,17 +86,20 @@ fn udp_bidir_window_waits_for_stream_threads() {
         };
         srv.await.unwrap().expect("server run");
 
-        // The server's exchanged results carry both streams: its receiving
-        // stream (forward bytes received) and its sending stream (reverse
-        // bytes sent). Pre-fix, the hogged pool keeps every data thread off
-        // the CPU until the window has already closed, and both are zero.
-        assert_eq!(results.streams.len(), 2, "bidir run has two streams");
-        for s in &results.streams {
+        // The report carries both data streams: the forward (server-received)
+        // and reverse (server-sent) halves. Pre-fix, the hogged pool keeps every
+        // data thread off the CPU until the window has already closed, so a
+        // stream moves zero bytes. (#137: the rich Report replaces the lean wire
+        // struct; per-stream bytes live on the sender/receiver/udp side objects.)
+        assert_eq!(results.end.streams.len(), 2, "bidir run has two streams");
+        for s in &results.end.streams {
+            let moved = s.sender.as_ref().map_or(0, |x| x.bytes)
+                + s.receiver.as_ref().map_or(0, |x| x.bytes)
+                + s.udp.as_ref().map_or(0, |x| x.bytes);
             assert!(
-                s.bytes > 0,
-                "stream {} moved no bytes — test window opened before the \
-                 data threads started (#178): {results:?}",
-                s.id
+                moved > 0,
+                "a stream moved no bytes — test window opened before the \
+                 data threads started (#178): {results:?}"
             );
         }
     });

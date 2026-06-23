@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.4"
+version = "0.8.0"
 authors = ["Evan Henry"]
 edition = "2021"
 # MSRV floor 1.85 (review r1, verified empirically): the locked base64ct 1.8
