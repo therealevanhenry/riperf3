@@ -327,8 +327,10 @@ pub struct IntervalStream {
     pub retransmits: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snd_cwnd: Option<u64>,
+    // Signed so macOS can emit the faithful -1 (like iperf3's get_snd_wnd);
+    // non-negative values serialize identically to the old u64 (#161).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub snd_wnd: Option<u64>,
+    pub snd_wnd: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -456,8 +458,10 @@ pub struct TcpStreamSide {
     // emits when those are unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_snd_cwnd: Option<u64>,
+    // Signed i64 (the signed-max keeps macOS's -1 at 0); non-negative values
+    // serialize byte-identically to the old u64 (#161).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_snd_wnd: Option<u64>,
+    pub max_snd_wnd: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rtt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,8 +598,9 @@ pub struct StreamReport {
 pub struct TcpEndExtras {
     pub max_snd_cwnd: u64,
     /// Peak peer-advertised send window, where the platform reader captures
-    /// it (Linux UAPI mirror / FreeBSD) — iperf3's stream_max_snd_wnd (#161).
-    pub max_snd_wnd: u64,
+    /// it (Linux UAPI mirror / FreeBSD) — iperf3's stream_max_snd_wnd. Signed:
+    /// the signed-max accumulation keeps macOS's faithful -1 at 0 (#161).
+    pub max_snd_wnd: i64,
     pub max_rtt: u32,
     pub min_rtt: u32,
     pub mean_rtt: u32,

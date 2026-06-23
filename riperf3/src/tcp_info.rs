@@ -7,9 +7,10 @@ pub struct TcpInfoSnapshot {
     /// reader multiplies by mss; macOS and FreeBSD report bytes and are used
     /// raw, like iperf3 (#155).
     pub snd_cwnd: u64,
-    /// Send window advertised by the receiver, in bytes.
-    #[allow(dead_code)]
-    pub snd_wnd: u64,
+    /// Send window advertised by the receiver, in bytes. Signed so the macOS
+    /// reader can carry iperf3's faithful -1 (its `get_snd_wnd` returns -1
+    /// because the `HAVE_TCP_INFO_SND_WND` probe is dead on Apple) (#161).
+    pub snd_wnd: i64,
     /// Smoothed round-trip time in microseconds. On macOS the kernel's
     /// `tcpi_srtt` is MILLIseconds and is kept raw — iperf3 has the identical
     /// quirk (its APPLE `get_rtt` feeds tcpi_srtt into a usec-treated field),
@@ -151,9 +152,10 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         // HAVE_TCP_INFO_SND_WND probe prefers linux/tcp.h, so Linux builds
         // emit the live value) (#161).
         snd_wnd: if field_filled(std::mem::offset_of!(LinuxTcpInfo, tcpi_snd_wnd)) {
-            info.tcpi_snd_wnd as u64
+            info.tcpi_snd_wnd as i64
         } else {
-            0
+            // Pre-5.4 short copy: iperf3 emits 0 where it can't read the field.
+            0i64
         },
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,
@@ -258,9 +260,11 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         // xnu has the live value, but iperf3's HAVE_TCP_INFO_SND_WND probe
         // checks struct tcp_info — absent on macOS — so its APPLE snd_wnd
         // branch is dead and get_snd_wnd returns -1. Emitting the real value
-        // here would diverge from every macOS iperf3 build; the faithful -1
-        // needs the 0.8.0 i64 report fields, so pin 0 until then (#161).
-        snd_wnd: 0,
+        // here would diverge from every macOS iperf3 build. The 0.8.0 i64
+        // report fields landed (#161), so emit the faithful -1; the signed max
+        // accumulation keeps it out of max_snd_wnd (max(0,-1)==0), matching
+        // GT's macOS max_snd_wnd:0.
+        snd_wnd: -1,
         rtt: info.tcpi_srtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_maxseg,
@@ -297,7 +301,7 @@ pub fn get_tcp_info(fd: i32) -> Option<TcpInfoSnapshot> {
         // FreeBSD's tcpi_snd_cwnd is BYTES (tcp_usrreq.c) and iperf3 uses it
         // raw — the old ×mss inflated the Cwnd column ~mss-fold (#155).
         snd_cwnd: info.tcpi_snd_cwnd as u64,
-        snd_wnd: info.tcpi_snd_wnd as u64,
+        snd_wnd: info.tcpi_snd_wnd as i64,
         rtt: info.tcpi_rtt,
         rttvar: info.tcpi_rttvar,
         snd_mss: info.tcpi_snd_mss,
@@ -437,6 +441,32 @@ mod tests {
             info.snd_cwnd >= info.snd_mss as u64 && info.snd_cwnd < (1 << 30),
             "snd_cwnd implausible: {}",
             info.snd_cwnd
+        );
+    }
+
+    // #161: macOS must emit the FAITHFUL -1 for snd_wnd. iperf3's
+    // HAVE_TCP_INFO_SND_WND probe checks `struct tcp_info` (absent on macOS),
+    // so its APPLE get_snd_wnd branch is dead and get_snd_wnd returns -1;
+    // riperf3's reader pins -1 to match. The signed-max accumulation then keeps
+    // it out of max_snd_wnd (max(0,-1)==0), so end emits max_snd_wnd:0 like GT.
+    // Validated by the macOS native CI job (can't run on Linux).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_snapshot_emits_faithful_minus_one_snd_wnd() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client_stream = client.await.unwrap();
+
+        let info = get_tcp_info(server_stream.as_raw_fd()).expect("TCP_CONNECTION_INFO");
+        assert_eq!(
+            info.snd_wnd, -1,
+            "macOS get_snd_wnd is faithfully -1 (the dead APPLE probe), got {}",
+            info.snd_wnd
         );
     }
 }
