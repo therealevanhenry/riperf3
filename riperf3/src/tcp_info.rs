@@ -1,5 +1,5 @@
 /// Subset of TCP connection metrics from the kernel's `TCP_INFO` socket option.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TcpInfoSnapshot {
     /// Cumulative retransmissions over the connection lifetime.
     pub total_retransmits: u32,

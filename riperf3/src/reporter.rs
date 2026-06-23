@@ -909,10 +909,33 @@ pub fn spawn_interval_reporter(
                                         Some(info.pmtu),
                                         Some(info.reorder),
                                     )
-                                } else if let Some(s) = last_tcp[i] {
-                                    // Final-interval fallback (#55): the socket closed as
-                                    // the run ended, so a fresh read failed. Reuse the
-                                    // last sample's cwnd/rtt; no new retransmit count is
+                                } else if let Some(s) = stream
+                                    .counters
+                                    .final_tcp_sample()
+                                    .map(|info| TcpSample {
+                                        snd_cwnd: info.snd_cwnd,
+                                        snd_wnd: info.snd_wnd,
+                                        rtt: info.rtt,
+                                        rttvar: info.rttvar,
+                                        pmtu: info.pmtu,
+                                        reorder: info.reorder,
+                                    })
+                                    .or(last_tcp[i])
+                                {
+                                    // Final-interval fallback (#55/#245): the socket
+                                    // closed as the run ended, so a fresh read failed.
+                                    // PREFER the sender's genuinely-final snapshot
+                                    // (#245) — captured by snapshot_final_retransmits
+                                    // while the socket was still open, the LIVE
+                                    // cwnd/snd_wnd/rtt iperf3 reports by keeping its
+                                    // sockets open through the end exchange — and fall
+                                    // back to the previous interval's cached sample
+                                    // (#55) when no final snapshot exists. SAFE mid-run:
+                                    // final_tcp_sample is None until the sender exits
+                                    // (set AFTER the periodic ticks stop), so a transient
+                                    // read failure during the run still falls through to
+                                    // last_tcp[i] exactly as before — only the post-`done`
+                                    // final flush sees Some. No new retransmit count is
                                     // measurable for the sub-interval, so report 0.
                                     (
                                         Some(0),
@@ -1904,6 +1927,235 @@ mod interval_reporter_tests {
             "final interval must be a sub-interval partial; start={} end={} dur={dur}",
             last.sum.start,
             last.sum.end
+        );
+    }
+
+    /// #245: when the final partial interval's TCP_INFO read hits a CLOSED fd
+    /// (the sender dropped its socket on `done`, the #159 order), the fallback
+    /// must report the sender's GENUINELY-FINAL snapshot — captured by
+    /// `snapshot_final_retransmits` while the socket was still open — not blank
+    /// and not the previous interval's stale sample. Here the live read always
+    /// fails (`raw_fd = Some(-1)`), so `last_tcp` is never populated; pre-fix the
+    /// final interval's snd_cwnd/rtt would be `None`. The fix surfaces the stashed
+    /// final sample. Gated to platforms that read TCP_INFO at all (the reporter's
+    /// `has_retransmits` requires it) and to unix (raw fds).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_partial_prefers_sender_final_tcp_sample() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use crate::tcp_info::{has_retransmit_info, TcpInfoSnapshot};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        // The reporter only reads TCP_INFO where the platform provides it; on
+        // others has_retransmits is false and there's nothing to exercise.
+        if !has_retransmit_info() {
+            return;
+        }
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        // The sender's genuinely-final snapshot, with values no fresh loopback
+        // connection would produce — proves the final interval carries THESE.
+        counters.set_final_tcp_sample(TcpInfoSnapshot {
+            total_retransmits: 0,
+            snd_cwnd: 424_242_424,
+            snd_wnd: 31_337,
+            rtt: 271_828,
+            rttvar: 161_803,
+            snd_mss: 1_448,
+            pmtu: 1_492,
+            reorder: 5,
+        });
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: true,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            // An invalid fd: get_tcp_info fails on every tick AND the final
+            // flush, so last_tcp stays None and only the stashed final sample
+            // can fill the final interval (the closed-socket end state of #159).
+            raw_fd: Some(-1),
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            forceflush: false,
+            json_stream: false,
+            print: false,
+            blksize: 128 * 1024,
+            keep_intervals: false,
+            bidir: false,
+            is_server: false,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let report_start = std::time::Instant::now();
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+            None,
+            None,
+        )
+        .expect("reporter spawns for a positive interval");
+
+        // One full interval, then a partial second that ends mid-interval.
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5
+        counters.record_sent(500);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        done.store(true, Ordering::Relaxed);
+        reporter_end.finish(report_start.elapsed().as_secs_f64());
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        let n = g.intervals.len();
+        assert!(n >= 1, "expected at least one collected interval");
+        let last = &g.intervals[n - 1];
+        assert_eq!(
+            last.sum.bytes, 500,
+            "final partial carries the residual bytes (#55 invariant intact)"
+        );
+        let s = last
+            .streams
+            .first()
+            .expect("the final interval has a per-stream entry");
+        assert_eq!(
+            s.snd_cwnd,
+            Some(424_242_424),
+            "final interval must report the sender's genuinely-final cwnd (#245), \
+             not None (pre-fix the closed fd left it blank)"
+        );
+        assert_eq!(
+            s.rtt,
+            Some(271_828),
+            "final interval must report the sender's genuinely-final rtt (#245)"
+        );
+    }
+
+    /// #245: the genuinely-final snapshot must WIN over the previous interval's
+    /// cached `last_tcp` sample (the #55 fallback). A real loopback socket feeds
+    /// the periodic tick a real `last_tcp`; then the socket is dropped and a
+    /// distinct final snapshot is stashed. The closed-fd final flush must emit
+    /// the stashed values, not the real loopback ones — pre-fix it took the
+    /// stale `last_tcp`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_partial_overrides_cached_last_tcp_with_final_sample() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use crate::tcp_info::{has_retransmit_info, TcpInfoSnapshot};
+        use std::os::unix::io::AsRawFd;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        if !has_retransmit_info() {
+            return;
+        }
+
+        // A real connected loopback pair so the periodic tick reads a real,
+        // small cwnd into `last_tcp` (kept distinct from the sentinel below).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_join =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = client_join.await.unwrap();
+        let fd = server_stream.as_raw_fd();
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: true,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: Some(fd),
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            forceflush: false,
+            json_stream: false,
+            print: false,
+            blksize: 128 * 1024,
+            keep_intervals: false,
+            bidir: false,
+            is_server: false,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let report_start = std::time::Instant::now();
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+            None,
+            None,
+        )
+        .expect("reporter spawns for a positive interval");
+
+        // One full interval: the tick reads the live socket → last_tcp set to a
+        // real (small) cwnd.
+        counters.record_sent(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5
+
+        // Now the sender "exits": stash a sentinel final snapshot and CLOSE the
+        // socket so the final flush's live read fails (the #159 end state).
+        counters.set_final_tcp_sample(TcpInfoSnapshot {
+            total_retransmits: 0,
+            snd_cwnd: 424_242_424, // impossibly large for a fresh loopback cwnd
+            snd_wnd: 31_337,
+            rtt: 271_828,
+            rttvar: 161_803,
+            snd_mss: 1_448,
+            pmtu: 1_492,
+            reorder: 5,
+        });
+        drop(server_stream);
+        drop(client_stream);
+
+        counters.record_sent(500);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        done.store(true, Ordering::Relaxed);
+        reporter_end.finish(report_start.elapsed().as_secs_f64());
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        let n = g.intervals.len();
+        assert!(n >= 1, "expected at least one collected interval");
+        let last = &g.intervals[n - 1];
+        let s = last
+            .streams
+            .first()
+            .expect("the final interval has a per-stream entry");
+        // The sentinel, not the real loopback cwnd captured into last_tcp.
+        assert_eq!(
+            s.snd_cwnd,
+            Some(424_242_424),
+            "final interval must PREFER the sender's final snapshot over the \
+             cached last_tcp sample (#245); got {:?}",
+            s.snd_cwnd
+        );
+        assert_eq!(
+            s.rtt,
+            Some(271_828),
+            "final rtt must be the final sample (#245)"
         );
     }
 

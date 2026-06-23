@@ -46,6 +46,16 @@ pub struct StreamCounters {
     /// stream_prev_total_retrans the same way, so the exchanged total covers
     /// the post-omit window only. -1 = no boundary crossed.
     omit_retransmits: AtomicI64,
+    /// #245: the sender task's genuinely-final TCP_INFO snapshot (cwnd / snd_wnd
+    /// / rtt / rttvar / pmtu / reorder), captured by `snapshot_final_retransmits`
+    /// while the socket is still open, just before the sender drops it. The #159
+    /// stop→grace→flush order means the reporter's final partial-interval read
+    /// then hits a CLOSED fd; with this stashed the closed-fd fallback can report
+    /// the LIVE final sample instead of the previous interval's cached one (the
+    /// #55 stale fallback). `None` = not captured (receiver, UDP, non-unix, or no
+    /// platform support). Set ONCE per stream at sender exit, read ONCE at the
+    /// final flush — never contended, never on the hot path, so a plain Mutex.
+    final_tcp_sample: Mutex<Option<crate::tcp_info::TcpInfoSnapshot>>,
 }
 
 impl Default for StreamCounters {
@@ -65,6 +75,7 @@ impl StreamCounters {
             bytes_received_omit: AtomicU64::new(0),
             final_retransmits: AtomicI64::new(-1),
             omit_retransmits: AtomicI64::new(-1),
+            final_tcp_sample: Mutex::new(None),
         }
     }
 
@@ -102,6 +113,22 @@ impl StreamCounters {
     /// The snapshotted end-of-test retransmit total, or -1 if never captured.
     pub fn final_retransmits(&self) -> i64 {
         self.final_retransmits.load(Ordering::Relaxed)
+    }
+
+    /// Store the sender's genuinely-final TCP_INFO snapshot (#245; sender task
+    /// only, captured while the socket is still open just before it is dropped).
+    pub fn set_final_tcp_sample(&self, info: crate::tcp_info::TcpInfoSnapshot) {
+        if let Ok(mut g) = self.final_tcp_sample.lock() {
+            *g = Some(info);
+        }
+    }
+
+    /// The sender's genuinely-final TCP_INFO snapshot, or `None` if never
+    /// captured (#245). A poisoned lock also yields `None` — the closed-fd
+    /// fallback then degrades to the previous interval's cached sample, never
+    /// panics.
+    pub fn final_tcp_sample(&self) -> Option<crate::tcp_info::TcpInfoSnapshot> {
+        self.final_tcp_sample.lock().ok().and_then(|g| *g)
     }
 
     /// Record the omit-boundary retransmit baseline (#171; reporter boundary
@@ -535,6 +562,12 @@ fn snapshot_final_retransmits(stream: &TcpStream, counters: &StreamCounters) {
         use std::os::unix::io::AsRawFd;
         if let Some(info) = crate::tcp_info::get_tcp_info(stream.as_raw_fd()) {
             counters.set_final_retransmits(info.total_retransmits as i64);
+            // #245: stash the WHOLE final snapshot too (cwnd/snd_wnd/rtt/...),
+            // read here while the socket is still open. The reporter's final
+            // partial-interval read hits the closed fd post-#159; this lets its
+            // fallback report the live final sample instead of the previous
+            // interval's stale one (#55).
+            counters.set_final_tcp_sample(info);
         }
     }
     #[cfg(not(unix))]
@@ -2055,6 +2088,40 @@ mod tests {
         assert_eq!(c.bytes_received(), 125);
         assert_eq!(c.take_received_interval(), 125);
         assert_eq!(c.take_received_interval(), 0);
+    }
+
+    /// #245: the final TCP_INFO snapshot stash round-trips. Default is `None`
+    /// (no socket read yet — receiver/UDP/non-unix stay here, so the reporter's
+    /// closed-fd fallback keeps the #55 cached-sample behavior); after the sender
+    /// stashes its genuinely-final sample, the reporter reads back exactly those
+    /// values.
+    #[test]
+    fn final_tcp_sample_round_trip() {
+        let c = StreamCounters::new();
+        assert!(
+            c.final_tcp_sample().is_none(),
+            "no final sample captured yet → None (keeps the #55 fallback)"
+        );
+
+        let snap = crate::tcp_info::TcpInfoSnapshot {
+            total_retransmits: 7,
+            snd_cwnd: 123_456,
+            snd_wnd: 65_535,
+            rtt: 4_321,
+            rttvar: 99,
+            snd_mss: 1_448,
+            pmtu: 1_500,
+            reorder: 3,
+        };
+        c.set_final_tcp_sample(snap);
+
+        let got = c.final_tcp_sample().expect("captured sample reads back");
+        assert_eq!(got.snd_cwnd, 123_456);
+        assert_eq!(got.snd_wnd, 65_535);
+        assert_eq!(got.rtt, 4_321);
+        assert_eq!(got.rttvar, 99);
+        assert_eq!(got.pmtu, 1_500);
+        assert_eq!(got.reorder, 3);
     }
 
     /// Regression: verify that interval swap-and-reset does NOT
