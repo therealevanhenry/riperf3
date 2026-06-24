@@ -239,10 +239,21 @@ pub struct Start {
     pub tcp_mss_default: Option<u32>,
     pub target_bitrate: u64,
     pub fq_rate: u64,
-    pub sock_bufsize: u64,
-    pub sndbuf_actual: u64,
-    pub rcvbuf_actual: u64,
-    pub test_start: TestStart,
+    // #261: these four are populated only once the test reaches stream-setup /
+    // TestStart. On an upfront refusal (server-side rejection BEFORE TestStart,
+    // e.g. --server-max-duration / code 37) the client never sets up streams, so
+    // GT (iperf 3.21) OMITS them entirely — the document carries the early start
+    // metadata (timestamp, cookie, connecting_to) and an empty `end`. `Option` +
+    // skip-if-none reproduces that: `Some(..)` on a run that reached TestStart
+    // (every success and every mid-test interrupt), `None` on the refusal path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sock_bufsize: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sndbuf_actual: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rcvbuf_actual: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_start: Option<TestStart>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -397,14 +408,27 @@ pub struct IntervalSum {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct End {
+    // #261: a run that reached TestStart always has ≥1 stream, so on success/
+    // partial this serializes unchanged; on an upfront refusal it is empty and
+    // omitted, contributing to GT's bare `end: {}` (which carries no `streams`
+    // key either).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<EndStream>,
     /// UDP only: the datagram aggregate iperf3 emits as `sum` — BEFORE the
     /// sent/received pair in its key order (GT 3.21, fwd and bidir alike;
     /// the old field position serialized it after, a raw-diff divergence).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sum: Option<SumSide>,
-    pub sum_sent: SumSide,
-    pub sum_received: SumSide,
+    // #261: the summary aggregates and CPU figure exist only once the test
+    // reached TestStart. On an upfront refusal GT emits `end: {}` — every key
+    // omitted. With these three as `Option` + skip-if-none, an `End` whose
+    // optional fields are all `None` serializes as `{}`, matching GT byte-for-
+    // byte. A run that reached TestStart (success, mid-test interrupt) sets them
+    // `Some(..)`, so the success/partial shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sum_sent: Option<SumSide>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sum_received: Option<SumSide>,
     /// UDP bidir only (#214): the reverse-direction datagram aggregate,
     /// between the forward pair and the reverse pair, like iperf3.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,7 +438,8 @@ pub struct End {
     pub sum_sent_bidir_reverse: Option<SumSide>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_received_bidir_reverse: Option<SumSide>,
-    pub cpu_utilization_percent: CpuUtilization,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_utilization_percent: Option<CpuUtilization>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_tcp_congestion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -661,9 +686,19 @@ pub struct ReportInput {
     /// emitted as `start.tcp_mss` and suppresses `tcp_mss_default` (iperf3 parity).
     pub mss: Option<u32>,
     pub fq_rate: u64,
-    pub sock_bufsize: u64,
-    pub sndbuf_actual: u64,
-    pub rcvbuf_actual: u64,
+    /// Socket buffer sizes (`start.sock_bufsize` / `sndbuf_actual` /
+    /// `rcvbuf_actual`). `None` on a path that never set up data sockets (the
+    /// upfront-refusal path), so `build()` omits them like GT (#261).
+    pub sock_bufsize: Option<u64>,
+    pub sndbuf_actual: Option<u64>,
+    pub rcvbuf_actual: Option<u64>,
+    /// True once the test reached stream-setup / TestStart (#261). Drives the
+    /// stage-gated `start.test_start` and the `end` summary aggregates: GT
+    /// populates them only by how far the test progressed, and OMITS them on an
+    /// upfront refusal (server rejection before TestStart, e.g. code 37). A
+    /// mid-test interrupt or SERVER_TERMINATE DID reach TestStart, so it stays
+    /// `true` there — the partial document keeps the late fields it has.
+    pub reached_test_start: bool,
     pub interval: f64,
     pub gso: i32,
     pub gro: i32,
@@ -1170,15 +1205,22 @@ impl ReportInput {
             (self.congestion_used.clone(), self.congestion_used.clone())
         };
 
+        // #261: stage-gate the `end` summary aggregates on whether the test
+        // reached TestStart. On an upfront refusal (never reached it) every
+        // optional field is None and `streams` is empty, so `End` serializes as
+        // GT's bare `end: {}`. A run that reached TestStart (success, mid-test
+        // interrupt, SERVER_TERMINATE) keeps them — the partial document carries
+        // the late fields it has, unchanged from before.
+        let reached = self.reached_test_start;
         let end = End {
             streams: end_streams,
-            sum_sent,
-            sum_received,
+            sum_sent: reached.then_some(sum_sent),
+            sum_received: reached.then_some(sum_received),
             sum,
             sum_bidir_reverse,
             sum_sent_bidir_reverse,
             sum_received_bidir_reverse,
-            cpu_utilization_percent: self.cpu.clone(),
+            cpu_utilization_percent: reached.then(|| self.cpu.clone()),
             sender_tcp_congestion: cong_sender,
             receiver_tcp_congestion: cong_receiver,
         };
@@ -1231,10 +1273,15 @@ impl ReportInput {
                 tcp_mss_default,
                 target_bitrate: self.target_bitrate,
                 fq_rate: self.fq_rate,
-                sock_bufsize: self.sock_bufsize,
-                sndbuf_actual: self.sndbuf_actual,
-                rcvbuf_actual: self.rcvbuf_actual,
-                test_start: TestStart {
+                // #261: the socket buffers and `test_start` block are populated
+                // only once the test reached stream-setup / TestStart. On the
+                // upfront-refusal path `reached` is false → all omitted (the
+                // buffer fields are also `None` at the source there); GT does the
+                // same, so the refusal `start` carries only the early metadata.
+                sock_bufsize: reached.then_some(self.sock_bufsize).flatten(),
+                sndbuf_actual: reached.then_some(self.sndbuf_actual).flatten(),
+                rcvbuf_actual: reached.then_some(self.rcvbuf_actual).flatten(),
+                test_start: reached.then(|| TestStart {
                     protocol: if is_udp { "UDP" } else { "TCP" }.to_string(),
                     num_streams: self.num_streams,
                     blksize: self.blksize,
@@ -1257,12 +1304,22 @@ impl ReportInput {
                     interval: self.interval,
                     gso: self.gso,
                     gro: self.gro,
-                },
+                }),
             },
             intervals: self.intervals.clone(),
             end,
             extra_data: self.extra_data.clone(),
             server_output_text: self.server_output_text.clone(),
+            // #261 DELIBERATE DEVIATION: riperf3 emits a SINGLE `"error"` key
+            // holding the bare strerror message. GT (iperf 3.21) emits the
+            // `"error"` key TWICE on a client-side refusal — once as
+            // `SERVER ERROR - <msg>` and once as the bare `<msg>` — because two
+            // code paths both `cJSON_AddStringToObject(json, "error", ...)` the
+            // same key (an upstream defect we filed as esnet/iperf#2051). A
+            // duplicate object key is undefined in JSON; a conformant last-wins
+            // parser of GT's document resolves to the bare message, which is what
+            // riperf3 emits — so we are faithful to the *parsed* result while
+            // declining to reproduce the malformed wire bytes.
             error: self.error.clone(),
             server_output_json: self.server_output_json.clone(),
         }
@@ -1673,9 +1730,10 @@ mod tests {
             tcp_mss_default: 1448,
             mss: None,
             fq_rate: 0,
-            sock_bufsize: 0,
-            sndbuf_actual: 16384,
-            rcvbuf_actual: 87380,
+            sock_bufsize: Some(0),
+            sndbuf_actual: Some(16384),
+            rcvbuf_actual: Some(87380),
+            reached_test_start: true,
             interval: 1.0,
             gso: 0,
             gro: 0,
@@ -2540,6 +2598,139 @@ mod tests {
         ] {
             assert!(v["end"].get(k).is_some(), "end.{k} missing");
         }
+    }
+
+    /// #261: a run that reached TestStart (`reached_test_start = true`) carries
+    /// the full late shape — the four `start` late fields AND the `end` summary
+    /// aggregates are all present (`Some`). This is the SUCCESS-path invariant:
+    /// the Option-ification must NEVER drop a field from a real run.
+    #[test]
+    fn success_run_keeps_all_late_fields() {
+        let mut input = base_input();
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        assert!(input.reached_test_start, "base_input models a real run");
+        let report = input.build();
+        // start late fields: typed Option, all Some.
+        assert!(report.start.sock_bufsize.is_some(), "sock_bufsize");
+        assert!(report.start.sndbuf_actual.is_some(), "sndbuf_actual");
+        assert!(report.start.rcvbuf_actual.is_some(), "rcvbuf_actual");
+        assert!(report.start.test_start.is_some(), "test_start");
+        // end summaries: typed Option, all Some.
+        assert!(report.end.sum_sent.is_some(), "sum_sent");
+        assert!(report.end.sum_received.is_some(), "sum_received");
+        assert!(
+            report.end.cpu_utilization_percent.is_some(),
+            "cpu_utilization_percent"
+        );
+        assert!(!report.end.streams.is_empty(), "streams");
+        // And the serialized shape still emits every late key.
+        let v = serde_json::to_value(&report).unwrap();
+        for k in [
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
+            "test_start",
+        ] {
+            assert!(v["start"].get(k).is_some(), "serialized start.{k} dropped");
+        }
+        for k in [
+            "streams",
+            "sum_sent",
+            "sum_received",
+            "cpu_utilization_percent",
+        ] {
+            assert!(v["end"].get(k).is_some(), "serialized end.{k} dropped");
+        }
+    }
+
+    /// #261: the GT-faithful upfront-REFUSAL shape. When the test never reached
+    /// TestStart (`reached_test_start = false`, as on a code-37 server rejection
+    /// that arrives before stream setup), GT OMITS the late `start` fields and
+    /// emits a bare `end: {}` — but still carries the early start metadata
+    /// (timestamp/cookie/connecting_to) and the bare error message. Pinned
+    /// against the live GT capture (iperf 3.21 @ d39cf41).
+    #[test]
+    fn refusal_omits_late_fields_and_empty_end() {
+        let mut input = base_input();
+        // The refusal path: error set BEFORE TestStart, no streams, the late
+        // buffer inputs are None, and a REAL connect-time wall-clock (not 0).
+        input.error =
+            Some("client's requested duration exceeds the server's maximum permitted limit".into());
+        input.reached_test_start = false;
+        input.streams = vec![];
+        input.sock_bufsize = None;
+        input.sndbuf_actual = None;
+        input.rcvbuf_actual = None;
+        // No data streams were ever created, so the client never read back a
+        // congestion algorithm — the *_tcp_congestion keys are naturally absent
+        // on the real refusal path (driven by stream presence, not the gate).
+        input.congestion_used = None;
+        // base_input's start_time_millis stands in for the connect-time stamp the
+        // client passes on this path (non-zero — never epoch-0).
+        let v = serde_json::to_value(input.build()).unwrap();
+
+        // start: the EARLY metadata survives …
+        let start = v["start"].as_object().expect("start object");
+        for present in [
+            "connected",
+            "version",
+            "system_info",
+            "timestamp",
+            "connecting_to",
+        ] {
+            assert!(
+                start.contains_key(present),
+                "refusal start keeps {present}: {v}"
+            );
+        }
+        // … but the four late fields are OMITTED (GT's refusal shape).
+        for absent in [
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
+            "test_start",
+        ] {
+            assert!(
+                !start.contains_key(absent),
+                "refusal start must omit {absent}: {v}"
+            );
+        }
+        // timestamp carries a REAL wall-clock — never epoch-0.
+        assert_ne!(v["start"]["timestamp"]["timesecs"], serde_json::json!(0));
+        assert_ne!(
+            v["start"]["timestamp"]["timemillisecs"],
+            serde_json::json!(0)
+        );
+        assert_ne!(
+            v["start"]["timestamp"]["time"],
+            serde_json::json!("Thu, 01 Jan 1970 00:00:00 GMT"),
+            "refusal timestamp must not be the epoch: {v}"
+        );
+
+        // end is a bare, EMPTY object — no streams/sum_sent/sum_received/cpu keys.
+        assert_eq!(
+            v["end"].as_object().map(serde_json::Map::len),
+            Some(0),
+            "refusal end must serialize as the GT bare `end: {{}}`: {v}"
+        );
+
+        // intervals stays an empty array (the test never ran).
+        assert_eq!(v["intervals"].as_array().map(Vec::len), Some(0));
+
+        // exactly ONE `error` key holding the bare message (NOT GT's duplicate;
+        // esnet/iperf#2051) — verified at the raw-bytes level since serde_json's
+        // Value would silently de-duplicate object keys.
+        let raw = serde_json::to_string(&input.build()).unwrap();
+        assert_eq!(
+            raw.matches("\"error\"").count(),
+            1,
+            "exactly one error key (single clean key, not GT's #2051 duplicate): {raw}"
+        );
+        assert_eq!(
+            v["error"].as_str(),
+            Some("client's requested duration exceeds the server's maximum permitted limit"),
+            "the bare strerror, what a last-wins parser of GT's doc resolves to: {v}"
+        );
     }
 
     #[test]

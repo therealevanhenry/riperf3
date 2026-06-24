@@ -397,7 +397,7 @@ async fn tcp_reverse_bytes_limit_terminates() {
     // rate the 100ms end-condition poll overshoots the target (a pre-existing
     // characteristic shared with forward `-n`), so this guards termination +
     // floor, not an exact byte count.
-    let transferred: u64 = res.end.sum_sent.bytes;
+    let transferred: u64 = res.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         transferred >= target,
         "transferred {transferred} < requested {target}"
@@ -433,7 +433,7 @@ async fn tcp_reverse_blocks_limit_terminates() {
     let result = tokio::time::timeout(Duration::from_secs(15), client.run()).await;
     assert!(result.is_ok(), "-R -k hung — issue #60 regression");
     let res = result.unwrap().expect("-R -k errored");
-    let transferred: u64 = res.end.sum_sent.bytes;
+    let transferred: u64 = res.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         transferred >= blocks * blksize as u64,
         "transferred {transferred} < requested {blocks} blocks"
@@ -470,7 +470,7 @@ async fn tcp_byte_limit_overshoot_bounded_forward() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.bytes;
+    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -505,7 +505,7 @@ async fn tcp_byte_limit_overshoot_bounded_reverse() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_sent.bytes;
+    let bytes: u64 = result.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -548,7 +548,7 @@ async fn tcp_bitrate_is_paced() {
         .expect("client hung")
         .expect("client errored");
     // run() returns the rich report; forward → server received ≈ what we sent.
-    let bytes: u64 = result.end.sum_received.bytes;
+    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
     let achieved = bytes * 8 / secs;
     // Unpaced this is line rate (tens of Gbit/s, >100x target). Paced lands near
     // target; allow a generous band for burst/timing slack.
@@ -591,7 +591,7 @@ async fn tcp_low_bitrate_no_overshoot() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.bytes;
+    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
     let budget = (target / 8 * secs) as f64; // 250 KB
     let bound = budget * 1.25 + (128 * 1024) as f64;
     assert!(
@@ -623,7 +623,7 @@ async fn tcp_unlimited_is_not_paced() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.bytes;
+    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
     // A 200 Mbit cap would yield ~25 MB in 1 s; unthrottled loopback moves far
     // more. >200 MB confirms pacing didn't leak into the rate-0 path.
     assert!(
@@ -661,7 +661,7 @@ async fn tcp_bitrate_reverse_is_paced() {
         .expect("client hung")
         .expect("client errored");
     // Reverse: the server sends; its reported bytes ≈ what it paced out.
-    let bytes: u64 = result.end.sum_sent.bytes;
+    let bytes: u64 = result.end.sum_sent.as_ref().unwrap().bytes;
     let achieved = bytes * 8 / secs;
     assert!(
         achieved < target * 2,
@@ -2386,14 +2386,14 @@ mod client_run_return_value {
             "expected at least one stream in report.end"
         );
         assert!(
-            report.end.sum_sent.bytes > 0,
+            report.end.sum_sent.as_ref().unwrap().bytes > 0,
             "expected non-zero sent bytes, got {}",
-            report.end.sum_sent.bytes
+            report.end.sum_sent.as_ref().unwrap().bytes
         );
         assert!(
-            report.end.sum_received.bytes > 0,
+            report.end.sum_received.as_ref().unwrap().bytes > 0,
             "expected non-zero received bytes, got {}",
-            report.end.sum_received.bytes
+            report.end.sum_received.as_ref().unwrap().bytes
         );
         // start metadata is populated …
         assert!(
@@ -2402,7 +2402,12 @@ mod client_run_return_value {
             report.start.version
         );
         // … and the host CPU figure is a sane number.
-        let cpu = report.end.cpu_utilization_percent.host_total;
+        let cpu = report
+            .end
+            .cpu_utilization_percent
+            .as_ref()
+            .unwrap()
+            .host_total;
         assert!(
             cpu.is_finite() && cpu >= 0.0,
             "cpu host_total not a sane non-negative number: {cpu}"
@@ -2454,9 +2459,9 @@ mod client_run_return_value {
         );
         // Forward run: the server is the receiver, so its received aggregate moved.
         assert!(
-            report.end.sum_received.bytes > 0,
+            report.end.sum_received.as_ref().unwrap().bytes > 0,
             "server expected non-zero received bytes, got {}",
-            report.end.sum_received.bytes
+            report.end.sum_received.as_ref().unwrap().bytes
         );
         // Guards the build-once invariant on the server path too (#137).
         assert!(

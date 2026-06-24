@@ -15,8 +15,9 @@ release tags.
 
 The architecture-and-API release the 0.7.x faithfulness train deferred. Per the
 SemVer 0.x convention, this minor bump carries breaking **library API** changes
-(below); the wire protocol, CLI flags, and `-J`/text output are unchanged — the
-faithful iperf3 drop-in behavior is preserved.
+(below). The wire protocol and CLI flags are unchanged. The success-path `-J`/
+text output is byte-identical; the only `-J` change is on the upfront-refusal
+path, which is now byte-faithful to iperf3 (#261).
 
 ### Breaking
 
@@ -31,6 +32,16 @@ faithful iperf3 drop-in behavior is preserved.
 - **`TestResultsJson` / `StreamResultJson` are no longer re-exported** from the
   crate root (#137): they are the internal control-channel exchange model. The
   public result type is now `Report`.
+- **Several `Report` fields are now `Option`** (#261), so a refusal document can
+  faithfully omit the fields the test never produced (matching iperf3): on
+  `Start`, `sock_bufsize` / `sndbuf_actual` / `rcvbuf_actual` (`u64` →
+  `Option<u64>`) and `test_start` (`TestStart` → `Option<TestStart>`); on `End`,
+  `sum_sent` / `sum_received` (`SumSide` → `Option<SumSide>`) and
+  `cpu_utilization_percent` (`CpuUtilization` → `Option<CpuUtilization>`).
+  On a run that reached TestStart (every success and every mid-test interrupt)
+  these are always `Some`, so the serialized success/partial output is unchanged.
+  Migration: where you read `report.end.sum_sent.bytes`, use
+  `report.end.sum_sent.as_ref().unwrap().bytes` (or pattern-match the `Option`).
 
 ### Added
 
@@ -46,6 +57,26 @@ faithful iperf3 drop-in behavior is preserved.
   documented why the UDP data path deliberately uses `spawn_blocking` with
   blocking sockets — SO_SNDBUF backpressure, the sendmmsg batch path, the winsock
   demux constraint (#146). No behavior change.
+
+### Fixed
+
+- **The client `-J` upfront-refusal document is now byte-faithful to iperf3**
+  (#261). On a server rejection that arrives before TestStart (e.g. code 37,
+  `--server-max-duration`), iperf3 populates `Report` fields by how far the test
+  progressed: it omits `start.sock_bufsize` / `sndbuf_actual` / `rcvbuf_actual` /
+  `test_start`, emits a bare `end: {}`, and carries the real on-connect
+  wall-clock timestamp. riperf3 previously emitted those fields with epoch-0 /
+  zero placeholders; it now matches iperf3's shape. A mid-test interrupt or
+  SERVER_TERMINATE still carries its (partial) late fields, since those paths
+  reached TestStart.
+
+  Deliberate deviation: on this path iperf3 emits the `"error"` key **twice** (a
+  `SERVER ERROR - <msg>` variant and the bare `<msg>`) — an upstream defect from
+  two code paths writing the same cJSON key, filed as
+  [esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051). riperf3 emits a
+  single clean `"error"` key holding the bare message, which is what a conformant
+  last-wins parser of iperf3's malformed document resolves to. (Precedent: the
+  recorded `(os error N)` connect-failure suffix deviation, #151.)
 
 ## [0.7.4] - 2026-06-12
 

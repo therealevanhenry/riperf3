@@ -420,6 +420,53 @@ fn upfront_reject_json_doc_shapes() {
         Some(MAXDUR_MSG),
         "client doc adopts the relayed strerror: {doc}"
     );
+    // #261: the client's refusal doc is byte-faithful to GT's. The test never
+    // reached TestStart, so GT OMITS the late start fields and emits `end: {}` —
+    // while keeping the early metadata (timestamp/cookie/connecting_to). The
+    // start.timestamp carries the REAL on_connect wall-clock, NOT epoch-0.
+    let cstart = doc["start"].as_object().expect("client start object");
+    for present in [
+        "connected",
+        "version",
+        "system_info",
+        "timestamp",
+        "connecting_to",
+        "cookie",
+    ] {
+        assert!(
+            cstart.contains_key(present),
+            "#261 client refusal start keeps {present}: {doc}"
+        );
+    }
+    for absent in [
+        "sock_bufsize",
+        "sndbuf_actual",
+        "rcvbuf_actual",
+        "test_start",
+    ] {
+        assert!(
+            !cstart.contains_key(absent),
+            "#261 client refusal start must OMIT {absent} (GT shape): {doc}"
+        );
+    }
+    assert_eq!(
+        doc["end"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "#261 client refusal end must be the bare `end: {{}}`: {doc}"
+    );
+    assert_ne!(
+        doc["start"]["timestamp"]["timesecs"],
+        serde_json::json!(0),
+        "#261 refusal timestamp must be the real connect wall-clock, not epoch-0: {doc}"
+    );
+    // Exactly ONE `error` key (single clean key, not GT's #2051 duplicate) —
+    // checked against the raw bytes, since the parsed Value de-duplicates.
+    assert_eq!(
+        client.stdout.matches("\"error\"").count(),
+        1,
+        "#261 exactly one error key in the client doc: {out}",
+        out = client.stdout
+    );
 
     // Server skeleton doc.
     assert!(serr.trim().is_empty(), "server -J stderr empty: {serr}");
