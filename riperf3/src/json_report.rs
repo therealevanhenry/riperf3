@@ -3144,32 +3144,49 @@ mod tests {
         // Reverse UDP: the server sent the datagrams; it has no receiver stats,
         // so the sent packet count comes from the #256 authoritative per-stream
         // datagram counter (#283 plumbed it into -J), with the legacy
-        // bytes/blksize derivation as the fallback. The VALUE is unchanged from
-        // the pre-#283 "bytes / blksize" assertion — a full-block-only sender
-        // keeps datagrams_sent == bytes / blksize bit-for-bit.
+        // bytes/blksize derivation as the fallback.
+        //
+        // Source-pin: set the counter to a value that DIFFERS from bytes/blksize
+        // (99 vs 20_000/1000 = 20) so this proves the figure comes from the
+        // counter, not the legacy derivation. Both the per-stream and the
+        // aggregate-sum figures must follow the counter.
         let mut input = base_input();
         input.protocol = TransportProtocol::Udp;
         input.blksize = 1000;
         input.reverse = true;
         input.is_server = true;
-        // 20_000 bytes / 1000 blksize = 20 packets; set the COUNTER to 20 so the
-        // new counter path (datagrams_sent: Some) is exercised, not the fallback.
         input.streams = vec![StreamReport {
-            datagrams_sent: Some(20),
+            datagrams_sent: Some(99),
             ..tcp_stream(1, true, 20_000, 0)
         }];
         let v = serde_json::to_value(input.build()).unwrap();
         let udp = &v["end"]["streams"][0]["udp"];
         assert_eq!(udp["bytes"], 20_000);
         assert_eq!(
-            udp["packets"], 20,
-            "sent packets = datagram counter (== bytes / blksize): {udp}"
+            udp["packets"], 99,
+            "per-stream sent packets must come from the datagram counter, not bytes/blksize: {udp}"
         );
         assert_eq!(udp["sender"], true);
+        assert_eq!(
+            v["end"]["sum"]["packets"], 99,
+            "aggregate sum must follow the counter (local_sent_packets), not bytes/blksize: {v}"
+        );
 
-        // Equivalence: the counter path (datagrams_sent: Some) and the
-        // bytes/blksize fallback (datagrams_sent: None) MUST agree for a
-        // full-block-only sender — the #283 no-drift invariant.
+        // No-drift equivalence: for a real full-block-only sender the counter
+        // EQUALS bytes/blksize (20), so the counter path (Some) and the
+        // bytes/blksize fallback (None) produce the same figure — the #283
+        // invariant that keeps -J byte-identical to pre-#283.
+        let mut counter = base_input();
+        counter.protocol = TransportProtocol::Udp;
+        counter.blksize = 1000;
+        counter.reverse = true;
+        counter.is_server = true;
+        counter.streams = vec![StreamReport {
+            datagrams_sent: Some(20),
+            ..tcp_stream(1, true, 20_000, 0)
+        }];
+        let vc = serde_json::to_value(counter.build()).unwrap();
+
         let mut fallback = base_input();
         fallback.protocol = TransportProtocol::Udp;
         fallback.blksize = 1000;
@@ -3177,14 +3194,14 @@ mod tests {
         fallback.is_server = true;
         fallback.streams = vec![tcp_stream(1, true, 20_000, 0)]; // datagrams_sent: None
         let vf = serde_json::to_value(fallback.build()).unwrap();
+        assert_eq!(vc["end"]["streams"][0]["udp"]["packets"], 20);
         assert_eq!(
-            vf["end"]["streams"][0]["udp"]["packets"], udp["packets"],
-            "counter path and bytes/blk fallback must agree: {vf}"
+            vf["end"]["streams"][0]["udp"]["packets"], 20,
+            "a full-block sender's counter and the bytes/blk fallback both give 20: {vf}"
         );
-        // The aggregate sum mirrors the per-stream figure on both paths too.
         assert_eq!(
-            v["end"]["sum"]["packets"], vf["end"]["sum"]["packets"],
-            "aggregate sum must agree across counter/fallback paths"
+            vc["end"]["sum"]["packets"], vf["end"]["sum"]["packets"],
+            "counter path and bytes/blk fallback agree on the aggregate too"
         );
     }
 
