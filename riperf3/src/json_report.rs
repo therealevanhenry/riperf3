@@ -2744,39 +2744,45 @@ mod tests {
 
     #[test]
     fn udp_refusal_also_emits_bare_end() {
-        // Round-1 cold-review catch: the UDP aggregates (`sum` + the bidir trio)
-        // are Some(zeros) on a UDP refusal, so unless they too are gated on
+        // The UDP `end` aggregates (`sum` + the `sum_*_bidir_reverse` trio) are
+        // Some(zeros) on a UDP refusal, so unless they too are gated on
         // reached_test_start, `end` leaks `{"sum": {...}}` instead of GT's bare
         // `{}`. The TCP refusal test above never exercised this (TCP leaves those
-        // None), which is how it slipped the suite.
-        let mut input = base_input();
-        input.protocol = TransportProtocol::Udp;
-        input.error =
-            Some("client's requested duration exceeds the server's maximum permitted limit".into());
-        input.reached_test_start = false;
-        input.streams = vec![];
-        input.sock_bufsize = None;
-        input.sndbuf_actual = None;
-        input.rcvbuf_actual = None;
-        input.congestion_used = None;
-        let v = serde_json::to_value(input.build()).unwrap();
-        assert_eq!(
-            v["end"].as_object().map(serde_json::Map::len),
-            Some(0),
-            "UDP refusal end must serialize as GT's bare `end: {{}}` (no leaked `sum`): {v}"
-        );
-        // the late start fields are omitted on UDP too.
-        let start = v["start"].as_object().expect("start object");
-        for absent in [
-            "sock_bufsize",
-            "sndbuf_actual",
-            "rcvbuf_actual",
-            "test_start",
-        ] {
-            assert!(
-                !start.contains_key(absent),
-                "UDP refusal start must omit {absent}: {v}"
+        // None). Cover both bidir settings so all four aggregate gates are pinned:
+        // !bidir exercises `sum` (round-1 catch); bidir exercises the trio
+        // (round-2 catch — reverting any trio gate otherwise ships green).
+        for bidir in [false, true] {
+            let mut input = base_input();
+            input.protocol = TransportProtocol::Udp;
+            input.bidir = bidir;
+            input.error = Some(
+                "client's requested duration exceeds the server's maximum permitted limit".into(),
             );
+            input.reached_test_start = false;
+            input.streams = vec![];
+            input.sock_bufsize = None;
+            input.sndbuf_actual = None;
+            input.rcvbuf_actual = None;
+            input.congestion_used = None;
+            let v = serde_json::to_value(input.build()).unwrap();
+            assert_eq!(
+                v["end"].as_object().map(serde_json::Map::len),
+                Some(0),
+                "UDP refusal (bidir={bidir}) end must be GT's bare `end: {{}}` (no leaked aggregate): {v}"
+            );
+            // the late start fields are omitted on UDP too.
+            let start = v["start"].as_object().expect("start object");
+            for absent in [
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "test_start",
+            ] {
+                assert!(
+                    !start.contains_key(absent),
+                    "UDP refusal start must omit {absent}: {v}"
+                );
+            }
         }
     }
 
