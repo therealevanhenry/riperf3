@@ -42,7 +42,10 @@ Architecture-and-API release. Wire protocol and CLI flags unchanged; success-pat
 
 - Client `-J` upfront-refusal document is now byte-faithful to iperf3 (#261): omits the
   unreached `start`/`end` fields, emits `end: {}`, real on-connect timestamp (was epoch-0).
-  Emits one clean `"error"` key vs iperf3's duplicate-key defect ([esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051)).
+- Deliberate deviation from iperf3 (#261): where iperf3 emits the `"error"` key **twice**
+  on a relayed refusal (an upstream defect, [esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051)),
+  riperf3 emits a single clean `"error"` key — the bare message a conformant last-wins
+  parser resolves to.
 
 ## [0.7.4] - 2026-06-12
 
