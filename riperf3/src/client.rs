@@ -2113,6 +2113,15 @@ impl Client {
                     remote_port,
                     is_sender: s.is_sender,
                     local_bytes,
+                    // #256/#283: the authoritative per-stream SENT datagram
+                    // count, net of the `-O` omit baseline — the SAME source
+                    // #256 feeds to the wire/text per-stream figure
+                    // (datagrams_sent_net). Only on UDP streams THIS HOST sent;
+                    // None for received streams (the -J keeps the peer/bytes
+                    // path there). == local_bytes / blksize bit-for-bit for a
+                    // full-block-only sender, so the -J stays byte-identical.
+                    datagrams_sent: (is_udp && s.is_sender)
+                        .then(|| s.counters.datagrams_sent_net()),
                     remote_bytes: server_stream.map(|x| x.bytes),
                     // #235: the peer's exchanged SENT datagram count, net
                     // of its omitted baseline — exact when the peer keeps

@@ -578,7 +578,7 @@ pub struct CpuUtilization {
 /// (peer, from the exchanged results) byte counts and roles.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct StreamReport {
+pub(crate) struct StreamReport {
     pub id: i32,
     pub local_host: String,
     pub local_port: u16,
@@ -588,6 +588,15 @@ pub struct StreamReport {
     pub is_sender: bool,
     /// Bytes moved on this stream (local perspective).
     pub local_bytes: u64,
+    /// #256/#283: the authoritative per-stream SENT datagram count, net of the
+    /// `-O` omit baseline (`StreamCounters::datagrams_sent_net`) — the SAME
+    /// source #256 feeds to the WIRE/TEXT per-stream packet figure. Set ONLY on
+    /// streams THIS HOST SENT (UDP); `None` on received streams, where the `-J`
+    /// derivation keeps the peer/bytes path. The `-J` sender sites use it when
+    /// `Some`, else fall back to `local_bytes / blksize`. CRITICAL: a riperf3
+    /// UDP sender emits full `blksize` blocks only, so this equals
+    /// `local_bytes / blksize` bit-for-bit — the fallback and the counter agree.
+    pub datagrams_sent: Option<u64>,
     /// Bytes the peer reports for the opposite side of this stream, if known.
     pub remote_bytes: Option<u64>,
     /// Sender-side retransmit total: the LOCAL TCP_INFO cumulative for
@@ -620,7 +629,7 @@ pub struct StreamReport {
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct TcpEndExtras {
+pub(crate) struct TcpEndExtras {
     pub max_snd_cwnd: u64,
     /// Peak peer-advertised send window, where the platform reader captures
     /// it (Linux UAPI mirror / FreeBSD) — iperf3's stream_max_snd_wnd. Signed:
@@ -634,7 +643,7 @@ pub struct TcpEndExtras {
 
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct UdpStreamStats {
+pub(crate) struct UdpStreamStats {
     pub jitter_secs: f64,
     pub lost_packets: i64,
     pub packets: i64,
@@ -642,7 +651,7 @@ pub struct UdpStreamStats {
 }
 
 #[non_exhaustive]
-pub struct ReportInput {
+pub(crate) struct ReportInput {
     pub protocol: TransportProtocol,
     /// iperf3's `"error"` blob key (e.g. "the server has terminated") (#170).
     pub error: Option<String>,
@@ -771,7 +780,7 @@ impl ReportInput {
     /// Assemble the iperf3-schema report: the `start` block (timestamp, cookie,
     /// `system_info`, `tcp_mss_default`, socket buffers, and `test_start`
     /// parameters), the collected `intervals`, and the `end` block.
-    pub fn build(&self) -> Report {
+    pub(crate) fn build(&self) -> Report {
         let dur = self.duration;
         let is_udp = matches!(self.protocol, TransportProtocol::Udp);
 
@@ -899,7 +908,9 @@ impl ReportInput {
                     .map(|u| u.jitter_secs)
                     .sum::<f64>()
                     / (self.num_streams.max(1) as f64);
-                let rev_sent_packets = (local_sent / blk) as i64;
+                // #283: the #256 counter aggregate (== local_sent/blksize for a
+                // full-block-only sender), bytes/blk fallback per stream.
+                let rev_sent_packets = self.local_sent_packets();
                 sum = Some(self.udp_sum(0, false, fwd_packets, fwd_lost, fwd_jitter, fwd_packets));
                 sum_bidir_reverse = Some(self.udp_sum(
                     local_sent,
@@ -948,7 +959,9 @@ impl ReportInput {
                 // with measured loss/jitter). `sum` carries the server's sent bytes
                 // tagged with its role, and the packet/loss/jitter of whichever side
                 // the server actually measured (received in forward, sent in reverse).
-                let sent_packets = (local_sent / blk) as i64;
+                // #283: the #256 counter aggregate (== local_sent/blksize for a
+                // full-block-only sender), bytes/blk fallback per stream.
+                let sent_packets = self.local_sent_packets();
                 let (sum_packets, sum_lost, sum_jitter) = if server_is_sender {
                     (sent_packets, 0, 0.0)
                 } else {
@@ -1027,7 +1040,9 @@ impl ReportInput {
             // aggregates fall back to the receiver count when the sent
             // figure is absent (iperf_api.c ~4242, the same fallback the
             // single-direction arm already uses).
-            let fwd_sent_packets = (local_sent / blk) as i64;
+            // #283: the #256 counter aggregate (== local_sent/blksize for a
+            // full-block-only sender), bytes/blk fallback per stream.
+            let fwd_sent_packets = self.local_sent_packets();
             // #235: the reverse (peer-sent) figure prefers the exchanged
             // true counts; bytes-derived only as the fallback. (GT's
             // sum-class nets LOCAL omitted, :4243 — peer-netted here;
@@ -1133,10 +1148,19 @@ impl ReportInput {
             // #235: when the sent side is the PEER's (-R), prefer its
             // exchanged true counts over the bytes-derived figure (same
             // local-vs-peer omit-netting hedge as the bidir arm).
-            let sent_packets = (!fwd_sender)
-                .then(|| self.exchanged_sent_packets(false))
-                .flatten()
-                .unwrap_or((sent_bytes / blk) as i64);
+            // #283: forward (this host sends, `sent_bytes == local_sent > 0`)
+            // uses the #256 counter aggregate — == local_sent/blksize for a
+            // full-block-only sender, so byte-identical. Reverse keeps the
+            // peer-exchange path; the `sent_bytes / blk` fallback covers the
+            // terminated/odd-peer graft (local_sent == 0).
+            let sent_packets = if fwd_sender && local_sent > 0 {
+                self.local_sent_packets()
+            } else {
+                (!fwd_sender)
+                    .then(|| self.exchanged_sent_packets(false))
+                    .flatten()
+                    .unwrap_or((sent_bytes / blk) as i64)
+            };
             // iperf3's `sum` packet count falls back to the RECEIVER count
             // when the sender count is absent (iperf_api.c:4242, the
             // `packet_count = sender ? sender : receiver` running total) —
@@ -1361,8 +1385,9 @@ impl ReportInput {
             // terminated bidir probe — iperf3 0 vs riperf3's old 14.75).
             let (bytes, packets, has_sender_count) = if self.is_server {
                 if s.is_sender {
-                    let blk = self.blksize.max(1) as u64;
-                    (s.local_bytes, (s.local_bytes / blk) as i64, true)
+                    // #283: the authoritative #256 datagram counter (== bytes/
+                    // blksize for a full-block-only sender), bytes/blk fallback.
+                    (s.local_bytes, self.sent_datagrams(s), true)
                 } else {
                     // Sender count absent on EVERY server run, not just
                     // terminated ones (#238): GT's server does receive the
@@ -1376,8 +1401,8 @@ impl ReportInput {
             } else if s.is_sender && s.udp.is_none() && self.error.is_some() {
                 // Terminated before the exchange (#170): no peer-measured
                 // stats — iperf3 reports the sender's LOCAL packet count.
-                let blk = self.blksize.max(1) as u64;
-                (s.local_bytes, (s.local_bytes / blk) as i64, true)
+                // #283: the #256 counter (== bytes/blksize), bytes/blk fallback.
+                (s.local_bytes, self.sent_datagrams(s), true)
             } else if !s.is_sender && self.error.is_some() {
                 // Terminated receiver stream (-R): `bytes` is a SENDER-side
                 // count the dead peer never reported — iperf3 emits 0 while
@@ -1416,8 +1441,8 @@ impl ReportInput {
                 // diverge under forward trailing loss. The peer-measured
                 // jitter/lost VALUES stay on the entry below; exact tail-
                 // partial-datagram counts are #235's residue.
-                let blk = self.blksize.max(1) as u64;
-                (s.local_bytes, (s.local_bytes / blk) as i64, true)
+                // #283: the #256 counter (== bytes/blksize), bytes/blk fallback.
+                (s.local_bytes, self.sent_datagrams(s), true)
             };
             return EndStream {
                 sender: None,
@@ -1529,6 +1554,31 @@ impl ReportInput {
     /// bidir aggregates must use [`Self::retransmits_for`] — GT's results
     /// loop runs once per direction with a per-pass total_retransmits
     /// (iperf_api.c:4138/4235), so the two sent-aggregates never mix (#236).
+    /// #283: the SENT-side datagram count for a stream THIS HOST sent — the
+    /// authoritative #256 per-stream counter (`datagrams_sent`, net of `-O`)
+    /// when plumbed, else the legacy `local_bytes / blksize` derivation. A
+    /// riperf3 sender emits full `blksize` blocks only, so the two are equal
+    /// bit-for-bit; the fallback covers callers that never set the counter
+    /// (e.g. the upfront-refusal path, or a peer-grafted figure that arrives
+    /// here with `datagrams_sent: None`).
+    fn sent_datagrams(&self, s: &StreamReport) -> i64 {
+        let blk = self.blksize.max(1) as u64;
+        s.datagrams_sent.unwrap_or(s.local_bytes / blk) as i64
+    }
+
+    /// #283: the aggregate SENT datagram count over the streams THIS HOST sent —
+    /// the sum of `sent_datagrams` (the #256 counter with the bytes/blksize
+    /// fallback), replacing the old `local_sent / blksize` aggregate at the
+    /// UDP-sender sites. Equal to `local_sent / blksize` bit-for-bit for a
+    /// full-block-only sender.
+    fn local_sent_packets(&self) -> i64 {
+        self.streams
+            .iter()
+            .filter(|s| s.is_sender)
+            .map(|s| self.sent_datagrams(s))
+            .sum()
+    }
+
     fn sender_retransmits(&self) -> Option<i64> {
         self.retransmits_for(None)
     }
@@ -1881,6 +1931,10 @@ mod tests {
             remote_port: 5201,
             is_sender,
             local_bytes: local,
+            // #283: None → the -J sender sites take the bytes/blksize fallback,
+            // exactly as before the counter was plumbed (the existing fixtures
+            // assert that path; the counter path is exercised separately).
+            datagrams_sent: None,
             remote_bytes: remote,
             retransmits: None,
             tcp_end: None,
@@ -2326,6 +2380,9 @@ mod tests {
             remote_port: 5201,
             is_sender,
             local_bytes: local,
+            // #283: None → the -J sender sites take the bytes/blksize fallback
+            // (TCP fixtures don't touch the UDP datagram path anyway).
+            datagrams_sent: None,
             remote_bytes: Some(remote),
             retransmits,
             tcp_end: None,
@@ -3083,21 +3140,69 @@ mod tests {
     }
 
     #[test]
-    fn server_udp_reverse_stream_derives_sent_packets() {
-        // Reverse UDP: the server sent the datagrams; it has no receiver stats, so
-        // the sent packet count is derived from the bytes pushed (bytes / blksize).
+    fn server_udp_reverse_stream_uses_the_datagram_counter() {
+        // Reverse UDP: the server sent the datagrams; it has no receiver stats,
+        // so the sent packet count comes from the #256 authoritative per-stream
+        // datagram counter (#283 plumbed it into -J), with the legacy
+        // bytes/blksize derivation as the fallback.
+        //
+        // Source-pin: set the counter to a value that DIFFERS from bytes/blksize
+        // (99 vs 20_000/1000 = 20) so this proves the figure comes from the
+        // counter, not the legacy derivation. Both the per-stream and the
+        // aggregate-sum figures must follow the counter.
         let mut input = base_input();
         input.protocol = TransportProtocol::Udp;
         input.blksize = 1000;
         input.reverse = true;
         input.is_server = true;
-        // 20_000 bytes / 1000 blksize = 20 packets, no udp_recv_stats (sender).
-        input.streams = vec![tcp_stream(1, true, 20_000, 0)];
+        input.streams = vec![StreamReport {
+            datagrams_sent: Some(99),
+            ..tcp_stream(1, true, 20_000, 0)
+        }];
         let v = serde_json::to_value(input.build()).unwrap();
         let udp = &v["end"]["streams"][0]["udp"];
         assert_eq!(udp["bytes"], 20_000);
-        assert_eq!(udp["packets"], 20, "sent packets = bytes / blksize: {udp}");
+        assert_eq!(
+            udp["packets"], 99,
+            "per-stream sent packets must come from the datagram counter, not bytes/blksize: {udp}"
+        );
         assert_eq!(udp["sender"], true);
+        assert_eq!(
+            v["end"]["sum"]["packets"], 99,
+            "aggregate sum must follow the counter (local_sent_packets), not bytes/blksize: {v}"
+        );
+
+        // No-drift equivalence: for a real full-block-only sender the counter
+        // EQUALS bytes/blksize (20), so the counter path (Some) and the
+        // bytes/blksize fallback (None) produce the same figure — the #283
+        // invariant that keeps -J byte-identical to pre-#283.
+        let mut counter = base_input();
+        counter.protocol = TransportProtocol::Udp;
+        counter.blksize = 1000;
+        counter.reverse = true;
+        counter.is_server = true;
+        counter.streams = vec![StreamReport {
+            datagrams_sent: Some(20),
+            ..tcp_stream(1, true, 20_000, 0)
+        }];
+        let vc = serde_json::to_value(counter.build()).unwrap();
+
+        let mut fallback = base_input();
+        fallback.protocol = TransportProtocol::Udp;
+        fallback.blksize = 1000;
+        fallback.reverse = true;
+        fallback.is_server = true;
+        fallback.streams = vec![tcp_stream(1, true, 20_000, 0)]; // datagrams_sent: None
+        let vf = serde_json::to_value(fallback.build()).unwrap();
+        assert_eq!(vc["end"]["streams"][0]["udp"]["packets"], 20);
+        assert_eq!(
+            vf["end"]["streams"][0]["udp"]["packets"], 20,
+            "a full-block sender's counter and the bytes/blk fallback both give 20: {vf}"
+        );
+        assert_eq!(
+            vc["end"]["sum"]["packets"], vf["end"]["sum"]["packets"],
+            "counter path and bytes/blk fallback agree on the aggregate too"
+        );
     }
 
     #[test]

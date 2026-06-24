@@ -205,3 +205,121 @@ fn udp_reverse_omit_run_consumes_the_netted_exchanged_count() {
         assert!(packets > 0, "{key}: a real transfer happened: {v}");
     }
 }
+
+/// #283 (cold-review round-2 NIT): the FORWARD-path datagram count #283 plumbs
+/// into `-J` is the LOCAL sender's `datagrams_sent_net()` counter (not the
+/// peer-exchanged path the reverse test above covers), so it must be NET of the
+/// `-O` omit window. The client is the local sender here. A gross regression
+/// (`datagrams_sent()` instead of `_net()`) would inflate packets by the omit
+/// window's datagrams while bytes stay net, breaking `packets == net bytes/blk`.
+#[test]
+fn udp_forward_omit_run_uses_the_netted_datagram_counter() {
+    let _serial = common::udp_serial();
+    let ps = common::free_port().to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let out = common::run_client_ok(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-u",
+            "-O",
+            "1",
+            "-t",
+            "1",
+            "-b",
+            "5M",
+            "-J",
+        ],
+        Duration::from_secs(40),
+        "client -u -O 1",
+    )
+    .stdout;
+    let _ = server.0.wait();
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("client doc parses");
+    let blksize = v["start"]["test_start"]["blksize"]
+        .as_i64()
+        .expect("blksize");
+    for key in ["sum", "sum_sent"] {
+        let bytes = v["end"][key]["bytes"].as_i64().expect("bytes");
+        let packets = v["end"][key]["packets"].as_i64().expect("packets");
+        assert_eq!(
+            packets,
+            bytes / blksize,
+            "{key}: the forward datagram counter must be NET of the -O window \
+             (net bytes/blk for a full-block riperf3 sender) — a gross counter \
+             would exceed it: {v}"
+        );
+        assert!(packets > 0, "{key}: a real transfer happened: {v}");
+    }
+}
+
+/// #283 (cold-review round-2 NIT): the SERVER-side analog. In reverse the server
+/// is the sender, so its OWN `-J` (ridden back via `--get-server-output` as
+/// `server_output_json`) carries the server's `datagrams_sent_net()` count,
+/// which must also be NET of `-O` — guards the server.rs plumbing site, which is
+/// otherwise unexercised (the reverse test above reads only the CLIENT doc).
+#[test]
+fn udp_server_sender_omit_run_uses_the_netted_datagram_counter() {
+    let _serial = common::udp_serial();
+    let ps = common::free_port().to_string();
+    let mut server = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps, "-J"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    let out = common::run_client_ok(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-u",
+            "-R",
+            "-O",
+            "1",
+            "-t",
+            "1",
+            "-b",
+            "5M",
+            "--get-server-output",
+            "-J",
+        ],
+        Duration::from_secs(40),
+        "client -u -R -O 1 --get-server-output",
+    )
+    .stdout;
+    let _ = server.0.wait();
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("client doc parses");
+    let sj = &v["server_output_json"];
+    assert!(sj.is_object(), "server_output_json present (#33): {v}");
+    let blksize = sj["start"]["test_start"]["blksize"]
+        .as_i64()
+        .expect("server blksize");
+    for key in ["sum", "sum_sent"] {
+        let bytes = sj["end"][key]["bytes"].as_i64().expect("server bytes");
+        let packets = sj["end"][key]["packets"].as_i64().expect("server packets");
+        assert_eq!(
+            packets,
+            bytes / blksize,
+            "server {key}: the server's sender datagram counter must be NET of \
+             the -O window — a gross counter would exceed net bytes/blk: {sj}"
+        );
+        assert!(packets > 0, "server {key}: a real transfer happened: {sj}");
+    }
+}
