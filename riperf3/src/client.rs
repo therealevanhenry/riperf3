@@ -438,6 +438,10 @@ impl Client {
         let mut measured_secs = self.duration as f64;
         // Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
         let mut test_start_millis = 0u64;
+        // Wall-clock at on_connect (set at the end of the ParamExchange arm,
+        // GT's on_connect timing) — the timestamp the `-J` document carries on an
+        // upfront refusal that never reaches TestStart (#261).
+        let mut connect_time_millis = 0u64;
 
         // #145: AUDITABILITY ONLY — the last state this side processed, threaded
         // through the dispatch loop so an unexpected byte can be diagnosed against
@@ -489,6 +493,8 @@ impl Client {
                             .into_owned(),
                             tcp_mss_default: control_mss,
                             start_time_millis: test_start_millis,
+                            connect_time_millis,
+                            reached_test_start: true,
                         },
                         dump_secs,
                         Some(&msg),
@@ -501,6 +507,17 @@ impl Client {
                 TestState::ParamExchange => {
                     let params = self.build_params(blksize);
                     protocol::send_params(&mut ctrl, &params).await?;
+                    // #261: stamp the on_connect wall-clock HERE — GT runs
+                    // on_connect at the end of its PARAM_EXCHANGE case
+                    // (iperf_client_api.c:338, after iperf_exchange_parameters),
+                    // which sets start.timestamp. A subsequent upfront refusal
+                    // (e.g. code 37) arrives on the NEXT state read, after this
+                    // stamp, so the refusal document carries this real wall-clock
+                    // rather than epoch-0.
+                    connect_time_millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                     // #222: iperf3's connect text block — printed HERE,
                     // after the param exchange (GT's on_connect timing, r2
                     // item 5: a failed exchange prints no banner). The
@@ -611,6 +628,8 @@ impl Client {
                                 .into_owned(),
                                 tcp_mss_default: control_mss,
                                 start_time_millis: test_start_millis,
+                                connect_time_millis,
+                                reached_test_start: true,
                             },
                         );
                     }
@@ -650,6 +669,8 @@ impl Client {
                                     .into_owned(),
                                     tcp_mss_default: control_mss,
                                     start_time_millis: test_start_millis,
+                                    connect_time_millis,
+                                    reached_test_start: true,
                                 },
                                 measured_secs,
                                 Some("the server has terminated"),
@@ -679,6 +700,8 @@ impl Client {
                                     .into_owned(),
                                     tcp_mss_default: control_mss,
                                     start_time_millis: test_start_millis,
+                                    connect_time_millis,
+                                    reached_test_start: true,
                                 },
                                 measured_secs,
                                 Some(&msg),
@@ -713,6 +736,8 @@ impl Client {
                                         .into_owned(),
                                         tcp_mss_default: control_mss,
                                         start_time_millis: test_start_millis,
+                                        connect_time_millis,
+                                        reached_test_start: true,
                                     },
                                     measured_secs,
                                     Some(&msg),
@@ -754,6 +779,10 @@ impl Client {
                                 .into_owned(),
                                 tcp_mss_default: control_mss,
                                 start_time_millis: test_start_millis,
+                                connect_time_millis,
+                                // #261: the success path always reached TestStart —
+                                // full report structure, late fields present.
+                                reached_test_start: true,
                             },
                             measured_secs,
                             None,
@@ -796,6 +825,13 @@ impl Client {
                                 .into_owned(),
                                 tcp_mss_default: control_mss,
                                 start_time_millis: test_start_millis,
+                                connect_time_millis,
+                                // #261: a SERVER_ERROR relay before TestStart is
+                                // the upfront refusal (code 37 et al.) — emit GT's
+                                // minimal doc (`end: {}`, late start fields
+                                // omitted). The mid-test ControlEvent variant is
+                                // always past TestStart, so this stays true there.
+                                reached_test_start: test_start_millis > 0,
                             },
                             measured_secs,
                             Some(&msg),
@@ -824,6 +860,8 @@ impl Client {
                                 .into_owned(),
                             tcp_mss_default: control_mss,
                             start_time_millis: test_start_millis,
+                            connect_time_millis,
+                            reached_test_start: true,
                         },
                         measured_secs,
                         Some("the server has terminated"),
@@ -2134,14 +2172,39 @@ impl Client {
             // sndbuf/rcvbuf_actual are the kernel's actual sizes on a data socket.
             // .max(0): the public builder accepts an i32 window; clamp so a
             // negative can't wrap to a huge u64 (the CLI path is already >= 0).
-            sock_bufsize: self.window.map(|w| w.max(0) as u64).unwrap_or(0),
-            sndbuf_actual: streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0),
-            rcvbuf_actual: streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0),
+            // #261: `Some(..)` on a run that set up streams (build() gates them
+            // out on the upfront-refusal path via `reached_test_start`); a
+            // success run always carries them, so the shape is unchanged. A
+            // missing kernel readback still yields `Some(0)` on a real run, like
+            // iperf3.
+            sock_bufsize: Some(self.window.map(|w| w.max(0) as u64).unwrap_or(0)),
+            sndbuf_actual: Some(streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0)),
+            rcvbuf_actual: Some(streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0)),
+            // #261: false ONLY on the upfront server-refusal path (a SERVER_ERROR
+            // relay that arrives before stream setup, e.g. code 37) — there GT's
+            // client errexits through json_top, which never populated json_end, so
+            // the late `start` fields are omitted and `end` is `{}`. EVERY other
+            // path (success and the sigend/SERVER_TERMINATE dumps) renders the
+            // full structure — GT's interrupt dump shows 0/0/0 pre-data, NOT an
+            // empty end — so the flag is true and the partial document keeps its
+            // late fields. The flag is threaded explicitly via StartMeta because
+            // the refusal and a pre-data interrupt BOTH happen before TestStart
+            // and so are indistinguishable by the start wall-clock alone.
+            reached_test_start: start_meta.reached_test_start,
             interval: self.interval.unwrap_or(1.0),
             // riperf3's single --gsro flag drives both GSO and GRO.
             gso: i32::from(self.gsro),
             gro: i32::from(self.gsro),
-            start_time_millis: start_meta.start_time_millis,
+            // #261: on a run that reached TestStart use that wall-clock; on the
+            // upfront-refusal path TestStart was never reached (start wall-clock
+            // is 0), so fall back to the connect-time wall-clock — GT stamps
+            // start.timestamp at on_connect (after the param exchange, BEFORE the
+            // refusal arrives), never epoch-0.
+            start_time_millis: if start_meta.start_time_millis > 0 {
+                start_meta.start_time_millis
+            } else {
+                start_meta.connect_time_millis
+            },
             extra_data: self.extra_data.clone(),
             // --get-server-output (#33): the server's returned output rides
             // the -J report tail — only when WE requested it (iperf3 gates on
@@ -2267,7 +2330,19 @@ enum EndCondition {
 struct StartMeta {
     cookie: String,
     tcp_mss_default: u32,
+    /// Wall-clock at TestStart, ms since the Unix epoch. 0 until the TestStart
+    /// arm stamps it — its being > 0 is also the "reached TestStart" signal (#261).
     start_time_millis: u64,
+    /// Wall-clock at on_connect (right after the param exchange), ms since the
+    /// Unix epoch (#261). GT stamps `start.timestamp` here; on an upfront refusal
+    /// (rejection before TestStart) it is the only real wall-clock the document
+    /// has, so the refusal path uses it for the timestamp instead of epoch-0.
+    connect_time_millis: u64,
+    /// #261: false ONLY on the upfront server-refusal path — drives the
+    /// stage-gated omission of the late `start` fields and the bare `end: {}`.
+    /// True on every other path (success, sigend interrupt, SERVER_TERMINATE),
+    /// which all render the full report structure like GT.
+    reached_test_start: bool,
 }
 
 // ---------------------------------------------------------------------------

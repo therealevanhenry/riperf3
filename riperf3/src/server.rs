@@ -1967,9 +1967,14 @@ impl Server {
             tcp_mss_default: 0,
             mss: cfg.mss.filter(|&m| m > 0).map(|m| m as u32),
             fq_rate: params.fqrate.unwrap_or(0),
-            sock_bufsize: cfg.window.map(|w| w.max(0) as u64).unwrap_or(0),
-            sndbuf_actual: streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0),
-            rcvbuf_actual: streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0),
+            sock_bufsize: Some(cfg.window.map(|w| w.max(0) as u64).unwrap_or(0)),
+            sndbuf_actual: Some(streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0)),
+            rcvbuf_actual: Some(streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0)),
+            // #261: the server only ever assembles a full report on a run that
+            // reached TestStart — its upfront refusal renders the skeleton via
+            // json_report::error_document, not build(). So the late fields are
+            // always present here; the stage-gate is a no-op on this path.
+            reached_test_start: true,
             // The server reports at its 1s default; it has no -i.
             interval: 1.0,
             // GSO/GRO are client-side knobs, not exchanged; iperf3's server emits 0.

@@ -13,39 +13,39 @@ release tags.
 
 ## [0.8.0] - unreleased
 
-The architecture-and-API release the 0.7.x faithfulness train deferred. Per the
-SemVer 0.x convention, this minor bump carries breaking **library API** changes
-(below); the wire protocol, CLI flags, and `-J`/text output are unchanged — the
-faithful iperf3 drop-in behavior is preserved.
+Architecture-and-API release. Wire protocol and CLI flags unchanged; success-path
+`-J`/text output byte-identical. Breaking changes are library-API only.
 
 ### Breaking
 
-- **`Client::run` now returns `riperf3::Report`** (#137) — the rich
-  iperf3-schema report, the same object `-J`/`--json` serializes — instead of
-  the lean control-channel `TestResultsJson`. Library consumers get start
-  metadata, interval arrays, per-direction aggregates, and richer end summaries
-  directly. Migration: total bytes
-  `result.streams.iter().map(|s| s.bytes).sum()` → `result.end.sum_sent.bytes`
-  (forward) / `result.end.sum_received.bytes` (reverse); CPU
+- `Client::run` returns `riperf3::Report` (the rich `-J`-schema report) instead of
+  `TestResultsJson` (#137). Migration: `result.streams.iter().map(|s| s.bytes).sum()`
+  → `result.end.sum_sent.bytes` (fwd) / `.sum_received.bytes` (rev);
   `result.cpu_util_total` → `result.end.cpu_utilization_percent.host_total`.
-- **`TestResultsJson` / `StreamResultJson` are no longer re-exported** from the
-  crate root (#137): they are the internal control-channel exchange model. The
-  public result type is now `Report`.
+- `TestResultsJson` / `StreamResultJson` no longer re-exported from the crate root (#137).
+- Seven `Report` fields are now `Option` so a refusal document can omit what the test
+  never produced (#261): `Start::{sock_bufsize, sndbuf_actual, rcvbuf_actual, test_start}`,
+  `End::{sum_sent, sum_received, cpu_utilization_percent}`. Always `Some` once a run
+  reaches TestStart, so success output is unchanged. Migration: `…sum_sent.as_ref().unwrap()`.
 
 ### Added
 
-- **`Server::run_once() -> Result<Report>`** (#137) — serves exactly one test and
-  returns its rich report, the server-side analog of `Client::run`.
-  `Server::run` remains the long-lived accept loop (`Result<()>`).
-- **`riperf3::json_report` is a documented public module** (#137); its top-level
-  `Report` is re-exported at the crate root.
+- `Server::run_once() -> Result<Report>`: serve one test and return its report (#137).
+- `riperf3::json_report` is public; `Report` re-exported at the crate root (#137).
 
 ### Changed
 
-- Removed the unwired `#[allow(dead_code)]` async UDP sender/receiver variants and
-  documented why the UDP data path deliberately uses `spawn_blocking` with
-  blocking sockets — SO_SNDBUF backpressure, the sendmmsg batch path, the winsock
-  demux constraint (#146). No behavior change.
+- Removed the dead async UDP sender/receiver variants; documented the deliberate
+  `spawn_blocking`/blocking-socket UDP design (#146).
+
+### Fixed
+
+- Client `-J` upfront-refusal document is now byte-faithful to iperf3 (#261): omits the
+  unreached `start`/`end` fields, emits `end: {}`, real on-connect timestamp (was epoch-0).
+- Deliberate deviation from iperf3 (#261): where iperf3 emits the `"error"` key **twice**
+  on a relayed refusal (an upstream defect, [esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051)),
+  riperf3 emits a single clean `"error"` key — the bare message a conformant last-wins
+  parser resolves to.
 
 ## [0.7.4] - 2026-06-12
 
