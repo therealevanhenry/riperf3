@@ -1057,9 +1057,13 @@ impl Server {
                     // sent bytes, keeping the gross+baseline convention (#184
                     // — a zero here made an iperf3 client print `0/0` for a
                     // riperf3 server's reverse stream).
-                    let blk = cfg.blksize.max(1) as u64;
-                    let gross = (s.counters.bytes_sent() / blk) as i64;
-                    let net = (bytes / blk) as i64;
+                    // #256: the authoritative per-datagram send counter (an
+                    // exact `++sp->packet_count`), not the old `bytes/blksize`
+                    // derivation. Full-block-only senders keep this == the old
+                    // value bit-for-bit (no compat-matrix drift); making it
+                    // authoritative just protects against a future short-send.
+                    let gross = s.counters.datagrams_sent() as i64;
+                    let net = s.counters.datagrams_sent_net() as i64;
                     (0.0, 0, gross, 0, gross - net)
                 } else {
                     (0.0, 0, 0, 0, 0)
@@ -1768,11 +1772,13 @@ impl Server {
                         .unwrap_or((None, None, None))
                 } else if is_udp && s.is_sender {
                     // iperf3's sender line shows zero jitter/loss over the
-                    // sent datagram count, not blank columns (#184).
+                    // sent datagram count, not blank columns (#184). #256: the
+                    // authoritative post-omit datagram count, not bytes/blksize
+                    // (== the old value for full-block-only senders).
                     (
                         Some(0.0),
                         Some(0),
-                        Some((bytes / cfg.blksize.max(1) as u64) as i64),
+                        Some(s.counters.datagrams_sent_net() as i64),
                     )
                 } else {
                     (None, None, None)

@@ -35,6 +35,21 @@ pub struct StreamCounters {
     // post-omit window, like iperf3's stats reset in iperf_reset_stats.
     bytes_sent_omit: AtomicU64,
     bytes_received_omit: AtomicU64,
+    /// #256: an AUTHORITATIVE per-datagram send counter, the riperf3 analog of
+    /// iperf3's `++sp->packet_count` per send (iperf_udp.c). Incremented ONCE
+    /// PER BATCH (one relaxed `fetch_add` of the batch's successful-send count)
+    /// from the two real UDP send sites, so it carries the same amortized-atomic
+    /// cost as `bytes_sent` and adds no per-packet atomic on the hot path.
+    /// Today every UDP sender emits full `blksize` blocks only (no `-F` on UDP,
+    /// no short datagrams), so `datagrams_sent == bytes_sent / blksize`
+    /// bit-for-bit; making it authoritative means a future short-send/GSO change
+    /// can't silently corrupt the exchanged packet figure. UDP-sender-only:
+    /// TCP and receivers never touch it.
+    datagrams_sent: AtomicU64,
+    /// #256: the `-O/--omit` warm-up baseline for `datagrams_sent`, mirroring
+    /// `bytes_sent_omit` (#31). `snapshot_omit` captures it; `datagrams_sent_net`
+    /// subtracts it so the summary covers only the post-omit window.
+    datagrams_sent_omit: AtomicU64,
     /// #156: the sender's end-of-test retransmit total, snapshotted by the
     /// sender task while its socket is still open. The results exchange runs
     /// after the task has dropped (closed) the socket, so an exchange-time
@@ -73,6 +88,8 @@ impl StreamCounters {
             bytes_received_interval: AtomicU64::new(0),
             bytes_sent_omit: AtomicU64::new(0),
             bytes_received_omit: AtomicU64::new(0),
+            datagrams_sent: AtomicU64::new(0),
+            datagrams_sent_omit: AtomicU64::new(0),
             final_retransmits: AtomicI64::new(-1),
             omit_retransmits: AtomicI64::new(-1),
             final_tcp_sample: Mutex::new(None),
@@ -86,6 +103,12 @@ impl StreamCounters {
             .store(self.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
         self.bytes_received_omit.store(
             self.bytes_received.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // #256: mirror the byte-counter omit baseline for the datagram counter
+        // so `datagrams_sent_net` covers only the post-omit window.
+        self.datagrams_sent_omit.store(
+            self.datagrams_sent.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -102,6 +125,14 @@ impl StreamCounters {
         self.bytes_received
             .load(Ordering::Relaxed)
             .saturating_sub(self.bytes_received_omit.load(Ordering::Relaxed))
+    }
+
+    /// Datagrams sent since the omit boundary (#256; the whole run when `-O` is
+    /// unused). The authoritative per-stream UDP-sender packet figure, post-omit.
+    pub fn datagrams_sent_net(&self) -> u64 {
+        self.datagrams_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.datagrams_sent_omit.load(Ordering::Relaxed))
     }
 
     /// Store the end-of-test retransmit total (#156; sender task only, while
@@ -155,6 +186,15 @@ impl StreamCounters {
         self.bytes_sent_interval.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record datagrams sent (#256; called ONCE PER BATCH from the UDP send
+    /// loops, alongside `record_sent`, with the count of datagrams actually sent
+    /// in the batch). ONE relaxed `fetch_add` — no per-packet atomic, so the
+    /// hot-path cost amortizes exactly like `record_sent`. The riperf3 analog of
+    /// iperf3's `++sp->packet_count` per send, but batched.
+    pub fn record_datagrams_sent(&self, n: u64) {
+        self.datagrams_sent.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Record bytes received (called from the recv loop hot path).
     pub fn record_received(&self, n: u64) {
         self.bytes_received.fetch_add(n, Ordering::Relaxed);
@@ -189,6 +229,12 @@ impl StreamCounters {
 
     pub fn bytes_received(&self) -> u64 {
         self.bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// The cumulative authoritative datagram-send count (#256; gross, including
+    /// any omit window). UDP senders only; 0 on TCP and receivers.
+    pub fn datagrams_sent(&self) -> u64 {
+        self.datagrams_sent.load(Ordering::Relaxed)
     }
 }
 
@@ -1264,6 +1310,12 @@ pub fn run_udp_sender_sendmmsg(
                 let sent_count = results.count(); // consumes iterator, releases borrow
                 let batch_bytes = sent_count as u64 * blksize as u64;
                 counters.record_sent(batch_bytes);
+                // #256: authoritative datagram count — ONE relaxed atomic per
+                // batch, using the EXACT number sendmmsg reported sent. The
+                // EAGAIN/error arms below send nothing and rewind the whole
+                // batch, so they (correctly) record neither bytes nor packets;
+                // this matches `batch_bytes` exactly (= sent_count * blksize).
+                counters.record_datagrams_sent(sent_count as u64);
                 // Rewind seq for unsent packets
                 let unsent = batch_size - sent_count;
                 seq -= unsent as u64;
@@ -1476,6 +1528,11 @@ fn udp_send_loop(
         let cached_usec = cached_time.subsec_micros();
 
         let mut batch_bytes: u64 = 0;
+        // #256: count datagrams actually sent this batch, in lockstep with
+        // `batch_bytes` — incremented ONLY on the same successful `Ok(n)` arm.
+        // The WouldBlock/error arms `seq -= 1; break;` (excluding the unsent
+        // packet), so neither byte nor packet accounting includes it.
+        let mut batch_packets: u64 = 0;
 
         for _ in 0..batch_size {
             seq += 1;
@@ -1491,7 +1548,10 @@ fn udp_send_loop(
                 None => socket.send(&buf),
             };
             match sent {
-                Ok(n) => batch_bytes += n as u64,
+                Ok(n) => {
+                    batch_bytes += n as u64;
+                    batch_packets += 1;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     seq -= 1;
                     break;
@@ -1509,6 +1569,8 @@ fn udp_send_loop(
         }
 
         counters.record_sent(batch_bytes);
+        // #256: ONE relaxed atomic per batch, matching `record_sent` above.
+        counters.record_datagrams_sent(batch_packets);
 
         // Rate pacing: one clock check per batch, interruptible by `done`
         // and the `-t` deadline (#160 review r2). If behind schedule,
@@ -2088,6 +2150,50 @@ mod tests {
         assert_eq!(c.bytes_received(), 125);
         assert_eq!(c.take_received_interval(), 125);
         assert_eq!(c.take_received_interval(), 0);
+    }
+
+    /// #256: `record_datagrams_sent` accumulates the gross datagram count
+    /// (one `fetch_add` per batch). Mirrors `counters_basic` for the byte
+    /// counter. Default is 0 (TCP/receiver streams never touch it).
+    #[test]
+    fn datagram_counter_accumulates() {
+        let c = StreamCounters::new();
+        assert_eq!(c.datagrams_sent(), 0, "default is 0");
+        c.record_datagrams_sent(32); // batch 1
+        c.record_datagrams_sent(17); // batch 2 (a short batch — e.g. WouldBlock)
+        assert_eq!(c.datagrams_sent(), 49);
+        // No omit boundary yet → net == gross.
+        assert_eq!(c.datagrams_sent_net(), 49);
+    }
+
+    /// #256: `datagrams_sent_net` subtracts the omit baseline captured by
+    /// `snapshot_omit`, exactly like `bytes_sent_net` does for bytes (#31).
+    #[test]
+    fn datagram_counter_net_subtracts_omit_baseline() {
+        let c = StreamCounters::new();
+        c.record_datagrams_sent(10); // pre-omit (warm-up)
+        c.snapshot_omit(); // baseline = 10
+        assert_eq!(c.datagrams_sent_net(), 0, "right at the boundary, net is 0");
+        c.record_datagrams_sent(25); // post-omit
+        assert_eq!(c.datagrams_sent(), 35, "gross still counts the warm-up");
+        assert_eq!(c.datagrams_sent_net(), 25, "net covers only post-omit");
+    }
+
+    /// #256: a no-baseline (no `-O`) run reports gross == net, and a snapshot
+    /// taken before any sends leaves net == gross. Guards the saturating_sub
+    /// against an underflow when the baseline exceeds the live count.
+    #[test]
+    fn datagram_counter_net_without_baseline_is_gross() {
+        let c = StreamCounters::new();
+        c.record_datagrams_sent(7);
+        assert_eq!(c.datagrams_sent_net(), 7, "no -O → net == gross");
+        // saturating_sub: if a baseline somehow exceeds the live count, net is
+        // 0, never a wraparound.
+        let c2 = StreamCounters::new();
+        c2.record_datagrams_sent(100);
+        c2.snapshot_omit();
+        // (no further sends; baseline == live) → 0
+        assert_eq!(c2.datagrams_sent_net(), 0);
     }
 
     /// #245: the final TCP_INFO snapshot stash round-trips. Default is `None`
@@ -2732,6 +2838,94 @@ mod tests {
         );
     }
 
+    /// #256 NO-DRIFT EQUIVALENCE: the authoritative datagram counter MUST equal
+    /// `bytes_sent / blksize` bit-for-bit after a real `udp_send_loop` run. Every
+    /// UDP sender emits full `blksize` blocks only, so `bytes_sent` is always an
+    /// exact multiple of `blksize`; this pins the invariant the 52-cell compat
+    /// matrix relies on (the wire `packets` figure must not change). Run with a
+    /// non-zero rate so the loop takes the batched path (batch_size > 1) — the
+    /// regime where a batched-vs-per-packet accounting bug would show up.
+    #[test]
+    fn datagram_counter_equals_bytes_over_blksize_exactly() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false)); // deadline stops it
+        let counters = Arc::new(StreamCounters::new());
+        let blksize = 1400usize;
+
+        run_udp_sender_blocking(
+            send,
+            counters.clone(),
+            blksize,
+            done,
+            100_000_000, // rate>0 → batched (batch_size > 1)
+            1000,
+            0,
+            false,
+            false,
+            started(),
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap();
+
+        let bytes = counters.bytes_sent();
+        let datagrams = counters.datagrams_sent();
+        assert!(datagrams > 0, "should have sent at least one batch");
+        assert_eq!(
+            bytes % blksize as u64,
+            0,
+            "full-block-only invariant: bytes_sent must be a multiple of blksize"
+        );
+        // The bit-for-bit equivalence the compat matrix depends on: the
+        // authoritative counter equals the old bytes-derived figure exactly.
+        assert_eq!(
+            datagrams,
+            bytes / blksize as u64,
+            "datagrams_sent() must equal bytes_sent()/blksize EXACTLY (no drift)"
+        );
+
+        // And the net (post-omit) figure equals bytes_net/blksize after an omit
+        // snapshot — what the 4 derivation sites now emit.
+        counters.snapshot_omit();
+        assert_eq!(
+            counters.datagrams_sent_net(),
+            counters.bytes_sent_net() / blksize as u64,
+            "datagrams_sent_net() must equal bytes_sent_net()/blksize EXACTLY"
+        );
+        // Right at the boundary both are 0.
+        assert_eq!(counters.datagrams_sent_net(), 0);
+    }
+
+    /// #256: the same equivalence holds on the unpaced (rate 0) per-packet
+    /// regime where `batch_size == 1` — the `udp_send_loop` byte and packet
+    /// accumulators must stay in lockstep there too.
+    #[test]
+    fn datagram_counter_equals_bytes_over_blksize_unpaced() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(StreamCounters::new());
+        let blksize = 1400usize;
+
+        run_udp_sender_blocking(
+            send,
+            counters.clone(),
+            blksize,
+            done,
+            0, // rate 0 → batch_size 1 (per-packet regime)
+            1000,
+            0,
+            false,
+            false,
+            started(),
+            Some(Duration::from_millis(150)),
+        )
+        .unwrap();
+
+        let bytes = counters.bytes_sent();
+        assert!(bytes > 0);
+        assert_eq!(bytes % blksize as u64, 0);
+        assert_eq!(counters.datagrams_sent(), bytes / blksize as u64);
+    }
+
     /// Same deadline guarantee, but with a non-zero rate so `batch_size > 1`
     /// and the paced send loop runs — production never uses rate 0, so this
     /// covers the batched regime where the deadline is checked once per batch
@@ -2797,6 +2991,47 @@ mod tests {
             "sendmmsg sender should stop near its 200ms deadline, took {elapsed:?}"
         );
         assert!(counters.bytes_sent() > 0);
+    }
+
+    /// #256 NO-DRIFT EQUIVALENCE for the sendmmsg send site: the authoritative
+    /// datagram counter (incremented per batch with sendmmsg's `sent_count`)
+    /// must equal `bytes_sent / blksize` bit-for-bit, exactly as on the
+    /// per-packet path. This is the headline UDP throughput path on Linux.
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+    #[test]
+    fn datagram_counter_sendmmsg_equals_bytes_over_blksize() {
+        let (send, _recv) = udp_pair();
+        let done = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(StreamCounters::new());
+        let blksize = 1400usize;
+
+        run_udp_sender_sendmmsg(
+            send,
+            counters.clone(),
+            blksize,
+            done,
+            0, // unlimited → full batch ceiling
+            1000,
+            0,
+            false,
+            false,
+            started(),
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap();
+
+        let bytes = counters.bytes_sent();
+        assert!(bytes > 0);
+        assert_eq!(
+            bytes % blksize as u64,
+            0,
+            "full-block-only invariant on the sendmmsg path"
+        );
+        assert_eq!(
+            counters.datagrams_sent(),
+            bytes / blksize as u64,
+            "sendmmsg datagrams_sent() must equal bytes_sent()/blksize EXACTLY"
+        );
     }
 
     /// `max_duration = None` preserves the original behavior: the loop runs

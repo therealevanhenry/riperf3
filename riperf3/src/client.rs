@@ -734,8 +734,7 @@ impl Client {
                 }
 
                 TestState::ExchangeResults => {
-                    let results =
-                        self.build_results(&streams, cpu_start.as_ref(), blksize, measured_secs);
+                    let results = self.build_results(&streams, cpu_start.as_ref(), measured_secs);
                     protocol::send_results(&mut ctrl, &results).await?;
                     server_results = Some(protocol::recv_results(&mut ctrl).await?);
                 }
@@ -1566,7 +1565,6 @@ impl Client {
         &self,
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
-        blksize: usize,
         test_duration: f64,
     ) -> TestResultsJson {
         let cpu_end = CpuSnapshot::now();
@@ -1606,9 +1604,13 @@ impl Client {
                         // that count unconditionally (iperf_api.c
                         // `"packets"`). Fill the equivalent from sent bytes,
                         // keeping the gross+baseline convention (#184).
-                        let blk = blksize.max(1) as u64;
-                        let gross = (s.counters.bytes_sent() / blk) as i64;
-                        let net = (bytes / blk) as i64;
+                        // #256: the authoritative per-datagram send counter
+                        // (an exact `++sp->packet_count`), not the old
+                        // `bytes/blksize` derivation. Full-block-only senders
+                        // keep this == the old value bit-for-bit (no
+                        // compat-matrix drift).
+                        let gross = s.counters.datagrams_sent() as i64;
+                        let net = s.counters.datagrams_sent_net() as i64;
                         (0.0, 0, gross, 0, gross - net)
                     } else {
                         (0.0, 0, 0, 0, 0)
@@ -1739,7 +1741,6 @@ impl Client {
             self.print_results_text(
                 streams,
                 remote_cpu,
-                blksize,
                 test_duration,
                 cpu_start.map(|s| CpuSnapshot::now().utilization_since(s)),
             );
@@ -1786,7 +1787,6 @@ impl Client {
         &self,
         streams: &[DataStream],
         server_results: Option<&TestResultsJson>,
-        blksize: usize,
         test_duration: f64,
         local_cpu: Option<crate::cpu::CpuUtilization>,
     ) {
@@ -1825,12 +1825,15 @@ impl Client {
                     })
                     .unwrap_or((None, None, None))
             } else if is_udp {
-                // Local sending stream: iperf3's sender line shows zero
-                // jitter/loss over the sent datagram count.
+                // Local sending stream (UDP receivers took the recv-stats
+                // branch above, so this is the sender): iperf3's sender line
+                // shows zero jitter/loss over the sent datagram count. #256:
+                // the authoritative post-omit datagram count, not bytes/blksize
+                // (== the old value for full-block-only senders).
                 (
                     Some(0.0),
                     Some(0),
-                    Some((bytes / blksize.max(1) as u64) as i64),
+                    Some(s.counters.datagrams_sent_net() as i64),
                 )
             } else {
                 (None, None, None)
@@ -3276,7 +3279,7 @@ mod tests {
             rcvbuf_actual: None,
             congestion_used: None,
         };
-        let results = client.build_results(std::slice::from_ref(&ds), None, 1460, 1.0);
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
         assert_eq!(results.sender_has_retransmits, 1);
         assert!(
             results.streams[0].retransmits >= 0,
@@ -3362,7 +3365,7 @@ mod tests {
             congestion_used: None,
         };
         let client = crate::ClientBuilder::new("127.0.0.1").build().unwrap();
-        let results = client.build_results(std::slice::from_ref(&ds), None, 1460, 1.0);
+        let results = client.build_results(std::slice::from_ref(&ds), None, 1.0);
         assert_eq!(
             results.streams[0].retransmits, 3,
             "#171: warm-up retransmits (5) must be subtracted from the \
