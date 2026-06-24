@@ -56,6 +56,11 @@ pub use net::set_cpu_affinity;
 // `json_report` is the exception — it is the iperf3-schema result model that
 // `Client::run` / `Server::run_once` return, so it is a documented public
 // module (#137); its top-level `Report` is re-exported at the crate root above.
+// The module's PUBLIC surface is `Report` + its serialized sub-structs only;
+// the builder INPUT types (`ReportInput`/`StreamReport`/`TcpEndExtras`/
+// `UdpStreamStats`) are `pub(crate)` (incidentally exposed by #137, hidden in
+// 0.8.0 — #283), since they are assembled solely by the crate-private
+// `build_report_input`.
 
 pub(crate) mod auth;
 pub(crate) mod cpu;

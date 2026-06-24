@@ -1910,6 +1910,15 @@ impl Server {
                     remote_port,
                     is_sender: s.is_sender,
                     local_bytes,
+                    // #256/#283: the authoritative per-stream SENT datagram
+                    // count, net of the `-O` omit baseline — the SAME source
+                    // #256 feeds to the wire/text per-stream figure
+                    // (datagrams_sent_net). Only on UDP streams THIS HOST sent
+                    // (reverse/bidir); None for received streams. == local_bytes
+                    // / blksize bit-for-bit for a full-block-only sender, so the
+                    // -J stays byte-identical.
+                    datagrams_sent: (is_udp && s.is_sender)
+                        .then(|| s.counters.datagrams_sent_net()),
                     // The server never learns the peer's per-stream bytes; build()
                     // zeroes the un-measured side for is_server reports.
                     remote_bytes: None,
