@@ -1208,18 +1208,20 @@ impl ReportInput {
         // #261: stage-gate the `end` summary aggregates on whether the test
         // reached TestStart. On an upfront refusal (never reached it) every
         // optional field is None and `streams` is empty, so `End` serializes as
-        // GT's bare `end: {}`. A run that reached TestStart (success, mid-test
-        // interrupt, SERVER_TERMINATE) keeps them — the partial document carries
-        // the late fields it has, unchanged from before.
+        // GT's bare `end: {}`. This must cover the UDP aggregates too (`sum` and
+        // the bidir trio are `Some(zeros)` on a UDP refusal) or a UDP refusal
+        // leaks `end: {"sum": {...}}`. A run that reached TestStart (success,
+        // mid-test interrupt, SERVER_TERMINATE) keeps them — the partial document
+        // carries the late fields it has, unchanged from before.
         let reached = self.reached_test_start;
         let end = End {
             streams: end_streams,
             sum_sent: reached.then_some(sum_sent),
             sum_received: reached.then_some(sum_received),
-            sum,
-            sum_bidir_reverse,
-            sum_sent_bidir_reverse,
-            sum_received_bidir_reverse,
+            sum: reached.then_some(sum).flatten(),
+            sum_bidir_reverse: reached.then_some(sum_bidir_reverse).flatten(),
+            sum_sent_bidir_reverse: reached.then_some(sum_sent_bidir_reverse).flatten(),
+            sum_received_bidir_reverse: reached.then_some(sum_received_bidir_reverse).flatten(),
             cpu_utilization_percent: reached.then(|| self.cpu.clone()),
             sender_tcp_congestion: cong_sender,
             receiver_tcp_congestion: cong_receiver,
@@ -1278,6 +1280,13 @@ impl ReportInput {
                 // upfront-refusal path `reached` is false → all omitted (the
                 // buffer fields are also `None` at the source there); GT does the
                 // same, so the refusal `start` carries only the early metadata.
+                // NOTE: GT stages these at two distinct points — the buffers at
+                // CREATE_STREAMS (iperf_tcp.c) and `test_start` at TEST_START
+                // (iperf_api.c) — whereas this one `reached` flag flips at
+                // TestStart. A SERVER_ERROR arriving in the CreateStreams..
+                // TestStart window would diverge, but that window is unreachable
+                // against a riperf3 server (its only top-level SERVER_ERROR is the
+                // param-exchange refusal, before CreateStreams).
                 sock_bufsize: reached.then_some(self.sock_bufsize).flatten(),
                 sndbuf_actual: reached.then_some(self.sndbuf_actual).flatten(),
                 rcvbuf_actual: reached.then_some(self.rcvbuf_actual).flatten(),
@@ -2731,6 +2740,44 @@ mod tests {
             Some("client's requested duration exceeds the server's maximum permitted limit"),
             "the bare strerror, what a last-wins parser of GT's doc resolves to: {v}"
         );
+    }
+
+    #[test]
+    fn udp_refusal_also_emits_bare_end() {
+        // Round-1 cold-review catch: the UDP aggregates (`sum` + the bidir trio)
+        // are Some(zeros) on a UDP refusal, so unless they too are gated on
+        // reached_test_start, `end` leaks `{"sum": {...}}` instead of GT's bare
+        // `{}`. The TCP refusal test above never exercised this (TCP leaves those
+        // None), which is how it slipped the suite.
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.error =
+            Some("client's requested duration exceeds the server's maximum permitted limit".into());
+        input.reached_test_start = false;
+        input.streams = vec![];
+        input.sock_bufsize = None;
+        input.sndbuf_actual = None;
+        input.rcvbuf_actual = None;
+        input.congestion_used = None;
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"].as_object().map(serde_json::Map::len),
+            Some(0),
+            "UDP refusal end must serialize as GT's bare `end: {{}}` (no leaked `sum`): {v}"
+        );
+        // the late start fields are omitted on UDP too.
+        let start = v["start"].as_object().expect("start object");
+        for absent in [
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
+            "test_start",
+        ] {
+            assert!(
+                !start.contains_key(absent),
+                "UDP refusal start must omit {absent}: {v}"
+            );
+        }
     }
 
     #[test]
