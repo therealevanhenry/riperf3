@@ -83,7 +83,7 @@ watchdog is now iperf3's duration+omit+40s grace, flag-independent).
 
 ### Fixed
 
-- **The setup-starvation flake family's root cause** (#195): `udp_connect_client` died on the first transient ICMP bounce (the server's per-stream listener rebind gap) with ~29 s of handshake budget unused — it now rides through transient reset/refused feedback within its unchanged 30 s deadline, with distinct exhaustion diagnoses. Test-harness layers: deadlines above the client's own, a bounded pre-data retry with mode-aware classifiers, `udp_serial` coverage, diagnosable panics. Verified 20/20 quiet-host 2-core rounds and 24/24 on the new cloud hammer.
+- **The setup-starvation flake family's root cause** (#195): `udp_connect_client` died on the first transient ICMP bounce (the server's per-stream listener rebind gap) with ~29 s of handshake budget unused — it now rides through transient reset/refused feedback within its unchanged 30 s deadline, with distinct exhaustion diagnoses. Test-harness layers: deadlines above the client's own, a bounded pre-data retry with mode-aware classifiers, `udp_serial` coverage, diagnosable panics. Verified across 20/20 repeated local stress rounds and 24/24 CI stress runs.
 - **Server self-terminate is wire-faithful** (#224): `--server-bitrate-limit` and the `--server-max-duration` timer relay `SERVER_ERROR(-2)` + the `(i_errno, errno)` pair — not `SERVER_TERMINATE` — with no summary dump and the one-off exiting 0, exactly like iperf 3.21 (live-verified both directions, including real-iperf3 peers and 3.12). The client adopts the relayed `iperf_strerror` (codes 27/37/120/160 mapped; `int_errno=%d` fallback; unconditional errno append).
 - **Exactly one JSON render on terminate paths** (#225): the CLI no longer appends a second document (`-J`) or a second error+end event pair (`--json-stream`) after the library already rendered the error into the active sink.
 - **UDP bidir `-J` end block matches iperf3's shape exactly** (#214): six UDP-shaped aggregates (TCP bidir keeps four; pinned negative), `sum` ordered first, sender-figure bytes/packets/lost_percent provenance (live-proven on lossy and terminated runs), per-direction jitter averaged over `num_streams`, the server's strict no-graft zeros, and the per-stream sender-figure rule.
@@ -216,8 +216,8 @@ gates, plus a perf-drift bench against the 0.7.2 baseline at parity.
 - **UDP `SO_SNDBUF` is grow-only and skipped entirely under `-w`** (#163):
   iperf3 never sets it outside `-w`; the old unconditional set shrank the
   buffer up to ~90× at small batch products. (The filed #163 throughput
-  symptom was fixed by 0.7.2's #190 quantum batching — verified by a fleet
-  rate sweep at 10M/100M/1G and burst=1.)
+  symptom was fixed by 0.7.2's #190 quantum batching — verified by a rate
+  sweep at 10M/100M/1G and burst=1.)
 - **The `-O` omit boundary keeps TCP_INFO extremes** (#199): iperf3's
   iperf_reset_stats never clears max cwnd/snd_wnd/RTT (or the RTT mean's sum);
   the old full reset under-read every `max_*` after a warm-up.
