@@ -11,7 +11,7 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-06-28
 
 Architecture-and-API release. Wire protocol and CLI flags unchanged; success-path
 `-J`/text output byte-identical. Breaking changes are library-API only.
@@ -37,11 +37,28 @@ Architecture-and-API release. Wire protocol and CLI flags unchanged; success-pat
 
 - Removed the dead async UDP sender/receiver variants; documented the deliberate
   `spawn_blocking`/blocking-socket UDP design (#146).
+- Extracted the shared client/server data-stream setup (`StreamMeta`/`DataStream::from_meta`
+  + a socket-capture helper) so a new stream field is compiler-enforced across all call
+  sites; no behavior change (#144).
+- UDP sender datagram counts now come from an authoritative per-batch counter instead of
+  `bytes/blksize` derivation, so a future short/partial send can't silently corrupt the
+  count; wire/`-J`/text output is byte-identical (#256).
+- Control-state transitions are validated against a legal-next table; an out-of-order byte
+  logs a hardening diagnostic (debug/`-V`-gated) but is still tolerated exactly as iperf3
+  does — default output unchanged (#145).
+- Expanded CI: cross-compile checks for NetBSD, Intel macOS, and aarch64 Linux (gnu+musl),
+  plus a rustdoc gate (#272).
 
 ### Fixed
 
 - Client `-J` upfront-refusal document is now byte-faithful to iperf3 (#261): omits the
   unreached `start`/`end` fields, emits `end: {}`, real on-connect timestamp (was epoch-0).
+- Final partial interval now reports the genuinely-final `TCP_INFO` sample (cwnd/rtt/snd_wnd),
+  captured before the sender drops its socket, instead of the prior interval's stale values (#245).
+- Client relay of `SERVER_ERROR` mirrors iperf3's per-code `perr` trailing `: ` (code 160 and
+  the unknown-code fallback; codes 27/37/120 stay bare) (#248).
+- `snd_wnd` is signed end-to-end: macOS emits interval `-1` / `max_snd_wnd: 0` like iperf3,
+  Linux/FreeBSD the real value (#161).
 - Deliberate deviation from iperf3 (#261): where iperf3 emits the `"error"` key **twice**
   on a relayed refusal (an upstream defect, [esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051)),
   riperf3 emits a single clean `"error"` key — the bare message a conformant last-wins
