@@ -11,7 +11,7 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-06-28
 
 Architecture-and-API release. Wire protocol and CLI flags unchanged; success-path
 `-J`/text output byte-identical. Breaking changes are library-API only.
@@ -37,11 +37,29 @@ Architecture-and-API release. Wire protocol and CLI flags unchanged; success-pat
 
 - Removed the dead async UDP sender/receiver variants; documented the deliberate
   `spawn_blocking`/blocking-socket UDP design (#146).
+- Extracted the shared client/server data-stream setup (`StreamMeta`/`DataStream::from_meta`
+  + a socket-capture helper) so a new stream field is compiler-enforced across all call
+  sites; no behavior change (#144).
+- UDP sender datagram counts now come from an authoritative per-stream datagram counter
+  (incremented per send batch) instead of `bytes/blksize` derivation, so a future
+  short/partial send can't silently corrupt the count; wire/`-J`/text output is
+  byte-identical (#256).
+- Control-state transitions are validated against a legal-next table; an out-of-order byte
+  logs a hardening diagnostic (debug/`-V`-gated) but is still tolerated exactly as iperf3
+  does — default output unchanged (#145).
+- Expanded CI: cross-compile checks for NetBSD, Intel macOS, and aarch64 Linux (gnu+musl),
+  plus a rustdoc gate (#272).
 
 ### Fixed
 
 - Client `-J` upfront-refusal document is now byte-faithful to iperf3 (#261): omits the
   unreached `start`/`end` fields, emits `end: {}`, real on-connect timestamp (was epoch-0).
+- Final partial interval now reports the genuinely-final `TCP_INFO` sample (cwnd/rtt/snd_wnd),
+  captured before the sender drops its socket, instead of the prior interval's stale values (#245).
+- Client relay of `SERVER_ERROR` mirrors iperf3's per-code `perr` trailing `: ` (code 160 and
+  the unknown-code fallback; codes 27/37/120 stay bare) (#248).
+- `snd_wnd` is signed end-to-end: macOS emits interval `-1` / `max_snd_wnd: 0` like iperf3,
+  Linux/FreeBSD the real value (#161).
 - Deliberate deviation from iperf3 (#261): where iperf3 emits the `"error"` key **twice**
   on a relayed refusal (an upstream defect, [esnet/iperf#2051](https://github.com/esnet/iperf/issues/2051)),
   riperf3 emits a single clean `"error"` key — the bare message a conformant last-wins
@@ -65,7 +83,7 @@ watchdog is now iperf3's duration+omit+40s grace, flag-independent).
 
 ### Fixed
 
-- **The setup-starvation flake family's root cause** (#195): `udp_connect_client` died on the first transient ICMP bounce (the server's per-stream listener rebind gap) with ~29 s of handshake budget unused — it now rides through transient reset/refused feedback within its unchanged 30 s deadline, with distinct exhaustion diagnoses. Test-harness layers: deadlines above the client's own, a bounded pre-data retry with mode-aware classifiers, `udp_serial` coverage, diagnosable panics. Verified 20/20 quiet-host 2-core rounds and 24/24 on the new cloud hammer.
+- **The setup-starvation flake family's root cause** (#195): `udp_connect_client` died on the first transient ICMP bounce (the server's per-stream listener rebind gap) with ~29 s of handshake budget unused — it now rides through transient reset/refused feedback within its unchanged 30 s deadline, with distinct exhaustion diagnoses. Test-harness layers: deadlines above the client's own, a bounded pre-data retry with mode-aware classifiers, `udp_serial` coverage, diagnosable panics. Verified across 20/20 repeated local stress rounds and 24/24 CI stress runs.
 - **Server self-terminate is wire-faithful** (#224): `--server-bitrate-limit` and the `--server-max-duration` timer relay `SERVER_ERROR(-2)` + the `(i_errno, errno)` pair — not `SERVER_TERMINATE` — with no summary dump and the one-off exiting 0, exactly like iperf 3.21 (live-verified both directions, including real-iperf3 peers and 3.12). The client adopts the relayed `iperf_strerror` (codes 27/37/120/160 mapped; `int_errno=%d` fallback; unconditional errno append).
 - **Exactly one JSON render on terminate paths** (#225): the CLI no longer appends a second document (`-J`) or a second error+end event pair (`--json-stream`) after the library already rendered the error into the active sink.
 - **UDP bidir `-J` end block matches iperf3's shape exactly** (#214): six UDP-shaped aggregates (TCP bidir keeps four; pinned negative), `sum` ordered first, sender-figure bytes/packets/lost_percent provenance (live-proven on lossy and terminated runs), per-direction jitter averaged over `num_streams`, the server's strict no-graft zeros, and the per-stream sender-figure rule.
@@ -198,8 +216,8 @@ gates, plus a perf-drift bench against the 0.7.2 baseline at parity.
 - **UDP `SO_SNDBUF` is grow-only and skipped entirely under `-w`** (#163):
   iperf3 never sets it outside `-w`; the old unconditional set shrank the
   buffer up to ~90× at small batch products. (The filed #163 throughput
-  symptom was fixed by 0.7.2's #190 quantum batching — verified by a fleet
-  rate sweep at 10M/100M/1G and burst=1.)
+  symptom was fixed by 0.7.2's #190 quantum batching — verified by a rate
+  sweep at 10M/100M/1G and burst=1.)
 - **The `-O` omit boundary keeps TCP_INFO extremes** (#199): iperf3's
   iperf_reset_stats never clears max cwnd/snd_wnd/RTT (or the RTT mean's sum);
   the old full reset under-read every `max_*` after a warm-up.
