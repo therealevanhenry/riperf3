@@ -64,7 +64,7 @@ On a two-VM KVM sandbox (virtio-net bridge, MTU 9000, 8 vCPU/guest), a
 
 - **UDP** — riperf3 significantly faster in every cell (~+10–20%), and holds steady across `-P` instead of collapsing.
 - **TCP multi-stream** (`-P 8`) — a few percent ahead in every cell (~+4–10%).
-- **TCP single-stream** — within ~2% of iperf3 (~75 Gbps); a marginal residual that has read either side of parity across releases.
+- **TCP single-stream** — within ~2–3% of iperf3 (~75 Gbps); a marginal residual that has read either side of parity across releases.
 - **Wire-compatible** with iperf3 (current and 3.12) in both directions.
 
 [**BENCHMARKS.md**](https://github.com/therealevanhenry/riperf3/blob/main/BENCHMARKS.md)
