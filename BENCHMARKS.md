@@ -28,9 +28,10 @@ environment-specific.
 > cross-campaign absolutes moved UP for BOTH tools in lockstep — riperf3 +6.4%
 > to +13.2% and iperf3 (an unchanged binary) +5.0% to +15.6%, all 16 cells each
 > at p<0.05 — the environment-shift signature (host kernel 7.0.13 vs 0.7.4's
-> 7.0.11). This is also the first campaign with **0 failed runs of 960**: the
-> subshell-port harness bug diagnosed at 0.7.4 is fixed (unique port per run +
-> a listen-poll start). 0.8.0 is an architecture/API release; its only
+> 7.0.11). It is also the first clean campaign since the subshell-port bug was
+> introduced at 0.7.3 — **0 failed runs of 960** on the now-fixed harness
+> (unique port per run + a listen-poll start; 0.7.2's pre-bug campaign was
+> likewise clean). 0.8.0 is an architecture/API release; its only
 > data-path-adjacent change is the authoritative UDP datagram counter (#256),
 > byte-identical on the wire, and the campaign confirms the data path held.
 >
@@ -193,7 +194,8 @@ cell (`-t 5` s each), **960 runs**, run in **randomized order** across all
 either tool. 2 warm-ups per cell discarded; fresh `-s -1` server per run on a
 unique port; hard `timeout` wrappers; VMs confirmed idle and isolated for the
 duration. **This campaign recorded 0 failed runs of 960** — the first clean
-sweep. The subshell-port harness bug diagnosed at 0.7.4 (the per-run port
+sweep on the fixed harness (0.7.2's pre-bug campaign was also clean; 0.7.3 and
+0.7.4 ran with the bug). The subshell-port harness bug diagnosed at 0.7.4 (the per-run port
 increment ran in a subshell, so every measured run actually shared ONE port and
 a connect occasionally raced the previous server's teardown — 108 such rows at
 0.7.4, 101 at 0.7.3, none at 0.7.2) is fixed: a genuine unique port per run plus

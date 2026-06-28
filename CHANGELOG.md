@@ -40,9 +40,10 @@ Architecture-and-API release. Wire protocol and CLI flags unchanged; success-pat
 - Extracted the shared client/server data-stream setup (`StreamMeta`/`DataStream::from_meta`
   + a socket-capture helper) so a new stream field is compiler-enforced across all call
   sites; no behavior change (#144).
-- UDP sender datagram counts now come from an authoritative per-batch counter instead of
-  `bytes/blksize` derivation, so a future short/partial send can't silently corrupt the
-  count; wire/`-J`/text output is byte-identical (#256).
+- UDP sender datagram counts now come from an authoritative per-stream datagram counter
+  (incremented per send batch) instead of `bytes/blksize` derivation, so a future
+  short/partial send can't silently corrupt the count; wire/`-J`/text output is
+  byte-identical (#256).
 - Control-state transitions are validated against a legal-next table; an out-of-order byte
   logs a hardening diagnostic (debug/`-V`-gated) but is still tolerated exactly as iperf3
   does — default output unchanged (#145).
