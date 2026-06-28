@@ -15,8 +15,9 @@ matrix below were measured on our two-VM sandbox with internal tooling (the
 environment-specific.
 
 > **0.8.0 status.** Fully re-measured at the `0.8.0` release commit `90f7d21`
-> (version is already 0.8.0; the release adds only metadata — tag, lockfile,
-> changelog): the compatibility matrix is all-PASS (**52/52**, incl. the iperf3
+> (version was already bumped to 0.8.0 in development; the only change layered
+> on before tagging is docs — this changelog + benchmarks refresh): the
+> compatibility matrix is all-PASS (**52/52**, incl. the iperf3
 > 3.12 cross-pairs) and a fresh full N=30 campaign lands **12 riperf3 / 1 parity
 > / 3 slower** — riperf3 significantly faster in every UDP cell (+10.5% to
 > +19.8%) and every TCP `-P8` cell (+4.4% to +9.6%). The three "slower" cells
