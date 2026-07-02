@@ -314,6 +314,10 @@ impl Server {
         // #290: run-scoped console silence, armed FIRST so the listening
         // banner honors it. Construct-only-when-quiet (see the guard doc).
         let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
+        // #262: GT's per-test banner counter (iperf_server_api.c:137's
+        // server_test_number) — #1 on the first listen, incremented for each
+        // serve round so the re-printed banner numbers the UPCOMING test.
+        let mut server_test_number: u64 = 1;
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
@@ -346,7 +350,10 @@ impl Server {
                 vprintln!("{}", crate::utils::system_info());
             }
             Self::banner_line(sep);
-            Self::banner_line(&format!("Server listening on {}", self.port));
+            Self::banner_line(&format!(
+                "Server listening on {} (test #{server_test_number})",
+                self.port
+            ));
             Self::banner_line(sep);
         }
 
@@ -390,13 +397,19 @@ impl Server {
             if self.one_off {
                 break;
             }
+            // #262: the served round is over — the next banner numbers the
+            // upcoming test.
+            server_test_number += 1;
             if !json {
                 if self.verbose {
                     vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
                     vprintln!("{}", crate::utils::system_info());
                 }
                 Self::banner_line(sep);
-                Self::banner_line(&format!("Server listening on {}", self.port));
+                Self::banner_line(&format!(
+                    "Server listening on {} (test #{server_test_number})",
+                    self.port
+                ));
                 Self::banner_line(sep);
             }
         }

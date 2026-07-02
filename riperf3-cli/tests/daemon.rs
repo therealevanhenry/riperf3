@@ -124,3 +124,47 @@ fn daemon_server_serves_a_client() {
     // line above) leaves the reaper armed so it reaps the leaked daemon.
     reaper.pid = None;
 }
+
+/// #262: GT's accept banner carries a per-test counter —
+/// "Server listening on <port> (test #N)" (iperf_server_api.c:137),
+/// N starting at 1 and incrementing for each serve round, so the
+/// re-printed banner between tests shows #2, #3, ...
+#[test]
+fn server_banner_numbers_each_test() {
+    let port = common::free_port();
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    for _ in 0..2 {
+        let _ = common::run_client(
+            &["-c", "127.0.0.1", "-p", &ps, "-t", "1"],
+            Duration::from_secs(20),
+            "client",
+        );
+    }
+    let _ = server.0.kill();
+    let mut out = String::new();
+    use std::io::Read;
+    server
+        .0
+        .stdout
+        .take()
+        .expect("piped")
+        .read_to_string(&mut out)
+        .expect("read server stdout");
+    assert!(
+        out.contains(&format!("Server listening on {port} (test #1)")),
+        "first banner numbered #1 (GT shape): {out}"
+    );
+    assert!(
+        out.contains(&format!("Server listening on {port} (test #2)")),
+        "the re-printed banner increments to #2: {out}"
+    );
+}

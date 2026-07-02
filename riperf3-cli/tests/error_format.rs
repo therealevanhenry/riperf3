@@ -190,8 +190,12 @@ fn parse_class_errors_stay_on_stderr_even_with_json() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("riperf3: error - ") && stderr.contains("client only"),
-        "the #65 rejection stays plain text on stderr: {stderr:?}"
+        stderr.contains("riperf3: parameter error - ") && stderr.contains("client only"),
+        "the #65 rejection uses GT's parameter-error wording (#270): {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("--help"),
+        "the usage trailer rides the parameter-error class (#270): {stderr:?}"
     );
 }
 

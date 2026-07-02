@@ -588,3 +588,63 @@ fn post_exchange_interrupt_dump_keeps_the_peer_halves() {
          (GT merges exchanged data before its sigend dump): {doc}"
     );
 }
+
+/// #267: an abruptly-lost control connection (server SIGKILLed mid-test) is
+/// GT's IECTRLCLOSE class — text prints exactly
+/// `error - control socket has closed unexpectedly` (no summary block), and
+/// the `-J` doc is the POPULATED-so-far document: full start (the test
+/// reached TestStart), collected intervals, and a bare `end: {}` (GT's
+/// errexit never fills json_end) — live-captured on the issue.
+#[test]
+fn killed_server_takes_gt_ctrl_closed_shape() {
+    // --- text mode ---
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "5"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    unsafe { libc::kill(server.0.id() as i32, libc::SIGKILL) };
+    let (_, cerr, ccode) = wait_with_output_bounded(client, Duration::from_secs(10), "text client");
+    assert_eq!(ccode, 1, "GT exits 1 on IECTRLCLOSE");
+    assert!(
+        cerr.contains("error - control socket has closed unexpectedly"),
+        "GT's IECTRLCLOSE wording (#267): {cerr}"
+    );
+    assert!(
+        !cerr.contains("peer disconnected"),
+        "the old wording is gone: {cerr}"
+    );
+
+    // --- -J mode ---
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "5", "-J"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    unsafe { libc::kill(server.0.id() as i32, libc::SIGKILL) };
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(10), "-J client");
+    assert_eq!(ccode, 1);
+    let doc: serde_json::Value =
+        serde_json::from_str(cout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {cout}"));
+    assert!(
+        doc["start"]["test_start"].is_object(),
+        "the populated start survives (GT errexit keeps json_top): {doc}"
+    );
+    assert!(
+        !doc["intervals"].as_array().unwrap().is_empty(),
+        "collected intervals survive: {doc}"
+    );
+    assert_eq!(
+        doc["end"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "the errexit end is GT's bare `end: {{}}`: {doc}"
+    );
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("control socket has closed unexpectedly"),
+        "{doc}"
+    );
+}
