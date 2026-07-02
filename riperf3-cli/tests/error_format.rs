@@ -217,6 +217,13 @@ fn duration_range_validations_match_gt() {
             &["-s", "--server-max-duration", "86401"],
             "parameter error - test duration valid values are 0 to 86400 seconds",
         ),
+        // r1 F5: GT's range checks fire during the getopt loop, BEFORE its
+        // client-flag-on-server check — `-s -t 86401` reports the duration
+        // range, not the #65 client-only-flag error (live-verified).
+        (
+            &["-s", "-t", "86401"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
     ];
     for (args, want) in cases {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))

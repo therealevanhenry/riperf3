@@ -159,6 +159,15 @@ pub struct Report {
 /// intervals:[], end:{}, error}` on stdout and nothing to stderr
 /// (live-captured against 3.20+). Pretty-printed like the normal `-J` body.
 pub fn error_document(error: &str) -> String {
+    refusal_document(error, None)
+}
+
+/// The refusal skeleton with the refused client's `-b` when it sent one
+/// (#260 r1 F6): GT's get_parameters adds `target_bitrate` to json_start
+/// BEFORE running the refusal checks (iperf_api.c:2662), so both refusal
+/// kinds carry it. `error_document` (public, signature frozen) delegates
+/// with `None`.
+pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> String {
     // Field-ordered structs, not serde_json::json! — its maps serialize
     // alphabetically, breaking iperf3's start/intervals/end/error order
     // (the #168 envelope lesson).
@@ -167,6 +176,8 @@ pub fn error_document(error: &str) -> String {
         connected: [(); 0],
         version: String,
         system_info: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_bitrate: Option<u64>,
     }
     #[derive(Serialize)]
     struct ErrDoc {
@@ -180,6 +191,7 @@ pub fn error_document(error: &str) -> String {
             connected: [],
             version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
             system_info: crate::utils::system_info(),
+            target_bitrate,
         },
         intervals: [],
         end: serde_json::Map::new(),

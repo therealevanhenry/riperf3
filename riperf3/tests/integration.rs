@@ -2576,3 +2576,42 @@ async fn server_refuses_over_limit_rate_upfront() {
         }
     }
 }
+
+/// #260 r1 F3: when a client violates BOTH the max-duration and total-rate
+/// limits, GT's get_parameters runs the duration check first but the rate
+/// check's i_errno assignment WINS (no early return) — the refusal is
+/// IETOTALRATE, live-verified against GT 3.21.
+#[tokio::test]
+async fn both_violations_relay_total_rate_like_gt() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_max_duration(5)
+        .server_bitrate_limit(1_000_000)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(10)
+        .bandwidth(2_000_000)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(15), client.run())
+        .await
+        .expect("client hung");
+    let _ = server_task.await;
+    match result {
+        Err(riperf3::RiperfError::ServerErrorRelayed(msg)) => {
+            assert_eq!(
+                msg, "total required bandwidth is larger than server limit",
+                "the rate refusal wins over the duration refusal (GT last-assignment)"
+            );
+        }
+        other => panic!("expected the IETOTALRATE refusal, got {other:?}"),
+    }
+}
