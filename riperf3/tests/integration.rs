@@ -2412,6 +2412,20 @@ mod client_run_return_value {
             cpu.is_finite() && cpu >= 0.0,
             "cpu host_total not a sane non-negative number: {cpu}"
         );
+        // r1 F1 (#297): the started run's -J timestamp is the TestStart
+        // wall-clock (RunStage::Started) — a stage regression to epoch-0 or a
+        // misfiring connect-clock fallback shows here as a non-now value.
+        // (Previously only a unit pin guarded this; a mutation zeroing the
+        // Started stamp survived every integration test.)
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ts = report.start.timestamp.timesecs;
+        assert!(
+            now_secs.abs_diff(ts) < 300,
+            "start.timestamp.timesecs must be the real TestStart wall-clock: {ts} vs now {now_secs}"
+        );
         // intervals is built from the reporter's collected samples, which
         // build_report_input drains via mem::take — a non-empty array here guards
         // the #137 build-once invariant at the LIB layer (a double build would

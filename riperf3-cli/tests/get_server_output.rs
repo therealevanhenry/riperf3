@@ -154,7 +154,7 @@ fn json_client_gets_server_output_json() {
         Duration::from_secs(20),
         "client",
     );
-    let _ = server.0.wait();
+    let server_own = collect_stdout(server);
 
     let v: Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("client -J invalid ({e}): {out}"));
@@ -166,6 +166,23 @@ fn json_client_gets_server_output_json() {
     for k in ["start", "intervals", "end"] {
         assert!(sj.get(k).is_some(), "server_output_json missing {k}: {out}");
     }
+
+    // r1 F2 (#297): the server's OWN stdout doc is the SAME single build the
+    // attachment rode (ReportSource::Built is reused, never rebuilt) — a
+    // double build would empty this copy's intervals while the attachment
+    // stays populated. Previously this pipe was captured but never read.
+    let sv: Value = serde_json::from_str(&server_own)
+        .unwrap_or_else(|e| panic!("server -J invalid ({e}): {server_own}"));
+    let own_n = sv["intervals"].as_array().map(Vec::len).unwrap_or(0);
+    assert!(
+        own_n > 0,
+        "the -J server's own doc lost its intervals (double-build class): {server_own}"
+    );
+    assert_eq!(
+        Some(own_n),
+        sj["intervals"].as_array().map(Vec::len),
+        "the attachment and the server's own doc are the same single build"
+    );
 }
 
 /// Without the flag nothing changes: no Server output section, no keys.
