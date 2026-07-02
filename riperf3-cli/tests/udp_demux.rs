@@ -168,10 +168,12 @@ fn udp_demux_bidir_parallel_completes() {
     assert_all_streams_have_bytes(&report, 8, "bidir");
 }
 
-/// #288 (r1 mutation B): the demux server's `-J` `connected[]` must map each
-/// stream to the CLIENT's real source port (`peer_addr: Some(client_addr)` in
-/// the demux route table), with every local port being the shared demux
-/// socket's. A dropped/None peer_addr — or a stream/route mix-up — shows here.
+/// #288 (r1 mutation B, r2 finding 1): the demux server's `-J` `connected[]`
+/// must map each stream to the CLIENT's real source port
+/// (`peer_addr: Some(client_addr)` in the demux route table), with every
+/// local port being the shared demux socket's. BIDIR so ONE doc exercises
+/// BOTH SocketMeta literals — the sender branch and the receiver branch
+/// (r2 proved a forward-only pin leaves the sender literal mutation-silent).
 #[test]
 fn demux_server_connected_block_maps_streams_to_client_ports() {
     let _serial = udp_serial();
@@ -201,6 +203,7 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
                 "1",
                 "-P",
                 "2",
+                "--bidir",
                 "-J",
             ])
             .stdout(Stdio::piped())
@@ -251,7 +254,8 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
     let server_entries = sv["start"]["connected"]
         .as_array()
         .expect("server connected[]");
-    assert_eq!(server_entries.len(), 2, "one entry per stream: {sv}");
+    // -P 2 --bidir = 2 receiving + 2 sending streams on the server.
+    assert_eq!(server_entries.len(), 4, "one entry per stream: {sv}");
     let server_remote_ports: std::collections::BTreeSet<u64> = server_entries
         .iter()
         .map(|c| c["remote_port"].as_u64().expect("server remote_port"))
