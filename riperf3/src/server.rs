@@ -2311,11 +2311,11 @@ impl Server {
                     .and_then(|s| s.meta.sock.rcvbuf_actual)
                     .unwrap_or(0),
             ),
-            // #261: the server only ever assembles a full report on a run that
-            // reached TestStart — its upfront refusal renders the skeleton via
-            // json_report::error_document, not build(). So the late fields are
-            // always present here; the stage-gate is a no-op on this path.
-            reached_test_start: true,
+            // #261/#281: the server only ever assembles a full report on a run
+            // that reached TestStart — its upfront refusal renders the skeleton
+            // via json_report::error_document, not build(). Always Started/full.
+            start_stage: crate::json_report::StartStage::Started,
+            bare_end: false,
             // The server reports at its 1s default; it has no -i.
             interval: 1.0,
             // GSO/GRO are client-side knobs, not exchanged; iperf3's server emits 0.

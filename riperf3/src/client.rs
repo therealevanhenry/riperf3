@@ -415,10 +415,10 @@ impl Client {
                 }
                 TestState::ServerError => {
                     // #261: a relay arriving before TestStart is the upfront
-                    // refusal (code 37 et al.) — the dump takes GT's minimal
-                    // shape; after TestStart it keeps its late fields.
-                    let reached = ctx.stage.started();
-                    return Err(self.on_server_error_relay(&mut ctx, reached).await);
+                    // refusal (code 37 et al.) — its `end` is GT's bare {}.
+                    // After TestStart the dump keeps the full structure.
+                    let bare_end = !ctx.stage.started();
+                    return Err(self.on_server_error_relay(&mut ctx, bare_end).await);
                 }
 
                 // iperf_handle_message_client handles SERVER_TERMINATE in
@@ -581,13 +581,13 @@ impl Client {
 
     /// Render/emit the run's results from the context state — the one
     /// `render_results` plumbing site for every dump the dispatch loop makes
-    /// (#289). `server_results`/`reached`/`error` are per-dump; everything
-    /// else comes from the context.
+    /// (#289). `server_results`/`bare_end`/`error` are per-dump; everything
+    /// else (including the #281 start-stage) comes from the context.
     fn emit_results(
         &self,
         ctx: &RunCtx,
         server_results: Option<&TestResultsJson>,
-        reached_test_start: bool,
+        bare_end: bool,
         secs: f64,
         error: Option<&str>,
     ) -> crate::json_report::Report {
@@ -601,7 +601,7 @@ impl Client {
             // once. Downstream builders take the value, so nothing can
             // silently re-drain.
             crate::reporter::CollectedIntervals::drain(&ctx.interval_data),
-            &ctx.start_meta(reached_test_start),
+            &ctx.start_meta(bare_end),
             secs,
             error,
         )
@@ -625,7 +625,13 @@ impl Client {
         // r1 item 7: post-ExchangeResults interrupts keep the
         // peer halves GT would show (its sigend dump merges
         // already-exchanged data); None only pre-exchange.
-        self.emit_results(ctx, ctx.server_results.as_ref(), true, dump_secs, Some(msg))
+        self.emit_results(
+            ctx,
+            ctx.server_results.as_ref(),
+            false,
+            dump_secs,
+            Some(msg),
+        )
     }
 
     async fn on_param_exchange(&self, ctx: &mut RunCtx) -> Result<()> {
@@ -756,7 +762,7 @@ impl Client {
                 &ctx.streams,
                 ctx.cpu_start.as_ref(),
                 ctx.blksize,
-                &ctx.start_meta(true),
+                &ctx.start_meta(false),
             );
         }
     }
@@ -789,13 +795,13 @@ impl Client {
                 let _ = protocol::send_state(&mut ctx.ctrl, TestState::ClientTerminate).await;
                 // #137: return the rich report we just dumped (the
                 // local-only partial — no peer half on a signal exit).
-                let report = self.emit_results(ctx, None, true, ctx.measured_secs, Some(&msg));
+                let report = self.emit_results(ctx, None, false, ctx.measured_secs, Some(&msg));
                 return Ok(StepFlow::Return(Box::new(report)));
             }
             Some(ControlEvent::ServerError) => {
                 // Mid-test the run is always past TestStart, so the dump
                 // keeps the full report structure (#261).
-                return Err(self.on_server_error_relay(ctx, true).await);
+                return Err(self.on_server_error_relay(ctx, false).await);
             }
             Some(ControlEvent::Closed) | None => {}
         }
@@ -812,12 +818,11 @@ impl Client {
     }
 
     async fn on_display_results(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
-        // #261: the success path always reached TestStart —
-        // full report structure, late fields present.
+        // The success path: full report structure (stage is Started).
         let report = self.emit_results(
             ctx,
             ctx.server_results.as_ref(),
-            true,
+            false,
             ctx.measured_secs,
             None,
         );
@@ -831,20 +836,16 @@ impl Client {
     /// receipt line only (iperf_err's shape; no summary dump — that is
     /// SERVER_TERMINATE's). JSON sinks: render the full document/events with
     /// the error inside, like iperf3's json_top; the CLI suppresses its
-    /// generic re-render. `reached_test_start` is the caller's: a relay
-    /// before TestStart is the upfront refusal (code 37 et al.) — emit GT's
-    /// minimal doc (`end: {}`, late start fields omitted) (#261).
-    async fn on_server_error_relay(
-        &self,
-        ctx: &mut RunCtx,
-        reached_test_start: bool,
-    ) -> RiperfError {
+    /// generic re-render. `bare_end` is the caller's: a relay before
+    /// TestStart is the upfront refusal (code 37 et al.) — emit GT's minimal
+    /// doc (`end: {}`; the late start fields already gate on the stage) (#261).
+    async fn on_server_error_relay(&self, ctx: &mut RunCtx, bare_end: bool) -> RiperfError {
         let msg = match protocol::read_server_error_payload(&mut ctx.ctrl).await {
             Some((i_errno, os_errno)) => crate::error::iperf3_strerror(i_errno, os_errno),
             None => "server error".to_string(),
         };
         if self.json_output || self.json_stream {
-            self.emit_results(ctx, None, reached_test_start, ctx.measured_secs, Some(&msg));
+            self.emit_results(ctx, None, bare_end, ctx.measured_secs, Some(&msg));
         } else {
             // KNOWN CORNER (r1 n5): with --logfile set,
             // iperf_err writes this line to the logfile;
@@ -869,7 +870,7 @@ impl Client {
         self.emit_results(
             ctx,
             None,
-            true,
+            false,
             ctx.measured_secs,
             Some("the server has terminated"),
         );
@@ -2149,7 +2150,7 @@ impl Client {
             // .max(0): the public builder accepts an i32 window; clamp so a
             // negative can't wrap to a huge u64 (the CLI path is already >= 0).
             // #261: `Some(..)` on a run that set up streams (build() gates them
-            // out on the upfront-refusal path via `reached_test_start`); a
+            // out on the upfront-refusal path via the stage gate, #281); a
             // success run always carries them, so the shape is unchanged. A
             // missing kernel readback still yields `Some(0)` on a real run, like
             // iperf3.
@@ -2166,17 +2167,24 @@ impl Client {
                     .and_then(|s| s.meta.sock.rcvbuf_actual)
                     .unwrap_or(0),
             ),
-            // #261: false ONLY on the upfront server-refusal path (a SERVER_ERROR
-            // relay that arrives before stream setup, e.g. code 37) — there GT's
-            // client errexits through json_top, which never populated json_end, so
-            // the late `start` fields are omitted and `end` is `{}`. EVERY other
-            // path (success and the sigend/SERVER_TERMINATE dumps) renders the
-            // full structure — GT's interrupt dump shows 0/0/0 pre-data, NOT an
-            // empty end — so the flag is true and the partial document keeps its
-            // late fields. The flag is threaded explicitly via StartMeta because
-            // the refusal and a pre-data interrupt BOTH happen before TestStart
-            // and so are indistinguishable by the start wall-clock alone.
-            reached_test_start: start_meta.reached_test_start,
+            // #281: the start-stage derives from the run stage — Connecting
+            // (pre-ParamExchange: no wall-clock stamped), Connected (on_connect
+            // done), or Started — so interrupt dumps take GT's staged shapes
+            // with no per-arm threading.
+            start_stage: match start_meta.stage {
+                RunStage::Started { .. } => crate::json_report::StartStage::Started,
+                RunStage::PreTestStart { connect_millis: 0 } => {
+                    crate::json_report::StartStage::Connecting
+                }
+                RunStage::PreTestStart { .. } => crate::json_report::StartStage::Connected,
+            },
+            // #261: true ONLY on the upfront server-refusal path (a SERVER_ERROR
+            // relay before stream setup, e.g. code 37) — GT's client errexits
+            // through json_top with json_end never populated, so `end` is `{}`.
+            // Interrupt dumps are NOT bare (#281: GT renders zeroed sums +
+            // streams: []), which is why the flag stays explicit on StartMeta:
+            // the refusal and a pre-data interrupt share a stage but differ here.
+            bare_end: start_meta.bare_end,
             interval: self.interval.unwrap_or(1.0),
             // riperf3's single --gsro flag drives both GSO and GRO.
             gso: i32::from(self.gsro),
@@ -2317,14 +2325,13 @@ struct StartMeta {
     tcp_mss_default: u32,
     /// How far the run progressed and the wall-clock that goes with it (#286).
     stage: RunStage,
-    /// #261: false ONLY on the upfront server-refusal path — drives the
-    /// stage-gated omission of the late `start` fields and the bare `end: {}`.
-    /// True on every other path (success, sigend interrupt, SERVER_TERMINATE),
-    /// which all render the full report structure like GT. Kept EXPLICIT
-    /// (not derived from `stage`): a pre-TestStart sigend interrupt and the
-    /// refusal are the same stage but take different shapes — GT's interrupt
-    /// dump shows the full structure with 0/0/0, not the minimal refusal doc.
-    reached_test_start: bool,
+    /// #261/#281: true ONLY on the upfront server-refusal path — the `end`
+    /// object serializes bare (`{}`). Every other dump (success, sigend
+    /// interrupt, SERVER_TERMINATE) keeps the full end structure; the late
+    /// `start` fields gate on the STAGE, not this flag. Kept EXPLICIT: a
+    /// pre-TestStart sigend interrupt and the refusal share a stage but GT
+    /// gives the interrupt zeroed sums + `streams: []` and the refusal `{}`.
+    bare_end: bool,
 }
 
 /// How far the client's run has progressed, carrying the authoritative
@@ -2434,15 +2441,15 @@ struct RunCtx {
 
 impl RunCtx {
     /// Assemble the `StartMeta` for a report dump from the run's captured
-    /// state — the one construction site (#289). `reached_test_start` is the
+    /// state — the one construction site (#289). `bare_end` is the
     /// caller's call: true everywhere except the upfront server-refusal path
     /// (#261, see the field doc on StartMeta).
-    fn start_meta(&self, reached_test_start: bool) -> StartMeta {
+    fn start_meta(&self, bare_end: bool) -> StartMeta {
         StartMeta {
             cookie: String::from_utf8_lossy(&self.cookie[..protocol::COOKIE_SIZE - 1]).into_owned(),
             tcp_mss_default: self.control_mss,
             stage: self.stage,
-            reached_test_start,
+            bare_end,
         }
     }
 }

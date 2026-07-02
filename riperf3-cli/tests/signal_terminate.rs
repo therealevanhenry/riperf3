@@ -361,6 +361,128 @@ fn pre_data_interrupt_dump_reports_a_zero_window() {
              requested -t: {doc}"
         );
     }
+    // #281 (GT captures on the issue): a PRE-ParamExchange interrupt doc
+    // carries ONLY connected/version/system_info in `start` — GT stages the
+    // rest at on_connect (post-param-exchange) and TestStart respectively.
+    let start = doc["start"].as_object().expect("start object");
+    for present in ["connected", "version", "system_info"] {
+        assert!(
+            start.contains_key(present),
+            "pre-PE interrupt start keeps {present}: {doc}"
+        );
+    }
+    for absent in [
+        "timestamp",
+        "connecting_to",
+        "cookie",
+        "tcp_mss_default",
+        "target_bitrate",
+        "fq_rate",
+        "sock_bufsize",
+        "sndbuf_actual",
+        "rcvbuf_actual",
+        "test_start",
+    ] {
+        assert!(
+            !start.contains_key(absent),
+            "pre-PE interrupt start must omit {absent} (GT stage 0): {doc}"
+        );
+    }
+    // The interrupt end is the FULL zero structure — including a PRESENT
+    // (empty) streams key — NOT the refusal's bare `end: {{}}` (#261/#281).
+    assert_eq!(
+        doc["end"]["streams"].as_array().map(Vec::len),
+        Some(0),
+        "interrupt end carries streams: [] (GT), not an omitted key: {doc}"
+    );
+    assert!(
+        doc["end"]["cpu_utilization_percent"].is_object(),
+        "interrupt end keeps the cpu figure: {doc}"
+    );
+}
+
+/// #281: the POST-param-exchange / pre-TestStart interrupt window (GT stage 1
+/// — the second capture on the issue). The mock completes the param exchange
+/// (cookie → ParamExchange → params read) then stalls; the SIGTERM dump must
+/// carry the on_connect metadata (real timestamp, cookie, connecting_to,
+/// tcp_mss_default, target_bitrate, fq_rate) while still omitting the four
+/// TestStart-stage fields, with the same full-zeros end incl. streams: [].
+#[test]
+fn post_exchange_prestart_interrupt_dump_takes_gt_stage1_shape() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _mock = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut cookie = [0u8; 37];
+            let _ = s.read_exact(&mut cookie);
+            let _ = s.write_all(&[9u8]); // ParamExchange
+            let mut len = [0u8; 4];
+            if s.read_exact(&mut len).is_ok() {
+                let n = u32::from_be_bytes(len) as usize;
+                let mut params = vec![0u8; n];
+                let _ = s.read_exact(&mut params);
+            }
+            std::thread::sleep(Duration::from_secs(15)); // stall pre-TestStart
+        }
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-t", "5", "-J"]);
+    std::thread::sleep(Duration::from_millis(900));
+    unsafe {
+        libc::kill(client.0.id() as i32, libc::SIGTERM);
+    }
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(8), "client -J post-PE");
+    assert_eq!(ccode, 0);
+    let doc: serde_json::Value =
+        serde_json::from_str(cout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {cout}"));
+
+    let start = doc["start"].as_object().expect("start object");
+    for present in [
+        "connected",
+        "version",
+        "system_info",
+        "timestamp",
+        "connecting_to",
+        "cookie",
+        "target_bitrate",
+        "fq_rate",
+    ] {
+        assert!(
+            start.contains_key(present),
+            "post-PE interrupt start keeps {present} (GT stage 1): {doc}"
+        );
+    }
+    for absent in [
+        "sock_bufsize",
+        "sndbuf_actual",
+        "rcvbuf_actual",
+        "test_start",
+    ] {
+        assert!(
+            !start.contains_key(absent),
+            "post-PE interrupt start must omit {absent} (GT stage 1): {doc}"
+        );
+    }
+    assert_ne!(
+        doc["start"]["timestamp"]["timesecs"],
+        serde_json::json!(0),
+        "the stage-1 timestamp is the real on_connect wall-clock: {doc}"
+    );
+    assert_eq!(
+        doc["end"]["streams"].as_array().map(Vec::len),
+        Some(0),
+        "interrupt end carries streams: []: {doc}"
+    );
+    for key in ["sum_sent", "sum_received"] {
+        assert_eq!(
+            doc["end"][key]["seconds"].as_f64(),
+            Some(0.0),
+            "zero window: {doc}"
+        );
+    }
 }
 
 /// #231 r2 pin (mutation B): an interrupt AFTER ExchangeResults keeps the
