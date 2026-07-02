@@ -2485,3 +2485,72 @@ mod client_run_return_value {
     }
     // run_errors_when_server_skips_results_exchange migrated in-crate to src/client.rs (#67).
 }
+
+/// #260: GT's UPFRONT total-rate check at the param exchange
+/// (iperf_api.c:2666-2684, beside the #230 max-duration check):
+/// `total = num_streams * rate * (bidir ? 2 : 1)` — for BOTH `-b` and the fq
+/// rate — refused with SERVER_ERROR + IETOTALRATE(27) BEFORE CreateStreams.
+/// The client adopts iperf_strerror(27) (perr=0: no trailing ": ").
+#[tokio::test]
+async fn server_refuses_over_limit_rate_upfront() {
+    const MSG: &str = "total required bandwidth is larger than server limit";
+    // (bandwidth, fq, streams, bidir, refused)
+    let cases: &[(u64, u64, u32, bool, bool)] = &[
+        (2_000_000, 0, 1, false, true), // plain -b breach
+        (0, 2_000_000, 1, false, true), // fq-rate twin
+        (600_000, 0, 2, false, true),   // per-stream multiplier
+        (600_000, 0, 1, true, true),    // bidir doubler
+        // Under the limit: the test must proceed. Wide margin (0.2M vs 1M)
+        // so the RUNTIME 1 Hz breach check's pacing burstiness can't trip it.
+        (200_000, 0, 1, false, false),
+    ];
+    for &(bw, fq, streams, bidir, refused) in cases {
+        let server = ServerBuilder::new()
+            .port(Some(0))
+            .server_bitrate_limit(1_000_000)
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let bound = server.bind().await.expect("bind");
+        let port = bound.local_addr().unwrap().port();
+        let server_task = tokio::spawn(async move { bound.run_once().await });
+
+        let mut cb = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .num_streams(streams)
+            .bidir(bidir)
+            // Small blocks so the CONTROL case's real throughput respects its
+            // pacing: one default 128K block already averages ~1.05 Mbps over
+            // 1 s, tripping the (correct) RUNTIME breach check.
+            .blksize(8 * 1024)
+            .emit_output(false);
+        if bw > 0 {
+            cb = cb.bandwidth(bw);
+        }
+        if fq > 0 {
+            cb = cb.fq_rate(fq);
+        }
+        let client = cb.build().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), client.run())
+            .await
+            .expect("client hung");
+        let _ = server_task.await;
+
+        if refused {
+            match result {
+                Err(riperf3::RiperfError::ServerErrorRelayed(msg)) => {
+                    assert_eq!(msg, MSG, "GT strerror(27), perr=0 — no trailing colon");
+                }
+                other => panic!(
+                    "bw={bw} fq={fq} P={streams} bidir={bidir}: expected the \
+                     upfront IETOTALRATE refusal, got {other:?}"
+                ),
+            }
+        } else {
+            result.unwrap_or_else(|e| {
+                panic!("under-limit run must proceed (rate {bw} < limit): {e}")
+            });
+        }
+    }
+}

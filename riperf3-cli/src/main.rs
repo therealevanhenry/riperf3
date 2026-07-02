@@ -57,6 +57,30 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    // #259: GT's post-parse range validations (iperf_api.c:1386/1588/1596,
+    // MAX_TIME = 86400) — parameter-error class: GT wording + the usage
+    // trailer + exit 1, in every mode (parse-time precedes the sink choice,
+    // same rationale as parse_class_rejection above). The u32 arg types make
+    // GT's negative arms unrepresentable.
+    const MAX_TIME_SECS: u32 = 86_400;
+    let range_violation = if cli.time.is_some_and(|t| t > MAX_TIME_SECS)
+        || cli.server_max_duration.is_some_and(|d| d > MAX_TIME_SECS)
+    {
+        Some("test duration valid values are 0 to 86400 seconds")
+    } else if cli
+        .idle_timeout
+        .is_some_and(|t| !(1..=MAX_TIME_SECS).contains(&t))
+    {
+        Some("idle timeout parameter is not positive or larger than allowed limit")
+    } else {
+        None
+    };
+    if let Some(msg) = range_violation {
+        eprintln!("riperf3: parameter error - {msg}");
+        print_usage_trailer();
+        return std::process::ExitCode::FAILURE;
+    }
+
     // The error SINK is chosen by mode, like iperf_errexit (#198): -J puts
     // the message in a JSON document on stdout (nothing on stderr),
     // --json-stream emits an error event + empty end event, --logfile gets

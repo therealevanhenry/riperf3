@@ -699,6 +699,21 @@ impl Server {
                 return Ok(None);
             }
         }
+
+        // #260: GT's upfront total-rate check, immediately beside the
+        // duration check (iperf_api.c:2672-2684): total = num_streams * rate
+        // * (bidir ? 2 : 1), evaluated for BOTH the requested bitrate and the
+        // fq rate; refused with SERVER_ERROR + IETOTALRATE(27). Distinct from
+        // the in-flight 1 Hz breach check in await_test_end, which stays.
+        if let Some(limit) = self.server_bitrate_limit.filter(|&l| l > 0) {
+            let mult = u64::from(cfg.num_streams) * if cfg.bidir { 2 } else { 1 };
+            let over = |rate: u64| rate.saturating_mul(mult) > limit;
+            if over(cfg.bandwidth) || over(params.fqrate.unwrap_or(0)) {
+                // Refused before any test ran → no report.
+                self.refuse_total_rate(ctrl).await?;
+                return Ok(None);
+            }
+        }
         Ok(Some((cookie, params, cfg)))
     }
 
@@ -2391,6 +2406,29 @@ impl Server {
     /// --json-stream server gets the error + empty-end event pair with no
     /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
     /// persistent server goes on to serve the next test.
+    /// #260: the upfront IETOTALRATE(27) refusal — GT's get_parameters
+    /// total-rate check. Same sink shape as the max-duration refusal;
+    /// iperf_strerror(27) is perr=0, so the message carries no trailing ': '.
+    async fn refuse_total_rate(&self, ctrl: &mut tokio::net::TcpStream) -> Result<()> {
+        const MSG: &str = "total required bandwidth is larger than server limit";
+        protocol::send_server_error(ctrl, 27).await?;
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
+                &format!("error - {MSG}"),
+            ));
+        } else if self.json_output {
+            if !crate::macros::output_quiet() {
+                println!(
+                    "{}",
+                    crate::json_report::error_document(&format!("error - {MSG}"))
+                );
+            }
+        } else if !crate::macros::output_quiet() {
+            eprintln!("riperf3: error - {MSG}");
+        }
+        Ok(())
+    }
+
     async fn refuse_max_duration(&self, ctrl: &mut tokio::net::TcpStream) -> Result<()> {
         const MSG: &str =
             "client's requested duration exceeds the server's maximum permitted limit";
