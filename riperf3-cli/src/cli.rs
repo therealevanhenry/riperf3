@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Parser, ValueEnum};
+use clap::{ArgGroup, Parser};
 
 /// iperf3's IEENDCONDITIONS text, verbatim (#140).
 pub const END_CONDITIONS_MSG: &str = "only one test end condition (-t, -n, -k) may be specified";
@@ -43,8 +43,12 @@ pub struct Cli {
     // Case-sensitive like iperf3's [kmgtKMGT] (#241): lowercase = bit-rates,
     // UPPERCASE = byte-rates — ignore_case used to collapse `-f K` into
     // Kbits, silently a different unit.
-    #[arg(short, long, value_enum, value_name = "format")]
-    pub format: Option<Format>,
+    // A plain String, not a ValueEnum (#263): GT parses only `*optarg`, so
+    // `-f kilobits` means `-f k` — validation happens post-parse via
+    // [`parse_format_char`], rejecting with GT's IEBADFORMAT sentence
+    // instead of a clap invalid-value error.
+    #[arg(short, long, value_name = "format")]
+    pub format: Option<String>,
 
     /// Seconds between periodic throughput reports
     #[arg(short, long, value_name = "interval")]
@@ -483,8 +487,8 @@ impl Cli {
 
         // Format (#241): case-sensitive [kmgtKMGT], uppercase = byte-rates;
         // absent → the library's adaptive default ('a'), like iperf3 (#221).
-        if let Some(f) = &self.format {
-            builder = builder.format_char(f.as_char());
+        if let Some(c) = self.format.as_deref().and_then(parse_format_char) {
+            builder = builder.format_char(c);
         }
 
         if let Some(port) = self.port {
@@ -657,8 +661,8 @@ impl Cli {
         // Format (#242): the server-side -f was silently dropped — never
         // wired through the builder, every render site hardcoded adaptive.
         // Same case-sensitive mapping as the client (#241).
-        if let Some(f) = &self.format {
-            builder = builder.format_char(f.as_char());
+        if let Some(c) = self.format.as_deref().and_then(parse_format_char) {
+            builder = builder.format_char(c);
         }
         if let Some(port) = self.port {
             builder = builder.port(Some(port));
@@ -722,48 +726,12 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, ValueEnum)]
-pub enum Format {
-    /// Kbits/sec
-    #[value(name = "k")]
-    Kbits,
-    /// Mbits/sec
-    #[value(name = "m")]
-    Mbits,
-    /// Gbits/sec
-    #[value(name = "g")]
-    Gbits,
-    /// Tbits/sec
-    #[value(name = "t")]
-    Tbits,
-    /// KBytes/sec
-    #[value(name = "K")]
-    KBytes,
-    /// MBytes/sec
-    #[value(name = "M")]
-    MBytes,
-    /// GBytes/sec
-    #[value(name = "G")]
-    GBytes,
-    /// TBytes/sec
-    #[value(name = "T")]
-    TBytes,
-}
-
-impl Format {
-    /// The unit_snprintf-style char the lib's `format_char` expects.
-    fn as_char(&self) -> char {
-        match self {
-            Format::Kbits => 'k',
-            Format::Mbits => 'm',
-            Format::Gbits => 'g',
-            Format::Tbits => 't',
-            Format::KBytes => 'K',
-            Format::MBytes => 'M',
-            Format::GBytes => 'G',
-            Format::TBytes => 'T',
-        }
-    }
+/// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
+/// FIRST character only, so `-f kilobits` is `-f k` — and accepts exactly
+/// [kmgtKMGT]; anything else is IEBADFORMAT. 'B'/'b' stay lib-only in both
+/// tools (GT's getopt rejects them; unit_snprintf supports them).
+pub fn parse_format_char(arg: &str) -> Option<char> {
+    arg.chars().next().filter(|c| "kmgtKMGT".contains(*c))
 }
 
 // ---------------------------------------------------------------------------
@@ -813,31 +781,25 @@ mod cli_tests {
 
         #[test]
         fn test_common_format() {
-            // #241: case is semantic — all 8 of iperf3's [kmgtKMGT], each to
-            // its own variant, on both roles.
-            for (letter, want) in [
-                ("k", Format::Kbits),
-                ("m", Format::Mbits),
-                ("g", Format::Gbits),
-                ("t", Format::Tbits),
-                ("K", Format::KBytes),
-                ("M", Format::MBytes),
-                ("G", Format::GBytes),
-                ("T", Format::TBytes),
-            ] {
+            // #241: case is semantic — all 8 of iperf3's [kmgtKMGT] parse on
+            // both roles; #263: the raw string is kept (GT's *optarg rule
+            // applies at validation, not parse).
+            for letter in ["k", "m", "g", "t", "K", "M", "G", "T"] {
                 let cli = Cli::parse_from(["riperf3", "--server", "--format", letter]);
-                assert_eq!(cli.format, Some(want.clone()), "-f {letter} (server)");
+                assert_eq!(cli.format.as_deref(), Some(letter), "-f {letter} (server)");
                 let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", letter]);
-                assert_eq!(cli.format, Some(want), "-f {letter} (client)");
+                assert_eq!(cli.format.as_deref(), Some(letter), "-f {letter} (client)");
             }
         }
 
         #[test]
         fn test_format_chars_match_unit_snprintf() {
-            // The CLI→lib glue: each variant maps to the exact unit_snprintf
-            // char; uppercase survives (the old ignore_case + 4-variant enum
-            // collapsed K to 'k').
-            for (letter, ch) in [
+            // The CLI→lib glue: each accepted letter maps to the exact
+            // unit_snprintf char; uppercase survives (the old ignore_case +
+            // 4-variant enum collapsed K to 'k'). #263: only the FIRST char
+            // counts (GT's *optarg), and non-[kmgtKMGT] leads are rejected —
+            // including lib-only 'b'/'B'.
+            for (arg, ch) in [
                 ("k", 'k'),
                 ("m", 'm'),
                 ("g", 'g'),
@@ -846,9 +808,13 @@ mod cli_tests {
                 ("M", 'M'),
                 ("G", 'G'),
                 ("T", 'T'),
+                ("kilobits", 'k'),
+                ("MBytes", 'M'),
             ] {
-                let cli = Cli::parse_from(["riperf3", "--server", "--format", letter]);
-                assert_eq!(cli.format.unwrap().as_char(), ch, "-f {letter}");
+                assert_eq!(parse_format_char(arg), Some(ch), "-f {arg}");
+            }
+            for bad in ["x", "b", "B", "a", "A", "", "9k"] {
+                assert_eq!(parse_format_char(bad), None, "-f {bad} is IEBADFORMAT");
             }
         }
     }
@@ -1839,8 +1805,11 @@ mod cli_tests {
         #[test]
         fn format_wired() {
             // An explicit `-f g` must propagate (absent -f, the lib default
-            // 'a' stands — #221).
+            // 'a' stands — #221). #263: a full word rides its first char.
             let cli = Cli::parse_from(["riperf3", "-c", "h", "-f", "g"]);
+            let c = build_client_from_cli(&cli);
+            assert_eq!(c, expected_client("h").format_char('g').build().unwrap());
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-f", "gigabits"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").format_char('g').build().unwrap());
         }

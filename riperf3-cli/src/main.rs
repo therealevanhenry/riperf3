@@ -73,6 +73,14 @@ fn main() -> std::process::ExitCode {
         .is_some_and(|t| !(1..=MAX_TIME_SECS).contains(&t))
     {
         Some("idle timeout parameter is not positive or larger than allowed limit")
+    } else if cli
+        .format
+        .as_deref()
+        .is_some_and(|f| cli::parse_format_char(f).is_none())
+    {
+        // #263: GT's IEBADFORMAT — only the FIRST character of the argument
+        // is inspected (iperf_api.c:1241), and [kmgtKMGT] is the whole set.
+        Some("bad format specifier (valid formats are in the set [kmgtKMGT])")
     } else {
         None
     };
@@ -89,6 +97,15 @@ fn main() -> std::process::ExitCode {
         eprintln!("riperf3: parameter error - {msg}");
         print_usage_trailer();
         return std::process::ExitCode::FAILURE;
+    }
+
+    // #263: GT warns when an explicit -f rides JSON output — end of
+    // iperf_parse_arguments (iperf_api.c:2015-2017), both roles, and
+    // --json-stream sets json_output too (:1281). GT's warning() is a bare
+    // `warning: %s` fprintf to stderr, bypassing every sink (the -J document
+    // and --logfile included).
+    if (cli.json || cli.json_stream) && cli.format.is_some() {
+        eprintln!("warning: Report format (-f) flag ignored with JSON output (-J)");
     }
 
     // The error SINK is chosen by mode, like iperf_errexit (#198): -J puts
