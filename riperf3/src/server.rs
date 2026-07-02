@@ -2409,17 +2409,8 @@ impl Server {
         }
     }
 
-    /// #230: refuse a test at param exchange (GT's upfront requested-duration
-    /// check). Sends cleanup_server's relay — SERVER_ERROR + the
-    /// (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair — then renders GT's
-    /// refusal shapes per output mode (live-captured, iperf 3.21): text gets
-    /// the one stderr line; -J gets the skeleton error document (no
-    /// accepted_connection/cookie — GT skips on_connect on this path); a
-    /// --json-stream server gets the error + empty-end event pair with no
-    /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
-    /// persistent server goes on to serve the next test.
     /// #260: the upfront IETOTALRATE(27) refusal — GT's get_parameters
-    /// total-rate check. Same sink shape as the max-duration refusal;
+    /// total-rate check. Same sink shape as the max-duration refusal below;
     /// iperf_strerror(27) is perr=0, so the message carries no trailing ': '.
     async fn refuse_total_rate(
         &self,
@@ -2445,6 +2436,15 @@ impl Server {
         Ok(())
     }
 
+    /// #230: refuse a test at param exchange (GT's upfront requested-duration
+    /// check). Sends cleanup_server's relay — SERVER_ERROR + the
+    /// (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair — then renders GT's
+    /// refusal shapes per output mode (live-captured, iperf 3.21): text gets
+    /// the one stderr line; -J gets the skeleton error document (no
+    /// accepted_connection/cookie — GT skips on_connect on this path); a
+    /// --json-stream server gets the error + empty-end event pair with no
+    /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
+    /// persistent server goes on to serve the next test.
     async fn refuse_max_duration(
         &self,
         ctrl: &mut tokio::net::TcpStream,

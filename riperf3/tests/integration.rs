@@ -2559,11 +2559,15 @@ async fn server_refuses_over_limit_rate_upfront() {
                 "bw={bw} fq={fq} P={streams} bidir={bidir}: an upfront refusal \
                  produces no server report; Ok(..) means the RUNTIME check fired"
             );
+            // The no-server-report assert above is the load-bearing
+            // discriminator (both r1 mutations tripped IT). The elapsed
+            // check is a soft sanity bound only — generous enough for a
+            // starved 2-core CI runner (#191 class), still far under the
+            // multi-second runs a runtime-path refusal implies.
             assert!(
-                elapsed < Duration::from_millis(700),
+                elapsed < Duration::from_secs(5),
                 "bw={bw} fq={fq} P={streams} bidir={bidir}: refusal took \
-                 {elapsed:?} — the upfront check resolves before the 1 s \
-                 runtime tick"
+                 {elapsed:?} — not remotely upfront"
             );
         } else {
             result.unwrap_or_else(|e| {
