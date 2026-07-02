@@ -168,3 +168,65 @@ fn server_banner_numbers_each_test() {
         "the re-printed banner increments to #2: {out}"
     );
 }
+
+/// #262 r1 F3: idle-timeout expiries are GT's silent rc==2 restart
+/// (iperf_server_api.c:133-135) — no banner re-print, no counter increment,
+/// no stderr line. A client arriving after idle rounds is still test #1,
+/// and the post-test re-print says #2.
+#[test]
+fn idle_restarts_do_not_advance_the_banner_counter() {
+    let port = common::free_port();
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps, "--idle-timeout", "1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+
+    // Sit through at least two idle expiries.
+    std::thread::sleep(Duration::from_millis(2600));
+    let _ = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "1"],
+        Duration::from_secs(20),
+        "client",
+    );
+    let _ = server.0.kill();
+    let mut out = String::new();
+    let mut err = String::new();
+    use std::io::Read;
+    server
+        .0
+        .stdout
+        .take()
+        .expect("piped")
+        .read_to_string(&mut out)
+        .expect("read");
+    server
+        .0
+        .stderr
+        .take()
+        .expect("piped")
+        .read_to_string(&mut err)
+        .expect("read");
+
+    assert!(
+        out.contains(&format!("Server listening on {port} (test #1)")),
+        "the post-idle test is STILL #1: {out}"
+    );
+    assert!(
+        !out.contains("(test #3)") && !out.contains("(test #4)"),
+        "idle rounds must not advance the counter: {out}"
+    );
+    assert_eq!(
+        out.matches("Server listening").count(),
+        2,
+        "banners: the initial one + the post-test re-print, none per idle round: {out}"
+    );
+    assert!(
+        !err.contains("idle timeout"),
+        "GT's idle restart is silent on stderr: {err}"
+    );
+}

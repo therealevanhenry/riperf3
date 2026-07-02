@@ -61,8 +61,8 @@ pub enum RiperfError {
     #[error("the client has terminated")]
     ClientTerminated,
 
-    // #267: GT's IECTRLCLOSE wording — the class covers any abrupt loss of
-    // the control connection (iperf_error.c).
+    /// #267: GT's IECTRLCLOSE wording — the class covers any abrupt loss of
+    /// the control connection (iperf_error.c).
     #[error("control socket has closed unexpectedly")]
     PeerDisconnected,
 

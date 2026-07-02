@@ -648,3 +648,57 @@ fn killed_server_takes_gt_ctrl_closed_shape() {
         "{doc}"
     );
 }
+
+/// #267 r1 F1: the PRE-DATA window (server vanishes with a clean FIN after
+/// the param exchange, before TestStart) — GT emits exactly ONE -J doc:
+/// Connected-stage start (on_connect metadata, no test_start), bare end{},
+/// the IECTRLCLOSE error. A second skeleton doc (the CLI re-render) is the
+/// #225 violation this pin holds shut.
+#[test]
+fn predata_ctrl_close_emits_one_staged_doc() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _mock = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let mut cookie = [0u8; 37];
+            let _ = s.read_exact(&mut cookie);
+            let _ = s.write_all(&[9u8]); // ParamExchange
+            let mut len = [0u8; 4];
+            if s.read_exact(&mut len).is_ok() {
+                let n = u32::from_be_bytes(len) as usize;
+                let mut params = vec![0u8; n];
+                let _ = s.read_exact(&mut params);
+            }
+            // clean FIN: drop the socket
+        }
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-t", "5", "-J"]);
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(10), "-J pre-data FIN");
+    assert_eq!(ccode, 1);
+    let doc: serde_json::Value = serde_json::from_str(cout.trim()).unwrap_or_else(|e| {
+        panic!("exactly ONE -J doc (r1 F1: the CLI must not re-render) ({e}): {cout}")
+    });
+    let start = doc["start"].as_object().expect("start object");
+    assert!(
+        start.contains_key("cookie") && start.contains_key("timestamp"),
+        "Connected-stage start (on_connect metadata): {doc}"
+    );
+    assert!(
+        !start.contains_key("test_start"),
+        "pre-TestStart: no late fields: {doc}"
+    );
+    assert_eq!(
+        doc["end"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "bare end: {doc}"
+    );
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("control socket has closed unexpectedly"),
+        "{doc}"
+    );
+}

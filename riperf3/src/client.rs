@@ -905,7 +905,11 @@ impl Client {
         if self.json_output || self.json_stream {
             self.emit_results(ctx, None, true, ctx.measured_secs, Some(&e.to_string()));
         }
-        e
+        // r1 F1: GT folds every abrupt control loss into IECTRLCLOSE —
+        // returning the ONE variant keeps the CLI's #225 single-doc
+        // suppress-list exact (PeerDisconnected shares the Display text but
+        // not the suppress-list entry).
+        RiperfError::ControlSocketClosed
     }
 
     fn on_unexpected_state(&self, ctx: &RunCtx, other: TestState) {
