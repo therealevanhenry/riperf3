@@ -186,6 +186,21 @@ fn idle_restarts_do_not_advance_the_banner_counter() {
             .expect("spawn server"),
     );
 
+    // Accumulate stdout on a reader thread: the post-test banner re-print
+    // happens AFTER the client exits (the server still has to finish the
+    // round), so a kill right after run_client races it (review r2 f1).
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let reader = {
+        let buf = std::sync::Arc::clone(&out_buf);
+        let mut stdout = server.0.stdout.take().expect("piped");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            stdout.read_to_string(&mut s).expect("read");
+            buf.lock().unwrap().push_str(&s);
+        })
+    };
+
     // Sit through at least two idle expiries.
     std::thread::sleep(Duration::from_millis(2600));
     let _ = common::run_client(
@@ -193,17 +208,20 @@ fn idle_restarts_do_not_advance_the_banner_counter() {
         Duration::from_secs(20),
         "client",
     );
+    // Bounded-wait for the post-test re-print before killing: exactly two
+    // banners is the pass state, so waiting for the second can't mask the
+    // idle-rounds-print bug (that overshoots to 3+ and still fails below).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while out_buf.lock().unwrap().matches("Server listening").count() < 2
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let _ = server.0.kill();
-    let mut out = String::new();
+    reader.join().expect("reader thread");
+    let out = out_buf.lock().unwrap().clone();
     let mut err = String::new();
     use std::io::Read;
-    server
-        .0
-        .stdout
-        .take()
-        .expect("piped")
-        .read_to_string(&mut out)
-        .expect("read");
     server
         .0
         .stderr
