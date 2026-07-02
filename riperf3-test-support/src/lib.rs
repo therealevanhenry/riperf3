@@ -143,7 +143,10 @@ fn reset_tokens(s: &str) -> bool {
     s.contains("ConnectionReset")
         || s.contains("Connection reset")
         || s.contains("(os error 10054)")
+        // #267: the clean-EOF class now renders GT's IECTRLCLOSE wording;
+        // the old token stays for mixed-version transcripts.
         || s.contains("peer disconnected")
+        || s.contains("control socket has closed unexpectedly")
 }
 
 /// Is every stdout line a SETUP-phase text line (#222's unconditional
@@ -356,7 +359,9 @@ mod tests {
             "riperf3: error - Connection reset by peer (os error 104)",
             "riperf3: error - Connection reset by peer (os error 54)",
             // FreeBSD's FIN-before-RST ordering: the clean-EOF rendering
-            "riperf3: error - peer disconnected",
+            // (#267 renamed the class to GT's IECTRLCLOSE wording; the old
+            // token is kept in the matcher for mixed-version transcripts).
+            "riperf3: error - control socket has closed unexpectedly",
             // Windows WSAECONNRESET: no "reset"-cased substring at all
             "riperf3: error - An existing connection was forcibly closed by \
              the remote host. (os error 10054)",

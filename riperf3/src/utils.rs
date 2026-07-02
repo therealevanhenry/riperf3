@@ -579,7 +579,7 @@ mod error_tests {
         );
         assert_eq!(
             format!("{}", RiperfError::PeerDisconnected),
-            "peer disconnected"
+            "control socket has closed unexpectedly"
         );
         assert!(format!("{}", RiperfError::Aborted("test".into())).contains("test"));
         assert_eq!(

@@ -83,7 +83,11 @@ fn main() -> std::process::ExitCode {
     }
 
     if let Some(msg) = parse_class_rejection(&cli) {
-        eprintln!("riperf3: error - {msg}");
+        // #270: GT routes the parse-error class through 'parameter error - '
+        // with the usage trailer (live-probed for all three classes here:
+        // end-conditions, client-only, server-only).
+        eprintln!("riperf3: parameter error - {msg}");
+        print_usage_trailer();
         return std::process::ExitCode::FAILURE;
     }
 
@@ -109,6 +113,9 @@ fn main() -> std::process::ExitCode {
                     le,
                     riperf3::RiperfError::ServerTerminated
                         | riperf3::RiperfError::ServerErrorRelayed(_)
+                        // #267: the lib emits the populated ctrl-closed doc
+                        // (bare end{}) before returning this class.
+                        | riperf3::RiperfError::ControlSocketClosed
                 )
             });
             // --json-stream wins over -J when combined: iperf3's

@@ -377,7 +377,17 @@ impl Client {
             // the run_test arm. recv_state is a single 1-byte read, so the
             // select is cancel-safe.
             let state = tokio::select! {
-                s = protocol::recv_state(&mut ctx.ctrl) => s?,
+                s = protocol::recv_state(&mut ctx.ctrl) => match s {
+                    Ok(state) => state,
+                    // #267: a CLEAN close (EOF) is GT's IECTRLCLOSE — dump
+                    // the populated doc. Io-class failures (e.g. a pre-data
+                    // RST, the #195 retry surface) keep their own classes
+                    // and propagate bare, as before.
+                    Err(e @ (RiperfError::PeerDisconnected | RiperfError::ControlSocketClosed)) => {
+                        return Err(self.on_ctrl_lost(&ctx, e))
+                    }
+                    Err(e) => return Err(e),
+                },
                 msg = wait_interrupt(ctx.interrupt.as_mut()) => {
                     return Ok(self.on_interrupted_wait(&mut ctx, &msg).await);
                 }
@@ -768,7 +778,7 @@ impl Client {
     }
 
     async fn on_test_running(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
-        let (secs, event) = self
+        let (secs, event) = match self
             .run_test(
                 &mut ctx.ctrl,
                 &ctx.streams,
@@ -778,7 +788,15 @@ impl Client {
                 ctx.byte_budget.as_ref(),
                 &mut ctx.interrupt,
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            // #267: run_test surfaces a mid-test control-socket loss as
+            // ControlSocketClosed (IECTRLCLOSE) — GT's errexit emits the
+            // populated doc with a bare end{} on the JSON sinks.
+            Err(e @ RiperfError::ControlSocketClosed) => return Err(self.on_ctrl_lost(ctx, e)),
+            Err(e) => return Err(e),
+        };
         ctx.measured_secs = secs;
         match event {
             Some(ControlEvent::Terminated) => {
@@ -875,6 +893,23 @@ impl Client {
             Some("the server has terminated"),
         );
         RiperfError::ServerTerminated
+    }
+
+    /// #267: the control connection was lost abruptly (GT's IECTRLCLOSE
+    /// class — live captures on the issue). GT's errexit emits the
+    /// populated-so-far document on the JSON sinks: full start, collected
+    /// intervals, and a bare `end: {}` (json_end never filled). Text mode
+    /// dumps nothing — the CLI prints the one stderr line from the returned
+    /// error. The dump reuses the #281 machinery: current stage + bare_end.
+    fn on_ctrl_lost(&self, ctx: &RunCtx, e: RiperfError) -> RiperfError {
+        if self.json_output || self.json_stream {
+            self.emit_results(ctx, None, true, ctx.measured_secs, Some(&e.to_string()));
+        }
+        // r1 F1: GT folds every abrupt control loss into IECTRLCLOSE —
+        // returning the ONE variant keeps the CLI's #225 single-doc
+        // suppress-list exact (PeerDisconnected shares the Display text but
+        // not the suppress-list entry).
+        RiperfError::ControlSocketClosed
     }
 
     fn on_unexpected_state(&self, ctx: &RunCtx, other: TestState) {

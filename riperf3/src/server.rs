@@ -314,6 +314,10 @@ impl Server {
         // #290: run-scoped console silence, armed FIRST so the listening
         // banner honors it. Construct-only-when-quiet (see the guard doc).
         let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
+        // #262: GT's per-test banner counter (iperf_server_api.c:137's
+        // server_test_number) — #1 on the first listen, incremented for each
+        // serve round so the re-printed banner numbers the UPCOMING test.
+        let mut server_test_number: u64 = 1;
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
@@ -346,16 +350,26 @@ impl Server {
                 vprintln!("{}", crate::utils::system_info());
             }
             Self::banner_line(sep);
-            Self::banner_line(&format!("Server listening on {}", self.port));
+            Self::banner_line(&format!(
+                "Server listening on {} (test #{server_test_number})",
+                self.port
+            ));
             Self::banner_line(sep);
         }
 
         let mut interrupt_fired = self.interrupt.clone().map(|w| w.0);
         loop {
+            // #262 r1 F3: an idle-timeout expiry is GT's silent rc==2 restart
+            // (iperf_server_api.c:133-135) — no stderr line, no banner
+            // re-print, no counter increment; the accept simply re-arms.
+            let mut idle_restart = false;
             match self.handle_one_test(&listener).await {
                 // #137: the daemon loop discards each test's Report; library
                 // users who want it call `run_once`.
                 Ok(_) => {}
+                Err(RiperfError::Aborted(msg)) if msg == "idle timeout" => {
+                    idle_restart = true;
+                }
                 Err(RiperfError::PeerDisconnected) => {
                     if self.verbose {
                         vprintln!("Client disconnected.");
@@ -390,14 +404,22 @@ impl Server {
             if self.one_off {
                 break;
             }
-            if !json {
-                if self.verbose {
-                    vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
-                    vprintln!("{}", crate::utils::system_info());
+            if !idle_restart {
+                // #262: the served round is over — the next banner numbers
+                // the upcoming test.
+                server_test_number += 1;
+                if !json {
+                    if self.verbose {
+                        vprintln!("riperf3 {}", env!("CARGO_PKG_VERSION"));
+                        vprintln!("{}", crate::utils::system_info());
+                    }
+                    Self::banner_line(sep);
+                    Self::banner_line(&format!(
+                        "Server listening on {} (test #{server_test_number})",
+                        self.port
+                    ));
+                    Self::banner_line(sep);
                 }
-                Self::banner_line(sep);
-                Self::banner_line(&format!("Server listening on {}", self.port));
-                Self::banner_line(sep);
             }
         }
         Ok(())

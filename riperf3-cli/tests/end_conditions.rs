@@ -32,8 +32,14 @@ fn conflicting_end_conditions_exit_before_side_effects() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("only one test end condition (-t, -n, -k) may be specified"),
-        "stderr must carry iperf3's IEENDCONDITIONS text, got: {stderr}"
+        stderr.contains(
+            "parameter error - only one test end condition (-t, -n, -k) may be specified"
+        ),
+        "stderr must carry GT's parameter-error IEENDCONDITIONS shape (#270), got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("--help"),
+        "the usage trailer rides the parameter-error class (#270): {stderr}"
     );
     assert!(
         !pidfile.exists(),
