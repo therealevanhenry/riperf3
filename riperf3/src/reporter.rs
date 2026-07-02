@@ -529,6 +529,21 @@ struct TcpSample {
     reorder: u32,
 }
 
+// One conversion site (#292): a future TcpSample field then fails to compile
+// here instead of silently defaulting at a hand-copy.
+impl From<crate::tcp_info::TcpInfoSnapshot> for TcpSample {
+    fn from(info: crate::tcp_info::TcpInfoSnapshot) -> Self {
+        TcpSample {
+            snd_cwnd: info.snd_cwnd,
+            snd_wnd: info.snd_wnd,
+            rtt: info.rtt,
+            rttvar: info.rttvar,
+            pmtu: info.pmtu,
+            reorder: info.reorder,
+        }
+    }
+}
+
 /// Per-stream sender-side TCP_INFO extremes accumulated across the run (#36 PR2),
 /// for the `end.streams[].sender` object. Only meaningful for TCP sender streams.
 #[derive(Debug, Default, Clone, Copy)]
@@ -912,14 +927,7 @@ pub fn spawn_interval_reporter(
                                         e.rtt_samples += 1;
                                     }
                                     e.total_retransmits = Some(info.total_retransmits);
-                                    last_tcp[i] = Some(TcpSample {
-                                        snd_cwnd: info.snd_cwnd,
-                                        snd_wnd: info.snd_wnd,
-                                        rtt: info.rtt,
-                                        rttvar: info.rttvar,
-                                        pmtu: info.pmtu,
-                                        reorder: info.reorder,
-                                    });
+                                    last_tcp[i] = Some(TcpSample::from(info));
                                     (
                                         Some(delta as i64),
                                         Some(info.snd_cwnd),
@@ -932,14 +940,7 @@ pub fn spawn_interval_reporter(
                                 } else if let Some(s) = stream
                                     .counters
                                     .final_tcp_sample()
-                                    .map(|info| TcpSample {
-                                        snd_cwnd: info.snd_cwnd,
-                                        snd_wnd: info.snd_wnd,
-                                        rtt: info.rtt,
-                                        rttvar: info.rttvar,
-                                        pmtu: info.pmtu,
-                                        reorder: info.reorder,
-                                    })
+                                    .map(TcpSample::from)
                                     .or(last_tcp[i])
                                 {
                                     // Final-interval fallback (#55/#245): the socket

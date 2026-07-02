@@ -418,17 +418,11 @@ pub(crate) fn check_socket_window(
 /// (verified for IPv4 and IPv6 against `TcpStream::local_addr()`), so a stream
 /// whose socket is not AF_INET/AF_INET6 — which a TCP/UDP data socket never is —
 /// is the only case that would differ, and there it would yield `None`.
-#[allow(clippy::type_complexity)]
 pub(crate) fn capture_stream_meta(
     sock: socket2::SockRef,
     window: Option<i32>,
     apply_window: bool,
-) -> Result<(
-    Option<SocketAddr>,
-    Option<SocketAddr>,
-    Option<u64>,
-    Option<u64>,
-)> {
+) -> Result<SocketMeta> {
     if apply_window {
         apply_socket_window(&sock, window);
     }
@@ -437,7 +431,26 @@ pub(crate) fn capture_stream_meta(
     let sndbuf_actual = sock.send_buffer_size().ok().map(|v| v as u64);
     let rcvbuf_actual = sock.recv_buffer_size().ok().map(|v| v as u64);
     check_socket_window(window, sndbuf_actual, rcvbuf_actual)?;
-    Ok((local_addr, peer_addr, sndbuf_actual, rcvbuf_actual))
+    Ok(SocketMeta {
+        local_addr,
+        peer_addr,
+        sndbuf_actual,
+        rcvbuf_actual,
+    })
+}
+
+/// What `capture_stream_meta` reads off a data socket at creation, named
+/// (#288 — was a clippy-allowed 4-tuple that every call site destructured and
+/// re-spread): the real addresses for the `-J` `start.connected` block (#36)
+/// and the realized SO_SNDBUF/SO_RCVBUF for `sndbuf_actual`/`rcvbuf_actual`
+/// (#36 PR3). Embedded whole into `StreamMeta`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SocketMeta {
+    /// `None` if unavailable.
+    pub local_addr: Option<SocketAddr>,
+    pub peer_addr: Option<SocketAddr>,
+    pub sndbuf_actual: Option<u64>,
+    pub rcvbuf_actual: Option<u64>,
 }
 
 /// Read the TCP congestion-control algorithm actually in effect on a connected

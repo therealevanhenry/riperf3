@@ -70,7 +70,7 @@ pub struct StreamCounters {
     /// #55 stale fallback). `None` = not captured (receiver, UDP, non-unix, or no
     /// platform support). Set ONCE per stream at sender exit, read ONCE at the
     /// final flush — never contended, never on the hot path, so a plain Mutex.
-    final_tcp_sample: Mutex<Option<crate::tcp_info::TcpInfoSnapshot>>,
+    final_tcp_sample: std::sync::OnceLock<crate::tcp_info::TcpInfoSnapshot>,
 }
 
 impl Default for StreamCounters {
@@ -92,7 +92,7 @@ impl StreamCounters {
             datagrams_sent_omit: AtomicU64::new(0),
             final_retransmits: AtomicI64::new(-1),
             omit_retransmits: AtomicI64::new(-1),
-            final_tcp_sample: Mutex::new(None),
+            final_tcp_sample: std::sync::OnceLock::new(),
         }
     }
 
@@ -147,19 +147,19 @@ impl StreamCounters {
     }
 
     /// Store the sender's genuinely-final TCP_INFO snapshot (#245; sender task
-    /// only, captured while the socket is still open just before it is dropped).
+    /// only, captured while the socket is still open just before it is
+    /// dropped). `OnceLock` encodes the documented set-once contract in the
+    /// type (#292); a second call — which no path makes — would be ignored
+    /// rather than overwrite.
     pub fn set_final_tcp_sample(&self, info: crate::tcp_info::TcpInfoSnapshot) {
-        if let Ok(mut g) = self.final_tcp_sample.lock() {
-            *g = Some(info);
-        }
+        let _ = self.final_tcp_sample.set(info);
     }
 
     /// The sender's genuinely-final TCP_INFO snapshot, or `None` if never
-    /// captured (#245). A poisoned lock also yields `None` — the closed-fd
-    /// fallback then degrades to the previous interval's cached sample, never
-    /// panics.
+    /// captured (#245) — the closed-fd fallback then degrades to the previous
+    /// interval's cached sample.
     pub fn final_tcp_sample(&self) -> Option<crate::tcp_info::TcpInfoSnapshot> {
-        self.final_tcp_sample.lock().ok().and_then(|g| *g)
+        self.final_tcp_sample.get().copied()
     }
 
     /// Record the omit-boundary retransmit baseline (#171; reporter boundary
@@ -476,28 +476,14 @@ impl RateLimiter {
 
 /// A running data stream with its background task handle and shared state.
 pub struct DataStream {
-    /// Stream identifier (shown as `[ ID]` in output).
-    pub id: i32,
-    pub is_sender: bool,
-    pub counters: Arc<StreamCounters>,
+    /// Everything a create-streams path captured about this stream (#288 —
+    /// embedded, not flattened, so `from_meta`-style field copies can't
+    /// drift).
+    pub meta: StreamMeta,
     /// UDP-only: receiver-side jitter/loss stats behind a mutex.
     pub udp_recv_stats: Option<Arc<Mutex<UdpRecvStats>>>,
     /// The background send/recv task.
     pub task: JoinHandle<Result<()>>,
-    /// Raw TCP socket fd for TCP_INFO queries. `None` for UDP streams.
-    pub raw_fd: Option<i32>,
-    /// This stream's actual local/peer socket addresses, captured at creation
-    /// for the `-J` `start.connected` block (issue #36). `None` if unavailable.
-    pub local_addr: Option<std::net::SocketAddr>,
-    pub peer_addr: Option<std::net::SocketAddr>,
-    /// Actual SO_SNDBUF/SO_RCVBUF on this stream's socket, captured at creation
-    /// for the `-J` `start.sndbuf_actual`/`rcvbuf_actual` fields (#36 PR3).
-    pub sndbuf_actual: Option<u64>,
-    pub rcvbuf_actual: Option<u64>,
-    /// The TCP congestion-control algorithm actually in effect on this stream's
-    /// socket (read back via `getsockopt(TCP_CONGESTION)`), for the `congestion_used`
-    /// report field (#37). `None` for UDP and on platforms without TCP_CONGESTION.
-    pub congestion_used: Option<String>,
 }
 
 /// The non-task, non-stats fields a create-streams path captures per stream
@@ -509,41 +495,23 @@ pub struct DataStream {
 /// (the spawn shape and the receiver-only jitter mutex diverge by role) and
 /// are passed alongside the meta to `DataStream::from_meta`.
 pub(crate) struct StreamMeta {
+    /// Stream identifier (shown as `[ ID]` in output).
     pub id: i32,
     pub is_sender: bool,
     pub counters: Arc<StreamCounters>,
+    /// Raw TCP socket fd for TCP_INFO queries. `None` for UDP streams.
     pub raw_fd: Option<i32>,
-    pub local_addr: Option<std::net::SocketAddr>,
-    pub peer_addr: Option<std::net::SocketAddr>,
-    pub sndbuf_actual: Option<u64>,
-    pub rcvbuf_actual: Option<u64>,
+    /// The socket-level capture (#288): real addresses + realized buffer
+    /// sizes, taken whole from `net::capture_stream_meta`.
+    pub sock: crate::net::SocketMeta,
+    /// The TCP congestion-control algorithm actually in effect on this
+    /// stream's socket (read back via `getsockopt(TCP_CONGESTION)`), for the
+    /// `congestion_used` report field (#37). `None` for UDP and on platforms
+    /// without TCP_CONGESTION.
     pub congestion_used: Option<String>,
 }
 
 impl DataStream {
-    /// Assemble a `DataStream` from its captured `StreamMeta` plus the two
-    /// per-branch values: the spawned `task` and the receiver-only
-    /// `udp_recv_stats` (UDP receivers pass `Some`; everyone else `None`).
-    pub(crate) fn from_meta(
-        meta: StreamMeta,
-        task: JoinHandle<Result<()>>,
-        udp_recv_stats: Option<Arc<Mutex<UdpRecvStats>>>,
-    ) -> Self {
-        DataStream {
-            id: meta.id,
-            is_sender: meta.is_sender,
-            counters: meta.counters,
-            udp_recv_stats,
-            task,
-            raw_fd: meta.raw_fd,
-            local_addr: meta.local_addr,
-            peer_addr: meta.peer_addr,
-            sndbuf_actual: meta.sndbuf_actual,
-            rcvbuf_actual: meta.rcvbuf_actual,
-            congestion_used: meta.congestion_used,
-        }
-    }
-
     /// The omit-adjusted lifetime retransmit total to render/exchange for a TCP
     /// sending stream, or `None` for a receiver, a UDP stream, or a platform
     /// without TCP_INFO retransmits (Windows) — where iperf3 omits the `Retr`
@@ -553,19 +521,20 @@ impl DataStream {
     /// `iperf_reset_stats`. `Some(-1)` means info exists but the value was
     /// unavailable (iperf3's sentinel, rendered literally).
     pub(crate) fn sender_retransmits(&self, is_udp: bool) -> Option<i64> {
-        if !self.is_sender || is_udp || !crate::tcp_info::has_retransmit_info() {
+        if !self.meta.is_sender || is_udp || !crate::tcp_info::has_retransmit_info() {
             return None;
         }
-        let lifetime = match self.counters.final_retransmits() {
+        let lifetime = match self.meta.counters.final_retransmits() {
             n if n >= 0 => Some(n),
             _ => self
+                .meta
                 .raw_fd
                 .and_then(crate::tcp_info::get_tcp_info)
                 .map(|i| i.total_retransmits as i64),
         };
         Some(
             lifetime
-                .map(|t| self.counters.omit_adjusted_retransmits(t))
+                .map(|t| self.meta.counters.omit_adjusted_retransmits(t))
                 .unwrap_or(-1),
         )
     }
@@ -1895,67 +1864,6 @@ pub fn run_udp_receiver_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // #144: DataStream::from_meta must move every captured field through
-    // unchanged and attach the two per-branch values (task + udp_recv_stats).
-    // This is the round-trip guard that makes the bundled StreamMeta a safe
-    // single source of truth for the create-streams paths.
-    #[tokio::test]
-    async fn from_meta_round_trips_every_field() {
-        let counters = Arc::new(StreamCounters::new());
-        let local: std::net::SocketAddr = "127.0.0.1:5201".parse().unwrap();
-        let peer: std::net::SocketAddr = "10.0.0.2:40000".parse().unwrap();
-        let meta = StreamMeta {
-            id: 7,
-            is_sender: true,
-            counters: counters.clone(),
-            raw_fd: Some(42),
-            local_addr: Some(local),
-            peer_addr: Some(peer),
-            sndbuf_actual: Some(212_992),
-            rcvbuf_actual: Some(131_072),
-            congestion_used: Some("bbr".to_string()),
-        };
-        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
-        let task = tokio::spawn(async { Ok(()) });
-        let ds = DataStream::from_meta(meta, task, Some(stats.clone()));
-
-        assert_eq!(ds.id, 7);
-        assert!(ds.is_sender);
-        assert!(Arc::ptr_eq(&ds.counters, &counters));
-        assert_eq!(ds.raw_fd, Some(42));
-        assert_eq!(ds.local_addr, Some(local));
-        assert_eq!(ds.peer_addr, Some(peer));
-        assert_eq!(ds.sndbuf_actual, Some(212_992));
-        assert_eq!(ds.rcvbuf_actual, Some(131_072));
-        assert_eq!(ds.congestion_used.as_deref(), Some("bbr"));
-        assert!(ds.udp_recv_stats.is_some());
-        ds.task.abort();
-
-        // The None udp_recv_stats branch (TCP / UDP sender) round-trips too.
-        let meta2 = StreamMeta {
-            id: 1,
-            is_sender: false,
-            counters: Arc::new(StreamCounters::new()),
-            raw_fd: None,
-            local_addr: None,
-            peer_addr: None,
-            sndbuf_actual: None,
-            rcvbuf_actual: None,
-            congestion_used: None,
-        };
-        let ds2 = DataStream::from_meta(meta2, tokio::spawn(async { Ok(()) }), None);
-        assert_eq!(ds2.id, 1);
-        assert!(!ds2.is_sender);
-        assert!(ds2.raw_fd.is_none());
-        assert!(ds2.local_addr.is_none());
-        assert!(ds2.peer_addr.is_none());
-        assert!(ds2.sndbuf_actual.is_none());
-        assert!(ds2.rcvbuf_actual.is_none());
-        assert!(ds2.congestion_used.is_none());
-        assert!(ds2.udp_recv_stats.is_none());
-        ds2.task.abort();
-    }
 
     // #185: the paced UDP batch is sized to ~one pacing quantum of send budget,
     // not a fixed packet count. A low rate over a large datagram must drop to a
