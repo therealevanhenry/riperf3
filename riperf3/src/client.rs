@@ -346,8 +346,7 @@ impl Client {
             server_results: None,
             final_report: None,
             measured_secs: self.duration as f64,
-            test_start_millis: 0,
-            connect_time_millis: 0,
+            stage: RunStage::PreTestStart { connect_millis: 0 },
             prev_state: TestState::IperfStart,
         };
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
@@ -412,7 +411,7 @@ impl Client {
                     // #261: a relay arriving before TestStart is the upfront
                     // refusal (code 37 et al.) — the dump takes GT's minimal
                     // shape; after TestStart it keeps its late fields.
-                    let reached = ctx.test_start_millis > 0;
+                    let reached = ctx.stage.started();
                     return Err(self.on_server_error_relay(&mut ctx, reached).await);
                 }
 
@@ -591,7 +590,11 @@ impl Client {
             ctx.cpu_start.as_ref(),
             server_results,
             ctx.blksize,
-            &ctx.interval_data,
+            // The ONE drain of the reporter's collections (#287): emit_results
+            // is the single dump site, and every terminal path runs it at most
+            // once. Downstream builders take the value, so nothing can
+            // silently re-drain.
+            crate::reporter::CollectedIntervals::drain(&ctx.interval_data),
             &ctx.start_meta(reached_test_start),
             secs,
             error,
@@ -607,7 +610,7 @@ impl Client {
         // r1 item 5: a test that never STARTED reports a zero
         // window (GT's pre-data dump says 0/0/0), not the
         // requested -t default measured_secs still holds.
-        let dump_secs = if ctx.test_start_millis > 0 {
+        let dump_secs = if ctx.stage.started() {
             ctx.measured_secs
         } else {
             0.0
@@ -629,10 +632,17 @@ impl Client {
         // (e.g. code 37) arrives on the NEXT state read, after this
         // stamp, so the refusal document carries this real wall-clock
         // rather than epoch-0.
-        ctx.connect_time_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Stage no-regress guard (#286): a tolerant re-received ParamExchange
+        // after TestStart must not demote the stage (the old code merely
+        // re-stamped a by-then-unread connect clock).
+        if !ctx.stage.started() {
+            ctx.stage = RunStage::PreTestStart {
+                connect_millis: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            };
+        }
         // #222: iperf3's connect text block — printed HERE,
         // after the param exchange (GT's on_connect timing, r2
         // item 5: a failed exchange prints no banner). The
@@ -726,10 +736,12 @@ impl Client {
         // All streams are set up — release the UDP senders.
         ctx.start.store(true, Ordering::Relaxed);
         ctx.cpu_start = Some(CpuSnapshot::now());
-        ctx.test_start_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        ctx.stage = RunStage::Started {
+            start_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
 
         // --json-stream: emit the `start` event now, before the reporter
         // streams any `interval` events (faithful event order, #62).
@@ -738,7 +750,6 @@ impl Client {
                 &ctx.streams,
                 ctx.cpu_start.as_ref(),
                 ctx.blksize,
-                &ctx.interval_data,
                 &ctx.start_meta(true),
             );
         }
@@ -1661,7 +1672,7 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         start_meta: &StartMeta,
         test_duration: f64,
         error: Option<&str>,
@@ -1710,7 +1721,7 @@ impl Client {
                 cpu_start,
                 remote_cpu,
                 blksize,
-                interval_data,
+                collected,
                 start_meta,
                 test_duration,
             );
@@ -1724,7 +1735,7 @@ impl Client {
                 cpu_start,
                 remote_cpu,
                 blksize,
-                interval_data,
+                collected,
                 start_meta,
                 test_duration,
                 error,
@@ -1744,7 +1755,7 @@ impl Client {
                 cpu_start,
                 remote_cpu,
                 blksize,
-                interval_data,
+                collected,
                 start_meta,
                 test_duration,
             );
@@ -1958,7 +1969,7 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         start_meta: &StartMeta,
         test_duration: f64,
     ) -> crate::json_report::ReportInput {
@@ -1966,15 +1977,10 @@ impl Client {
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
         };
 
-        // Take the interval samples + per-stream extremes the reporter collected.
-        // Its task has been joined by now (run_test awaits it), so this is final.
-        let (collected_intervals, extremes) = match interval_data.lock() {
-            Ok(mut g) => (
-                std::mem::take(&mut g.intervals),
-                std::mem::take(&mut g.extremes),
-            ),
-            Err(_) => (Vec::new(), Vec::new()),
-        };
+        // The interval samples + per-stream extremes the reporter collected,
+        // handed in BY VALUE from the single drain point (#287) — a second
+        // build has nothing to drain, structurally.
+        let (collected_intervals, extremes) = (collected.intervals, collected.extremes);
 
         let cpu_end = CpuSnapshot::now();
         let cpu_util = cpu_start
@@ -2158,16 +2164,11 @@ impl Client {
             // riperf3's single --gsro flag drives both GSO and GRO.
             gso: i32::from(self.gsro),
             gro: i32::from(self.gsro),
-            // #261: on a run that reached TestStart use that wall-clock; on the
-            // upfront-refusal path TestStart was never reached (start wall-clock
-            // is 0), so fall back to the connect-time wall-clock — GT stamps
-            // start.timestamp at on_connect (after the param exchange, BEFORE the
-            // refusal arrives), never epoch-0.
-            start_time_millis: if start_meta.start_time_millis > 0 {
-                start_meta.start_time_millis
-            } else {
-                start_meta.connect_time_millis
-            },
+            // #261/#286: the stage's wall-clock — TestStart's once started; on
+            // the upfront-refusal path the connect-time clock (GT stamps
+            // start.timestamp at on_connect, after the param exchange, BEFORE
+            // the refusal arrives — never epoch-0 on a real run).
+            start_time_millis: start_meta.stage.timestamp_millis(),
             extra_data: self.extra_data.clone(),
             // --get-server-output (#33): the server's returned output rides
             // the -J report tail — only when WE requested it (iperf3 gates on
@@ -2195,7 +2196,7 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         start_meta: &StartMeta,
         test_duration: f64,
         error: Option<&str>,
@@ -2205,7 +2206,7 @@ impl Client {
             cpu_start,
             remote_cpu,
             blksize,
-            interval_data,
+            collected,
             start_meta,
             test_duration,
         );
@@ -2225,17 +2226,18 @@ impl Client {
         streams: &[DataStream],
         cpu_start: Option<&CpuSnapshot>,
         blksize: usize,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
         start_meta: &StartMeta,
     ) {
         // The `start` event carries no summary window, so the elapsed value is
-        // unused here; pass the nominal duration.
+        // unused here; pass the nominal duration. Nothing is collected yet at
+        // TestStart (the reporter spawns after this event), so the builder
+        // gets explicit empty collections (#287).
         let input = self.build_report_input(
             streams,
             cpu_start,
             None,
             blksize,
-            interval_data,
+            crate::reporter::CollectedIntervals::default(),
             start_meta,
             self.duration as f64,
         );
@@ -2254,7 +2256,7 @@ impl Client {
         cpu_start: Option<&CpuSnapshot>,
         remote_cpu: Option<&TestResultsJson>,
         blksize: usize,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         start_meta: &StartMeta,
         test_duration: f64,
     ) -> crate::json_report::Report {
@@ -2263,7 +2265,7 @@ impl Client {
             cpu_start,
             remote_cpu,
             blksize,
-            interval_data,
+            collected,
             start_meta,
             test_duration,
         );
@@ -2289,23 +2291,64 @@ enum EndCondition {
 }
 
 /// Start-of-test metadata for the `-J` `start` block (#36 PR3), captured in
-/// `run()` where the cookie / control-MSS / start wall-clock are known.
+/// `run()` where the cookie / control-MSS / stage wall-clock are known.
 struct StartMeta {
     cookie: String,
     tcp_mss_default: u32,
-    /// Wall-clock at TestStart, ms since the Unix epoch. 0 until the TestStart
-    /// arm stamps it — its being > 0 is also the "reached TestStart" signal (#261).
-    start_time_millis: u64,
-    /// Wall-clock at on_connect (right after the param exchange), ms since the
-    /// Unix epoch (#261). GT stamps `start.timestamp` here; on an upfront refusal
-    /// (rejection before TestStart) it is the only real wall-clock the document
-    /// has, so the refusal path uses it for the timestamp instead of epoch-0.
-    connect_time_millis: u64,
+    /// How far the run progressed and the wall-clock that goes with it (#286).
+    stage: RunStage,
     /// #261: false ONLY on the upfront server-refusal path — drives the
     /// stage-gated omission of the late `start` fields and the bare `end: {}`.
     /// True on every other path (success, sigend interrupt, SERVER_TERMINATE),
-    /// which all render the full report structure like GT.
+    /// which all render the full report structure like GT. Kept EXPLICIT
+    /// (not derived from `stage`): a pre-TestStart sigend interrupt and the
+    /// refusal are the same stage but take different shapes — GT's interrupt
+    /// dump shows the full structure with 0/0/0, not the minimal refusal doc.
     reached_test_start: bool,
+}
+
+/// How far the client's run has progressed, carrying the authoritative
+/// wall-clock for the `-J` `start.timestamp` at that point (#286 — the
+/// single-value replacement for the old `test_start_millis` /
+/// `connect_time_millis` / start-is-zero tri-state). GT stamps
+/// `start.timestamp` at on_connect (the end of its PARAM_EXCHANGE case,
+/// iperf_api.c:338) and the TestStart processing then re-stamps it, so the
+/// timestamp a dump carries is exactly the stage's clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStage {
+    /// The param exchange has not completed: no real wall-clock yet (a dump
+    /// from here — e.g. an interrupt during the first state wait — carries
+    /// epoch-0, as before).
+    PreTestStart {
+        /// Wall-clock at on_connect, ms since the Unix epoch; 0 until the
+        /// ParamExchange arm stamps it (#261). On an upfront refusal this is
+        /// the only real wall-clock the document has.
+        connect_millis: u64,
+    },
+    /// TestStart was processed: the test ran (or is running).
+    Started {
+        /// Wall-clock at TestStart, ms since the Unix epoch (#36 PR3).
+        start_millis: u64,
+    },
+}
+
+impl RunStage {
+    /// The test reached TestStart. Replaces the old `test_start_millis > 0`
+    /// sentinel probes (#286).
+    fn started(&self) -> bool {
+        matches!(self, RunStage::Started { .. })
+    }
+
+    /// The wall-clock the `-J` `start.timestamp` carries for a dump made at
+    /// this stage — the TestStart clock once started, else the on_connect
+    /// clock (#261's refusal-timestamp rule, previously the
+    /// `if start > 0 { start } else { connect }` fallback).
+    fn timestamp_millis(&self) -> u64 {
+        match *self {
+            RunStage::PreTestStart { connect_millis } => connect_millis,
+            RunStage::Started { start_millis } => start_millis,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,12 +2400,10 @@ struct RunCtx {
     /// Authoritative test duration captured from run_test: `-t` for a duration
     /// run, the measured elapsed for `-n`/`-k`. Drives the summary window (#103).
     measured_secs: f64,
-    /// Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
-    test_start_millis: u64,
-    /// Wall-clock at on_connect (set at the end of the ParamExchange arm,
-    /// GT's on_connect timing) — the timestamp the `-J` document carries on an
-    /// upfront refusal that never reaches TestStart (#261).
-    connect_time_millis: u64,
+    /// How far the run has progressed + the `-J` start.timestamp wall-clock
+    /// for a dump made now (#286): the ParamExchange arm stamps the connect
+    /// clock (GT's on_connect timing), the TestStart arm advances to Started.
+    stage: RunStage,
     /// #145: AUDITABILITY ONLY — the last state this side processed, kept so
     /// an unexpected byte can be diagnosed against the transition table.
     /// Seeded at IperfStart (the first state the client legally receives is
@@ -2375,13 +2416,12 @@ impl RunCtx {
     /// Assemble the `StartMeta` for a report dump from the run's captured
     /// state — the one construction site (#289). `reached_test_start` is the
     /// caller's call: true everywhere except the upfront server-refusal path
-    /// (#261). #286 tracks collapsing the underlying tri-state itself.
+    /// (#261, see the field doc on StartMeta).
     fn start_meta(&self, reached_test_start: bool) -> StartMeta {
         StartMeta {
             cookie: String::from_utf8_lossy(&self.cookie[..protocol::COOKIE_SIZE - 1]).into_owned(),
             tcp_mss_default: self.control_mss,
-            start_time_millis: self.test_start_millis,
-            connect_time_millis: self.connect_time_millis,
+            stage: self.stage,
             reached_test_start,
         }
     }
@@ -3211,6 +3251,46 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    mod run_stage {
+        use crate::client::RunStage;
+
+        /// #286: the stage enum's two contracts — `started()` replaces the old
+        /// `test_start_millis > 0` sentinel probes, and `timestamp_millis()`
+        /// replaces the `if start > 0 { start } else { connect }` fallback
+        /// (#261's refusal-timestamp rule).
+        #[test]
+        fn started_and_timestamp_follow_the_stage() {
+            let fresh = RunStage::PreTestStart { connect_millis: 0 };
+            assert!(!fresh.started());
+            assert_eq!(
+                fresh.timestamp_millis(),
+                0,
+                "no clock before the param exchange — a dump here carries \
+                 epoch-0, as before #286"
+            );
+
+            let connected = RunStage::PreTestStart {
+                connect_millis: 1_700_000_000_123,
+            };
+            assert!(!connected.started(), "the refusal window is pre-start");
+            assert_eq!(
+                connected.timestamp_millis(),
+                1_700_000_000_123,
+                "the refusal document carries the on_connect wall-clock (#261)"
+            );
+
+            let started = RunStage::Started {
+                start_millis: 1_700_000_000_456,
+            };
+            assert!(started.started());
+            assert_eq!(
+                started.timestamp_millis(),
+                1_700_000_000_456,
+                "once started, the TestStart wall-clock wins"
+            );
+        }
+    }
+
     mod stream_report_retransmits_quadrants {
         use crate::client::stream_report_retransmits;
 

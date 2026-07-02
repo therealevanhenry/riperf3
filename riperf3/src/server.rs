@@ -211,6 +211,16 @@ struct EndState {
     test_duration: f64,
 }
 
+/// Where the test's rich report stands after `finish_server_output` (#287):
+/// either already built (the JSON-mode --get-server-output pre-exchange build,
+/// #33 — the drained collections are inside) or still pending, carrying the
+/// drained collections to the single post-exchange build. Exactly one build
+/// happens either way, by construction.
+enum ReportSource {
+    Built(Box<crate::json_report::Report>),
+    Pending(crate::reporter::CollectedIntervals),
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -508,9 +518,16 @@ impl Server {
         // monolith's counter read order.
         let result_streams = self.build_result_streams(&ctx, &end);
 
+        // The ONE drain of the reporter's collections (#287): the reporter was
+        // joined in shutdown_and_flush, so the take is final. From here the
+        // collections move by value — into the pre-exchange build (JSON-mode
+        // --get-server-output) or through `ReportSource::Pending` to the
+        // single post-exchange build below.
+        let collected = crate::reporter::CollectedIntervals::drain(&ctx.interval_data);
+
         // ---- --get-server-output finish + ExchangeResults / IperfDone ----
-        let (server_output_text, server_output_json, prebuilt_report) =
-            self.finish_server_output(&mut ctx, &end);
+        let (server_output_text, server_output_json, report_source) =
+            self.finish_server_output(&mut ctx, &end, collected);
         let was_captured = server_output_text.is_some();
         self.exchange_results_phase(
             &mut ctx,
@@ -521,12 +538,15 @@ impl Server {
         )
         .await?;
 
-        // #137: build the rich report ONCE — handle_one_test returns it (run
-        // discards it; run_once hands it back to the library caller). build_report
-        // drains the collected intervals via mem::take, so it must be built
-        // exactly once; reuse the pre-exchange build when --get-server-output
-        // already attached it (#33).
-        let report = prebuilt_report.unwrap_or_else(|| self.build_ctx_report(&ctx, &end));
+        // #137/#287: the report is built exactly ONCE per test, by
+        // construction — the collections moved either into the pre-exchange
+        // --get-server-output build (#33) or arrive here for the single
+        // post-exchange build. handle_one_test returns it (run discards it;
+        // run_once hands it back to the library caller).
+        let report = match report_source {
+            ReportSource::Built(report) => *report,
+            ReportSource::Pending(collected) => self.build_ctx_report(&ctx, &end, collected),
+        };
 
         self.emit_final_output(&ctx, &end, &report, was_captured);
 
@@ -1007,7 +1027,6 @@ impl Server {
                 &ctx.accepted_host,
                 ctx.accepted_port,
                 ctx.test_start_millis,
-                &ctx.interval_data,
             );
         }
 
@@ -1333,17 +1352,16 @@ impl Server {
     /// --get-server-output (#33): finish the diverted text (render the final
     /// summaries into the capture first, so the client sees the complete
     /// report), or attach the full -J report for a JSON-mode server. Returns
-    /// `(server_output_text, server_output_json, prebuilt_report)`.
+    /// `(server_output_text, server_output_json, report_source)` — the drained
+    /// collections go in and come back either inside the pre-built report or
+    /// untouched for the single post-exchange build (#287).
     fn finish_server_output(
         &self,
         ctx: &mut TestRunCtx,
         end: &EndState,
-    ) -> (
-        Option<String>,
-        Option<serde_json::Value>,
-        Option<crate::json_report::Report>,
-    ) {
-        let mut prebuilt_report: Option<crate::json_report::Report> = None;
+        collected: crate::reporter::CollectedIntervals,
+    ) -> (Option<String>, Option<serde_json::Value>, ReportSource) {
+        let mut report_source = ReportSource::Pending(collected);
         let (server_output_text, server_output_json) = if let Some(capture) = ctx.capture.take() {
             let summaries = Self::text_summaries(&ctx.streams, end.test_duration, &ctx.cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
@@ -1388,22 +1406,31 @@ impl Server {
             // (discard_json = json_stream && ... && !(server && get_server_output),
             // iperf_api.c:3900) — without this a real iperf3 client
             // requesting output silently got none (#168).
-            let report = self.build_ctx_report(ctx, end);
+            let ReportSource::Pending(collected) = report_source else {
+                unreachable!("report_source is Pending until this single build");
+            };
+            let report = self.build_ctx_report(ctx, end, collected);
             let value = serde_json::to_value(&report).ok();
-            prebuilt_report = Some(report);
+            report_source = ReportSource::Built(Box::new(report));
             (None, value)
         } else {
             (None, None)
         };
-        (server_output_text, server_output_json, prebuilt_report)
+        (server_output_text, server_output_json, report_source)
     }
 
-    /// The one `build_report` plumbing site for the pipeline (#289):
-    /// build_report drains the collected intervals via mem::take, so it must
-    /// be built exactly once per test — the pre-exchange --get-server-output
-    /// build is reused as `prebuilt_report` (#33/#137). #287 tracks making
-    /// that invariant structural.
-    fn build_ctx_report(&self, ctx: &TestRunCtx, end: &EndState) -> crate::json_report::Report {
+    /// The one `build_report` plumbing site for the pipeline (#289). The
+    /// drained collections arrive BY VALUE and move into the report, so the
+    /// old "must be built exactly once" comment-invariant is structural
+    /// (#287): the pre-exchange --get-server-output build consumes them into
+    /// `ReportSource::Built` (#33/#137), else they ride `Pending` to the
+    /// single post-exchange build.
+    fn build_ctx_report(
+        &self,
+        ctx: &TestRunCtx,
+        end: &EndState,
+        collected: crate::reporter::CollectedIntervals,
+    ) -> crate::json_report::Report {
         self.build_report(
             &ctx.streams,
             &ctx.cfg,
@@ -1414,7 +1441,7 @@ impl Server {
             &ctx.accepted_host,
             ctx.accepted_port,
             ctx.test_start_millis,
-            &ctx.interval_data,
+            collected,
             end.report_error.as_deref(),
         )
     }
@@ -2067,22 +2094,18 @@ impl Server {
         accepted_host: &str,
         accepted_port: u16,
         start_time_millis: u64,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         error: Option<&str>,
     ) -> crate::json_report::ReportInput {
         use crate::json_report::{
             CpuUtilization, ReportInput, StreamReport, TcpEndExtras, UdpStreamStats,
         };
 
-        // Take the interval samples + per-stream TCP_INFO extremes the reporter
-        // collected (its task is joined by now, so this is final).
-        let (collected_intervals, extremes) = match interval_data.lock() {
-            Ok(mut g) => (
-                std::mem::take(&mut g.intervals),
-                std::mem::take(&mut g.extremes),
-            ),
-            Err(_) => (Vec::new(), Vec::new()),
-        };
+        // The interval samples + per-stream TCP_INFO extremes the reporter
+        // collected, handed in BY VALUE from the single drain point in
+        // handle_one_test (#287) — a second build has nothing to drain,
+        // structurally.
+        let (collected_intervals, extremes) = (collected.intervals, collected.extremes);
 
         let is_udp = matches!(cfg.protocol, TransportProtocol::Udp);
 
@@ -2262,7 +2285,7 @@ impl Server {
         accepted_host: &str,
         accepted_port: u16,
         start_time_millis: u64,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
+        collected: crate::reporter::CollectedIntervals,
         error: Option<&str>,
     ) -> crate::json_report::Report {
         self.build_report_input(
@@ -2275,7 +2298,7 @@ impl Server {
             accepted_host,
             accepted_port,
             start_time_millis,
-            interval_data,
+            collected,
             error,
         )
         .build()
@@ -2323,9 +2346,9 @@ impl Server {
 
     /// `--json-stream`: emit the server's `end` event (#62). The interval events
     /// were already streamed live by the reporter.
-    // Takes the already-built `Report` (#137: handle_one_test builds it once and
-    // returns it) so the report isn't reassembled — build_report_input drains the
-    // collected intervals via mem::take, so a second build would lose them.
+    // Takes the already-built `Report` (#137: handle_one_test builds it once
+    // and returns it) so the report isn't reassembled — the collected
+    // intervals moved into it by value at build time (#287).
     fn emit_json_stream_end(&self, report: &crate::json_report::Report) {
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(
             "end",
@@ -2351,8 +2374,9 @@ impl Server {
         accepted_host: &str,
         accepted_port: u16,
         start_time_millis: u64,
-        interval_data: &Arc<Mutex<crate::reporter::CollectedIntervals>>,
     ) {
+        // Nothing is collected yet at TestStart (the reporter spawns after
+        // this event), so the builder gets explicit empty collections (#287).
         let input = self.build_report_input(
             streams,
             cfg,
@@ -2363,7 +2387,7 @@ impl Server {
             accepted_host,
             accepted_port,
             start_time_millis,
-            interval_data,
+            crate::reporter::CollectedIntervals::default(),
             None,
         );
         crate::reporter::emit_json_stream_line(&crate::json_report::json_stream_event(

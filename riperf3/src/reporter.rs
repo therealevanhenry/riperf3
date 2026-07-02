@@ -568,6 +568,22 @@ pub struct CollectedIntervals {
     pub extremes: Vec<StreamExtremes>,
 }
 
+impl CollectedIntervals {
+    /// Drain the shared collector — the single ownership-transfer point from
+    /// the reporter to the report builder (#287). Every builder downstream
+    /// takes the collections BY VALUE, so a second build has nothing to drain
+    /// and the old "must be built exactly once" comment-invariant is now
+    /// structural. Callers drain only after the reporter task is joined, so
+    /// the take is final; a poisoned lock yields empty collections (the old
+    /// in-builder fallback).
+    pub(crate) fn drain(shared: &Mutex<Self>) -> Self {
+        shared
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+}
+
 /// End-of-test signal from the test driver to the interval reporter (#55).
 ///
 /// The reporter's periodic ticks fall on idealized boundaries, but a run can end
