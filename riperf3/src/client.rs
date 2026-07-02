@@ -46,6 +46,9 @@ pub struct Client {
     pub(crate) extra_data: Option<String>,
     pub(crate) verbose: bool,
     pub(crate) json_output: bool,
+    /// #290: console output enabled (default). When false, `run` returns the
+    /// rich Report and the crate writes nothing to stdout/stderr.
+    pub(crate) emit_output: bool,
     pub(crate) json_stream: bool,
     /// #210: fired by the consumer (the CLI's first signal) with the
     /// formatted interrupt message; the run dumps stats, sends
@@ -300,6 +303,9 @@ impl Client {
     }
 
     pub async fn run(&self) -> Result<crate::json_report::Report> {
+        // #290: run-scoped console silence, armed FIRST so even the -V
+        // preamble honors it. Construct-only-when-quiet (see the guard doc).
+        let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
         let interrupt = self.interrupt.clone().map(|w| w.0);
         // -T/--title: prefix every client text line with "<title>:  " (#34),
         // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
@@ -845,7 +851,10 @@ impl Client {
             // riperf3's logfile plumbing lives in the
             // CLI (#198), so this lib line stays on
             // stderr. Revisit with the sink plumbing.
-            eprintln!("riperf3: SERVER ERROR - {msg}");
+            // #290: quiet runs surface the error via Err alone.
+            if !crate::macros::output_quiet() {
+                eprintln!("riperf3: SERVER ERROR - {msg}");
+            }
         }
         RiperfError::ServerErrorRelayed(msg)
     }
@@ -1764,7 +1773,8 @@ impl Client {
     /// iperf3's format strings. Only consulted when WE requested it, like
     /// test->get_server_output gate (a misbehaving server can't inject).
     fn print_server_output(&self, server_results: Option<&TestResultsJson>) {
-        if !self.get_server_output {
+        // #290: nothing to print on a quiet run.
+        if !self.get_server_output || crate::macros::output_quiet() {
             return;
         }
         let Some(server) = server_results else { return };
@@ -2220,7 +2230,10 @@ impl Client {
         // iperf3's iperf_json_finish attaches the run error to the blob (#170).
         input.error = error.map(str::to_owned);
         let report = input.build();
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        // #290: a quiet run returns the report without printing the document.
+        if !crate::macros::output_quiet() {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
         report
     }
 
@@ -2284,7 +2297,7 @@ impl Client {
         // --json-stream-full-output: the complete monolithic document also
         // prints after the stream, like iperf_json_finish keeping
         // print_full_json under the flag (iperf_api.c:5323) (#213).
-        if self.json_stream_full_output {
+        if self.json_stream_full_output && !crate::macros::output_quiet() {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         report
@@ -2462,6 +2475,7 @@ pub struct ClientBuilder {
     extra_data: Option<String>,
     verbose: bool,
     json_output: bool,
+    emit_output: bool,
     json_stream: bool,
     interrupt: Option<InterruptWatch>,
     json_stream_full_output: bool,
@@ -2522,6 +2536,7 @@ impl Default for ClientBuilder {
             extra_data: None,
             verbose: false,
             json_output: false,
+            emit_output: true,
             json_stream: false,
             interrupt: None,
             json_stream_full_output: false,
@@ -2720,6 +2735,23 @@ impl ClientBuilder {
     /// When combined with [`Self::json_stream`], stream mode wins (#220).
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
+        self
+    }
+
+    /// Console output from `run` (#290). `true` (the default) keeps today's
+    /// behavior: the crate prints the mode's report (text banners/summary,
+    /// the `-J` document, or `--json-stream` events) to the host process's
+    /// stdout, exactly like the CLI. `false` runs silently — the returned
+    /// [`Report`](crate::Report) is the only output; nothing is written to
+    /// stdout or stderr. Wire behavior is unaffected either way (a quiet
+    /// server still relays `--get-server-output` text to the peer).
+    ///
+    /// Note: with authentication configured but no password provided, a run
+    /// still BLOCKS reading the password from stdin — quiet suppresses the
+    /// prompt, not the read. Supply the password via the builder or the
+    /// `RIPERF3_PASSWORD`/`IPERF3_PASSWORD` env vars for unattended use.
+    pub fn emit_output(mut self, enabled: bool) -> Self {
+        self.emit_output = enabled;
         self
     }
 
@@ -3214,6 +3246,7 @@ impl ClientBuilder {
             extra_data: self.extra_data,
             verbose: self.verbose,
             json_output: self.json_output,
+            emit_output: self.emit_output,
             json_stream: self.json_stream,
             interrupt: self.interrupt.clone(),
             json_stream_full_output: self.json_stream_full_output,

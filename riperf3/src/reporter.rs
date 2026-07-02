@@ -86,7 +86,10 @@ fn titled(line: std::fmt::Arguments) {
     // into the exchange buffer while still printing — iperf3's iperf_printf
     // dual-writes (console + server_output_list).
     crate::macros::capture_line(&rendered);
-    println!("{rendered}");
+    // #290: a quiet run captures but never touches stdout.
+    if !crate::macros::output_quiet() {
+        println!("{rendered}");
+    }
 }
 
 /// Print the header line for interval reports.
@@ -151,6 +154,10 @@ pub fn print_header(
 /// reporter flushes its own `interval` events via the per-tick flush.
 pub(crate) fn emit_json_stream_line(line: &str) {
     use std::io::Write;
+    // #290: a quiet run emits no stream events on stdout.
+    if crate::macros::output_quiet() {
+        return;
+    }
     println!("{line}");
     let _ = std::io::stdout().flush();
 }
@@ -1197,10 +1204,16 @@ pub fn spawn_interval_reporter(
                     // `-J` collects intervals for the final batched blob; `--json-stream`
                     // emits each one live as `{"event":"interval","data":{...}}`.
                     if config.json_stream {
-                        println!(
-                            "{}",
-                            crate::json_report::json_stream_event("interval", &interval)
-                        );
+                        // #290: a quiet run emits no live event — but the
+                        // RETENTION decision below must not change with
+                        // quietness, or the returned Report's intervals would
+                        // differ between a loud and a quiet run.
+                        if !crate::macros::output_quiet() {
+                            println!(
+                                "{}",
+                                crate::json_report::json_stream_event("interval", &interval)
+                            );
+                        }
                         // A json-stream SERVER additionally keeps them when
                         // the client requested --get-server-output: iperf3's
                         // discard_json exists precisely to retain the

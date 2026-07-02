@@ -251,6 +251,10 @@ pub struct Server {
     pub(crate) use_pkcs1_padding: bool,
     /// Emit the test results as iperf3-schema JSON on stdout instead of text (#50).
     pub(crate) json_output: bool,
+    /// #290: console output enabled (default). When false, `run`/`run_once`
+    /// write nothing to stdout/stderr; reports flow via the return value and
+    /// the wire (--get-server-output still relays).
+    pub(crate) emit_output: bool,
     /// Stream line-delimited interval JSON during the test (`--json-stream`).
     pub(crate) json_stream: bool,
     /// #210: fired by the consumer (the CLI's first signal); a running test
@@ -299,10 +303,17 @@ impl Server {
     /// (#216). Not tee'd into the --get-server-output capture — iperf3's
     /// banner prints before the test's JSON/capture exists.
     fn banner_line(line: &str) {
-        println!("{}{line}", crate::macros::output_timestamp_prefix());
+        // #290 (r1 finding 1): the quiet gate must live at the PRINT SITE —
+        // arming the flag in run() silences nothing here by itself.
+        if !crate::macros::output_quiet() {
+            println!("{}{line}", crate::macros::output_timestamp_prefix());
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
+        // #290: run-scoped console silence, armed FIRST so the listening
+        // banner honors it. Construct-only-when-quiet (see the guard doc).
+        let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
         // Daemonizing (`-s -D`) is a process-level concern handled by the binary
         // *before* the tokio runtime is built — `daemon()` forks, and a fork from
         // inside a multi-threaded runtime would leave the child with no worker
@@ -356,12 +367,14 @@ impl Server {
                     // live-captured) and keeps serving (#210). In the JSON
                     // modes the doc/event carried it — stderr stays silent
                     // like iperf_err (review r1 f1/f3).
-                    if !json {
+                    if !json && !crate::macros::output_quiet() {
                         eprintln!("riperf3: {}", RiperfError::ClientTerminated);
                     }
                 }
                 Err(e) => {
-                    eprintln!("riperf3: error - {e}");
+                    if !crate::macros::output_quiet() {
+                        eprintln!("riperf3: error - {e}");
+                    }
                 }
             }
 
@@ -400,14 +413,47 @@ impl Server {
     /// banner — it is a library entry point, not the daemon. The test report is
     /// still printed to stdout in `-J` / text mode, like `Client::run`.
     pub async fn run_once(&self) -> Result<crate::json_report::Report> {
-        let listener = net::tcp_listen(
+        let listener = self.listen().await?;
+        self.serve_once(&listener).await
+    }
+
+    /// Bind the configured listener ONCE and return an owned handle that can
+    /// serve tests on it (#291) — the accept()-style building block
+    /// `run_once`'s per-call rebind couldn't be: sequential tests keep the
+    /// port (no steal window, no re-listen race), and a `port(Some(0))`
+    /// ephemeral bind is learnable via [`BoundServer::local_addr`] before any
+    /// client connects. Consumes the `Server` (like a socket `bind`
+    /// constructor), so the handle is `'static` and moves freely into
+    /// spawned tasks.
+    pub async fn bind(self) -> Result<BoundServer> {
+        let listener = self.listen().await?;
+        Ok(BoundServer {
+            server: self,
+            listener,
+        })
+    }
+
+    /// The configured control listener — shared by `run_once` and `bind`.
+    async fn listen(&self) -> Result<tokio::net::TcpListener> {
+        net::tcp_listen(
             self.bind_address.as_deref(),
             self.port,
             self.ip_version,
             self.bind_dev.as_deref(),
         )
-        .await?;
-        match self.handle_one_test(&listener).await? {
+        .await
+    }
+
+    /// One test on an already-bound listener: the shared body of
+    /// [`Server::run_once`] and [`BoundServer::run_once`] (#291), with the
+    /// #290 console-quiet scope.
+    async fn serve_once(
+        &self,
+        listener: &tokio::net::TcpListener,
+    ) -> Result<crate::json_report::Report> {
+        // #290: run-scoped console silence for this test.
+        let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
+        match self.handle_one_test(listener).await? {
             Some(report) => Ok(report),
             // Reachable only with an interrupt watch set (e.g. the CLI's signal
             // handling): interrupted while idle, before any client connected.
@@ -1243,7 +1289,7 @@ impl Server {
         // still EXITS 0 after this — live-verified wart, mirrored by NOT
         // returning an error from this path (#224).
         if let Some(msg) = ctx.server_error {
-            if !self.json_output && !self.json_stream {
+            if !self.json_output && !self.json_stream && !crate::macros::output_quiet() {
                 eprintln!("riperf3: error - {msg}");
             }
         }
@@ -2326,6 +2372,10 @@ impl Server {
     /// `-J`: pretty-print the server's single batched report blob (#50), or a
     /// prebuilt one (#33).
     fn print_results_json(&self, report: &crate::json_report::Report) {
+        // #290: a quiet run returns the report without printing the document.
+        if crate::macros::output_quiet() {
+            return;
+        }
         match serde_json::to_string_pretty(report) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("riperf3: error - failed to serialize JSON: {e}"),
@@ -2353,11 +2403,13 @@ impl Server {
                 &format!("error - {MSG}"),
             ));
         } else if self.json_output {
-            println!(
-                "{}",
-                crate::json_report::error_document(&format!("error - {MSG}"))
-            );
-        } else {
+            if !crate::macros::output_quiet() {
+                println!(
+                    "{}",
+                    crate::json_report::error_document(&format!("error - {MSG}"))
+                );
+            }
+        } else if !crate::macros::output_quiet() {
             eprintln!("riperf3: error - {MSG}");
         }
         Ok(())
@@ -2375,7 +2427,7 @@ impl Server {
         ));
         // --json-stream-full-output: the monolithic document follows the
         // stream, like iperf_json_finish under the flag (#213).
-        if self.json_stream_full_output {
+        if self.json_stream_full_output && !crate::macros::output_quiet() {
             println!("{}", serde_json::to_string_pretty(report).unwrap());
         }
     }
@@ -2417,6 +2469,38 @@ impl Server {
 }
 
 // ---------------------------------------------------------------------------
+// BoundServer (#291)
+// ---------------------------------------------------------------------------
+
+/// A [`Server`] bound to its listener (#291) — the accept()-style building
+/// block. Obtained from [`Server::bind`]; holds the port across sequential
+/// [`run_once`](BoundServer::run_once) calls, so a library caller serving N
+/// tests has no rebind gap and can learn a `port(Some(0))` ephemeral
+/// assignment up front via [`local_addr`](BoundServer::local_addr).
+pub struct BoundServer {
+    server: Server,
+    listener: tokio::net::TcpListener,
+}
+
+impl BoundServer {
+    /// The bound listener's local address — the resolved port for a
+    /// `port(Some(0))` ephemeral bind.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        self.listener.local_addr().map_err(RiperfError::Io)
+    }
+
+    /// Serve exactly one test on the held listener and return its rich
+    /// [`Report`](crate::Report) — the same contract as
+    /// [`Server::run_once`], minus the per-call rebind. No "Server
+    /// listening" banner (a library entry point, not the daemon); the test
+    /// report still prints in `-J` / text mode unless the server was built
+    /// with `emit_output(false)` (#290).
+    pub async fn run_once(&self) -> Result<crate::json_report::Report> {
+        self.server.serve_once(&self.listener).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
 
@@ -2438,6 +2522,7 @@ pub struct ServerBuilder {
     time_skew_threshold: u32,
     use_pkcs1_padding: bool,
     json_output: bool,
+    emit_output: bool,
     json_stream: bool,
     interrupt: Option<crate::client::InterruptWatch>,
     json_stream_full_output: bool,
@@ -2464,6 +2549,7 @@ impl Default for ServerBuilder {
             time_skew_threshold: 10,
             use_pkcs1_padding: false,
             json_output: false,
+            emit_output: true,
             json_stream: false,
             interrupt: None,
             json_stream_full_output: false,
@@ -2501,6 +2587,16 @@ impl ServerBuilder {
     /// When combined with [`Self::json_stream`], stream mode wins (#220).
     pub fn json_output(mut self, enabled: bool) -> Self {
         self.json_output = enabled;
+        self
+    }
+
+    /// Console output from `run`/`run_once` (#290). `true` (the default)
+    /// keeps today's behavior; `false` runs silently — reports flow only via
+    /// the return value and the wire (`--get-server-output` still relays the
+    /// text report to the requesting client). See
+    /// [`ClientBuilder::emit_output`](crate::ClientBuilder::emit_output).
+    pub fn emit_output(mut self, enabled: bool) -> Self {
+        self.emit_output = enabled;
         self
     }
 
@@ -2697,6 +2793,7 @@ impl ServerBuilder {
             time_skew_threshold: self.time_skew_threshold,
             use_pkcs1_padding: self.use_pkcs1_padding,
             json_output: self.json_output,
+            emit_output: self.emit_output,
             json_stream: self.json_stream,
             interrupt: self.interrupt.clone(),
             json_stream_full_output: self.json_stream_full_output,
