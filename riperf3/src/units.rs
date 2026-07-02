@@ -63,7 +63,7 @@ pub(crate) fn g2(v: f64) -> String {
     let sci = format!("{v:.1e}");
     let (mant, exp) = sci.split_once('e').expect("LowerExp always has an e");
     let exp: i32 = exp.parse().expect("integer exponent");
-    if exp < -4 || exp >= 2 {
+    if !(-4..2).contains(&exp) {
         let mant = mant.trim_end_matches('0').trim_end_matches('.');
         format!("{mant}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
     } else {

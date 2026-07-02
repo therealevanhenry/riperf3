@@ -2772,7 +2772,11 @@ mod interval_reporter_tests {
             "a >=10% empty tail is reported like GT; got {} intervals",
             g.intervals.len()
         );
-        assert_eq!(g.intervals.last().unwrap().sum.bytes, 0, "the tail is the zero row");
+        assert_eq!(
+            g.intervals.last().unwrap().sum.bytes,
+            0,
+            "the tail is the zero row"
+        );
     }
 }
 

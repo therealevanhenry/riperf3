@@ -262,9 +262,8 @@ fn json_with_format_warns_on_stderr() {
         WARNING,
         "the warning is stderr's ONLY line under -J (errors go in the doc)"
     );
-    let doc: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout still carries the JSON document");
+    let doc: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout still carries the JSON document");
     assert!(doc["error"].as_str().is_some());
 
     // --json-stream implies json_output in GT, so it warns the same way.
