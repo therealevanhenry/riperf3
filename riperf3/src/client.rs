@@ -329,11 +329,6 @@ impl Client {
         let cookie = protocol::make_cookie();
         let (ctrl, control_mss, blksize) = self.connect_control(&cookie).await?;
 
-        let done = Arc::new(AtomicBool::new(false));
-        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
-        // sender parked on the start barrier can't leak if setup fails (#5).
-        let _done_guard = stream::DoneOnDrop(done.clone());
-
         // The run's accumulated state, threaded through the per-state
         // handlers (#289) — field docs on RunCtx.
         let mut ctx = RunCtx {
@@ -342,7 +337,7 @@ impl Client {
             cookie,
             control_mss,
             blksize,
-            done,
+            done: Arc::new(AtomicBool::new(false)),
             start: Arc::new(AtomicBool::new(false)),
             interval_data: Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default())),
             streams: Vec::new(),
@@ -355,6 +350,12 @@ impl Client {
             connect_time_millis: 0,
             prev_state: TestState::IperfStart,
         };
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        // Declared AFTER ctx so an early return drops the guard FIRST —
+        // `done` is set before ctx's fields (the control socket) drop, the
+        // monolith's drop order (r1 F1).
+        let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
         // ---- State machine: react to server-driven transitions ----
         loop {

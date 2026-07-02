@@ -458,11 +458,6 @@ impl Server {
         // ---- Auth validation (after params, before streams) ----
         self.authenticate(&mut ctrl, &params).await?;
 
-        let done = Arc::new(AtomicBool::new(false));
-        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
-        // sender parked on the start barrier can't leak if setup fails (#5).
-        let _done_guard = stream::DoneOnDrop(done.clone());
-
         // The test's accumulated state, threaded through the pipeline phases
         // (#289) — field docs on TestRunCtx.
         let mut ctx = TestRunCtx {
@@ -474,7 +469,7 @@ impl Server {
             cfg,
             want_server_output,
             capture,
-            done,
+            done: Arc::new(AtomicBool::new(false)),
             start: Arc::new(AtomicBool::new(false)),
             streams: Vec::new(),
             byte_budget: None,
@@ -490,6 +485,12 @@ impl Server {
             client_terminated: false,
             interrupted: None,
         };
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        // Declared AFTER ctx so an early return drops the guard FIRST —
+        // `done` is set before ctx's fields (the control socket, the capture
+        // guard) drop, the monolith's drop order (r1 F1).
+        let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
         // ---- CreateStreams ----
         self.setup_data_streams(&mut ctx, listener).await?;
