@@ -952,7 +952,21 @@ impl ReportInput {
         let blk = self.blksize.max(1) as u64;
         // iperf3's `stream_must_be_sender` for the aggregate `sender` flag.
         let fwd_sender = !self.reverse;
-        let retransmits = self.sender_retransmits();
+        // #281 r1 F1: on a STREAM-LESS dump (pre-TestStart interrupt) GT still
+        // prints `sum_sent.retransmits: 0` when the local side would be a
+        // retransmit-capable TCP sender — its sender_has_retransmits is a
+        // role-level flag set before any stream exists (iperf_api.c:637; the
+        // receiving role sets 0 at :639, so a reverse client OMITS the key —
+        // both live-verified on the issue). Runs WITH streams keep the
+        // stream-derived figure untouched.
+        let retransmits = self.sender_retransmits().or_else(|| {
+            (self.streams.is_empty()
+                && !is_udp
+                && !self.reverse
+                && !self.is_server
+                && crate::tcp_info::has_retransmit_info())
+            .then_some(0)
+        });
 
         let mut sum = None;
         let mut sum_bidir_reverse = None;
@@ -2934,6 +2948,95 @@ mod tests {
             );
         }
         assert_eq!(v["end"]["sum_sent"]["seconds"].as_f64(), Some(0.0));
+        // #281 r1 F1: GT prints retransmits: 0 on the stream-less TCP dump
+        // when the local role is a retransmit-capable sender (and omits it
+        // on platforms without TCP_INFO retransmits, like GT).
+        if crate::tcp_info::has_retransmit_info() {
+            assert_eq!(
+                v["end"]["sum_sent"]["retransmits"].as_i64(),
+                Some(0),
+                "stream-less TCP forward dump carries retransmits: 0 (GT): {v}"
+            );
+        } else {
+            assert!(v["end"]["sum_sent"].get("retransmits").is_none());
+        }
+    }
+
+    /// #281 r1 F2: the hand-written Start/End serializers own the key ORDER
+    /// the derive used to guarantee — pin the raw on-wire sequences (the
+    /// Interval struct has the same style of pin). Parsed-Value asserts can't
+    /// see order; this reads the serialized string.
+    #[test]
+    fn manual_serializer_key_order_is_pinned() {
+        let mut input = base_input();
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+
+        let keys = |obj: &str| -> Vec<String> {
+            // Top-level keys of the serialized sub-object `obj`, in on-wire
+            // order: a quoted token is a KEY iff it sits at depth 1 and the
+            // next non-quote char is ':'. String VALUES are skipped by the
+            // lookahead. (No escapes occur in these fixture keys/values.)
+            let from = raw.find(&format!("\"{obj}\":")).unwrap() + obj.len() + 3;
+            let bytes = raw.as_bytes();
+            let mut depth = 0i32;
+            let mut i = from;
+            let mut out = Vec::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b'"' => {
+                        let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                        if depth == 1 && bytes.get(close + 1) == Some(&b':') {
+                            out.push(raw[i + 1..close].to_string());
+                        }
+                        i = close;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out
+        };
+        let start_keys = keys("start");
+        assert_eq!(
+            start_keys,
+            [
+                "connected",
+                "version",
+                "system_info",
+                "timestamp",
+                "connecting_to",
+                "cookie",
+                "tcp_mss_default",
+                "target_bitrate",
+                "fq_rate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "test_start"
+            ],
+            "start key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
+        let end_keys = keys("end");
+        assert_eq!(
+            end_keys,
+            [
+                "streams",
+                "sum_sent",
+                "sum_received",
+                "cpu_utilization_percent",
+                "sender_tcp_congestion",
+                "receiver_tcp_congestion"
+            ],
+            "end key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
     }
 
     /// #281: the pre-ParamExchange shape (GT stage 0, second capture on the
