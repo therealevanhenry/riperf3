@@ -300,7 +300,7 @@ impl Client {
     }
 
     pub async fn run(&self) -> Result<crate::json_report::Report> {
-        let mut interrupt = self.interrupt.clone().map(|w| w.0);
+        let interrupt = self.interrupt.clone().map(|w| w.0);
         // -T/--title: prefix every client text line with "<title>:  " (#34),
         // matching iperf3. Run-scoped (cleared on drop) and only in plain-text
         // mode — `-J` and `--json-stream` emit machine JSON, which iperf3 never
@@ -327,6 +327,161 @@ impl Client {
 
         // ---- Generate cookie and connect ----
         let cookie = protocol::make_cookie();
+        let (ctrl, control_mss, blksize) = self.connect_control(&cookie).await?;
+
+        let done = Arc::new(AtomicBool::new(false));
+        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
+        // sender parked on the start barrier can't leak if setup fails (#5).
+        let _done_guard = stream::DoneOnDrop(done.clone());
+
+        // The run's accumulated state, threaded through the per-state
+        // handlers (#289) — field docs on RunCtx.
+        let mut ctx = RunCtx {
+            ctrl,
+            interrupt,
+            cookie,
+            control_mss,
+            blksize,
+            done,
+            start: Arc::new(AtomicBool::new(false)),
+            interval_data: Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default())),
+            streams: Vec::new(),
+            byte_budget: None,
+            cpu_start: None,
+            server_results: None,
+            final_report: None,
+            measured_secs: self.duration as f64,
+            test_start_millis: 0,
+            connect_time_millis: 0,
+            prev_state: TestState::IperfStart,
+        };
+
+        // ---- State machine: react to server-driven transitions ----
+        loop {
+            // #231: iperf_catch_sigend is armed for the WHOLE run, so the
+            // central state wait polls the interrupt watch like the
+            // TEST_RUNNING selects — covering the setup phases AND the
+            // post-test ExchangeResults/DisplayResults waits, which
+            // previously ignored a signal until the control read returned
+            // (against a wedged server: forever, with only the CLI's #211
+            // second-signal hard exit as the way out). iperf_got_sigend's
+            // client arm has NO phase gate: it dumps the accumulated stats
+            // from any phase (empty rows pre-data), tells the peer via
+            // CLIENT_TERMINATE, and exits signal-normal — the same shape as
+            // the run_test arm. recv_state is a single 1-byte read, so the
+            // select is cancel-safe.
+            let state = tokio::select! {
+                s = protocol::recv_state(&mut ctx.ctrl) => s?,
+                msg = wait_interrupt(ctx.interrupt.as_mut()) => {
+                    return Ok(self.on_interrupted_wait(&mut ctx, &msg).await);
+                }
+            };
+
+            let flow = match state {
+                TestState::ParamExchange => {
+                    self.on_param_exchange(&mut ctx).await?;
+                    StepFlow::Continue
+                }
+
+                TestState::CreateStreams => {
+                    self.on_create_streams(&mut ctx).await?;
+                    StepFlow::Continue
+                }
+
+                TestState::TestStart => {
+                    self.on_test_start(&mut ctx);
+                    StepFlow::Continue
+                }
+
+                TestState::TestRunning => self.on_test_running(&mut ctx).await?,
+
+                TestState::ExchangeResults => {
+                    self.on_exchange_results(&mut ctx).await?;
+                    StepFlow::Continue
+                }
+
+                TestState::DisplayResults => self.on_display_results(&mut ctx).await?,
+
+                TestState::IperfDone => StepFlow::Break,
+
+                TestState::AccessDenied => {
+                    return Err(RiperfError::AccessDenied);
+                }
+                TestState::ServerError => {
+                    // #261: a relay arriving before TestStart is the upfront
+                    // refusal (code 37 et al.) — the dump takes GT's minimal
+                    // shape; after TestStart it keeps its late fields.
+                    let reached = ctx.test_start_millis > 0;
+                    return Err(self.on_server_error_relay(&mut ctx, reached).await);
+                }
+
+                // iperf_handle_message_client handles SERVER_TERMINATE in
+                // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
+                // server interrupt racing the client's TestEnd lands here
+                // (the ExchangeResults wait) — dump the partial summary and
+                // surface IESERVERTERM instead of dying later on a bare
+                // peer-disconnect with no dump.
+                TestState::ServerTerminate => {
+                    return Err(self.on_server_terminate(&ctx));
+                }
+
+                other => {
+                    self.on_unexpected_state(&ctx, other);
+                    StepFlow::Continue
+                }
+            };
+
+            match flow {
+                StepFlow::Continue => {}
+                StepFlow::Break => break,
+                StepFlow::Return(report) => return Ok(*report),
+            }
+            // #145: AUDITABILITY ONLY — advance the table cursor to the state
+            // just handled, before the next recv. Reached only by the arms that
+            // fall through (the break/return arms end the run anyway).
+            ctx.prev_state = state;
+        }
+
+        // ---- Clean up ----
+        ctx.done.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for s in ctx.streams {
+            let _ = s.task.await;
+        }
+
+        // #222: every clean text-mode client run closes with a blank line +
+        // "iperf Done." (iperf_client_api.c:853) — AFTER the results check
+        // (r1 item 9: a failed exchange must not print Done; GT's
+        // cleanup_and_fail never does), and as two prints so a --timestamps
+        // prefix lands on both lines like GT (item 10b).
+        // Protocol-correctness guard kept: a clean run must have completed the
+        // results exchange. The RETURNED value is the rich report captured at
+        // DisplayResults (#137), not the lean wire struct.
+        if ctx.server_results.is_none() {
+            return Err(RiperfError::Protocol(
+                "missing server results in control exchange".into(),
+            ));
+        }
+        if !self.json_output && !self.json_stream {
+            vprintln!("");
+            vprintln!("iperf Done.");
+        }
+        ctx.final_report
+            .ok_or_else(|| RiperfError::Protocol("results not displayed before IPERF_DONE".into()))
+    }
+
+    // -----------------------------------------------------------------------
+    // run() setup + per-state handlers (#289). Each handler is one arm of the
+    // old monolithic dispatch loop, moved verbatim; `run` owns only the loop.
+    // -----------------------------------------------------------------------
+
+    /// Dial the control connection and negotiate the pre-state-machine basics:
+    /// TCP options, control MSS, the resolved UDP block size, keepalive, the
+    /// cookie write, and the early `-V` lines (GT's iperf_connect timing).
+    async fn connect_control(
+        &self,
+        cookie: &[u8; protocol::COOKIE_SIZE],
+    ) -> Result<(TcpStream, u32, usize)> {
         let mut ctrl = net::tcp_connect(
             &self.host,
             self.port,
@@ -398,7 +553,7 @@ impl Client {
             net::set_tcp_keepalive(&ctrl, idle, intv, cnt)?;
         }
 
-        protocol::send_cookie(&mut ctrl, &cookie).await?;
+        protocol::send_cookie(&mut ctrl, cookie).await?;
 
         // #222 (-V): GT's iperf_connect prints these right after the cookie
         // write, BEFORE the param exchange (r3 item 2 — a failed exchange
@@ -412,511 +567,309 @@ impl Client {
         }
 
         // (#222 r2 item 5: the connect text block prints after the param
-        // exchange — GT's client on_connect timing — see the ParamExchange
-        // arm; a failed exchange must not have printed the banner.)
+        // exchange — GT's client on_connect timing — see on_param_exchange;
+        // a failed exchange must not have printed the banner.)
 
-        let done = Arc::new(AtomicBool::new(false));
-        // Signal `done` on every exit path (incl. early `?` returns) so a UDP
-        // sender parked on the start barrier can't leak if setup fails (#5).
-        let _done_guard = stream::DoneOnDrop(done.clone());
-        // Released at TestStart so UDP senders don't transmit during stream
-        // setup (issue #5): the create-streams handshake is lost under a flood.
-        let start = Arc::new(AtomicBool::new(false));
-        // Interval samples + TCP_INFO extremes the reporter collects during the
-        // run, read back at DisplayResults for the `-J` blob (#36 PR2).
-        let interval_data = Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default()));
-        let mut streams: Vec<DataStream> = Vec::new();
-        let mut byte_budget: Option<(Arc<AtomicI64>, i64)> = None;
-        let mut cpu_start: Option<CpuSnapshot> = None;
-        let mut server_results: Option<TestResultsJson> = None;
-        // The rich report `run` returns to the library caller (#137): captured
-        // from the DisplayResults print so the returned value IS what `-J`/text
-        // printed (built once). The interrupt path returns its own local report.
-        let mut final_report: Option<crate::json_report::Report> = None;
-        // Authoritative test duration captured from run_test: `-t` for a duration
-        // run, the measured elapsed for `-n`/`-k`. Drives the summary window (#103).
-        let mut measured_secs = self.duration as f64;
-        // Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
-        let mut test_start_millis = 0u64;
-        // Wall-clock at on_connect (set at the end of the ParamExchange arm,
-        // GT's on_connect timing) — the timestamp the `-J` document carries on an
-        // upfront refusal that never reaches TestStart (#261).
-        let mut connect_time_millis = 0u64;
+        Ok((ctrl, control_mss, blksize))
+    }
 
-        // #145: AUDITABILITY ONLY — the last state this side processed, threaded
-        // through the dispatch loop so an unexpected byte can be diagnosed against
-        // the transition table. Seeded at IperfStart (the first state the client
-        // legally receives is the server's first send). Updated at the bottom of
-        // each loop iteration, before the next recv. Never used to reject.
-        let mut prev_state = TestState::IperfStart;
+    /// Render/emit the run's results from the context state — the one
+    /// `print_results` plumbing site for every dump the dispatch loop makes
+    /// (#289). `server_results`/`reached`/`error` are per-dump; everything
+    /// else comes from the context.
+    fn emit_results(
+        &self,
+        ctx: &RunCtx,
+        server_results: Option<&TestResultsJson>,
+        reached_test_start: bool,
+        secs: f64,
+        error: Option<&str>,
+    ) -> crate::json_report::Report {
+        self.print_results(
+            &ctx.streams,
+            ctx.cpu_start.as_ref(),
+            server_results,
+            ctx.blksize,
+            &ctx.interval_data,
+            &ctx.start_meta(reached_test_start),
+            secs,
+            error,
+        )
+    }
 
-        // ---- State machine: react to server-driven transitions ----
-        loop {
-            // #231: iperf_catch_sigend is armed for the WHOLE run, so the
-            // central state wait polls the interrupt watch like the
-            // TEST_RUNNING selects — covering the setup phases AND the
-            // post-test ExchangeResults/DisplayResults waits, which
-            // previously ignored a signal until the control read returned
-            // (against a wedged server: forever, with only the CLI's #211
-            // second-signal hard exit as the way out). iperf_got_sigend's
-            // client arm has NO phase gate: it dumps the accumulated stats
-            // from any phase (empty rows pre-data), tells the peer via
-            // CLIENT_TERMINATE, and exits signal-normal — the same shape as
-            // the run_test arm. recv_state is a single 1-byte read, so the
-            // select is cancel-safe.
-            let state = tokio::select! {
-                s = protocol::recv_state(&mut ctrl) => s?,
-                msg = wait_interrupt(interrupt.as_mut()) => {
-                    let _ = protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
-                    // r1 item 5: a test that never STARTED reports a zero
-                    // window (GT's pre-data dump says 0/0/0), not the
-                    // requested -t default measured_secs still holds.
-                    let dump_secs = if test_start_millis > 0 {
-                        measured_secs
-                    } else {
-                        0.0
-                    };
-                    // #137: return the rich report we just dumped.
-                    let report = self.print_results(
-                        &streams,
-                        cpu_start.as_ref(),
-                        // r1 item 7: post-ExchangeResults interrupts keep the
-                        // peer halves GT would show (its sigend dump merges
-                        // already-exchanged data); None only pre-exchange.
-                        server_results.as_ref(),
-                        blksize,
-                        &interval_data,
-                        &StartMeta {
-                            cookie: String::from_utf8_lossy(
-                                &cookie[..protocol::COOKIE_SIZE - 1],
-                            )
-                            .into_owned(),
-                            tcp_mss_default: control_mss,
-                            start_time_millis: test_start_millis,
-                            connect_time_millis,
-                            reached_test_start: true,
-                        },
-                        dump_secs,
-                        Some(&msg),
-                    );
-                    return Ok(report);
-                }
-            };
+    /// The central state wait's interrupt arm (#231): iperf_got_sigend's
+    /// client arm has NO phase gate — it dumps the accumulated stats from any
+    /// phase (empty rows pre-data), tells the peer via CLIENT_TERMINATE, and
+    /// exits signal-normal.
+    async fn on_interrupted_wait(&self, ctx: &mut RunCtx, msg: &str) -> crate::json_report::Report {
+        let _ = protocol::send_state(&mut ctx.ctrl, TestState::ClientTerminate).await;
+        // r1 item 5: a test that never STARTED reports a zero
+        // window (GT's pre-data dump says 0/0/0), not the
+        // requested -t default measured_secs still holds.
+        let dump_secs = if ctx.test_start_millis > 0 {
+            ctx.measured_secs
+        } else {
+            0.0
+        };
+        // #137: return the rich report we just dumped.
+        // r1 item 7: post-ExchangeResults interrupts keep the
+        // peer halves GT would show (its sigend dump merges
+        // already-exchanged data); None only pre-exchange.
+        self.emit_results(ctx, ctx.server_results.as_ref(), true, dump_secs, Some(msg))
+    }
 
-            match state {
-                TestState::ParamExchange => {
-                    let params = self.build_params(blksize);
-                    protocol::send_params(&mut ctrl, &params).await?;
-                    // #261: stamp the on_connect wall-clock HERE — GT runs
-                    // on_connect at the end of its PARAM_EXCHANGE case
-                    // (iperf_client_api.c:338, after iperf_exchange_parameters),
-                    // which sets start.timestamp. A subsequent upfront refusal
-                    // (e.g. code 37) arrives on the NEXT state read, after this
-                    // stamp, so the refusal document carries this real wall-clock
-                    // rather than epoch-0.
-                    connect_time_millis = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    // #222: iperf3's connect text block — printed HERE,
-                    // after the param exchange (GT's on_connect timing, r2
-                    // item 5: a failed exchange prints no banner). The
-                    // banner is UNCONDITIONAL in text mode; the detail
-                    // lines are -V. JSON modes print none of this.
-                    if !self.json_output && !self.json_stream {
-                        if self.verbose {
-                            // (Control connection MSS + the UDP size line
-                            // print at GT's iperf_connect timing, right
-                            // after the cookie write — r3 item 2.)
-                            vprintln!(
-                                "Time: {}",
-                                crate::json_report::http_date(
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0)
-                                )
-                            );
-                        }
-                        vprintln!("Connecting to host {}, port {}", self.host, self.port);
-                        if self.reverse {
-                            // Unconditional like the banner (iperf_api.c:995-998).
-                            vprintln!("Reverse mode, remote host {} is sending", self.host);
-                        }
-                        if self.verbose {
-                            vprintln!(
-                                "      Cookie: {}",
-                                String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
-                            );
-                            if matches!(self.protocol, TransportProtocol::Tcp) {
-                                // -M prints the SET value with no suffix (iperf_api.c:
-                                // 1034-1037); only the unset case is "(default)".
-                                match self.mss {
-                                    Some(m) => vprintln!("      TCP MSS: {m}"),
-                                    None => vprintln!("      TCP MSS: {control_mss} (default)"),
-                                }
-                            }
-                            if self.bandwidth != 0 {
-                                vprintln!("      Target Bitrate: {}", self.bandwidth);
-                            }
-                        }
+    async fn on_param_exchange(&self, ctx: &mut RunCtx) -> Result<()> {
+        let params = self.build_params(ctx.blksize);
+        protocol::send_params(&mut ctx.ctrl, &params).await?;
+        // #261: stamp the on_connect wall-clock HERE — GT runs
+        // on_connect at the end of its PARAM_EXCHANGE case
+        // (iperf_client_api.c:338, after iperf_exchange_parameters),
+        // which sets start.timestamp. A subsequent upfront refusal
+        // (e.g. code 37) arrives on the NEXT state read, after this
+        // stamp, so the refusal document carries this real wall-clock
+        // rather than epoch-0.
+        ctx.connect_time_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // #222: iperf3's connect text block — printed HERE,
+        // after the param exchange (GT's on_connect timing, r2
+        // item 5: a failed exchange prints no banner). The
+        // banner is UNCONDITIONAL in text mode; the detail
+        // lines are -V. JSON modes print none of this.
+        if !self.json_output && !self.json_stream {
+            if self.verbose {
+                // (Control connection MSS + the UDP size line
+                // print at GT's iperf_connect timing, right
+                // after the cookie write — r3 item 2.)
+                vprintln!(
+                    "Time: {}",
+                    crate::json_report::http_date(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                );
+            }
+            vprintln!("Connecting to host {}, port {}", self.host, self.port);
+            if self.reverse {
+                // Unconditional like the banner (iperf_api.c:995-998).
+                vprintln!("Reverse mode, remote host {} is sending", self.host);
+            }
+            if self.verbose {
+                vprintln!(
+                    "      Cookie: {}",
+                    String::from_utf8_lossy(&ctx.cookie[..protocol::COOKIE_SIZE - 1])
+                );
+                if matches!(self.protocol, TransportProtocol::Tcp) {
+                    // -M prints the SET value with no suffix (iperf_api.c:
+                    // 1034-1037); only the unset case is "(default)".
+                    match self.mss {
+                        Some(m) => vprintln!("      TCP MSS: {m}"),
+                        None => vprintln!("      TCP MSS: {} (default)", ctx.control_mss),
                     }
                 }
-
-                TestState::CreateStreams => {
-                    (streams, byte_budget) =
-                        self.create_streams(&cookie, &done, &start, blksize).await?;
-                    // #222: the per-stream preamble, unconditional in text
-                    // mode (iperf3 prints it for every stream on connect).
-                    if !self.json_output && !self.json_stream {
-                        for s in &streams {
-                            if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
-                                vprintln!(
-                                    "[{:3}] local {} port {} connected to {} port {}",
-                                    s.id,
-                                    l.ip().to_canonical(),
-                                    l.port(),
-                                    p.ip().to_canonical(),
-                                    p.port()
-                                );
-                            }
-                        }
-                    }
+                if self.bandwidth != 0 {
+                    vprintln!("      Target Bitrate: {}", self.bandwidth);
                 }
+            }
+        }
+        Ok(())
+    }
 
-                TestState::TestStart => {
-                    // #222 (-V): iperf3's Starting Test parameter line —
-                    // the bytes/blocks/time variants (iperf_api.c:929-935).
-                    if self.verbose && !self.json_output && !self.json_stream {
-                        let proto = match self.protocol {
-                            TransportProtocol::Tcp => "TCP",
-                            TransportProtocol::Udp => "UDP",
-                        };
-                        let head = format!(
-                            "Starting Test: protocol: {proto}, {} streams, {blksize} \
-                             byte blocks, omitting {} seconds",
-                            self.num_streams, self.omit
-                        );
-                        if let Some(bytes) = self.bytes_to_send {
-                            vprintln!("{head}, {bytes} bytes to send, tos {}", self.tos);
-                        } else if let Some(blocks) = self.blocks_to_send {
-                            vprintln!("{head}, {blocks} blocks to send, tos {}", self.tos);
-                        } else {
-                            vprintln!("{head}, {} second test, tos {}", self.duration, self.tos);
-                        }
-                    }
-                    // All streams are set up — release the UDP senders.
-                    start.store(true, Ordering::Relaxed);
-                    cpu_start = Some(CpuSnapshot::now());
-                    test_start_millis = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-
-                    // --json-stream: emit the `start` event now, before the reporter
-                    // streams any `interval` events (faithful event order, #62).
-                    if self.json_stream {
-                        self.emit_json_stream_start(
-                            &streams,
-                            cpu_start.as_ref(),
-                            blksize,
-                            &interval_data,
-                            &StartMeta {
-                                cookie: String::from_utf8_lossy(
-                                    &cookie[..protocol::COOKIE_SIZE - 1],
-                                )
-                                .into_owned(),
-                                tcp_mss_default: control_mss,
-                                start_time_millis: test_start_millis,
-                                connect_time_millis,
-                                reached_test_start: true,
-                            },
-                        );
-                    }
-                }
-
-                TestState::TestRunning => {
-                    let (secs, event) = self
-                        .run_test(
-                            &mut ctrl,
-                            &streams,
-                            &done,
-                            blksize,
-                            interval_data.clone(),
-                            byte_budget.as_ref(),
-                            &mut interrupt,
-                        )
-                        .await?;
-                    measured_secs = secs;
-                    match event {
-                        Some(ControlEvent::Terminated) => {
-                            // SERVER_TERMINATE mid-test: iperf3 temporarily
-                            // flips to DISPLAY_RESULTS, renders a summary from
-                            // the PARTIAL local data (no peer half), then
-                            // errexits with IESERVERTERM (#170). A -J run
-                            // carries the message in the blob's "error" key,
-                            // like iperf_json_finish.
-                            self.print_results(
-                                &streams,
-                                cpu_start.as_ref(),
-                                None,
-                                blksize,
-                                &interval_data,
-                                &StartMeta {
-                                    cookie: String::from_utf8_lossy(
-                                        &cookie[..protocol::COOKIE_SIZE - 1],
-                                    )
-                                    .into_owned(),
-                                    tcp_mss_default: control_mss,
-                                    start_time_millis: test_start_millis,
-                                    connect_time_millis,
-                                    reached_test_start: true,
-                                },
-                                measured_secs,
-                                Some("the server has terminated"),
-                            );
-                            return Err(RiperfError::ServerTerminated);
-                        }
-                        Some(ControlEvent::Interrupted(msg)) => {
-                            // iperf_got_sigend (#210): dump the accumulated
-                            // stats (the same DISPLAY_RESULTS flip), tell the
-                            // peer via CLIENT_TERMINATE, and return normally —
-                            // the signal-normal exit is the CALLER's business
-                            // (iperf3 exits 0 on TERM/INT/HUP).
-                            let _ =
-                                protocol::send_state(&mut ctrl, TestState::ClientTerminate).await;
-                            // #137: return the rich report we just dumped (the
-                            // local-only partial — no peer half on a signal exit).
-                            let report = self.print_results(
-                                &streams,
-                                cpu_start.as_ref(),
-                                None,
-                                blksize,
-                                &interval_data,
-                                &StartMeta {
-                                    cookie: String::from_utf8_lossy(
-                                        &cookie[..protocol::COOKIE_SIZE - 1],
-                                    )
-                                    .into_owned(),
-                                    tcp_mss_default: control_mss,
-                                    start_time_millis: test_start_millis,
-                                    connect_time_millis,
-                                    reached_test_start: true,
-                                },
-                                measured_secs,
-                                Some(&msg),
-                            );
-                            return Ok(report);
-                        }
-                        Some(ControlEvent::ServerError) => {
-                            // #224: read the relay pair (safe here, outside
-                            // the select) and ADOPT the mapped error like
-                            // iperf_handle_message_client. NO text dump —
-                            // that is SERVER_TERMINATE's shape — but the
-                            // JSON sinks render the full document/events
-                            // with the error inside, like iperf3's json_top
-                            // (the CLI suppresses its generic re-render).
-                            let msg = match protocol::read_server_error_payload(&mut ctrl).await {
-                                Some((i_errno, os_errno)) => {
-                                    crate::error::iperf3_strerror(i_errno, os_errno)
-                                }
-                                None => "server error".to_string(),
-                            };
-                            if self.json_output || self.json_stream {
-                                self.print_results(
-                                    &streams,
-                                    cpu_start.as_ref(),
-                                    None,
-                                    blksize,
-                                    &interval_data,
-                                    &StartMeta {
-                                        cookie: String::from_utf8_lossy(
-                                            &cookie[..protocol::COOKIE_SIZE - 1],
-                                        )
-                                        .into_owned(),
-                                        tcp_mss_default: control_mss,
-                                        start_time_millis: test_start_millis,
-                                        connect_time_millis,
-                                        reached_test_start: true,
-                                    },
-                                    measured_secs,
-                                    Some(&msg),
-                                );
-                            } else {
-                                // KNOWN CORNER (r1 n5): with --logfile set,
-                                // iperf_err writes this line to the logfile;
-                                // riperf3's logfile plumbing lives in the
-                                // CLI (#198), so this lib line stays on
-                                // stderr. Revisit with the sink plumbing.
-                                eprintln!("riperf3: SERVER ERROR - {msg}");
-                            }
-                            return Err(RiperfError::ServerErrorRelayed(msg));
-                        }
-                        Some(ControlEvent::Closed) | None => {}
-                    }
-                    // Test finished — send TestEnd
-                    protocol::send_state(&mut ctrl, TestState::TestEnd).await?;
-                }
-
-                TestState::ExchangeResults => {
-                    let results = self.build_results(&streams, cpu_start.as_ref(), measured_secs);
-                    protocol::send_results(&mut ctrl, &results).await?;
-                    server_results = Some(protocol::recv_results(&mut ctrl).await?);
-                }
-
-                TestState::DisplayResults => {
-                    final_report = Some(
-                        self.print_results(
-                            &streams,
-                            cpu_start.as_ref(),
-                            server_results.as_ref(),
-                            blksize,
-                            &interval_data,
-                            &StartMeta {
-                                cookie: String::from_utf8_lossy(
-                                    &cookie[..protocol::COOKIE_SIZE - 1],
-                                )
-                                .into_owned(),
-                                tcp_mss_default: control_mss,
-                                start_time_millis: test_start_millis,
-                                connect_time_millis,
-                                // #261: the success path always reached TestStart —
-                                // full report structure, late fields present.
-                                reached_test_start: true,
-                            },
-                            measured_secs,
-                            None,
-                        ),
-                    );
-                    protocol::send_state(&mut ctrl, TestState::IperfDone).await?;
-                    break; // test complete — server will close the connection
-                }
-
-                TestState::IperfDone => break,
-
-                TestState::AccessDenied => {
-                    return Err(RiperfError::AccessDenied);
-                }
-                TestState::ServerError => {
-                    // #224: read the (i_errno, errno) relay pair and ADOPT
-                    // the mapped error, like iperf_handle_message_client.
-                    // Text mode: the "SERVER ERROR - …" receipt line only
-                    // (iperf_err's shape; no summary dump — that is
-                    // SERVER_TERMINATE's). JSON sinks: render the full
-                    // document/events with the error inside, like iperf3's
-                    // json_top; the CLI suppresses its generic re-render.
-                    let msg = match protocol::read_server_error_payload(&mut ctrl).await {
-                        Some((i_errno, os_errno)) => {
-                            crate::error::iperf3_strerror(i_errno, os_errno)
-                        }
-                        None => "server error".to_string(),
-                    };
-                    if self.json_output || self.json_stream {
-                        self.print_results(
-                            &streams,
-                            cpu_start.as_ref(),
-                            None,
-                            blksize,
-                            &interval_data,
-                            &StartMeta {
-                                cookie: String::from_utf8_lossy(
-                                    &cookie[..protocol::COOKIE_SIZE - 1],
-                                )
-                                .into_owned(),
-                                tcp_mss_default: control_mss,
-                                start_time_millis: test_start_millis,
-                                connect_time_millis,
-                                // #261: a SERVER_ERROR relay before TestStart is
-                                // the upfront refusal (code 37 et al.) — emit GT's
-                                // minimal doc (`end: {}`, late start fields
-                                // omitted). The mid-test ControlEvent variant is
-                                // always past TestStart, so this stays true there.
-                                reached_test_start: test_start_millis > 0,
-                            },
-                            measured_secs,
-                            Some(&msg),
-                        );
-                    } else {
-                        eprintln!("riperf3: SERVER ERROR - {msg}");
-                    }
-                    return Err(RiperfError::ServerErrorRelayed(msg));
-                }
-
-                // iperf_handle_message_client handles SERVER_TERMINATE in
-                // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
-                // server interrupt racing the client's TestEnd lands here
-                // (the ExchangeResults wait) — dump the partial summary and
-                // surface IESERVERTERM instead of dying later on a bare
-                // peer-disconnect with no dump.
-                TestState::ServerTerminate => {
-                    self.print_results(
-                        &streams,
-                        cpu_start.as_ref(),
-                        None,
-                        blksize,
-                        &interval_data,
-                        &StartMeta {
-                            cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1])
-                                .into_owned(),
-                            tcp_mss_default: control_mss,
-                            start_time_millis: test_start_millis,
-                            connect_time_millis,
-                            reached_test_start: true,
-                        },
-                        measured_secs,
-                        Some("the server has terminated"),
-                    );
-                    return Err(RiperfError::ServerTerminated);
-                }
-
-                other => {
-                    if self.verbose {
-                        vprintln!("Unexpected state: {other:?}");
-                    }
-                    // #145: AUDITABILITY ONLY — diagnose the unexpected byte
-                    // against the transition table (off by default; the -V
-                    // line above is unchanged). ServerTerminate/ServerError
-                    // are handled by their own arms above, so they never reach
-                    // here. Behavior unchanged: the loop continues (tolerant).
-                    log::debug!(
-                        "client: unexpected control state {other:?} after \
-                         {prev_state:?} (legal_next={:?})",
-                        protocol::legal_next(prev_state, protocol::Role::Client)
+    async fn on_create_streams(&self, ctx: &mut RunCtx) -> Result<()> {
+        (ctx.streams, ctx.byte_budget) = self
+            .create_streams(&ctx.cookie, &ctx.done, &ctx.start, ctx.blksize)
+            .await?;
+        // #222: the per-stream preamble, unconditional in text
+        // mode (iperf3 prints it for every stream on connect).
+        if !self.json_output && !self.json_stream {
+            for s in &ctx.streams {
+                if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
+                    vprintln!(
+                        "[{:3}] local {} port {} connected to {} port {}",
+                        s.id,
+                        l.ip().to_canonical(),
+                        l.port(),
+                        p.ip().to_canonical(),
+                        p.port()
                     );
                 }
             }
-            // #145: AUDITABILITY ONLY — advance the table cursor to the state
-            // just handled, before the next recv. Reached only by the arms that
-            // fall through (the break/return arms end the run anyway).
-            prev_state = state;
         }
+        Ok(())
+    }
 
-        // ---- Clean up ----
-        done.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        for s in streams {
-            let _ = s.task.await;
+    fn on_test_start(&self, ctx: &mut RunCtx) {
+        // #222 (-V): iperf3's Starting Test parameter line —
+        // the bytes/blocks/time variants (iperf_api.c:929-935).
+        if self.verbose && !self.json_output && !self.json_stream {
+            let proto = match self.protocol {
+                TransportProtocol::Tcp => "TCP",
+                TransportProtocol::Udp => "UDP",
+            };
+            let head = format!(
+                "Starting Test: protocol: {proto}, {} streams, {} \
+                 byte blocks, omitting {} seconds",
+                self.num_streams, ctx.blksize, self.omit
+            );
+            if let Some(bytes) = self.bytes_to_send {
+                vprintln!("{head}, {bytes} bytes to send, tos {}", self.tos);
+            } else if let Some(blocks) = self.blocks_to_send {
+                vprintln!("{head}, {blocks} blocks to send, tos {}", self.tos);
+            } else {
+                vprintln!("{head}, {} second test, tos {}", self.duration, self.tos);
+            }
         }
+        // All streams are set up — release the UDP senders.
+        ctx.start.store(true, Ordering::Relaxed);
+        ctx.cpu_start = Some(CpuSnapshot::now());
+        ctx.test_start_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        // #222: every clean text-mode client run closes with a blank line +
-        // "iperf Done." (iperf_client_api.c:853) — AFTER the results check
-        // (r1 item 9: a failed exchange must not print Done; GT's
-        // cleanup_and_fail never does), and as two prints so a --timestamps
-        // prefix lands on both lines like GT (item 10b).
-        // Protocol-correctness guard kept: a clean run must have completed the
-        // results exchange. The RETURNED value is the rich report captured at
-        // DisplayResults (#137), not the lean wire struct.
-        if server_results.is_none() {
-            return Err(RiperfError::Protocol(
-                "missing server results in control exchange".into(),
-            ));
+        // --json-stream: emit the `start` event now, before the reporter
+        // streams any `interval` events (faithful event order, #62).
+        if self.json_stream {
+            self.emit_json_stream_start(
+                &ctx.streams,
+                ctx.cpu_start.as_ref(),
+                ctx.blksize,
+                &ctx.interval_data,
+                &ctx.start_meta(true),
+            );
         }
-        if !self.json_output && !self.json_stream {
-            vprintln!("");
-            vprintln!("iperf Done.");
+    }
+
+    async fn on_test_running(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
+        let (secs, event) = self
+            .run_test(
+                &mut ctx.ctrl,
+                &ctx.streams,
+                &ctx.done,
+                ctx.blksize,
+                ctx.interval_data.clone(),
+                ctx.byte_budget.as_ref(),
+                &mut ctx.interrupt,
+            )
+            .await?;
+        ctx.measured_secs = secs;
+        match event {
+            Some(ControlEvent::Terminated) => {
+                // SERVER_TERMINATE mid-test: same dump-and-errexit shape as
+                // the any-state arm (#170/#210) — see on_server_terminate.
+                return Err(self.on_server_terminate(ctx));
+            }
+            Some(ControlEvent::Interrupted(msg)) => {
+                // iperf_got_sigend (#210): dump the accumulated
+                // stats (the same DISPLAY_RESULTS flip), tell the
+                // peer via CLIENT_TERMINATE, and return normally —
+                // the signal-normal exit is the CALLER's business
+                // (iperf3 exits 0 on TERM/INT/HUP).
+                let _ = protocol::send_state(&mut ctx.ctrl, TestState::ClientTerminate).await;
+                // #137: return the rich report we just dumped (the
+                // local-only partial — no peer half on a signal exit).
+                let report = self.emit_results(ctx, None, true, ctx.measured_secs, Some(&msg));
+                return Ok(StepFlow::Return(Box::new(report)));
+            }
+            Some(ControlEvent::ServerError) => {
+                // Mid-test the run is always past TestStart, so the dump
+                // keeps the full report structure (#261).
+                return Err(self.on_server_error_relay(ctx, true).await);
+            }
+            Some(ControlEvent::Closed) | None => {}
         }
-        final_report
-            .ok_or_else(|| RiperfError::Protocol("results not displayed before IPERF_DONE".into()))
+        // Test finished — send TestEnd
+        protocol::send_state(&mut ctx.ctrl, TestState::TestEnd).await?;
+        Ok(StepFlow::Continue)
+    }
+
+    async fn on_exchange_results(&self, ctx: &mut RunCtx) -> Result<()> {
+        let results = self.build_results(&ctx.streams, ctx.cpu_start.as_ref(), ctx.measured_secs);
+        protocol::send_results(&mut ctx.ctrl, &results).await?;
+        ctx.server_results = Some(protocol::recv_results(&mut ctx.ctrl).await?);
+        Ok(())
+    }
+
+    async fn on_display_results(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
+        // #261: the success path always reached TestStart —
+        // full report structure, late fields present.
+        let report = self.emit_results(
+            ctx,
+            ctx.server_results.as_ref(),
+            true,
+            ctx.measured_secs,
+            None,
+        );
+        ctx.final_report = Some(report);
+        protocol::send_state(&mut ctx.ctrl, TestState::IperfDone).await?;
+        Ok(StepFlow::Break) // test complete — server will close the connection
+    }
+
+    /// #224: read the (i_errno, errno) relay pair and ADOPT the mapped error,
+    /// like iperf_handle_message_client. Text mode: the "SERVER ERROR - …"
+    /// receipt line only (iperf_err's shape; no summary dump — that is
+    /// SERVER_TERMINATE's). JSON sinks: render the full document/events with
+    /// the error inside, like iperf3's json_top; the CLI suppresses its
+    /// generic re-render. `reached_test_start` is the caller's: a relay
+    /// before TestStart is the upfront refusal (code 37 et al.) — emit GT's
+    /// minimal doc (`end: {}`, late start fields omitted) (#261).
+    async fn on_server_error_relay(
+        &self,
+        ctx: &mut RunCtx,
+        reached_test_start: bool,
+    ) -> RiperfError {
+        let msg = match protocol::read_server_error_payload(&mut ctx.ctrl).await {
+            Some((i_errno, os_errno)) => crate::error::iperf3_strerror(i_errno, os_errno),
+            None => "server error".to_string(),
+        };
+        if self.json_output || self.json_stream {
+            self.emit_results(ctx, None, reached_test_start, ctx.measured_secs, Some(&msg));
+        } else {
+            // KNOWN CORNER (r1 n5): with --logfile set,
+            // iperf_err writes this line to the logfile;
+            // riperf3's logfile plumbing lives in the
+            // CLI (#198), so this lib line stays on
+            // stderr. Revisit with the sink plumbing.
+            eprintln!("riperf3: SERVER ERROR - {msg}");
+        }
+        RiperfError::ServerErrorRelayed(msg)
+    }
+
+    /// SERVER_TERMINATE, mid-test or in ANY state (#210 review r1 n2 — a
+    /// server interrupt racing the client's TestEnd lands on the
+    /// ExchangeResults wait): iperf3 temporarily flips to DISPLAY_RESULTS,
+    /// renders a summary from the PARTIAL local data (no peer half), then
+    /// errexits with IESERVERTERM (#170). A -J run carries the message in
+    /// the blob's "error" key, like iperf_json_finish.
+    fn on_server_terminate(&self, ctx: &RunCtx) -> RiperfError {
+        self.emit_results(
+            ctx,
+            None,
+            true,
+            ctx.measured_secs,
+            Some("the server has terminated"),
+        );
+        RiperfError::ServerTerminated
+    }
+
+    fn on_unexpected_state(&self, ctx: &RunCtx, other: TestState) {
+        if self.verbose {
+            vprintln!("Unexpected state: {other:?}");
+        }
+        // #145: AUDITABILITY ONLY — diagnose the unexpected byte
+        // against the transition table (off by default; the -V
+        // line above is unchanged). ServerTerminate/ServerError
+        // are handled by their own arms above, so they never reach
+        // here. Behavior unchanged: the loop continues (tolerant).
+        log::debug!(
+            "client: unexpected control state {other:?} after \
+             {:?} (legal_next={:?})",
+            ctx.prev_state,
+            protocol::legal_next(ctx.prev_state, protocol::Role::Client)
+        );
     }
 
     fn build_params(&self, blksize: usize) -> TestParams {
@@ -2352,6 +2305,85 @@ struct StartMeta {
     /// True on every other path (success, sigend interrupt, SERVER_TERMINATE),
     /// which all render the full report structure like GT.
     reached_test_start: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Client run dispatch (#289)
+// ---------------------------------------------------------------------------
+
+/// What a state handler tells the [`Client::run`] dispatch loop to do next
+/// (#289). Error exits propagate as `Err` through the handlers' `Result`s.
+enum StepFlow {
+    /// Keep receiving control states.
+    Continue,
+    /// The run is over (DisplayResults handled / IperfDone) — leave the loop
+    /// for the cleanup tail and the captured final report.
+    Break,
+    /// End the run NOW with this report (the signal-interrupt shape: dump and
+    /// exit without the cleanup tail). Boxed to keep the enum small.
+    Return(Box<crate::json_report::Report>),
+}
+
+/// The state `Client::run` threads through its per-state handlers (#289): the
+/// control connection, the negotiated parameters, and everything the run
+/// accumulates. One instance per run; the loop-local variables the old
+/// monolithic `run` mutated in place are now named fields with one owner.
+struct RunCtx {
+    ctrl: TcpStream,
+    /// The armed interrupt watch (#210/#231); `run_test` and the central state
+    /// wait both poll it.
+    interrupt: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    cookie: [u8; protocol::COOKIE_SIZE],
+    /// Control-connection MSS: sizes UDP datagrams (issue #6) and feeds the
+    /// `-J` start.tcp_mss_default field (#36 PR3).
+    control_mss: u32,
+    blksize: usize,
+    done: Arc<AtomicBool>,
+    /// Released at TestStart so UDP senders don't transmit during stream
+    /// setup (issue #5): the create-streams handshake is lost under a flood.
+    start: Arc<AtomicBool>,
+    /// Interval samples + TCP_INFO extremes the reporter collects during the
+    /// run, read back at DisplayResults for the `-J` blob (#36 PR2).
+    interval_data: Arc<Mutex<crate::reporter::CollectedIntervals>>,
+    streams: Vec<DataStream>,
+    byte_budget: Option<(Arc<AtomicI64>, i64)>,
+    cpu_start: Option<CpuSnapshot>,
+    server_results: Option<TestResultsJson>,
+    /// The rich report `run` returns to the library caller (#137): captured
+    /// from the DisplayResults print so the returned value IS what `-J`/text
+    /// printed (built once). The interrupt path returns its own local report.
+    final_report: Option<crate::json_report::Report>,
+    /// Authoritative test duration captured from run_test: `-t` for a duration
+    /// run, the measured elapsed for `-n`/`-k`. Drives the summary window (#103).
+    measured_secs: f64,
+    /// Wall-clock at TestStart, for the `-J` start.timestamp (#36 PR3).
+    test_start_millis: u64,
+    /// Wall-clock at on_connect (set at the end of the ParamExchange arm,
+    /// GT's on_connect timing) — the timestamp the `-J` document carries on an
+    /// upfront refusal that never reaches TestStart (#261).
+    connect_time_millis: u64,
+    /// #145: AUDITABILITY ONLY — the last state this side processed, kept so
+    /// an unexpected byte can be diagnosed against the transition table.
+    /// Seeded at IperfStart (the first state the client legally receives is
+    /// the server's first send); advanced by the dispatch loop after each
+    /// handled state, before the next recv. Never used to reject.
+    prev_state: TestState,
+}
+
+impl RunCtx {
+    /// Assemble the `StartMeta` for a report dump from the run's captured
+    /// state — the one construction site (#289). `reached_test_start` is the
+    /// caller's call: true everywhere except the upfront server-refusal path
+    /// (#261). #286 tracks collapsing the underlying tri-state itself.
+    fn start_meta(&self, reached_test_start: bool) -> StartMeta {
+        StartMeta {
+            cookie: String::from_utf8_lossy(&self.cookie[..protocol::COOKIE_SIZE - 1]).into_owned(),
+            tcp_mss_default: self.control_mss,
+            start_time_millis: self.test_start_millis,
+            connect_time_millis: self.connect_time_millis,
+            reached_test_start,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
