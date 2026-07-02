@@ -399,6 +399,16 @@ fn pre_data_interrupt_dump_reports_a_zero_window() {
         doc["end"]["cpu_utilization_percent"].is_object(),
         "interrupt end keeps the cpu figure: {doc}"
     );
+    // #281 r1 F1: the stream-less TCP forward dump carries GT's role-level
+    // `sum_sent.retransmits: 0` (platform-gated exactly like GT: present
+    // where TCP_INFO retransmits exist — the Linux/FreeBSD CI legs — absent
+    // elsewhere, e.g. the Windows native leg).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    assert_eq!(
+        doc["end"]["sum_sent"]["retransmits"].as_i64(),
+        Some(0),
+        "stream-less TCP forward dump carries retransmits: 0 (GT): {doc}"
+    );
 }
 
 /// #281: the POST-param-exchange / pre-TestStart interrupt window (GT stage 1
@@ -483,6 +493,16 @@ fn post_exchange_prestart_interrupt_dump_takes_gt_stage1_shape() {
             "zero window: {doc}"
         );
     }
+    // #281 r1 F1: the stream-less TCP forward dump carries GT's role-level
+    // `sum_sent.retransmits: 0` (platform-gated exactly like GT: present
+    // where TCP_INFO retransmits exist — the Linux/FreeBSD CI legs — absent
+    // elsewhere, e.g. the Windows native leg).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    assert_eq!(
+        doc["end"]["sum_sent"]["retransmits"].as_i64(),
+        Some(0),
+        "stream-less TCP forward dump carries retransmits: 0 (GT): {doc}"
+    );
 }
 
 /// #231 r2 pin (mutation B): an interrupt AFTER ExchangeResults keeps the
