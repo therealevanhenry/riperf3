@@ -182,8 +182,9 @@ fn interval_cells(bytes: u64, start: f64, end: f64, format_char: char) -> (Strin
     (transfer, units::format_rate(bits_per_sec, format_char))
 }
 
-/// Print one interval line.
-pub fn print_interval(interval: &StreamInterval, format_char: char) {
+/// Render one interval line (no trailing newline). Pure, so the exact row
+/// bytes are pinnable against live GT captures (#264).
+pub fn format_interval_line(interval: &StreamInterval, format_char: char) -> String {
     let id = fmt_id_role(interval.stream_id, interval.role_tag);
     let (transfer, rate) =
         interval_cells(interval.bytes, interval.start, interval.end, format_char);
@@ -194,7 +195,7 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
         (interval.jitter, interval.lost, interval.total_packets)
     {
         let pct = lost_percent(lost, total);
-        titled(format_args!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
             interval.start,
             interval.end,
@@ -205,7 +206,7 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
             total,
             pct,
             omit_tag,
-        ));
+        )
     } else if let Some(sent) = interval.sent_packets {
         // UDP sender row: the sent-datagram count, with the blank jitter/loss
         // pad ONLY in bidir — iperf3's zbuf is 10 spaces in bidir and empty
@@ -215,31 +216,39 @@ pub fn print_interval(interval: &StreamInterval, format_char: char) {
         } else {
             ""
         };
-        titled(format_args!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {pad}{sent}  {}",
             interval.start, interval.end, transfer, rate, omit_tag,
-        ));
+        )
     } else if let (Some(retr), None) = (interval.retransmits, interval.snd_cwnd) {
         // TCP [SUM] with retransmits: iperf3's report_sum_bw_retrans_format
         // carries Retr but no Cwnd (a SUM has no single congestion window) —
         // without this branch the populated Retr fell through to the bare
         // format and vanished (#143 review r1 n3).
-        titled(format_args!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}            {}",
             interval.start, interval.end, transfer, rate, retr, omit_tag,
-        ));
+        )
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
-        titled(format_args!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}   {:>10}  {}",
             interval.start, interval.end, transfer, rate, retr, cwnd_str, omit_tag,
-        ));
+        )
     } else {
-        titled(format_args!(
+        format!(
             "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {}",
             interval.start, interval.end, transfer, rate, omit_tag,
-        ));
+        )
     }
+}
+
+/// Print one interval line.
+pub fn print_interval(interval: &StreamInterval, format_char: char) {
+    titled(format_args!(
+        "{}",
+        format_interval_line(interval, format_char)
+    ));
 }
 
 /// Print the separator line.
