@@ -213,9 +213,28 @@ pub(crate) fn json_stream_event<T: Serialize>(event: &'static str, data: &T) -> 
 // start{}
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+/// How far the run progressed when the document was built (#281) — drives
+/// which `start` fields serialize, mirroring GT's three staging points:
+/// pre-ParamExchange (connected/version/system_info only), on_connect
+/// (+ timestamp/connecting_to/cookie/mss/target_bitrate/fq_rate), and
+/// TestStart (+ the four #261 late fields). `pub(crate)`: stage flags are
+/// build inputs, not schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartStage {
+    Connecting,
+    Connected,
+    Started,
+}
+
+// Serialize is HAND-WRITTEN (below) so the GT stage gating can omit fields
+// that are bare (non-Option) in the frozen 0.8.0 schema — timestamp, cookie,
+// target_bitrate, fq_rate — without the 0.9.0 break Option-ifying them would
+// be (#281). Field order in the impl matches declaration order exactly.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Start {
+    /// #281: the GT staging point this document was built at.
+    pub(crate) stage: StartStage,
     pub connected: Vec<Connection>,
     pub version: String,
     pub system_info: String,
@@ -225,17 +244,13 @@ pub struct Start {
     // present, and they share the `{host, port}` shape. They sit in the same slot
     // (right after `timestamp`), so a single struct serializes both roles in
     // iperf3's order.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub connecting_to: Option<ConnectingTo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_connection: Option<ConnectingTo>,
     pub cookie: String,
     // iperf3 emits exactly one of these, and only for TCP (iperf_api.c:1021):
     // `tcp_mss` when `-M`/`--set-mss` was given, else `tcp_mss_default` (the
     // control-socket MSS). UDP emits neither.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_mss: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_mss_default: Option<u32>,
     pub target_bitrate: u64,
     pub fq_rate: u64,
@@ -243,17 +258,58 @@ pub struct Start {
     // TestStart. On an upfront refusal (server-side rejection BEFORE TestStart,
     // e.g. --server-max-duration / code 37) the client never sets up streams, so
     // GT (iperf 3.21) OMITS them entirely — the document carries the early start
-    // metadata (timestamp, cookie, connecting_to) and an empty `end`. `Option` +
-    // skip-if-none reproduces that: `Some(..)` on a run that reached TestStart
-    // (every success and every mid-test interrupt), `None` on the refusal path.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // metadata (timestamp, cookie, connecting_to) and an empty `end`. Gated by
+    // `stage == Started` in the manual Serialize impl (#261/#281).
     pub sock_bufsize: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sndbuf_actual: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub rcvbuf_actual: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub test_start: Option<TestStart>,
+}
+
+impl Serialize for Start {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = serializer.serialize_map(None)?;
+        // GT stage 0 — always present, from the very first dump on.
+        m.serialize_entry("connected", &self.connected)?;
+        m.serialize_entry("version", &self.version)?;
+        m.serialize_entry("system_info", &self.system_info)?;
+        if self.stage != StartStage::Connecting {
+            // GT stage 1 — stamped at on_connect (end of PARAM_EXCHANGE).
+            m.serialize_entry("timestamp", &self.timestamp)?;
+            if let Some(v) = &self.connecting_to {
+                m.serialize_entry("connecting_to", v)?;
+            }
+            if let Some(v) = &self.accepted_connection {
+                m.serialize_entry("accepted_connection", v)?;
+            }
+            m.serialize_entry("cookie", &self.cookie)?;
+            if let Some(v) = &self.tcp_mss {
+                m.serialize_entry("tcp_mss", v)?;
+            }
+            if let Some(v) = &self.tcp_mss_default {
+                m.serialize_entry("tcp_mss_default", v)?;
+            }
+            m.serialize_entry("target_bitrate", &self.target_bitrate)?;
+            m.serialize_entry("fq_rate", &self.fq_rate)?;
+        }
+        if self.stage == StartStage::Started {
+            // GT stage 2 — the #261 late fields, stamped at TestStart.
+            if let Some(v) = &self.sock_bufsize {
+                m.serialize_entry("sock_bufsize", v)?;
+            }
+            if let Some(v) = &self.sndbuf_actual {
+                m.serialize_entry("sndbuf_actual", v)?;
+            }
+            if let Some(v) = &self.rcvbuf_actual {
+                m.serialize_entry("rcvbuf_actual", v)?;
+            }
+            if let Some(v) = &self.test_start {
+                m.serialize_entry("test_start", v)?;
+            }
+        }
+        m.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -405,45 +461,76 @@ pub struct IntervalSum {
 // end{}
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+// Serialize is HAND-WRITTEN (below): the refusal's bare `end: {}` (#261) and
+// the pre-TestStart interrupt's full-zeros end WITH a present `streams: []`
+// key (#281 — GT emits the key empty there) can't both be expressed by a
+// fixed per-field skip. Field order in the impl matches declaration order.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct End {
-    // #261: a run that reached TestStart always has ≥1 stream, so on success/
-    // partial this serializes unchanged; on an upfront refusal it is empty and
-    // omitted, contributing to GT's bare `end: {}` (which carries no `streams`
-    // key either).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// #261/#281: true ONLY on the upfront-refusal path — the whole object
+    /// serializes as GT's bare `{}`. Every other dump (success, mid-test or
+    /// pre-TestStart interrupt, SERVER_TERMINATE) renders the full structure,
+    /// including `streams: []` when no stream ever existed.
+    pub(crate) bare: bool,
     pub streams: Vec<EndStream>,
     /// UDP only: the datagram aggregate iperf3 emits as `sum` — BEFORE the
     /// sent/received pair in its key order (GT 3.21, fwd and bidir alike;
     /// the old field position serialized it after, a raw-diff divergence).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum: Option<SumSide>,
-    // #261: the summary aggregates and CPU figure exist only once the test
-    // reached TestStart. On an upfront refusal GT emits `end: {}` — every key
-    // omitted. With these three as `Option` + skip-if-none, an `End` whose
-    // optional fields are all `None` serializes as `{}`, matching GT byte-for-
-    // byte. A run that reached TestStart (success, mid-test interrupt) sets them
-    // `Some(..)`, so the success/partial shape is unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_sent: Option<SumSide>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_received: Option<SumSide>,
     /// UDP bidir only (#214): the reverse-direction datagram aggregate,
     /// between the forward pair and the reverse pair, like iperf3.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_bidir_reverse: Option<SumSide>,
     /// Bidir only: the reverse-direction aggregates.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_sent_bidir_reverse: Option<SumSide>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sum_received_bidir_reverse: Option<SumSide>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_utilization_percent: Option<CpuUtilization>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_tcp_congestion: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_tcp_congestion: Option<String>,
+}
+
+impl Serialize for End {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = serializer.serialize_map(None)?;
+        if self.bare {
+            // The refusal's bare `end: {}` (#261) — no keys at all.
+            return m.end();
+        }
+        // `streams` is UNCONDITIONAL — GT emits `[]` on a stream-less
+        // interrupt dump (#281); only the bare refusal omits the key.
+        m.serialize_entry("streams", &self.streams)?;
+        if let Some(v) = &self.sum {
+            m.serialize_entry("sum", v)?;
+        }
+        if let Some(v) = &self.sum_sent {
+            m.serialize_entry("sum_sent", v)?;
+        }
+        if let Some(v) = &self.sum_received {
+            m.serialize_entry("sum_received", v)?;
+        }
+        if let Some(v) = &self.sum_bidir_reverse {
+            m.serialize_entry("sum_bidir_reverse", v)?;
+        }
+        if let Some(v) = &self.sum_sent_bidir_reverse {
+            m.serialize_entry("sum_sent_bidir_reverse", v)?;
+        }
+        if let Some(v) = &self.sum_received_bidir_reverse {
+            m.serialize_entry("sum_received_bidir_reverse", v)?;
+        }
+        if let Some(v) = &self.cpu_utilization_percent {
+            m.serialize_entry("cpu_utilization_percent", v)?;
+        }
+        if let Some(v) = &self.sender_tcp_congestion {
+            m.serialize_entry("sender_tcp_congestion", v)?;
+        }
+        if let Some(v) = &self.receiver_tcp_congestion {
+            m.serialize_entry("receiver_tcp_congestion", v)?;
+        }
+        m.end()
+    }
 }
 
 /// One `end.streams[]` entry. iperf3 nests the per-direction stats: TCP carries
@@ -701,13 +788,15 @@ pub(crate) struct ReportInput {
     pub sock_bufsize: Option<u64>,
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
-    /// True once the test reached stream-setup / TestStart (#261). Drives the
-    /// stage-gated `start.test_start` and the `end` summary aggregates: GT
-    /// populates them only by how far the test progressed, and OMITS them on an
-    /// upfront refusal (server rejection before TestStart, e.g. code 37). A
-    /// mid-test interrupt or SERVER_TERMINATE DID reach TestStart, so it stays
-    /// `true` there — the partial document keeps the late fields it has.
-    pub reached_test_start: bool,
+    /// How far the run progressed when this document is built (#281): drives
+    /// the three-stage `start` field gating (see [`StartStage`]). The client
+    /// derives it from its run stage; the server always builds at `Started`.
+    pub start_stage: StartStage,
+    /// True ONLY on the upfront server-refusal path (#261): the `end` object
+    /// serializes bare (`{}`). Interrupt dumps — mid-test OR pre-TestStart —
+    /// keep the full end structure (GT emits zeroed sums + `streams: []`
+    /// there, #281).
+    pub bare_end: bool,
     pub interval: f64,
     pub gso: i32,
     pub gro: i32,
@@ -783,6 +872,8 @@ impl ReportInput {
     pub(crate) fn build(&self) -> Report {
         let dur = self.duration;
         let is_udp = matches!(self.protocol, TransportProtocol::Udp);
+        // #281: the TestStart-stage gate for the four late `start` fields.
+        let started = self.start_stage == StartStage::Started;
 
         let connected: Vec<Connection> = self
             .streams
@@ -861,7 +952,11 @@ impl ReportInput {
         let blk = self.blksize.max(1) as u64;
         // iperf3's `stream_must_be_sender` for the aggregate `sender` flag.
         let fwd_sender = !self.reverse;
-        let retransmits = self.sender_retransmits();
+        // #281 r1 F1 / #300 r2 F1: the role-level stream-less fallback — see
+        // stream_less_sender_retransmits. Runs WITH streams are untouched.
+        let retransmits = self
+            .sender_retransmits()
+            .or_else(|| self.stream_less_sender_retransmits());
 
         let mut sum = None;
         let mut sum_bidir_reverse = None;
@@ -1128,7 +1223,14 @@ impl ReportInput {
                 Some(self.tcp_sum(rev_sent, false, self.retransmits_for(Some(false))));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
-                self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))),
+                // #300 r2 F1: the bidir forward pass takes the same role-level
+                // stream-less fallback — GT's flag covers bidir senders too.
+                self.tcp_sum(
+                    local_sent,
+                    true,
+                    self.retransmits_for(Some(true))
+                        .or_else(|| self.stream_less_sender_retransmits()),
+                ),
                 self.tcp_sum(fwd_recv, true, None),
             )
         } else if is_udp {
@@ -1229,24 +1331,21 @@ impl ReportInput {
             (self.congestion_used.clone(), self.congestion_used.clone())
         };
 
-        // #261: stage-gate the `end` summary aggregates on whether the test
-        // reached TestStart. On an upfront refusal (never reached it) every
-        // optional field is None and `streams` is empty, so `End` serializes as
-        // GT's bare `end: {}`. This must cover the UDP aggregates too (`sum` and
-        // the bidir trio are `Some(zeros)` on a UDP refusal) or a UDP refusal
-        // leaks `end: {"sum": {...}}`. A run that reached TestStart (success,
-        // mid-test interrupt, SERVER_TERMINATE) keeps them — the partial document
-        // carries the late fields it has, unchanged from before.
-        let reached = self.reached_test_start;
+        // #261/#281: the refusal's `end` is bare `{}` (every key omitted, the
+        // manual Serialize short-circuits on `bare`); every OTHER dump keeps
+        // the full structure — a pre-TestStart interrupt renders zeroed sums
+        // and a present `streams: []`, exactly GT's sigend shape.
+        let keep = !self.bare_end;
         let end = End {
+            bare: self.bare_end,
             streams: end_streams,
-            sum_sent: reached.then_some(sum_sent),
-            sum_received: reached.then_some(sum_received),
-            sum: reached.then_some(sum).flatten(),
-            sum_bidir_reverse: reached.then_some(sum_bidir_reverse).flatten(),
-            sum_sent_bidir_reverse: reached.then_some(sum_sent_bidir_reverse).flatten(),
-            sum_received_bidir_reverse: reached.then_some(sum_received_bidir_reverse).flatten(),
-            cpu_utilization_percent: reached.then(|| self.cpu.clone()),
+            sum_sent: keep.then_some(sum_sent),
+            sum_received: keep.then_some(sum_received),
+            sum: keep.then_some(sum).flatten(),
+            sum_bidir_reverse: keep.then_some(sum_bidir_reverse).flatten(),
+            sum_sent_bidir_reverse: keep.then_some(sum_sent_bidir_reverse).flatten(),
+            sum_received_bidir_reverse: keep.then_some(sum_received_bidir_reverse).flatten(),
+            cpu_utilization_percent: keep.then(|| self.cpu.clone()),
             sender_tcp_congestion: cong_sender,
             receiver_tcp_congestion: cong_receiver,
         };
@@ -1284,6 +1383,7 @@ impl ReportInput {
         };
         Report {
             start: Start {
+                stage: self.start_stage,
                 connected,
                 version: self.version.clone(),
                 system_info: self.system_info.clone(),
@@ -1299,22 +1399,21 @@ impl ReportInput {
                 tcp_mss_default,
                 target_bitrate: self.target_bitrate,
                 fq_rate: self.fq_rate,
-                // #261: the socket buffers and `test_start` block are populated
-                // only once the test reached stream-setup / TestStart. On the
-                // upfront-refusal path `reached` is false → all omitted (the
-                // buffer fields are also `None` at the source there); GT does the
-                // same, so the refusal `start` carries only the early metadata.
+                // #261/#281: the socket buffers and `test_start` block are
+                // populated only once the test reached stream-setup /
+                // TestStart — the manual Serialize also gates them on
+                // `stage == Started`, so both the refusal AND the
+                // pre-TestStart interrupt omit them, like GT.
                 // NOTE: GT stages these at two distinct points — the buffers at
                 // CREATE_STREAMS (iperf_tcp.c) and `test_start` at TEST_START
-                // (iperf_api.c) — whereas this one `reached` flag flips at
-                // TestStart. A SERVER_ERROR arriving in the CreateStreams..
-                // TestStart window would diverge, but that window is unreachable
-                // against a riperf3 server (its only top-level SERVER_ERROR is the
-                // param-exchange refusal, before CreateStreams).
-                sock_bufsize: reached.then_some(self.sock_bufsize).flatten(),
-                sndbuf_actual: reached.then_some(self.sndbuf_actual).flatten(),
-                rcvbuf_actual: reached.then_some(self.rcvbuf_actual).flatten(),
-                test_start: reached.then(|| TestStart {
+                // (iperf_api.c) — whereas this stage flips at TestStart. A
+                // dump landing in the CreateStreams..TestStart window would
+                // diverge, but that window is unreachable against a riperf3
+                // server for refusals, and vanishingly narrow for interrupts.
+                sock_bufsize: started.then_some(self.sock_bufsize).flatten(),
+                sndbuf_actual: started.then_some(self.sndbuf_actual).flatten(),
+                rcvbuf_actual: started.then_some(self.rcvbuf_actual).flatten(),
+                test_start: started.then(|| TestStart {
                     protocol: if is_udp { "UDP" } else { "TCP" }.to_string(),
                     num_streams: self.num_streams,
                     blksize: self.blksize,
@@ -1571,6 +1670,22 @@ impl ReportInput {
     /// fallback), replacing the old `local_sent / blksize` aggregate at the
     /// UDP-sender sites. Equal to `local_sent / blksize` bit-for-bit for a
     /// full-block-only sender.
+    /// #281/#300 r2 F1: GT's role-level `sender_has_retransmits` on a
+    /// STREAM-LESS dump — set for any SENDING mode (forward AND bidir,
+    /// check_sender_has_retransmits iperf_api.c:634-639) on retransmit-capable
+    /// TCP, so GT prints `sum_sent.retransmits: 0` before any stream exists;
+    /// a reverse client's flag is 0 pre-exchange, so the key is omitted
+    /// (both live-verified on the issue). None whenever streams exist — the
+    /// stream-derived figures always win.
+    fn stream_less_sender_retransmits(&self) -> Option<i64> {
+        (self.streams.is_empty()
+            && !matches!(self.protocol, TransportProtocol::Udp)
+            && !self.reverse
+            && !self.is_server
+            && crate::tcp_info::has_retransmit_info())
+        .then_some(0)
+    }
+
     fn local_sent_packets(&self) -> i64 {
         self.streams
             .iter()
@@ -1792,7 +1907,8 @@ mod tests {
             sock_bufsize: Some(0),
             sndbuf_actual: Some(16384),
             rcvbuf_actual: Some(87380),
-            reached_test_start: true,
+            start_stage: StartStage::Started,
+            bare_end: false,
             interval: 1.0,
             gso: 0,
             gro: 0,
@@ -2674,7 +2790,11 @@ mod tests {
     fn success_run_keeps_all_late_fields() {
         let mut input = base_input();
         input.streams = vec![tcp_stream(1, true, 10, 10)];
-        assert!(input.reached_test_start, "base_input models a real run");
+        assert_eq!(
+            input.start_stage,
+            StartStage::Started,
+            "base_input models a real run"
+        );
         let report = input.build();
         // start late fields: typed Option, all Some.
         assert!(report.start.sock_bufsize.is_some(), "sock_bufsize");
@@ -2722,7 +2842,8 @@ mod tests {
         // buffer inputs are None, and a REAL connect-time wall-clock (not 0).
         input.error =
             Some("client's requested duration exceeds the server's maximum permitted limit".into());
-        input.reached_test_start = false;
+        input.start_stage = StartStage::Connected;
+        input.bare_end = true;
         input.streams = vec![];
         input.sock_bufsize = None;
         input.sndbuf_actual = None;
@@ -2799,6 +2920,209 @@ mod tests {
         );
     }
 
+    /// #281: the pre-TestStart INTERRUPT shape (GT capture on the issue) —
+    /// stage Connected, NOT bare: the late `start` fields are omitted while
+    /// the on_connect metadata stays, and `end` is the FULL zero structure
+    /// with a PRESENT `streams: []` key (the refusal's bare `{}` would be
+    /// wrong here).
+    #[test]
+    fn prestart_interrupt_keeps_full_end_with_empty_streams() {
+        let mut input = base_input();
+        input.error = Some("interrupt - the client has terminated by signal".into());
+        input.start_stage = StartStage::Connected;
+        input.bare_end = false;
+        input.streams = vec![];
+        input.congestion_used = None;
+        // The real pre-start dump passes a ZERO window (r1 item 5) — model it.
+        input.elapsed = 0.0;
+        let v = serde_json::to_value(input.build()).unwrap();
+
+        let start = v["start"].as_object().expect("start object");
+        for present in ["connected", "version", "system_info", "timestamp", "cookie"] {
+            assert!(start.contains_key(present), "keeps {present}: {v}");
+        }
+        for absent in [
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
+            "test_start",
+        ] {
+            assert!(!start.contains_key(absent), "omits {absent}: {v}");
+        }
+        assert_eq!(
+            v["end"]["streams"].as_array().map(Vec::len),
+            Some(0),
+            "the interrupt end carries streams: [] (GT), not an omitted key: {v}"
+        );
+        for key in ["sum_sent", "sum_received", "cpu_utilization_percent"] {
+            assert!(
+                v["end"].get(key).is_some(),
+                "the interrupt end keeps {key} (zeroed), unlike the refusal: {v}"
+            );
+        }
+        assert_eq!(v["end"]["sum_sent"]["seconds"].as_f64(), Some(0.0));
+        // #281 r1 F1: GT prints retransmits: 0 on the stream-less TCP dump
+        // when the local role is a retransmit-capable sender (and omits it
+        // on platforms without TCP_INFO retransmits, like GT).
+        if crate::tcp_info::has_retransmit_info() {
+            assert_eq!(
+                v["end"]["sum_sent"]["retransmits"].as_i64(),
+                Some(0),
+                "stream-less TCP forward dump carries retransmits: 0 (GT): {v}"
+            );
+        } else {
+            assert!(v["end"]["sum_sent"].get("retransmits").is_none());
+        }
+    }
+
+    /// #300 r2 F1+F2: the role-level stream-less retransmits rule per
+    /// direction — GT's check_sender_has_retransmits (iperf_api.c:634-639)
+    /// sets the flag for any SENDING mode (forward AND bidir; live captures
+    /// on the issue), while a reverse client's flag is 0 pre-exchange so the
+    /// key is OMITTED. Pins both polarities so neither gate can silently
+    /// drop (r2 mutation A survived without the reverse pin).
+    #[test]
+    fn stream_less_retransmits_follows_the_gt_role_rule() {
+        if !crate::tcp_info::has_retransmit_info() {
+            return;
+        }
+        let shapes = [
+            (false, false, true, "forward client emits retransmits: 0"),
+            (true, false, false, "reverse client omits the key"),
+            (
+                false,
+                true,
+                true,
+                "bidir client emits retransmits: 0 (r2 F1)",
+            ),
+        ];
+        for (reverse, bidir, present, why) in shapes {
+            let mut input = base_input();
+            input.error = Some("interrupt".into());
+            input.start_stage = StartStage::Connected;
+            input.streams = vec![];
+            input.reverse = reverse;
+            input.bidir = bidir;
+            input.congestion_used = None;
+            let v = serde_json::to_value(input.build()).unwrap();
+            assert_eq!(
+                v["end"]["sum_sent"].get("retransmits").is_some(),
+                present,
+                "{why}: {v}"
+            );
+            if present {
+                assert_eq!(
+                    v["end"]["sum_sent"]["retransmits"].as_i64(),
+                    Some(0),
+                    "{why}: {v}"
+                );
+            }
+        }
+    }
+
+    /// #281 r1 F2: the hand-written Start/End serializers own the key ORDER
+    /// the derive used to guarantee — pin the raw on-wire sequences (the
+    /// Interval struct has the same style of pin). Parsed-Value asserts can't
+    /// see order; this reads the serialized string.
+    #[test]
+    fn manual_serializer_key_order_is_pinned() {
+        let mut input = base_input();
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+
+        let keys = |obj: &str| -> Vec<String> {
+            // Top-level keys of the serialized sub-object `obj`, in on-wire
+            // order: a quoted token is a KEY iff it sits at depth 1 and the
+            // next non-quote char is ':'. String VALUES are skipped by the
+            // lookahead. (No escapes occur in these fixture keys/values.)
+            let from = raw.find(&format!("\"{obj}\":")).unwrap() + obj.len() + 3;
+            let bytes = raw.as_bytes();
+            let mut depth = 0i32;
+            let mut i = from;
+            let mut out = Vec::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b'"' => {
+                        let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                        if depth == 1 && bytes.get(close + 1) == Some(&b':') {
+                            out.push(raw[i + 1..close].to_string());
+                        }
+                        i = close;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out
+        };
+        let start_keys = keys("start");
+        assert_eq!(
+            start_keys,
+            [
+                "connected",
+                "version",
+                "system_info",
+                "timestamp",
+                "connecting_to",
+                "cookie",
+                "tcp_mss_default",
+                "target_bitrate",
+                "fq_rate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "test_start"
+            ],
+            "start key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
+        let end_keys = keys("end");
+        assert_eq!(
+            end_keys,
+            [
+                "streams",
+                "sum_sent",
+                "sum_received",
+                "cpu_utilization_percent",
+                "sender_tcp_congestion",
+                "receiver_tcp_congestion"
+            ],
+            "end key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
+    }
+
+    /// #281: the pre-ParamExchange shape (GT stage 0, second capture on the
+    /// issue) — `start` carries ONLY connected/version/system_info; even the
+    /// timestamp and cookie are absent, because GT stamps them at on_connect.
+    #[test]
+    fn connecting_stage_start_carries_only_the_earliest_metadata() {
+        let mut input = base_input();
+        input.error = Some("interrupt - the client has terminated by signal".into());
+        input.start_stage = StartStage::Connecting;
+        input.bare_end = false;
+        input.streams = vec![];
+        input.congestion_used = None;
+        let v = serde_json::to_value(input.build()).unwrap();
+
+        // serde_json::Value re-orders keys alphabetically, so assert the SET
+        // here; the on-wire order is the manual impl's entry order.
+        let start = v["start"].as_object().expect("start object");
+        let mut keys: Vec<_> = start.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["connected", "system_info", "version"],
+            "GT stage 0 is exactly these three: {v}"
+        );
+        assert_eq!(v["end"]["streams"].as_array().map(Vec::len), Some(0));
+    }
+
     #[test]
     fn udp_refusal_also_emits_bare_end() {
         // The UDP `end` aggregates (`sum` + the `sum_*_bidir_reverse` trio) are
@@ -2815,7 +3139,8 @@ mod tests {
             input.error = Some(
                 "client's requested duration exceeds the server's maximum permitted limit".into(),
             );
-            input.reached_test_start = false;
+            input.start_stage = StartStage::Connected;
+            input.bare_end = true;
             input.streams = vec![];
             input.sock_bufsize = None;
             input.sndbuf_actual = None;
