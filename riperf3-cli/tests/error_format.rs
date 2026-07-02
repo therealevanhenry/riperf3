@@ -261,3 +261,45 @@ fn duration_range_validations_match_gt() {
         "-t 86400 is legal (0..=86400): {stderr}"
     );
 }
+
+/// #263: GT's -f parse (iperf_api.c:1236-1256) takes `*optarg` — the FIRST
+/// character only — and rejects anything outside [kmgtKMGT] with
+/// IEBADFORMAT's exact sentence. 'b'/'B' are CLI-unreachable in GT too
+/// (lib-only unit_snprintf arms), so riperf3 rejects them identically.
+#[test]
+fn format_specifier_rejections_match_gt() {
+    const WANT: &str =
+        "parameter error - bad format specifier (valid formats are in the set [kmgtKMGT])";
+    for args in [
+        &["-c", "127.0.0.1", "-f", "x"][..],
+        &["-c", "127.0.0.1", "-f", "b"][..],
+        &["-c", "127.0.0.1", "-f", "B"][..],
+        &["-s", "-f", "x"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {WANT}")),
+            "{args:?}: GT's IEBADFORMAT sentence expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+    // First-char parse: `-f kilobits` is `-f k` in GT (*optarg), NOT an
+    // invalid-value rejection. It sails past parsing and fails on connect.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", "9", "-f", "kilobits"])
+        .output()
+        .expect("spawn riperf3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("parameter error") && stderr.contains("unable to connect"),
+        "-f kilobits parses as -f k (optarg[0]): {stderr}"
+    );
+}

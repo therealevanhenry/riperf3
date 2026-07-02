@@ -202,3 +202,107 @@ fn client_uppercase_k_is_byte_rate_lowercase_is_bit_rate() {
         );
     }
 }
+
+/// #263: GT parses only `optarg[0]` (iperf_api.c:1241), so a full word is
+/// its first letter — `-f kilobits` renders Kbits/sec rows exactly like
+/// `-f k` (live-verified: GT accepts it and fails later on connect, never
+/// with a format rejection).
+#[test]
+fn full_word_format_parses_as_first_char() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&[], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = common::run_client(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "-b",
+            "10M",
+            "-f",
+            "kilobits",
+        ],
+        Duration::from_secs(30),
+        "client -f kilobits",
+    );
+    let _ = collect(server, "server");
+
+    assert_eq!(client.status.code(), Some(0), "{}", client.stderr);
+    assert!(
+        client.stdout.contains(" Kbits/sec"),
+        "-f kilobits is -f k: {out}",
+        out = client.stdout
+    );
+}
+
+/// #263: GT warns `warning: Report format (-f) flag ignored with JSON
+/// output (-J)` on STDERR when -J rides with an explicit -f
+/// (iperf_api.c:2016, warning() prints bare `warning: %s` — no program
+/// prefix). The JSON document still lands on stdout. --json-stream sets
+/// json_output too (iperf_api.c:1281), so it warns identically. Text mode
+/// never warns.
+#[test]
+fn json_with_format_warns_on_stderr() {
+    const WARNING: &str = "warning: Report format (-f) flag ignored with JSON output (-J)";
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+
+    // -J client (connect-refused, so the run is short and errors).
+    let out = Command::new(bin)
+        .args(["-c", "127.0.0.1", "-p", "1", "-J", "-f", "k"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.trim(),
+        WARNING,
+        "the warning is stderr's ONLY line under -J (errors go in the doc)"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("stdout still carries the JSON document");
+    assert!(doc["error"].as_str().is_some());
+
+    // --json-stream implies json_output in GT, so it warns the same way.
+    let out = Command::new(bin)
+        .args(["-c", "127.0.0.1", "-p", "1", "--json-stream", "-f", "m"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.trim(), WARNING, "--json-stream + -f warns too");
+
+    // Text mode: no warning (unit_format simply applies).
+    let out = Command::new(bin)
+        .args(["-c", "127.0.0.1", "-p", "1", "-f", "k"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("warning"),
+        "no warning without JSON output: {stderr}"
+    );
+
+    // The server role warns at startup too (GT's check is role-agnostic,
+    // end of iperf_parse_arguments).
+    let ps = common::free_port().to_string();
+    let mut server = spawn_server(&["-J", "-f", "k"], &ps);
+    std::thread::sleep(Duration::from_millis(400));
+    let _ = server.0.kill();
+    let mut err = String::new();
+    use std::io::Read;
+    server
+        .0
+        .stderr
+        .take()
+        .expect("piped")
+        .read_to_string(&mut err)
+        .expect("read server stderr");
+    assert!(
+        err.contains(WARNING),
+        "server -J -f warns at startup: {err:?}"
+    );
+}
