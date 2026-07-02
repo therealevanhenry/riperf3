@@ -194,3 +194,66 @@ fn parse_class_errors_stay_on_stderr_even_with_json() {
         "the #65 rejection stays plain text on stderr: {stderr:?}"
     );
 }
+
+/// #259: GT's post-parse range validations (iperf_api.c:1386/1588/1596,
+/// MAX_TIME = 86400 in iperf.h:472), with GT's exact wordings + the usage
+/// trailer + exit 1 (all live-captured on the issue).
+#[test]
+fn duration_range_validations_match_gt() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-c", "127.0.0.1", "-t", "86401"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
+        (
+            &["-s", "--idle-timeout", "0"],
+            "parameter error - idle timeout parameter is not positive or larger than allowed limit",
+        ),
+        (
+            &["-s", "--idle-timeout", "86401"],
+            "parameter error - idle timeout parameter is not positive or larger than allowed limit",
+        ),
+        (
+            &["-s", "--server-max-duration", "86401"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
+        // r1 F5: GT's range checks fire during the getopt loop, BEFORE its
+        // client-flag-on-server check — `-s -t 86401` reports the duration
+        // range, not the #65 client-only-flag error (live-verified).
+        (
+            &["-s", "-t", "86401"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "range violations exit 1 like GT: {args:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {want}")),
+            "{args:?}: GT wording expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors (GT shape): {stderr}"
+        );
+    }
+    // The boundary VALUES are legal: -t 86400 must not be rejected at parse
+    // time (it fails later on connect, not with a parameter error).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", "9", "-t", "86400"])
+        .output()
+        .expect("spawn riperf3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("parameter error"),
+        "-t 86400 is legal (0..=86400): {stderr}"
+    );
+}

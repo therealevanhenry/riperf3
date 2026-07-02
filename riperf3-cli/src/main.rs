@@ -52,6 +52,36 @@ fn main() -> std::process::ExitCode {
     // both post-parse — so parse-time errors go to STDERR in every mode
     // (#198 review r1 f1, live-verified: `iperf3 -s -t 5 -J` errors in
     // plain text on stderr with empty stdout).
+    // #259: GT's post-parse range validations (iperf_api.c:1386/1588/1596,
+    // MAX_TIME = 86400) — parameter-error class: GT wording + the usage
+    // trailer + exit 1, in every mode (parse-time precedes the sink choice).
+    // Ordered BEFORE parse_class_rejection: GT's range checks fire inside
+    // its getopt loop, ahead of the client-flag-on-server class (r1 F5).
+    // RECORDED DEVIATION (r1 F4): with TWO violating flags GT reports the
+    // command-line-FIRST one (per-flag getopt checks); riperf3 checks in a
+    // fixed order (duration, then idle-timeout) — clap's derive parse has no
+    // cheap arg-position access, and the divergence needs two simultaneously
+    // invalid flags. The u32 arg types make GT's negative arms
+    // unrepresentable.
+    const MAX_TIME_SECS: u32 = 86_400;
+    let range_violation = if cli.time.is_some_and(|t| t > MAX_TIME_SECS)
+        || cli.server_max_duration.is_some_and(|d| d > MAX_TIME_SECS)
+    {
+        Some("test duration valid values are 0 to 86400 seconds")
+    } else if cli
+        .idle_timeout
+        .is_some_and(|t| !(1..=MAX_TIME_SECS).contains(&t))
+    {
+        Some("idle timeout parameter is not positive or larger than allowed limit")
+    } else {
+        None
+    };
+    if let Some(msg) = range_violation {
+        eprintln!("riperf3: parameter error - {msg}");
+        print_usage_trailer();
+        return std::process::ExitCode::FAILURE;
+    }
+
     if let Some(msg) = parse_class_rejection(&cli) {
         eprintln!("riperf3: error - {msg}");
         return std::process::ExitCode::FAILURE;

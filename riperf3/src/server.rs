@@ -692,12 +692,39 @@ impl Server {
         // default (absent time → 10). The flag arms NO timer — the in-flight
         // watchdog is duration-anchored and flag-independent, like
         // GT's create_server_timers.
-        if let Some(max) = self.server_max_duration.filter(|&m| m > 0) {
-            if cfg.duration.saturating_add(cfg.omit) > max || cfg.duration == 0 {
-                // Refused before any test ran → no report.
-                self.refuse_max_duration(ctrl).await?;
-                return Ok(None);
-            }
+        let duration_violated = self
+            .server_max_duration
+            .filter(|&m| m > 0)
+            .is_some_and(|max| cfg.duration.saturating_add(cfg.omit) > max || cfg.duration == 0);
+
+        // #260: GT's upfront total-rate check, immediately beside the
+        // duration check (iperf_api.c:2672-2684): total = num_streams * rate
+        // * (bidir ? 2 : 1), evaluated for BOTH the requested bitrate and the
+        // fq rate; refused with SERVER_ERROR + IETOTALRATE(27). Distinct from
+        // the in-flight 1 Hz breach check in await_test_end, which stays.
+        let rate_violated = self
+            .server_bitrate_limit
+            .filter(|&l| l > 0)
+            .is_some_and(|limit| {
+                let mult = u64::from(cfg.num_streams) * if cfg.bidir { 2 } else { 1 };
+                let over = |rate: u64| rate.saturating_mul(mult) > limit;
+                over(cfg.bandwidth) || over(params.fqrate.unwrap_or(0))
+            });
+
+        // r1 F3: GT runs the duration check first but has NO early return —
+        // the rate check's later i_errno assignment wins, so a doubly-
+        // violating client is refused with IETOTALRATE (live-verified).
+        // GT stamps json_start.target_bitrate before the checks run
+        // (iperf_api.c:2662), so both refusal docs carry the client's -b.
+        let refused_rate = params.bandwidth.filter(|&b| b > 0);
+        if rate_violated {
+            // Refused before any test ran → no report.
+            self.refuse_total_rate(ctrl, refused_rate).await?;
+            return Ok(None);
+        }
+        if duration_violated {
+            self.refuse_max_duration(ctrl, refused_rate).await?;
+            return Ok(None);
         }
         Ok(Some((cookie, params, cfg)))
     }
@@ -2382,6 +2409,33 @@ impl Server {
         }
     }
 
+    /// #260: the upfront IETOTALRATE(27) refusal — GT's get_parameters
+    /// total-rate check. Same sink shape as the max-duration refusal below;
+    /// iperf_strerror(27) is perr=0, so the message carries no trailing ': '.
+    async fn refuse_total_rate(
+        &self,
+        ctrl: &mut tokio::net::TcpStream,
+        target_bitrate: Option<u64>,
+    ) -> Result<()> {
+        const MSG: &str = "total required bandwidth is larger than server limit";
+        protocol::send_server_error(ctrl, 27).await?;
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
+                &format!("error - {MSG}"),
+            ));
+        } else if self.json_output {
+            if !crate::macros::output_quiet() {
+                println!(
+                    "{}",
+                    crate::json_report::refusal_document(&format!("error - {MSG}"), target_bitrate)
+                );
+            }
+        } else if !crate::macros::output_quiet() {
+            eprintln!("riperf3: error - {MSG}");
+        }
+        Ok(())
+    }
+
     /// #230: refuse a test at param exchange (GT's upfront requested-duration
     /// check). Sends cleanup_server's relay — SERVER_ERROR + the
     /// (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair — then renders GT's
@@ -2391,7 +2445,11 @@ impl Server {
     /// --json-stream server gets the error + empty-end event pair with no
     /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
     /// persistent server goes on to serve the next test.
-    async fn refuse_max_duration(&self, ctrl: &mut tokio::net::TcpStream) -> Result<()> {
+    async fn refuse_max_duration(
+        &self,
+        ctrl: &mut tokio::net::TcpStream,
+        target_bitrate: Option<u64>,
+    ) -> Result<()> {
         const MSG: &str =
             "client's requested duration exceeds the server's maximum permitted limit";
         protocol::send_server_error(ctrl, 37).await?;
@@ -2406,7 +2464,7 @@ impl Server {
             if !crate::macros::output_quiet() {
                 println!(
                     "{}",
-                    crate::json_report::error_document(&format!("error - {MSG}"))
+                    crate::json_report::refusal_document(&format!("error - {MSG}"), target_bitrate)
                 );
             }
         } else if !crate::macros::output_quiet() {

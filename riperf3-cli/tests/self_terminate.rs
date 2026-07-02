@@ -644,3 +644,61 @@ fn watchdog_fires_at_duration_plus_grace_despite_rate_ticks() {
     assert_eq!(scode, 0, "one-off exits 0 on self-terminate");
     // ChildGuard SIGKILLs the wedged client on drop.
 }
+
+/// #260 r1 F6: GT's get_parameters adds `target_bitrate` to json_start BEFORE
+/// running the refusal checks (iperf_api.c:2662), so a REFUSED client that
+/// sent `-b` leaves the server's -J skeleton carrying it — for BOTH refusal
+/// kinds. Clients without -b keep the plain #230 skeleton (pinned above).
+#[test]
+fn refusal_skeleton_carries_the_client_target_bitrate() {
+    for (server_extra, client_extra) in [
+        (
+            &["--server-bitrate-limit", "1M"][..],
+            &["-b", "2M", "-t", "2"][..],
+        ),
+        (
+            &["--server-max-duration", "1"][..],
+            &["-b", "2M", "-t", "10"][..],
+        ),
+    ] {
+        let port = common::free_port();
+        let ps = port.to_string();
+        let mut args = vec!["-s", "-1", "-p", &ps, "-J"];
+        args.extend_from_slice(server_extra);
+        let server = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_riperf3"))
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn server"),
+        );
+
+        let mut cargs = vec!["-c", "127.0.0.1", "-p", &ps];
+        cargs.extend_from_slice(client_extra);
+        let _ = common::run_client(&cargs, Duration::from_secs(20), "refused client");
+        // -1 server exits after the refusal; bounded wait, then read its doc.
+        let mut server = server;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.0.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "server did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut sout = String::new();
+        server
+            .0
+            .stdout
+            .take()
+            .expect("piped")
+            .read_to_string(&mut sout)
+            .expect("read server doc");
+        let sdoc: serde_json::Value = serde_json::from_str(sout.trim())
+            .unwrap_or_else(|e| panic!("server -J doc ({e}): {sout}"));
+        assert_eq!(
+            sdoc["start"]["target_bitrate"].as_u64(),
+            Some(2_000_000),
+            "{server_extra:?}: the refusal skeleton carries the refused \
+             client's -b (GT json_start order: after system_info): {sdoc}"
+        );
+    }
+}

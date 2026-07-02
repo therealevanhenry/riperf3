@@ -931,6 +931,10 @@ impl Client {
         // it. `bandwidth` is the effective rate after the build-time default
         // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
         p.bandwidth = Some(self.bandwidth);
+        // #260 r1 F2: GT sends `fqrate` whenever nonzero (iperf_api.c:2457-8)
+        // — the server needs it for its upfront total-rate check AND for
+        // fq-paced reverse/bidir sending. riperf3 never serialized it.
+        p.fqrate = self.fq_rate.filter(|&r| r > 0);
         // Sent only when set, like iperf3 (`if (test->settings->burst)`): the
         // server's reverse/bidir sender batches on the client's burst (#160).
         p.burst = (self.burst > 0).then_some(self.burst as i32);
@@ -3068,6 +3072,19 @@ impl ClientBuilder {
     pub fn build(self) -> std::result::Result<Client, ConfigError> {
         let host = self.host.ok_or(ConfigError::MissingField("host"))?;
 
+        // #259: GT's MAX_TIME bound (iperf.h:472). Over-range durations would
+        // wrap the i32 wire field a real iperf3 peer parses; the CLI already
+        // rejects with GT's parameter-error wording, this guards lib callers.
+        if self.duration > 86_400 {
+            return Err(ConfigError::InvalidValue(
+                "duration",
+                format!(
+                    "{} exceeds the valid range 0 to 86400 seconds",
+                    self.duration
+                ),
+            ));
+        }
+
         // Reject a -B literal whose family contradicts -4/-6 at config time,
         // mirroring the server-side check (#12); a bind hostname is validated
         // against the target family at connect time instead (#15).
@@ -3335,6 +3352,28 @@ mod tests {
                 1_700_000_000_456,
                 "once started, the TestStart wall-clock wins"
             );
+        }
+    }
+
+    mod duration_range {
+        /// #259: the builder caps -t at GT's MAX_TIME (86400) so an
+        /// over-range duration can't wrap the i32 wire field a real iperf3
+        /// peer parses (the CLI rejects earlier with GT's wording; this is
+        /// the lib-caller guard).
+        #[test]
+        fn build_rejects_over_max_time_durations() {
+            let err = crate::ClientBuilder::new("127.0.0.1")
+                .duration(86_401)
+                .build()
+                .expect_err("duration over MAX_TIME must not build");
+            assert!(
+                err.to_string().contains("86400"),
+                "the error names the GT bound: {err}"
+            );
+            assert!(crate::ClientBuilder::new("127.0.0.1")
+                .duration(86_400)
+                .build()
+                .is_ok());
         }
     }
 
