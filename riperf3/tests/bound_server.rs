@@ -58,11 +58,10 @@ async fn bind_once_serves_sequential_tests_on_one_port() {
 /// bind()): one test served on the configured port, report returned.
 #[tokio::test]
 async fn run_once_still_serves_one_test() {
-    let server = ServerBuilder::new().port(Some(0)).build().unwrap();
-    // run_once on port 0 can't learn the port externally — this pin uses a
-    // fixed high port instead, mirroring the pre-#291 usage.
-    drop(server);
-    let port = 15790;
+    // run_once on port 0 can't learn the port externally — take a free
+    // ephemeral port from the shared helper instead of pinning one (r2 nit:
+    // a hardcoded port is a collision-flake risk on shared runners).
+    let port = riperf3_test_support::free_port();
     let server = ServerBuilder::new().port(Some(port)).build().unwrap();
     let server_task = tokio::spawn(async move { server.run_once().await });
     tokio::time::sleep(Duration::from_millis(150)).await;

@@ -2745,6 +2745,11 @@ impl ClientBuilder {
     /// [`Report`](crate::Report) is the only output; nothing is written to
     /// stdout or stderr. Wire behavior is unaffected either way (a quiet
     /// server still relays `--get-server-output` text to the peer).
+    ///
+    /// Note: with authentication configured but no password provided, a run
+    /// still BLOCKS reading the password from stdin — quiet suppresses the
+    /// prompt, not the read. Supply the password via the builder or the
+    /// `RIPERF3_PASSWORD`/`IPERF3_PASSWORD` env vars for unattended use.
     pub fn emit_output(mut self, enabled: bool) -> Self {
         self.emit_output = enabled;
         self

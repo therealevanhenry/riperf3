@@ -146,6 +146,24 @@ fn spawn_child(quiet: bool, test_name: &str) -> std::process::Output {
 
 /// Lines the libtest harness itself prints in the child; everything else on
 /// stdout must have come from the riperf3 crate.
+/// r2 nit: quiet children may emit ONLY the completion marker on stderr —
+/// any other line means a stderr gate regressed (the error sinks, the auth
+/// prompt, the daemon loop's eprintln paths).
+fn assert_stderr_only_marker(out: &std::process::Output) {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stray: Vec<&str> = err
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && t != "QUIET_CHILD_DONE"
+        })
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a quiet child wrote to stderr beyond the marker: {stray:#?}"
+    );
+}
+
 fn non_harness_stdout(out: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(out)
         .lines()
@@ -193,6 +211,7 @@ fn quiet_run_writes_nothing_to_stdout() {
         leaked.is_empty(),
         "emit_output(false) must write NOTHING to stdout, got: {leaked:#?}"
     );
+    assert_stderr_only_marker(&out);
 }
 
 /// Positive control for the harness filter above: the SAME child with output
@@ -270,4 +289,5 @@ fn quiet_json_stream_emits_no_events() {
         leaked.is_empty(),
         "quiet json-stream leaked stdout lines (r1 mutation b): {leaked:#?}"
     );
+    assert_stderr_only_marker(&out);
 }
