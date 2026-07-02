@@ -167,12 +167,15 @@ pub(crate) fn output_quiet() -> bool {
 /// A COUNTER, not a bool: an in-process client + bound-server pair each hold
 /// a guard, and the first one to finish must not un-silence the other
 /// (a bool's drop did exactly that — the closing "iperf Done." leaked).
-pub(crate) struct OutputQuietGuard;
+// The private unit field makes `set()` the ONLY constructor (r1 finding 3):
+// a literal `OutputQuietGuard` elsewhere in the crate would skip the
+// increment and its Drop would underflow the counter into permanent silence.
+pub(crate) struct OutputQuietGuard(());
 
 impl OutputQuietGuard {
     pub(crate) fn set() -> Self {
         OUTPUT_QUIET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        OutputQuietGuard
+        OutputQuietGuard(())
     }
 }
 

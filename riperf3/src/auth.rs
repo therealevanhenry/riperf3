@@ -169,8 +169,12 @@ pub fn read_password() -> Result<String> {
         return Ok(pw);
     }
 
-    // Interactive prompt with echo disabled — safe, cross-platform
-    eprint!("Password: ");
+    // Interactive prompt with echo disabled — safe, cross-platform.
+    // #290 (r1 finding 2): a quiet run suppresses the PROMPT (the stderr
+    // write); the stdin read itself is the pre-existing interactive wart.
+    if !crate::macros::output_quiet() {
+        eprint!("Password: ");
+    }
     rpassword::read_password()
         .map_err(|e| RiperfError::Protocol(format!("password read failed: {e}")))
 }

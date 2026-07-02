@@ -303,7 +303,11 @@ impl Server {
     /// (#216). Not tee'd into the --get-server-output capture — iperf3's
     /// banner prints before the test's JSON/capture exists.
     fn banner_line(line: &str) {
-        println!("{}{line}", crate::macros::output_timestamp_prefix());
+        // #290 (r1 finding 1): the quiet gate must live at the PRINT SITE —
+        // arming the flag in run() silences nothing here by itself.
+        if !crate::macros::output_quiet() {
+            println!("{}{line}", crate::macros::output_timestamp_prefix());
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
