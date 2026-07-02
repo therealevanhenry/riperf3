@@ -931,6 +931,10 @@ impl Client {
         // it. `bandwidth` is the effective rate after the build-time default
         // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
         p.bandwidth = Some(self.bandwidth);
+        // #260 r1 F2: GT sends `fqrate` whenever nonzero (iperf_api.c:2457-8)
+        // — the server needs it for its upfront total-rate check AND for
+        // fq-paced reverse/bidir sending. riperf3 never serialized it.
+        p.fqrate = self.fq_rate.filter(|&r| r > 0);
         // Sent only when set, like iperf3 (`if (test->settings->burst)`): the
         // server's reverse/bidir sender batches on the client's burst (#160).
         p.burst = (self.burst > 0).then_some(self.burst as i32);

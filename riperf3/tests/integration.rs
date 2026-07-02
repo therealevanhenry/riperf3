@@ -2532,10 +2532,12 @@ async fn server_refuses_over_limit_rate_upfront() {
             cb = cb.fq_rate(fq);
         }
         let client = cb.build().unwrap();
+        let t0 = std::time::Instant::now();
         let result = tokio::time::timeout(Duration::from_secs(15), client.run())
             .await
             .expect("client hung");
-        let _ = server_task.await;
+        let elapsed = t0.elapsed();
+        let server_result = server_task.await.expect("server task");
 
         if refused {
             match result {
@@ -2547,10 +2549,30 @@ async fn server_refuses_over_limit_rate_upfront() {
                      upfront IETOTALRATE refusal, got {other:?}"
                 ),
             }
+            // r1 F1: the refusal must be the UPFRONT param-exchange check, not
+            // the runtime 1 Hz breach check (which relays the IDENTICAL code +
+            // message ~1 s in). Two discriminators: an upfront-refused test
+            // never ran, so the server has NO report (run_once errs), and the
+            // whole exchange resolves well under the first rate tick.
+            assert!(
+                server_result.is_err(),
+                "bw={bw} fq={fq} P={streams} bidir={bidir}: an upfront refusal \
+                 produces no server report; Ok(..) means the RUNTIME check fired"
+            );
+            assert!(
+                elapsed < Duration::from_millis(700),
+                "bw={bw} fq={fq} P={streams} bidir={bidir}: refusal took \
+                 {elapsed:?} — the upfront check resolves before the 1 s \
+                 runtime tick"
+            );
         } else {
             result.unwrap_or_else(|e| {
                 panic!("under-limit run must proceed (rate {bw} < limit): {e}")
             });
+            assert!(
+                server_result.is_ok(),
+                "the under-limit control produces a real server report"
+            );
         }
     }
 }
