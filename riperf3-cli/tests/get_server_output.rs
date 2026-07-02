@@ -138,7 +138,7 @@ fn json_client_gets_server_output_text() {
 fn json_client_gets_server_output_json() {
     let port = free_port();
     let ps = port.to_string();
-    let mut server = spawn_server_capturing(&["-J"], &ps);
+    let server = spawn_server_capturing(&["-J"], &ps);
 
     let out = run_capturing(
         &[
