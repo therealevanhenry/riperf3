@@ -836,12 +836,11 @@ impl Server {
                     // `sndbuf_actual` / `rcvbuf_actual` (#50), captured before the
                     // stream moves into its task. TCP applied -w earlier in
                     // configure_tcp_stream_full, so apply_window is false (#144).
-                    let (local_addr, peer_addr_s, sndbuf_actual, rcvbuf_actual) =
-                        net::capture_stream_meta(
-                            socket2::SockRef::from(&data_stream),
-                            ctx.cfg.window,
-                            false,
-                        )?;
+                    let sock = net::capture_stream_meta(
+                        socket2::SockRef::from(&data_stream),
+                        ctx.cfg.window,
+                        false,
+                    )?;
                     // #37: congestion algorithm actually in effect on this stream.
                     let congestion_used = net::tcp_congestion_used(&data_stream);
 
@@ -869,21 +868,18 @@ impl Server {
                         })
                     };
 
-                    ctx.streams.push(DataStream::from_meta(
-                        StreamMeta {
+                    ctx.streams.push(DataStream {
+                        meta: StreamMeta {
                             id: stream_id,
                             is_sender,
                             counters,
                             raw_fd,
-                            local_addr,
-                            peer_addr: peer_addr_s,
-                            sndbuf_actual,
-                            rcvbuf_actual,
+                            sock,
                             congestion_used,
                         },
                         task,
-                        None,
-                    ));
+                        udp_recv_stats: None,
+                    });
                 }
             }
             TransportProtocol::Udp => {
@@ -958,10 +954,10 @@ impl Server {
         // Starting Test parameter line, like the client side.
         if !self.json_output && !self.json_stream {
             for s in &ctx.streams {
-                if let (Some(l), Some(p)) = (s.local_addr, s.peer_addr) {
+                if let (Some(l), Some(p)) = (s.meta.sock.local_addr, s.meta.sock.peer_addr) {
                     vprintln!(
                         "[{:3}] local {} port {} connected to {} port {}",
-                        s.id,
+                        s.meta.id,
                         l.ip().to_canonical(),
                         l.port(),
                         p.ip().to_canonical(),
@@ -1039,11 +1035,11 @@ impl Server {
                 .streams
                 .iter()
                 .map(|s| crate::reporter::IntervalStreamRef {
-                    id: s.id,
-                    is_sender: s.is_sender,
-                    counters: s.counters.clone(),
+                    id: s.meta.id,
+                    is_sender: s.meta.is_sender,
+                    counters: s.meta.counters.clone(),
                     udp_recv_stats: s.udp_recv_stats.clone(),
-                    raw_fd: s.raw_fd,
+                    raw_fd: s.meta.raw_fd,
                 })
                 .collect();
             crate::reporter::spawn_interval_reporter(
@@ -1164,7 +1160,7 @@ impl Server {
                     let elapsed = test_start.elapsed().as_secs_f64();
                     if elapsed > 0.0 {
                         let total_bytes: u64 = ctx.streams.iter().map(|s| {
-                            s.counters.bytes_sent() + s.counters.bytes_received()
+                            s.meta.counters.bytes_sent() + s.meta.counters.bytes_received()
                         }).sum();
                         let bits_per_sec = total_bytes as f64 * 8.0 / elapsed;
                         if let Some(limit) = bitrate_limit {
@@ -1291,10 +1287,10 @@ impl Server {
     ) -> Vec<protocol::StreamResultJson> {
         let mut result_streams = Vec::new();
         for s in &ctx.streams {
-            let bytes = if s.is_sender {
-                s.counters.bytes_sent_net()
+            let bytes = if s.meta.is_sender {
+                s.meta.counters.bytes_sent_net()
             } else {
-                s.counters.bytes_received_net()
+                s.meta.counters.bytes_received_net()
             };
 
             let (jitter, errors, packets, omitted_errors, omitted_packets) =
@@ -1310,7 +1306,7 @@ impl Server {
                     } else {
                         (0.0, 0, 0, 0, 0)
                     }
-                } else if s.is_sender && matches!(ctx.cfg.protocol, TransportProtocol::Udp) {
+                } else if s.meta.is_sender && matches!(ctx.cfg.protocol, TransportProtocol::Udp) {
                     // iperf3's UDP sender counts every datagram it sends
                     // (iperf_udp.c `++sp->packet_count`) and exchanges that
                     // count unconditionally (iperf_api.c `"packets"`); the
@@ -1323,8 +1319,8 @@ impl Server {
                     // derivation. Full-block-only senders keep this == the old
                     // value bit-for-bit (no compat-matrix drift); making it
                     // authoritative just protects against a future short-send.
-                    let gross = s.counters.datagrams_sent() as i64;
-                    let net = s.counters.datagrams_sent_net() as i64;
+                    let gross = s.meta.counters.datagrams_sent() as i64;
+                    let net = s.meta.counters.datagrams_sent_net() as i64;
                     (0.0, 0, gross, 0, gross - net)
                 } else {
                     (0.0, 0, 0, 0, 0)
@@ -1334,7 +1330,7 @@ impl Server {
             let retransmits = s.sender_retransmits(is_udp_stream).unwrap_or(-1);
 
             result_streams.push(protocol::StreamResultJson {
-                id: s.id,
+                id: s.meta.id,
                 bytes,
                 retransmits,
                 jitter,
@@ -1378,7 +1374,7 @@ impl Server {
                 self.verbose,
                 ctx.cfg.protocol,
             );
-            if self.verbose && ctx.streams.iter().any(|s| s.is_sender) {
+            if self.verbose && ctx.streams.iter().any(|s| s.meta.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
                 // the peer's CPU is never exchanged to the server (#50).
@@ -1391,8 +1387,12 @@ impl Server {
                 );
             }
             if self.verbose && matches!(ctx.cfg.protocol, TransportProtocol::Tcp) {
-                if let Some(c) = ctx.streams.iter().find_map(|s| s.congestion_used.clone()) {
-                    if ctx.streams.iter().any(|s| s.is_sender) {
+                if let Some(c) = ctx
+                    .streams
+                    .iter()
+                    .find_map(|s| s.meta.congestion_used.clone())
+                {
+                    if ctx.streams.iter().any(|s| s.meta.is_sender) {
                         vprintln!("snd_tcp_congestion {c}");
                     } else {
                         vprintln!("rcv_tcp_congestion {c}");
@@ -1466,7 +1466,7 @@ impl Server {
                 cpu_util_system: end.cpu_util.host_system,
                 // #156: 1 when this side is a retransmit-capable TCP sender
                 // (reverse/bidir), like iperf3's check_sender_has_retransmits.
-                sender_has_retransmits: if ctx.streams.iter().any(|s| s.is_sender) {
+                sender_has_retransmits: if ctx.streams.iter().any(|s| s.meta.is_sender) {
                     i64::from(
                         matches!(ctx.cfg.protocol, TransportProtocol::Tcp)
                             && crate::tcp_info::has_retransmit_info(),
@@ -1476,7 +1476,10 @@ impl Server {
                 },
                 // #37: the congestion algorithm actually in effect (read back at stream
                 // creation); None for UDP / unsupported platforms.
-                congestion_used: ctx.streams.first().and_then(|s| s.congestion_used.clone()),
+                congestion_used: ctx
+                    .streams
+                    .first()
+                    .and_then(|s| s.meta.congestion_used.clone()),
                 server_output_text,
                 server_output_json,
                 streams: result_streams,
@@ -1574,7 +1577,7 @@ impl Server {
                 self.verbose,
                 ctx.cfg.protocol,
             );
-            if self.verbose && ctx.streams.iter().any(|s| s.is_sender) {
+            if self.verbose && ctx.streams.iter().any(|s| s.meta.is_sender) {
                 // GT gates the CPU line on the SENDING side (iperf_api.c:
                 // 4563): a -R server prints it, with ZERO remote figures —
                 // the peer's CPU is never exchanged to the server (#50).
@@ -1587,8 +1590,12 @@ impl Server {
                 );
             }
             if self.verbose && matches!(ctx.cfg.protocol, TransportProtocol::Tcp) {
-                if let Some(c) = ctx.streams.iter().find_map(|s| s.congestion_used.clone()) {
-                    let is_sender = ctx.streams.iter().any(|s| s.is_sender);
+                if let Some(c) = ctx
+                    .streams
+                    .iter()
+                    .find_map(|s| s.meta.congestion_used.clone())
+                {
+                    let is_sender = ctx.streams.iter().any(|s| s.meta.is_sender);
                     if is_sender {
                         vprintln!("snd_tcp_congestion {c}");
                     } else {
@@ -1677,7 +1684,7 @@ impl Server {
             // std + moved. apply_window=true: honor -w/--window on the server's
             // UDP data socket too (#59) so reverse/bidir UDP matches iperf3,
             // before the read-back (#144).
-            let (local_addr, peer_addr_s, sndbuf_actual, rcvbuf_actual) =
+            let sock =
                 net::capture_stream_meta(socket2::SockRef::from(&data_sock), cfg.window, true)?;
 
             let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
@@ -1699,21 +1706,18 @@ impl Server {
                         std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
-                streams.push(DataStream::from_meta(
-                    StreamMeta {
+                streams.push(DataStream {
+                    meta: StreamMeta {
                         id: stream_id,
                         is_sender,
                         counters,
                         raw_fd: None,
-                        local_addr,
-                        peer_addr: peer_addr_s,
-                        sndbuf_actual,
-                        rcvbuf_actual,
+                        sock,
                         congestion_used: None,
                     },
                     task,
-                    None,
-                ));
+                    udp_recv_stats: None,
+                });
             } else {
                 let c = counters.clone();
                 let d = done.clone();
@@ -1724,21 +1728,18 @@ impl Server {
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
-                streams.push(DataStream::from_meta(
-                    StreamMeta {
+                streams.push(DataStream {
+                    meta: StreamMeta {
                         id: stream_id,
                         is_sender,
                         counters,
                         raw_fd: None,
-                        local_addr,
-                        peer_addr: peer_addr_s,
-                        sndbuf_actual,
-                        rcvbuf_actual,
+                        sock,
                         congestion_used: None,
                     },
                     task,
-                    Some(stats),
-                ));
+                    udp_recv_stats: Some(stats),
+                });
             }
         }
         // #178: hold TestStart (sent by the caller right after this returns)
@@ -1946,21 +1947,23 @@ impl Server {
                         md,
                     )
                 });
-                streams.push(DataStream::from_meta(
-                    StreamMeta {
+                streams.push(DataStream {
+                    meta: StreamMeta {
                         id: stream_id,
                         is_sender,
                         counters,
                         raw_fd: None,
-                        local_addr,
-                        peer_addr: Some(client_addr),
-                        sndbuf_actual,
-                        rcvbuf_actual,
+                        sock: crate::net::SocketMeta {
+                            local_addr,
+                            peer_addr: Some(client_addr),
+                            sndbuf_actual,
+                            rcvbuf_actual,
+                        },
                         congestion_used: None,
                     },
                     task,
-                    None,
-                ));
+                    udp_recv_stats: None,
+                });
             } else {
                 let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                 routes.insert(
@@ -1974,21 +1977,23 @@ impl Server {
                 // below; give each a resolved placeholder task so the per-stream
                 // join at teardown stays uniform. The real handle is `demux_handle`.
                 let task = tokio::spawn(async { Ok::<(), RiperfError>(()) });
-                streams.push(DataStream::from_meta(
-                    StreamMeta {
+                streams.push(DataStream {
+                    meta: StreamMeta {
                         id: stream_id,
                         is_sender,
                         counters,
                         raw_fd: None,
-                        local_addr,
-                        peer_addr: Some(client_addr),
-                        sndbuf_actual,
-                        rcvbuf_actual,
+                        sock: crate::net::SocketMeta {
+                            local_addr,
+                            peer_addr: Some(client_addr),
+                            sndbuf_actual,
+                            rcvbuf_actual,
+                        },
                         congestion_used: None,
                     },
                     task,
-                    Some(stats),
-                ));
+                    udp_recv_stats: Some(stats),
+                });
             }
         }
 
@@ -2021,10 +2026,10 @@ impl Server {
         streams
             .iter()
             .map(|s| {
-                let bytes = if s.is_sender {
-                    s.counters.bytes_sent_net()
+                let bytes = if s.meta.is_sender {
+                    s.meta.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received_net()
+                    s.meta.counters.bytes_received_net()
                 };
 
                 let (jitter, lost, total) = if let Some(ref udp_stats) = s.udp_recv_stats {
@@ -2041,7 +2046,7 @@ impl Server {
                             )
                         })
                         .unwrap_or((None, None, None))
-                } else if is_udp && s.is_sender {
+                } else if is_udp && s.meta.is_sender {
                     // iperf3's sender line shows zero jitter/loss over the
                     // sent datagram count, not blank columns (#184). #256: the
                     // authoritative post-omit datagram count, not bytes/blksize
@@ -2049,18 +2054,18 @@ impl Server {
                     (
                         Some(0.0),
                         Some(0),
-                        Some(s.counters.datagrams_sent_net() as i64),
+                        Some(s.meta.counters.datagrams_sent_net() as i64),
                     )
                 } else {
                     (None, None, None)
                 };
 
                 crate::reporter::StreamSummary {
-                    stream_id: s.id,
+                    stream_id: s.meta.id,
                     start: 0.0,
                     end: test_duration,
                     bytes,
-                    is_sender: s.is_sender,
+                    is_sender: s.meta.is_sender,
                     // TCP sender lines carry the retransmit total (#184).
                     retransmits: s.sender_retransmits(is_udp),
                     jitter,
@@ -2069,7 +2074,7 @@ impl Server {
                     // Bidir tags every line with the stream's direction (#184).
                     role_tag: cfg
                         .bidir
-                        .then_some(crate::reporter::bidir_role_tag(true, s.is_sender)),
+                        .then_some(crate::reporter::bidir_role_tag(true, s.meta.is_sender)),
                 }
             })
             .collect()
@@ -2112,10 +2117,10 @@ impl Server {
         let stream_reports: Vec<StreamReport> = streams
             .iter()
             .map(|s| {
-                let local_bytes = if s.is_sender {
-                    s.counters.bytes_sent_net()
+                let local_bytes = if s.meta.is_sender {
+                    s.meta.counters.bytes_sent_net()
                 } else {
-                    s.counters.bytes_received_net()
+                    s.meta.counters.bytes_received_net()
                 };
 
                 // The server measures UDP loss/jitter on the streams it
@@ -2132,10 +2137,14 @@ impl Server {
                 // to_canonical(): unwrap IPv4-mapped IPv6 from the dual-stack
                 // listener to plain IPv4 in connected[], matching iperf3.
                 let (local_host, local_port) = s
+                    .meta
+                    .sock
                     .local_addr
                     .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_default();
                 let (remote_host, remote_port) = s
+                    .meta
+                    .sock
                     .peer_addr
                     .map(|a| (a.ip().to_canonical().to_string(), a.port()))
                     .unwrap_or_default();
@@ -2144,7 +2153,7 @@ impl Server {
                 // for streams the server sent (reverse / bidir).
                 let ext = extremes
                     .iter()
-                    .find(|e| e.stream_id == s.id && e.has_samples());
+                    .find(|e| e.stream_id == s.meta.id && e.has_samples());
                 let tcp_end = ext.map(|e| TcpEndExtras {
                     max_snd_cwnd: e.max_snd_cwnd,
                     max_snd_wnd: e.max_snd_wnd,
@@ -2157,7 +2166,7 @@ impl Server {
                 // reverse/bidir streams; a stream it received has no retransmit
                 // count (None → omitted), so it can't leak a 0 into sum_sent on a
                 // forward test (where iperf3's server emits no retransmits).
-                let retransmits = if is_udp || !s.is_sender {
+                let retransmits = if is_udp || !s.meta.is_sender {
                     None
                 } else {
                     ext.and_then(|e| e.total_retransmits)
@@ -2170,12 +2179,12 @@ impl Server {
                 };
 
                 StreamReport {
-                    id: s.id,
+                    id: s.meta.id,
                     local_host,
                     local_port,
                     remote_host,
                     remote_port,
-                    is_sender: s.is_sender,
+                    is_sender: s.meta.is_sender,
                     local_bytes,
                     // #256/#283: the authoritative per-stream SENT datagram
                     // count, net of the `-O` omit baseline — the SAME source
@@ -2184,8 +2193,8 @@ impl Server {
                     // (reverse/bidir); None for received streams. == local_bytes
                     // / blksize bit-for-bit for a full-block-only sender, so the
                     // -J stays byte-identical.
-                    datagrams_sent: (is_udp && s.is_sender)
-                        .then(|| s.counters.datagrams_sent_net()),
+                    datagrams_sent: (is_udp && s.meta.is_sender)
+                        .then(|| s.meta.counters.datagrams_sent_net()),
                     // The server never learns the peer's per-stream bytes; build()
                     // zeroes the un-measured side for is_server reports.
                     remote_bytes: None,
@@ -2236,7 +2245,7 @@ impl Server {
             // #37: the congestion algorithm actually in effect on the server's data
             // socket, read back via getsockopt(TCP_CONGESTION). None for UDP /
             // unsupported platforms.
-            congestion_used: streams.first().and_then(|s| s.congestion_used.clone()),
+            congestion_used: streams.first().and_then(|s| s.meta.congestion_used.clone()),
             cookie: String::from_utf8_lossy(&cookie[..protocol::COOKIE_SIZE - 1]).to_string(),
             // iperf3's server emits tcp_mss_default = 0 (it never reads the control
             // socket MSS); the requested -M (via params) still surfaces as tcp_mss.
@@ -2244,8 +2253,18 @@ impl Server {
             mss: cfg.mss.filter(|&m| m > 0).map(|m| m as u32),
             fq_rate: params.fqrate.unwrap_or(0),
             sock_bufsize: Some(cfg.window.map(|w| w.max(0) as u64).unwrap_or(0)),
-            sndbuf_actual: Some(streams.first().and_then(|s| s.sndbuf_actual).unwrap_or(0)),
-            rcvbuf_actual: Some(streams.first().and_then(|s| s.rcvbuf_actual).unwrap_or(0)),
+            sndbuf_actual: Some(
+                streams
+                    .first()
+                    .and_then(|s| s.meta.sock.sndbuf_actual)
+                    .unwrap_or(0),
+            ),
+            rcvbuf_actual: Some(
+                streams
+                    .first()
+                    .and_then(|s| s.meta.sock.rcvbuf_actual)
+                    .unwrap_or(0),
+            ),
             // #261: the server only ever assembles a full report on a run that
             // reached TestStart — its upfront refusal renders the skeleton via
             // json_report::error_document, not build(). So the late fields are
