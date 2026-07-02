@@ -952,21 +952,11 @@ impl ReportInput {
         let blk = self.blksize.max(1) as u64;
         // iperf3's `stream_must_be_sender` for the aggregate `sender` flag.
         let fwd_sender = !self.reverse;
-        // #281 r1 F1: on a STREAM-LESS dump (pre-TestStart interrupt) GT still
-        // prints `sum_sent.retransmits: 0` when the local side would be a
-        // retransmit-capable TCP sender — its sender_has_retransmits is a
-        // role-level flag set before any stream exists (iperf_api.c:637; the
-        // receiving role sets 0 at :639, so a reverse client OMITS the key —
-        // both live-verified on the issue). Runs WITH streams keep the
-        // stream-derived figure untouched.
-        let retransmits = self.sender_retransmits().or_else(|| {
-            (self.streams.is_empty()
-                && !is_udp
-                && !self.reverse
-                && !self.is_server
-                && crate::tcp_info::has_retransmit_info())
-            .then_some(0)
-        });
+        // #281 r1 F1 / #300 r2 F1: the role-level stream-less fallback — see
+        // stream_less_sender_retransmits. Runs WITH streams are untouched.
+        let retransmits = self
+            .sender_retransmits()
+            .or_else(|| self.stream_less_sender_retransmits());
 
         let mut sum = None;
         let mut sum_bidir_reverse = None;
@@ -1233,7 +1223,14 @@ impl ReportInput {
                 Some(self.tcp_sum(rev_sent, false, self.retransmits_for(Some(false))));
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
-                self.tcp_sum(local_sent, true, self.retransmits_for(Some(true))),
+                // #300 r2 F1: the bidir forward pass takes the same role-level
+                // stream-less fallback — GT's flag covers bidir senders too.
+                self.tcp_sum(
+                    local_sent,
+                    true,
+                    self.retransmits_for(Some(true))
+                        .or_else(|| self.stream_less_sender_retransmits()),
+                ),
                 self.tcp_sum(fwd_recv, true, None),
             )
         } else if is_udp {
@@ -1673,6 +1670,22 @@ impl ReportInput {
     /// fallback), replacing the old `local_sent / blksize` aggregate at the
     /// UDP-sender sites. Equal to `local_sent / blksize` bit-for-bit for a
     /// full-block-only sender.
+    /// #281/#300 r2 F1: GT's role-level `sender_has_retransmits` on a
+    /// STREAM-LESS dump — set for any SENDING mode (forward AND bidir,
+    /// check_sender_has_retransmits iperf_api.c:634-639) on retransmit-capable
+    /// TCP, so GT prints `sum_sent.retransmits: 0` before any stream exists;
+    /// a reverse client's flag is 0 pre-exchange, so the key is omitted
+    /// (both live-verified on the issue). None whenever streams exist — the
+    /// stream-derived figures always win.
+    fn stream_less_sender_retransmits(&self) -> Option<i64> {
+        (self.streams.is_empty()
+            && !matches!(self.protocol, TransportProtocol::Udp)
+            && !self.reverse
+            && !self.is_server
+            && crate::tcp_info::has_retransmit_info())
+        .then_some(0)
+    }
+
     fn local_sent_packets(&self) -> i64 {
         self.streams
             .iter()
@@ -2959,6 +2972,51 @@ mod tests {
             );
         } else {
             assert!(v["end"]["sum_sent"].get("retransmits").is_none());
+        }
+    }
+
+    /// #300 r2 F1+F2: the role-level stream-less retransmits rule per
+    /// direction — GT's check_sender_has_retransmits (iperf_api.c:634-639)
+    /// sets the flag for any SENDING mode (forward AND bidir; live captures
+    /// on the issue), while a reverse client's flag is 0 pre-exchange so the
+    /// key is OMITTED. Pins both polarities so neither gate can silently
+    /// drop (r2 mutation A survived without the reverse pin).
+    #[test]
+    fn stream_less_retransmits_follows_the_gt_role_rule() {
+        if !crate::tcp_info::has_retransmit_info() {
+            return;
+        }
+        let shapes = [
+            (false, false, true, "forward client emits retransmits: 0"),
+            (true, false, false, "reverse client omits the key"),
+            (
+                false,
+                true,
+                true,
+                "bidir client emits retransmits: 0 (r2 F1)",
+            ),
+        ];
+        for (reverse, bidir, present, why) in shapes {
+            let mut input = base_input();
+            input.error = Some("interrupt".into());
+            input.start_stage = StartStage::Connected;
+            input.streams = vec![];
+            input.reverse = reverse;
+            input.bidir = bidir;
+            input.congestion_used = None;
+            let v = serde_json::to_value(input.build()).unwrap();
+            assert_eq!(
+                v["end"]["sum_sent"].get("retransmits").is_some(),
+                present,
+                "{why}: {v}"
+            );
+            if present {
+                assert_eq!(
+                    v["end"]["sum_sent"]["retransmits"].as_i64(),
+                    Some(0),
+                    "{why}: {v}"
+                );
+            }
         }
     }
 

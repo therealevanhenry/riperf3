@@ -401,9 +401,9 @@ fn pre_data_interrupt_dump_reports_a_zero_window() {
     );
     // #281 r1 F1: the stream-less TCP forward dump carries GT's role-level
     // `sum_sent.retransmits: 0` (platform-gated exactly like GT: present
-    // where TCP_INFO retransmits exist — the Linux/FreeBSD CI legs — absent
-    // elsewhere, e.g. the Windows native leg).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    // where TCP_INFO retransmits exist — the Linux/FreeBSD/macOS CI legs —
+    // absent elsewhere, e.g. the Windows native leg).
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
     assert_eq!(
         doc["end"]["sum_sent"]["retransmits"].as_i64(),
         Some(0),
@@ -495,9 +495,9 @@ fn post_exchange_prestart_interrupt_dump_takes_gt_stage1_shape() {
     }
     // #281 r1 F1: the stream-less TCP forward dump carries GT's role-level
     // `sum_sent.retransmits: 0` (platform-gated exactly like GT: present
-    // where TCP_INFO retransmits exist — the Linux/FreeBSD CI legs — absent
-    // elsewhere, e.g. the Windows native leg).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    // where TCP_INFO retransmits exist — the Linux/FreeBSD/macOS CI legs —
+    // absent elsewhere, e.g. the Windows native leg).
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
     assert_eq!(
         doc["end"]["sum_sent"]["retransmits"].as_i64(),
         Some(0),
