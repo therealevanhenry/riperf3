@@ -37,7 +37,7 @@ pub use client::{Client, ClientBuilder};
 mod server;
 // TestConfig is server-internal (built from received wire params, not used in
 // any public signature); it stays crate-private rather than a public type (#67).
-pub use server::{Server, ServerBuilder};
+pub use server::{BoundServer, Server, ServerBuilder};
 
 // The transport enum used across the public builder API. `TestResultsJson` /
 // `StreamResultJson` are the internal control-channel exchange model and are no

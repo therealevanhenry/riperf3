@@ -149,6 +149,39 @@ fn render_timestamp(_fmt: &str) -> String {
     )
 }
 
+/// Console-quiet flag for library callers (#290): when set (run-scoped, via
+/// [`OutputQuietGuard`]), every console `println!`/`eprintln!` the crate makes
+/// is skipped — while `log::` records and the `--get-server-output` capture
+/// tee keep working, so a quiet server can still relay its report on the
+/// wire. Process-global like OUTPUT_TITLE (one run at a time); visible across
+/// the reporter task, which a thread-local could not be.
+static OUTPUT_QUIET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True while any active run asked for no console output (#290).
+pub(crate) fn output_quiet() -> bool {
+    OUTPUT_QUIET.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// RAII guard arming the run-scoped console-quiet flag (#290). Construct ONLY
+/// when quiet is requested (callers gate then `.then(OutputQuietGuard::set)`).
+/// A COUNTER, not a bool: an in-process client + bound-server pair each hold
+/// a guard, and the first one to finish must not un-silence the other
+/// (a bool's drop did exactly that — the closing "iperf Done." leaked).
+pub(crate) struct OutputQuietGuard;
+
+impl OutputQuietGuard {
+    pub(crate) fn set() -> Self {
+        OUTPUT_QUIET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OutputQuietGuard
+    }
+}
+
+impl Drop for OutputQuietGuard {
+    fn drop(&mut self) {
+        OUTPUT_QUIET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn set_output_title(title: Option<String>) {
     if let Ok(mut g) = OUTPUT_TITLE.write() {
         *g = title;
@@ -195,7 +228,10 @@ macro_rules! vprintln {
                 format_args!($($arg)*)
             );
             $crate::macros::capture_line(&line);
-            println!("{line}");
+            // #290: a quiet run logs + captures but never touches stdout.
+            if !$crate::macros::output_quiet() {
+                println!("{line}");
+            }
         }
     };
 }
