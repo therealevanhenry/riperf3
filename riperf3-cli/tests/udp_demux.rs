@@ -36,12 +36,16 @@ fn free_port() -> u16 {
 }
 
 // Reaper guard + bounded wait now live in riperf3-test-support (#192).
-use common::{wait_bounded, ChildGuard};
+use common::{udp_serial, wait_bounded, ChildGuard};
 
 /// Run one UDP mode against a demux-forced one-off server and return the client's
 /// parsed `-J` report. `extra` carries the direction flag (`-R`, `--bidir`, or
 /// nothing for forward).
 fn run_demux_udp(extra: &[&str], who: &str) -> Value {
+    // #191-class: concurrent UDP-connect handshakes starve each other under
+    // load (this binary went from 3 to 4 UDP tests with the #288 pin, and the
+    // fourth tipped it over locally). Serialize within the binary.
+    let _serial = udp_serial();
     let bin = env!("CARGO_BIN_EXE_riperf3");
     let port = free_port();
     let port_s = port.to_string();
@@ -162,4 +166,105 @@ fn udp_demux_bidir_parallel_completes() {
     // The exact #80 case: 4 receiving + 4 sending streams over one server socket.
     let report = run_demux_udp(&["--bidir"], "bidir");
     assert_all_streams_have_bytes(&report, 8, "bidir");
+}
+
+/// #288 (r1 mutation B): the demux server's `-J` `connected[]` must map each
+/// stream to the CLIENT's real source port (`peer_addr: Some(client_addr)` in
+/// the demux route table), with every local port being the shared demux
+/// socket's. A dropped/None peer_addr — or a stream/route mix-up — shows here.
+#[test]
+fn demux_server_connected_block_maps_streams_to_client_ports() {
+    let _serial = udp_serial();
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let port = free_port();
+    let port_s = port.to_string();
+
+    let server = Command::new(bin)
+        .args(["-s", "-1", "-p", &port_s, "-J"])
+        .env("RIPERF3_UDP_SERVER_DEMUX", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = ChildGuard(server);
+
+    let retry_deadline = Instant::now() + Duration::from_secs(10);
+    let out = loop {
+        let client = Command::new(bin)
+            .args([
+                "-c",
+                "127.0.0.1",
+                "-p",
+                &port_s,
+                "-u",
+                "-t",
+                "1",
+                "-P",
+                "2",
+                "-J",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run client");
+        // -J puts the refusal text in the stdout DOCUMENT, stderr empty
+        // (#198), so classify on BOTH — the stderr-only check silently
+        // never retried and failed on the first compile-load-delayed accept.
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&client.stdout),
+            String::from_utf8_lossy(&client.stderr)
+        );
+        if common::refused(&client.status, &combined) && Instant::now() < retry_deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        assert!(client.status.success(), "client failed: {combined}");
+        break String::from_utf8_lossy(&client.stdout).into_owned();
+    };
+
+    // Server exits after the one test (-1); read its whole doc.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.0.try_wait().expect("try_wait").is_none() {
+        assert!(Instant::now() < deadline, "server did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sdoc = String::new();
+    use std::io::Read;
+    server
+        .0
+        .stdout
+        .take()
+        .expect("piped")
+        .read_to_string(&mut sdoc)
+        .expect("read server doc");
+
+    let cv: Value = serde_json::from_str(&out).expect("client doc parses");
+    let sv: Value = serde_json::from_str(&sdoc).expect("server doc parses");
+
+    let client_local_ports: std::collections::BTreeSet<u64> = cv["start"]["connected"]
+        .as_array()
+        .expect("client connected[]")
+        .iter()
+        .map(|c| c["local_port"].as_u64().expect("client local_port"))
+        .collect();
+    let server_entries = sv["start"]["connected"]
+        .as_array()
+        .expect("server connected[]");
+    assert_eq!(server_entries.len(), 2, "one entry per stream: {sv}");
+    let server_remote_ports: std::collections::BTreeSet<u64> = server_entries
+        .iter()
+        .map(|c| c["remote_port"].as_u64().expect("server remote_port"))
+        .collect();
+    assert_eq!(
+        server_remote_ports, client_local_ports,
+        "each server stream maps to a real client source port: {sv}"
+    );
+    for c in server_entries {
+        assert_eq!(
+            c["local_port"].as_u64(),
+            Some(u64::from(port)),
+            "every demux stream shares the one server socket: {sv}"
+        );
+    }
 }

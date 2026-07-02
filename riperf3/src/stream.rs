@@ -493,7 +493,7 @@ pub struct DataStream {
 /// the #25-class "fixed one create-streams branch, forgot the other" drift.
 /// The `task` and `udp_recv_stats` stay out — they're computed per branch
 /// (the spawn shape and the receiver-only jitter mutex diverge by role) and
-/// are passed alongside the meta to `DataStream::from_meta`.
+/// are set directly on the `DataStream` literal alongside `meta` (#288).
 pub(crate) struct StreamMeta {
     /// Stream identifier (shown as `[ ID]` in output).
     pub id: i32,

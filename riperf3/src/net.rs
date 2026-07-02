@@ -1006,6 +1006,45 @@ pub async fn udp_bind_reusable(
 mod tests {
     use super::*;
 
+    /// #288 (r1 blocker): `capture_stream_meta` must map each socket property
+    /// to ITS OWN `SocketMeta` field. The struct literal is a hand-built copy
+    /// site (the class the deleted `from_meta` round-trip guarded), and a
+    /// sndbuf/rcvbuf transposition is invisible to every functional test —
+    /// `check_socket_window` runs on the untransposed locals, and UDP's
+    /// defaults are equal so only a TCP-style distinct pair can catch it.
+    /// Buffers are asserted against the socket's OWN getters (the kernel
+    /// doubles requested sizes on Linux), set explicitly DISTINCT first.
+    #[test]
+    fn capture_stream_meta_maps_every_field_to_its_own() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+
+        let sock = socket2::SockRef::from(&client);
+        sock.set_send_buffer_size(64 * 1024).unwrap();
+        sock.set_recv_buffer_size(256 * 1024).unwrap();
+        let snd = sock.send_buffer_size().unwrap() as u64;
+        let rcv = sock.recv_buffer_size().unwrap() as u64;
+        assert_ne!(snd, rcv, "the swap-detection premise: distinct sizes");
+
+        let meta = capture_stream_meta(socket2::SockRef::from(&client), None, false)
+            .expect("capture on a live socket");
+        assert_eq!(
+            meta.local_addr,
+            Some(client.local_addr().unwrap()),
+            "local_addr is THIS socket's own address"
+        );
+        assert_eq!(
+            meta.peer_addr,
+            Some(client.peer_addr().unwrap()),
+            "peer_addr is the remote's address"
+        );
+        assert_eq!(meta.sndbuf_actual, Some(snd), "sndbuf maps to SO_SNDBUF");
+        assert_eq!(meta.rcvbuf_actual, Some(rcv), "rcvbuf maps to SO_RCVBUF");
+        drop(server_side);
+    }
+
     /// #163: configure_udp_sender must be GROW-ONLY. The old unconditional
     /// set_send_buffer_size shrank SO_SNDBUF ~9-90x below the OS default at
     /// moderate batch×blksize products (worst at -b rate/1: one datagram!) —
