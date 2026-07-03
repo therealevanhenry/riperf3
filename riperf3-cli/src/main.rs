@@ -25,6 +25,13 @@ fn main() -> std::process::ExitCode {
                 ErrorKind::MissingRequiredArgument
                     if e.to_string().contains("--server") && e.to_string().contains("--client") =>
                 {
+                    // RECORDED DEVIATION (#332 r2 N2): GT's IENOROLE fires
+                    // LAST in its post-loop sequence (iperf_api.c:2001-2004),
+                    // so its in-loop/blksize/end-conditions checks all beat
+                    // it on a role-less command line (live: `-l -1` → GT
+                    // "block size too large", riperf3 this sentence). clap's
+                    // required mode group fires first by construction (#198);
+                    // same reject class + exit either way.
                     eprintln!(
                         "riperf3: parameter error - must either be a client (-c) or server (-s)"
                     );
@@ -371,6 +378,10 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
             // only fires for blksize > 0 (:1939-1941), so `-u -l -5`
             // PROCEEDS into a negative datagram size; riperf3 rejects it
             // with the UDP sentence instead of reproducing the garbage run.
+            // Corollary (#332 r2 N3): in combined cells GT may still reject
+            // via a LATER post-loop check where this arm preempts with a
+            // different sentence (live: `-u -l -5 -t 5 -n 5` → GT
+            // IEENDCONDITIONS vs our IEUDPBLOCKSIZE — same class + exit).
             if (!cli.udp && v < 0) || v > 1_048_576 {
                 return Some("block size too large (maximum = 1048576 bytes)".to_string());
             }
