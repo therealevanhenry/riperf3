@@ -773,6 +773,137 @@ fn mid_test_ctrl_eof_with_data_held_exits_bounded() {
     );
 }
 
+/// #330 exchange-phase cells: full protocol through TestEnd; after the
+/// server's ExchangeResults(13), `blob`: None = EOF before the results,
+/// Some((promised_len, partial)) = a short blob then EOF.
+fn run_exchange_fail_scenario(
+    json: bool,
+    blob: Option<(u32, &'static [u8])>,
+) -> (String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut args = vec!["-s", "-1", "-p", &port_s];
+    if json {
+        args.push("-J");
+    }
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        if let Some((promised, partial)) = blob {
+            ctrl.write_all(&promised.to_be_bytes()).unwrap();
+            ctrl.write_all(partial).unwrap();
+        }
+        drop((ctrl, data)); // EOF where the results were due
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+
+    mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits");
+    (
+        sout_reader.join().expect("stdout"),
+        serr_reader.join().expect("stderr"),
+        status,
+    )
+}
+
+const RECV_RESULTS_ERR: &str = "error - unable to receive results: ";
+
+/// #330: EOF where the client's results were due — GT's IERECVRESULTS
+/// (live-probed): the Nread_json warning on stderr EVEN under -J (GT's
+/// warning() bypasses every sink), the doc's error key in the #248
+/// dangling-`: ` errno-0 perr form (RECORDED DEVIATION: GT appends a
+/// STALE errno's strerror), POPULATED end, exit 0.
+#[test]
+fn exchange_eof_takes_gt_recv_results_shape_in_json() {
+    let (sout, serr, status) = run_exchange_fail_scenario(true, None);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(RECV_RESULTS_ERR),
+        "the IERECVRESULTS key in the errno-0 perr form: {doc}"
+    );
+    assert!(
+        doc["end"]["streams"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "TEST_END processing ran — populated end: {doc}"
+    );
+    assert_eq!(
+        serr.trim(),
+        "warning: Failed to read JSON data size - read returned 0; errno=0",
+        "GT's read-site warning, sink-bypassing, and nothing else: {serr}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #330, text half: the warning, the error line, and the summary.
+#[test]
+fn exchange_eof_prints_warning_line_and_summary_in_text() {
+    let (sout, serr, status) = run_exchange_fail_scenario(false, None);
+    // No whole-string trim: the error line's dangling `: ` IS the pin.
+    let lines: Vec<&str> = serr.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "warning: Failed to read JSON data size - read returned 0; errno=0",
+            &format!("riperf3: {RECV_RESULTS_ERR}") as &str,
+        ],
+        "warning then the error line, once each: {serr}"
+    );
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        1,
+        "the completed round prints its summary: {sout}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #330: a short results blob then EOF — GT's expected/received warning
+/// verbatim (live: "expected 500 bytes but received 5; errno=0").
+#[test]
+fn exchange_short_blob_prints_gt_length_warning() {
+    let (_sout, serr, status) = run_exchange_fail_scenario(false, Some((500, b"{\"cp")));
+    assert!(
+        serr.contains(
+            "warning: JSON size of data read does not correspond to offered length - \
+             expected 500 bytes but received 4; errno=0"
+        ),
+        "GT's short-blob warning with the real counts: {serr}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
 /// #325 r2 F6: the CLIENT side of the same default — GT's client message
 /// handler IEMESSAGEs an unmapped byte too (iperf_client_api.c:409-411).
 /// The byte replaces ExchangeResults(13) at the client's direct state wait

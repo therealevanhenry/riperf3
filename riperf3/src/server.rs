@@ -267,6 +267,16 @@ struct TestRunCtx {
     /// Mid-test rides bare_end (no final dump); end-loop keeps the
     /// populated end (the exchange completed) — both live-probed.
     ctrl_closed: bool,
+    /// #330: the exchange-phase results read failed — GT's IERECVRESULTS
+    /// surface (live-probed): the Nread_json warning already printed to
+    /// stderr, the doc keeps the POPULATED end (TEST_END processing ran)
+    /// plus `error - unable to receive results: ` (the dangling `: ` is
+    /// the #248 perr form at errno 0 — RECORDED DEVIATION: GT appends
+    /// strerror of a STALE errno here, "Transport endpoint is not
+    /// connected" on Linux, while its own warning reports errno=0; we
+    /// print the honest errno-0 form instead of reproducing the stale
+    /// read), exit 0, persistent keeps serving.
+    exchange_recv_failed: bool,
     /// #330 r1 F1: a mid-test IPERF_DONE — GT's switch has an EXPLICIT
     /// no-error arm for it (iperf_server_api.c:287-288) and Nread wrote
     /// the byte into test->state, so its run loop exits CLEAN: no error
@@ -467,6 +477,16 @@ impl Server {
                         eprintln!("riperf3: {}", RiperfError::ClientTerminated);
                     }
                 }
+                Err(RiperfError::RecvResultsFailed) => {
+                    // #330: GT text prints `iperf3: error - unable to
+                    // receive results: ` once (the #248 dangling perr form
+                    // at errno 0 — see the ctx field's deviation record);
+                    // under -J the doc carried it and stderr keeps only
+                    // the read-site warning.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!("riperf3: error - {}: ", RiperfError::RecvResultsFailed);
+                    }
+                }
                 Err(RiperfError::UnknownControlMessage) => {
                     // #325: GT main.c:174 prints `iperf3: error - <IEMESSAGE
                     // sentence>` once and keeps serving; a failed test is
@@ -664,6 +684,7 @@ impl Server {
             unknown_message: false,
             ctrl_closed: false,
             early_done: false,
+            exchange_recv_failed: false,
             bare_end: false,
             interrupted: None,
         };
@@ -737,6 +758,10 @@ impl Server {
                 // #330: IECTRLCLOSE's read-site line is a DIRECT iperf_err
                 // — bare, no prefix (live-probed both windows).
                 end.report_error = Some(CTRL_CLOSED_MSG.to_string());
+            } else if ctx.exchange_recv_failed {
+                // #330: the perr dangling `: ` at errno 0 (#248 form; see
+                // the field's deviation record).
+                end.report_error = Some(format!("error - {}: ", RiperfError::RecvResultsFailed));
             }
         }
 
@@ -776,6 +801,7 @@ impl Server {
             || ctx.client_terminated
             || ctx.ctrl_closed
             || ctx.early_done
+            || ctx.exchange_recv_failed
         {
             for s in &ctx.streams {
                 s.task.abort();
@@ -811,6 +837,12 @@ impl Server {
             // loop prints GT's read-site line for exactly this class (the
             // doc'd mid/end-loop EOF), while pre-test EOFs stay quiet.
             return Err(RiperfError::ControlSocketClosed);
+        }
+        if ctx.exchange_recv_failed {
+            // #330: the doc rendered above; the caller prints GT's text
+            // line (json keeps stderr to the warning alone) and keeps
+            // serving — a failed test is rc -1, one-off exit 0.
+            return Err(RiperfError::RecvResultsFailed);
         }
         Ok(Some(report))
     }
@@ -1516,6 +1548,7 @@ impl Server {
             || ctx.client_terminated
             || ctx.ctrl_closed
             || ctx.early_done
+            || ctx.exchange_recv_failed
         {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its
@@ -1839,7 +1872,16 @@ impl Server {
             // iperf3's server reports only its own measured bytes and a 0 remote
             // CPU (#50).
             let _client_results = tokio::select! {
-                r = protocol::recv_results(&mut ctx.ctrl) => r?,
+                r = protocol::recv_results_server(&mut ctx.ctrl) => match r {
+                    Ok(v) => v,
+                    // #330: any malformed results read is GT's
+                    // IERECVRESULTS — the warning printed at the read
+                    // site; the finalize phases render the doc.
+                    Err(_) => {
+                        ctx.exchange_recv_failed = true;
+                        return Ok(());
+                    }
+                },
                 msg = crate::client::wait_interrupt(exchange_interrupt.as_mut()) => {
                     let _ = protocol::send_state(&mut ctx.ctrl, TestState::ServerTerminate).await;
                     ctx.interrupted = Some(msg);

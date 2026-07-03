@@ -554,6 +554,11 @@ pub async fn send_results(stream: &mut TcpStream, results: &TestResultsJson) -> 
 /// Receive test results from length-prefixed JSON (no size limit).
 pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
     let value = json_read(stream, 0).await?;
+    validate_results(value)
+}
+
+/// The #271 shape validation shared by both results readers.
+fn validate_results(value: serde_json::Value) -> Result<TestResultsJson> {
     let results: TestResultsJson = serde_json::from_value(value)?;
     // #271: GT accepts BOTH omitted_* keys (>=3.14 peer) or NEITHER (old
     // peer), and fails the exchange with IERECVRESULTS when exactly one is
@@ -567,6 +572,55 @@ pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
         return Err(crate::error::RiperfError::RecvResultsFailed);
     }
     Ok(results)
+}
+
+/// The SERVER's results read (#330): a malformed read gets GT's Nread_json
+/// warning surface — deterministic `warning: ...` lines on STDERR in every
+/// mode (GT's warning() bypasses all sinks; live-probed under -J) — and
+/// maps to the IERECVRESULTS class the caller renders into the doc. The
+/// client keeps the plain [`recv_results`]: its warning parity needs its
+/// own GT probes (noted on #330).
+pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJson> {
+    let mut len_buf = [0u8; 4];
+    let mut got = 0usize;
+    while got < 4 {
+        match stream.read(&mut len_buf[got..]).await {
+            // GT's Nread returns the partial count on EOF; the warning
+            // echoes it verbatim (live: "read returned 0; errno=0").
+            Ok(0) => {
+                eprintln!("warning: Failed to read JSON data size - read returned {got}; errno=0");
+                return Err(crate::error::RiperfError::RecvResultsFailed);
+            }
+            Ok(n) => got += n,
+            Err(e) => {
+                eprintln!(
+                    "warning: Failed to read JSON data size - read returned -1; errno={}",
+                    e.raw_os_error().unwrap_or(0)
+                );
+                return Err(crate::error::RiperfError::RecvResultsFailed);
+            }
+        }
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    let mut got = 0usize;
+    while got < len {
+        match stream.read(&mut buf[got..]).await {
+            Ok(0) | Err(_) => {
+                // GT's short-blob warning, expected/received verbatim
+                // (live: "expected 500 bytes but received 5; errno=0").
+                eprintln!(
+                    "warning: JSON size of data read does not correspond to offered length - \
+                     expected {len} bytes but received {got}; errno=0"
+                );
+                return Err(crate::error::RiperfError::RecvResultsFailed);
+            }
+            Ok(n) => got += n,
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&buf).map_err(|_| crate::error::RiperfError::RecvResultsFailed)?;
+    validate_results(value)
 }
 
 // ---------------------------------------------------------------------------

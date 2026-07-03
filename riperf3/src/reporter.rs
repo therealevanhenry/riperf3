@@ -268,6 +268,13 @@ pub fn print_separator() {
 /// GT drops only the short empty tail its comment attributes to control
 /// messages queuing behind data. With `-i 0` the threshold is zero, so the
 /// whole-run flush is unconditionally kept.
+///
+/// RECORDED DEVIATION (#330 item 5, #333 r2 N2): on ERROR-truncated rounds
+/// (mid-test IEMESSAGE/EOF) and sub-tick complete rounds, this flush emits
+/// one partial interval GT never shows — GT's reporter is timer-driven and
+/// dead by then, so its doc carries whole ticks only (live: byte-9 cell =
+/// GT intervals [], riperf3 [1]). Kept: the flush is the #210 terminate
+/// convention and load-bearing for every interrupt dump shape.
 fn keep_final_interval(len_secs: f64, interval_secs: f64, residual_bytes: u64) -> bool {
     len_secs >= interval_secs * 0.10 || residual_bytes > 0
 }
