@@ -434,10 +434,11 @@ impl Client {
 
                 TestState::TestRunning => self.on_test_running(&mut ctx).await?,
 
-                TestState::ExchangeResults => {
-                    self.on_exchange_results(&mut ctx).await?;
-                    StepFlow::Continue
-                }
+                TestState::ExchangeResults => match self.on_exchange_results(&mut ctx).await? {
+                    // #268: a signal landed inside the bulk results read.
+                    Some(report) => return Ok(report),
+                    None => StepFlow::Continue,
+                },
 
                 TestState::DisplayResults => self.on_display_results(&mut ctx).await?,
 
@@ -856,11 +857,26 @@ impl Client {
         Ok(StepFlow::Continue)
     }
 
-    async fn on_exchange_results(&self, ctx: &mut RunCtx) -> Result<()> {
+    /// Returns the interrupt dump when a signal lands mid-exchange (#268):
+    /// the bulk results read joins the #231 interrupt surface — a peer
+    /// wedging mid-payload (length prefix + partial JSON, then nothing)
+    /// must not outlive a signal. GT's sigend has no phase gate here
+    /// either; the dump carries no peer half (the results never arrived).
+    async fn on_exchange_results(
+        &self,
+        ctx: &mut RunCtx,
+    ) -> Result<Option<crate::json_report::Report>> {
         let results = self.build_results(&ctx.streams, ctx.cpu_start.as_ref(), ctx.measured_secs);
         protocol::send_results(&mut ctx.ctrl, &results).await?;
-        ctx.server_results = Some(protocol::recv_results(&mut ctx.ctrl).await?);
-        Ok(())
+        tokio::select! {
+            r = protocol::recv_results(&mut ctx.ctrl) => {
+                ctx.server_results = Some(r?);
+                Ok(None)
+            }
+            msg = wait_interrupt(ctx.interrupt.as_mut()) => {
+                Ok(Some(self.on_interrupted_wait(ctx, &msg).await))
+            }
+        }
     }
 
     async fn on_display_results(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
