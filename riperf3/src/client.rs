@@ -1016,6 +1016,21 @@ impl Client {
         // — the server needs it for its upfront total-rate check AND for
         // fq-paced reverse/bidir sending. riperf3 never serialized it.
         p.fqrate = self.fq_rate.filter(|&r| r > 0);
+        // #316: the UDP GSO/GRO block rides unconditionally for UDP like GT
+        // (iperf_api.c:2465-2472): flags from --gsro, dg_size = blksize when
+        // GSO is on (GT :1946-1953), bf_size floored to a dg_size multiple
+        // from the 65507 default (GSO_BF_MAX_SIZE); the defaults ride even
+        // when off, so the server may enable its side independently.
+        if self.protocol == TransportProtocol::Udp {
+            const BF_MAX: i64 = 65507;
+            let on = self.gsro;
+            let dg = if on { blksize as i64 } else { 0 };
+            p.gso = Some(i64::from(on));
+            p.gso_dg_size = Some(dg);
+            p.gso_bf_size = Some(if on && dg > 0 { (BF_MAX / dg) * dg } else { BF_MAX });
+            p.gro = Some(i64::from(on));
+            p.gro_bf_size = Some(BF_MAX);
+        }
         // Sent only when set, like iperf3 (`if (test->settings->burst)`): the
         // server's reverse/bidir sender batches on the client's burst (#160).
         p.burst = (self.burst > 0).then_some(self.burst as i32);

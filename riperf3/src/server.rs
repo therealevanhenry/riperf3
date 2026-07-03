@@ -28,6 +28,12 @@ pub(crate) struct TestConfig {
     /// The client's `--fq-rate` (0 = unset): GT paces its ACCEPTED data
     /// sockets with it too (iperf_tcp.c:138-153, #302).
     pub fq_rate: u64,
+    /// The client's GSO/GRO request (#316, GT iperf_api.c:2599-2619): the
+    /// server enables UDP_SEGMENT/UDP_GRO on its UDP sockets when asked —
+    /// best-effort like the client's #45 posture.
+    pub gso: bool,
+    pub gso_dg_size: i64,
+    pub gro: bool,
     pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
@@ -122,6 +128,17 @@ impl TestConfig {
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
             fq_rate: params.fqrate.unwrap_or(0),
+            gso: params.gso.unwrap_or(0) != 0,
+            // GT recomputes a zero dg_size from the negotiated blksize
+            // (iperf_api.c:2607-2613); DEFAULT_UDP_BLKSIZE guards blksize 0.
+            gso_dg_size: match params.gso_dg_size.unwrap_or(0) {
+                0 if params.gso.unwrap_or(0) != 0 => match params.len.unwrap_or(0) {
+                    blk if blk > 0 => i64::from(blk),
+                    _ => 1460,
+                },
+                v => v,
+            },
+            gro: params.gro.unwrap_or(0) != 0,
             burst,
             // The client's --pacing-timer quantum (#32); iperf3 always sends
             // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.

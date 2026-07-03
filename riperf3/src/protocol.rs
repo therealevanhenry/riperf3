@@ -333,6 +333,21 @@ pub struct TestParams {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fqrate: Option<u64>,
 
+    // #316: GT sends the UDP GSO/GRO block unconditionally for UDP
+    // ("Always send these fields to allow server to use GSO/GRO even if
+    // client doesn't support it", iperf_api.c:2465-2472) — flags plus the
+    // datagram/buffer sizes the peer's send/recv paths adopt (:2599-2619).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gso: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gso_dg_size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gso_bf_size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gro: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gro_bf_size: Option<i64>,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pacing_timer: Option<i32>,
 
