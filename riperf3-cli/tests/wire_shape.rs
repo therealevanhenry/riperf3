@@ -665,6 +665,114 @@ fn mid_test_test_start_byte_is_a_gt_noop() {
     );
 }
 
+/// #330 r1 F1: a mid-test IPERF_DONE is GT's explicit CLEAN arm
+/// (iperf_server_api.c:287-288 + the byte lands in test->state, exiting
+/// its run loop): NO error key, NO stderr, bare end{}, exit 0
+/// (live-probed) — not the IEMESSAGE default.
+#[test]
+fn mid_test_iperf_done_ends_clean_and_bare_in_json() {
+    let (sout, serr, status) = run_scenario_full(true, Some(16), true, MOCK_PARAMS);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert!(
+        doc["error"].is_null(),
+        "GT's IPERF_DONE arm carries no error: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().is_some_and(|o| o.is_empty()),
+        "the final stats dump never ran — bare end{{}}: {doc}"
+    );
+    assert!(serr.trim().is_empty(), "no stderr surface: {serr}");
+    assert!(status.success(), "clean exit like GT");
+}
+
+/// #330 r1 F1, text half: nothing on stderr, no summary, exit 0.
+#[test]
+fn mid_test_iperf_done_ends_clean_in_text() {
+    let (sout, serr, status) = run_scenario_full(false, Some(16), true, MOCK_PARAMS);
+    assert!(serr.trim().is_empty(), "no stderr surface: {serr}");
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        0,
+        "no summary mid-test: {sout}"
+    );
+    assert!(status.success(), "clean exit like GT");
+}
+
+/// #330 r1 F6: the -J twin of the mid-test known-stray cell — the
+/// prefixed doc key over the bare end (live-probed byte 9 ≡ byte 99).
+#[test]
+fn mid_test_known_stray_state_takes_iemessage_shape_in_json() {
+    let (sout, serr, status) = run_scenario_full(true, Some(9), true, MOCK_PARAMS);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {IEMESSAGE}").as_str()),
+        "the prefixed IEMESSAGE key: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().is_some_and(|o| o.is_empty()),
+        "bare end mid-test: {doc}"
+    );
+    assert!(serr.trim().is_empty(), "-J stderr silent: {serr}");
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #330 r1 F5: ctrl EOF while the peer HOLDS the data socket — the
+/// abort-gate cell the both-sockets-close pins can't discriminate (data
+/// tasks EOF on their own there). GT's cleanup closes the data sockets
+/// and exits on its own clock.
+#[test]
+fn mid_test_ctrl_eof_with_data_held_exits_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Close ONLY the control socket; the data socket stays held far past
+    // the assertion window (detached thread; closes at process exit).
+    std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        drop(ctrl);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        drop(data);
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits while the peer still holds the data socket");
+    assert!(status.success(), "clean exit like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CTRL_CLOSED}"),
+        "the line prints NOW, not after the peer relents"
+    );
+}
+
 /// #325 r2 F6: the CLIENT side of the same default — GT's client message
 /// handler IEMESSAGEs an unmapped byte too (iperf_client_api.c:409-411).
 /// The byte replaces ExchangeResults(13) at the client's direct state wait

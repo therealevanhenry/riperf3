@@ -267,6 +267,12 @@ struct TestRunCtx {
     /// Mid-test rides bare_end (no final dump); end-loop keeps the
     /// populated end (the exchange completed) — both live-probed.
     ctrl_closed: bool,
+    /// #330 r1 F1: a mid-test IPERF_DONE — GT's switch has an EXPLICIT
+    /// no-error arm for it (iperf_server_api.c:287-288) and Nread wrote
+    /// the byte into test->state, so its run loop exits CLEAN: no error
+    /// key, no stderr, bare end{}, exit 0 (live-probed). The exchange is
+    /// skipped (the peer has left the protocol).
+    early_done: bool,
     interrupted: Option<String>,
 }
 
@@ -438,17 +444,15 @@ impl Server {
                 Err(RiperfError::Aborted(msg)) if msg == "idle timeout" => {
                     idle_restart = true;
                 }
-                Err(RiperfError::PeerDisconnected) => {
-                    if self.verbose {
-                        vprintln!("Client disconnected.");
-                    }
-                }
                 Err(RiperfError::ControlSocketClosed) => {
                     // #330: the mid-test / end-loop control EOF — GT prints
                     // its read-site sentence once (iperf_server_api.c:
                     // 249-254) and keeps serving; under -J the doc carried
-                    // it (sink rule). Pre-test EOFs (port scans) stay on
-                    // the quiet PeerDisconnected arm above.
+                    // it (sink rule). (r1 F3: the old PeerDisconnected arm
+                    // is gone — both server recv_state sites convert EOF to
+                    // this class now, so it had no constructor left.
+                    // Pre-test EOFs like port scans ride the generic Io arm
+                    // below, same as GT's per-scan cookie-read error line.)
                     if !json && !crate::macros::output_quiet() {
                         eprintln!("riperf3: {CTRL_CLOSED_MSG}");
                     }
@@ -524,11 +528,12 @@ impl Server {
     /// banner — it is a library entry point, not the daemon. The test report is
     /// still printed to stdout in `-J` / text mode, like `Client::run`.
     ///
-    /// Peer-caused test failures surface as errors AFTER the report was
+    /// Peer-caused test endings surface as errors AFTER the report was
     /// rendered to the active sink: a CLIENT_TERMINATE returns
-    /// [`RiperfError::ClientTerminated`] and an unhandled control byte
-    /// returns [`RiperfError::UnknownControlMessage`] (#325) — both mirror
-    /// GT's failed-test rc, which its one-off still exits 0 on.
+    /// [`RiperfError::ClientTerminated`], an unhandled control byte
+    /// returns [`RiperfError::UnknownControlMessage`] (#325), and a
+    /// control-connection EOF returns [`RiperfError::ControlSocketClosed`]
+    /// (#330) — all mirror GT rounds its one-off still exits 0 on.
     pub async fn run_once(&self) -> Result<crate::json_report::Report> {
         let listener = self.listen().await?;
         self.serve_once(&listener).await
@@ -658,6 +663,7 @@ impl Server {
             client_terminated: false,
             unknown_message: false,
             ctrl_closed: false,
+            early_done: false,
             bare_end: false,
             interrupted: None,
         };
@@ -769,6 +775,7 @@ impl Server {
             || ctx.unknown_message
             || ctx.client_terminated
             || ctx.ctrl_closed
+            || ctx.early_done
         {
             for s in &ctx.streams {
                 s.task.abort();
@@ -1405,12 +1412,21 @@ impl Server {
                             break;
                         }
                         // GT's TEST_START arm is a bare no-op mid-test too
-                        // (iperf_server_api.c:266-267) — ONE switch serves
-                        // every phase.
+                        // (iperf_server_api.c:266-267).
                         Ok(TestState::TestStart) => {}
+                        // #330 r1 F1: IPERF_DONE has its own CLEAN arm in
+                        // GT (:287-288) — the byte lands in test->state and
+                        // the run loop exits with no error surface at all
+                        // (live-probed: doc error null, bare end, exit 0).
+                        Ok(TestState::IperfDone) => {
+                            ctx.early_done = true;
+                            ctx.bare_end = true;
+                            break;
+                        }
                         // #330: every OTHER known state mid-test hits GT's
-                        // same IEMESSAGE default (live-probed: byte 9 = the
-                        // prefixed doc key, exit 0). The #145 tolerance is
+                        // IEMESSAGE default (live-probed: byte 9 = the
+                        // prefixed doc key, exit 0; the full stray set is
+                        // 2/9/10/11/13/14/15/-1/-2). The #145 tolerance is
                         // gone on this loop like the end loop's (#329).
                         Ok(_) => {
                             ctx.unknown_message = true;
@@ -1499,6 +1515,7 @@ impl Server {
             || ctx.unknown_message
             || ctx.client_terminated
             || ctx.ctrl_closed
+            || ctx.early_done
         {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its
@@ -1778,6 +1795,7 @@ impl Server {
         if !ctx.client_terminated
             && !ctx.unknown_message
             && !ctx.ctrl_closed
+            && !ctx.early_done
             && ctx.interrupted.is_none()
             && ctx.server_error.is_none()
         {
