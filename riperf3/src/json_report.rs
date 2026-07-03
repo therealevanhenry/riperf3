@@ -3132,17 +3132,28 @@ mod tests {
         }
         assert_eq!(v["end"]["sum_sent"]["seconds"].as_f64(), Some(0.0));
         // #281 r1 F1: GT prints retransmits: 0 on the stream-less TCP dump
-        // when the local role is a retransmit-capable sender (and omits it
-        // on platforms without TCP_INFO retransmits, like GT).
-        if crate::tcp_info::has_retransmit_info() {
-            assert_eq!(
-                v["end"]["sum_sent"]["retransmits"].as_i64(),
-                Some(0),
-                "stream-less TCP forward dump carries retransmits: 0 (GT): {v}"
-            );
-        } else {
-            assert!(v["end"]["sum_sent"].get("retransmits").is_none());
-        }
+        // when the local role is a retransmit-capable sender, and omits it
+        // when the capability is off. Both polarities are deterministic on
+        // every platform now that the capability is a resolved input field
+        // (base_input sets it true; the flag-off twin re-builds with false).
+        assert_eq!(
+            v["end"]["sum_sent"]["retransmits"].as_i64(),
+            Some(0),
+            "stream-less TCP forward dump carries retransmits: 0 (GT): {v}"
+        );
+        let mut flagless = base_input();
+        flagless.error = Some("interrupt - the client has terminated by signal".into());
+        flagless.start_stage = StartStage::Connected;
+        flagless.bare_end = false;
+        flagless.streams = vec![];
+        flagless.congestion_used = None;
+        flagless.elapsed = 0.0;
+        flagless.local_has_retransmit_info = false;
+        let v = serde_json::to_value(flagless.build()).unwrap();
+        assert!(
+            v["end"]["sum_sent"].get("retransmits").is_none(),
+            "capability off omits the key, like GT: {v}"
+        );
     }
 
     /// #300 r2 F1+F2: the role-level stream-less retransmits rule per
@@ -3153,9 +3164,6 @@ mod tests {
     /// drop (r2 mutation A survived without the reverse pin).
     #[test]
     fn stream_less_retransmits_follows_the_gt_role_rule() {
-        if !crate::tcp_info::has_retransmit_info() {
-            return;
-        }
         let shapes = [
             (false, false, true, "forward client emits retransmits: 0"),
             (true, false, false, "reverse client omits the key"),
