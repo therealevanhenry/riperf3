@@ -2217,10 +2217,10 @@ impl Server {
         if !routes.is_empty() {
             let s = shared.clone();
             let d = done.clone();
-            *demux_handle = Some(
-                thread_gate
-                    .spawn(move || stream::run_udp_server_demux_receiver(s, routes, d, u64bit)),
-            );
+            let bs = cfg.blksize;
+            *demux_handle = Some(thread_gate.spawn(move || {
+                stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
+            }));
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun

@@ -1624,6 +1624,43 @@ pub(crate) fn run_udp_server_demux_sender(
     )
 }
 
+/// GT's unified UDP receive loop (#316, iperf_udp.c:124-232): one read may
+/// carry a UDP_GRO-coalesced train of datagrams whose headers sit at the
+/// NEGOTIATED blksize stride — GT reads the cmsg segment size but pins the
+/// walk stride to blksize (iperf_udp.c:89-90), so a plain read of the
+/// coalesced payload parses identically to its recvmsg. With GRO off the
+/// buffer holds one datagram and exactly one header parses, same as ever.
+/// Before this walk, UDP_GRO in front of a single-header parse booked the
+/// other segments as sequence-gap loss (the 97% phantom-loss failure from
+/// the #327 r1 review).
+///
+/// RECORDED DEVIATION (short datagrams only): a single datagram >= one
+/// header but < blksize still parses here — GT's full-stride guard
+/// (`buf_sz >= dgram_sz`) skips it and books the gap as loss. Unreachable
+/// from conforming senders (both tools send whole-blksize datagrams), and
+/// parsing is the pre-GSO iperf3 behavior riperf3 always matched.
+fn walk_udp_headers(buf: &[u8], blksize: usize, use_64bit: bool, stats: &Mutex<UdpRecvStats>) {
+    let hdr = UdpHeader::wire_size(use_64bit);
+    // Guard degenerate blksize < header (params floor it in practice):
+    // never walk overlapping headers.
+    let stride = blksize.max(hdr);
+    let Ok(mut st) = stats.lock() else { return };
+    let mut off = 0;
+    while off + hdr <= buf.len() {
+        if let Some(header) = UdpHeader::read_from(&buf[off..], use_64bit) {
+            // GT stamps arrival per header INSIDE the walk
+            // (iperf_udp.c:216) — the jitter EWMA sees distinct transit
+            // values across a train.
+            let arrival = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            st.update(&header, arrival);
+        }
+        off += stride;
+    }
+}
+
 /// Where one client's datagrams are accounted in the single-socket UDP server
 /// demux: the receiving stream's byte counters and its jitter/loss stats.
 pub(crate) struct UdpDemuxRoute {
@@ -1649,6 +1686,7 @@ pub(crate) struct UdpDemuxRoute {
 pub(crate) fn run_udp_server_demux_receiver(
     socket: Arc<std::net::UdpSocket>,
     routes: std::collections::HashMap<std::net::SocketAddr, UdpDemuxRoute>,
+    blksize: usize,
     done: Arc<AtomicBool>,
     use_64bit: bool,
 ) -> Result<()> {
@@ -1681,15 +1719,8 @@ pub(crate) fn run_udp_server_demux_receiver(
                 // and records 0 bytes with no header.
                 if let Some(route) = routes.get(&src) {
                     route.counters.record_received(n as u64);
-                    if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {
-                        let arrival = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs_f64();
-                        if let Ok(mut stats) = route.stats.lock() {
-                            stats.update(&header, arrival);
-                        }
-                    }
+                    // #316: GRO-aware — one read may hold a whole train.
+                    walk_udp_headers(&buf[..n], blksize, use_64bit, &route.stats);
                 }
             }
             Err(e)
@@ -1821,15 +1852,8 @@ pub fn run_udp_receiver_blocking(
             Ok(0) => break,
             Ok(n) => {
                 counters.record_received(n as u64);
-                if let Some(header) = UdpHeader::read_from(&buf[..n], use_64bit) {
-                    let arrival = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    if let Ok(mut stats) = udp_stats.lock() {
-                        stats.update(&header, arrival);
-                    }
-                }
+                // #316: GRO-aware — one read may hold a whole train.
+                walk_udp_headers(&buf[..n], blksize, use_64bit, &udp_stats);
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -3185,6 +3209,89 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         };
         assert!(res.is_ok(), "receiver returned error: {res:?}");
+    }
+
+    // ---- #316: GRO-coalesced trains walk headers at the blksize stride ------
+
+    /// One 3×blksize buffer with sequential headers at each stride — exactly
+    /// what a UDP_GRO socket hands userspace when the kernel coalesces a GSO
+    /// train. GT's unified receive loop walks it at the NEGOTIATED blksize
+    /// (iperf_udp.c:89-90 pins the stride to blksize, :124-232 the walk); a
+    /// single-header parse books the other segments as sequence-gap loss —
+    /// the 97% phantom-loss failure from the #327 review.
+    fn gro_train(blksize: usize, seqs: &[u64]) -> Vec<u8> {
+        let mut buf = vec![0u8; blksize * seqs.len()];
+        for (i, seq) in seqs.iter().enumerate() {
+            UdpHeader {
+                sec: 0,
+                usec: 0,
+                seq: *seq,
+            }
+            .write_to(&mut buf[i * blksize..], false);
+        }
+        buf
+    }
+
+    #[test]
+    fn udp_receiver_walks_coalesced_trains_at_blksize_stride() {
+        let (send, recv) = udp_pair();
+        let counters = Arc::new(StreamCounters::new());
+        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let c = counters.clone();
+        let s = stats.clone();
+        let d = done.clone();
+        let h = std::thread::spawn(move || run_udp_receiver_blocking(recv, c, s, 1024, d, false));
+
+        send.send(&gro_train(1024, &[1, 2, 3])).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        done.store(true, Ordering::Relaxed);
+        h.join().unwrap().unwrap();
+
+        assert_eq!(counters.bytes_received(), 3072, "bytes count once per read");
+        let st = stats.lock().unwrap();
+        assert_eq!(
+            st.packet_count, 3,
+            "all three train headers walked, not just the first"
+        );
+        assert_eq!(st.cnt_error, 0, "no phantom sequence-gap loss");
+    }
+
+    #[test]
+    fn udp_demux_receiver_walks_coalesced_trains_at_blksize_stride() {
+        let demux = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let send = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        send.connect(demux.local_addr().unwrap()).unwrap();
+
+        let counters = Arc::new(StreamCounters::new());
+        let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let routes = std::collections::HashMap::from([(
+            send.local_addr().unwrap(),
+            UdpDemuxRoute {
+                counters: counters.clone(),
+                stats: stats.clone(),
+            },
+        )]);
+
+        let sock = demux.clone();
+        let d = done.clone();
+        let h =
+            std::thread::spawn(move || run_udp_server_demux_receiver(sock, routes, 1024, d, false));
+
+        send.send(&gro_train(1024, &[1, 2, 3])).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        done.store(true, Ordering::Relaxed);
+        h.join().unwrap().unwrap();
+
+        assert_eq!(counters.bytes_received(), 3072, "bytes count once per read");
+        let st = stats.lock().unwrap();
+        assert_eq!(
+            st.packet_count, 3,
+            "all three train headers walked, not just the first"
+        );
+        assert_eq!(st.cnt_error, 0, "no phantom sequence-gap loss");
     }
 }
 
