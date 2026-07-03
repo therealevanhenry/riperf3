@@ -1821,6 +1821,15 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
+        // #316: honor the client's GSO/GRO request on the server's UDP
+        // sockets — best-effort like the client's #45 posture (a kernel
+        // without UDP_SEGMENT/UDP_GRO degrades to plain sends).
+        if cfg.gso {
+            let _ = net::set_udp_gso(&udp_listener, cfg.gso_dg_size.clamp(1, 65507) as u16);
+        }
+        if cfg.gro {
+            let _ = net::set_udp_gro(&udp_listener);
+        }
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -1987,6 +1996,14 @@ impl Server {
         // which is Windows-default (where the sockopt no-ops) and Linux
         // opt-in via RIPERF3_UDP_SERVER_DEMUX.
         net::apply_fq_rate(&udp_sock, cfg.fq_rate);
+        // #316: the demux shared socket IS the data socket — same GSO/GRO
+        // honor, best-effort.
+        if cfg.gso {
+            let _ = net::set_udp_gso(&udp_sock, cfg.gso_dg_size.clamp(1, 65507) as u16);
+        }
+        if cfg.gro {
+            let _ = net::set_udp_gro(&udp_sock);
+        }
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -2476,9 +2493,10 @@ impl Server {
             bare_end: false,
             // The server reports at its 1s default; it has no -i.
             interval: 1.0,
-            // GSO/GRO are client-side knobs, not exchanged; iperf3's server emits 0.
-            gso: 0,
-            gro: 0,
+            // #316: the GSO/GRO request IS exchanged now — GT's server
+            // test_start carries the adopted values (live-probed gso:1).
+            gso: i32::from(cfg.gso),
+            gro: i32::from(cfg.gro),
             start_time_millis,
             // The client sends --extra-data via the parameter exchange; echo it
             // into the server's -J output too, like iperf3 (#35).
@@ -2997,6 +3015,33 @@ impl ServerBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// #316: the server adopts the client's exchanged GSO/GRO request
+    /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
+    /// from the negotiated blksize (:2607-2613).
+    #[test]
+    fn test_config_adopts_the_gsro_block() {
+        let params = crate::protocol::TestParams {
+            udp: Some(true),
+            len: Some(1200),
+            gso: Some(1),
+            gso_dg_size: Some(0), // old/odd peer: recompute from blksize
+            gro: Some(1),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        assert!(cfg.gso && cfg.gro);
+        assert_eq!(cfg.gso_dg_size, 1200, "zero dg_size recomputes from len");
+
+        // Absent block (old peer): everything off.
+        let params = crate::protocol::TestParams {
+            udp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        assert!(!cfg.gso && !cfg.gro);
+    }
+
     use super::*;
 
     /// Receive one datagram and return the IP_TOS control message byte, via

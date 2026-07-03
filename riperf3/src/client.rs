@@ -1027,7 +1027,11 @@ impl Client {
             let dg = if on { blksize as i64 } else { 0 };
             p.gso = Some(i64::from(on));
             p.gso_dg_size = Some(dg);
-            p.gso_bf_size = Some(if on && dg > 0 { (BF_MAX / dg) * dg } else { BF_MAX });
+            p.gso_bf_size = Some(if on && dg > 0 {
+                (BF_MAX / dg) * dg
+            } else {
+                BF_MAX
+            });
             p.gro = Some(i64::from(on));
             p.gro_bf_size = Some(BF_MAX);
         }
@@ -4237,6 +4241,42 @@ mod tests {
             let c = ClientBuilder::new("h").build().unwrap();
             assert_eq!(c.protocol, TransportProtocol::Tcp);
             assert_eq!(c.bandwidth, 0);
+        }
+
+        #[test]
+        fn udp_params_carry_the_gsro_block_like_gt() {
+            // #316: GT sends the five GSO/GRO keys unconditionally for UDP
+            // (iperf_api.c:2465-2472) — defaults ride even when off, so the
+            // server may enable its side independently.
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .build()
+                .unwrap();
+            let p = c.build_params(1460);
+            assert_eq!(p.gso, Some(0));
+            assert_eq!(p.gso_dg_size, Some(0));
+            assert_eq!(p.gso_bf_size, Some(65507));
+            assert_eq!(p.gro, Some(0));
+            assert_eq!(p.gro_bf_size, Some(65507));
+
+            // --gsro on: dg = blksize, bf floored to a dg multiple (GT
+            // :1946-1953).
+            let c = ClientBuilder::new("h")
+                .protocol(TransportProtocol::Udp)
+                .gsro(true)
+                .build()
+                .unwrap();
+            let p = c.build_params(1460);
+            assert_eq!(p.gso, Some(1));
+            assert_eq!(p.gso_dg_size, Some(1460));
+            assert_eq!(p.gso_bf_size, Some((65507 / 1460) * 1460));
+            assert_eq!(p.gro, Some(1));
+
+            // TCP: the block is absent, like GT's Pudp gate.
+            let c = ClientBuilder::new("h").build().unwrap();
+            let p = c.build_params(1460);
+            assert_eq!(p.gso, None);
+            assert_eq!(p.gro_bf_size, None);
         }
 
         #[test]
