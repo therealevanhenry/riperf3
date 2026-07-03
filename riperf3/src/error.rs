@@ -59,8 +59,13 @@ pub enum RiperfError {
     /// iperf3's IEMESSAGE (#325): an unhandled control byte. GT's end-loop
     /// switch has arms for only TEST_START / TEST_END / IPERF_DONE /
     /// CLIENT_TERMINATE — every other value, known state or not, hits
-    /// `default: i_errno = IEMESSAGE` (iperf_server_api.c:309-311). GT's
-    /// sentence, no "protocol violation" wrapper (#151 convention).
+    /// `default: i_errno = IEMESSAGE` (iperf_server_api.c:309-311). The
+    /// CLIENT's message handler defaults to the same code
+    /// (iperf_client_api.c:409-411), so recv_state surfaces this on both
+    /// roles — the client's text line and -J doc match GT byte-for-byte
+    /// (r2-verified; the client doc carries the BARE sentence, no
+    /// `error - ` prefix). GT's sentence, no "protocol violation" wrapper
+    /// (#151 convention).
     #[error("received an unknown control message (ensure other side is iperf3 and not iperf)")]
     UnknownControlMessage,
 

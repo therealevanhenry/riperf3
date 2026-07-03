@@ -105,13 +105,16 @@ pub(crate) enum Role {
 /// processed and which `role` it plays.
 ///
 /// AUDITABILITY TABLE, NOT AN IDEALIZED PROTOCOL. This deliberately matches
-/// iperf3's *actual* tolerances — derived from the server's send sequence plus
-/// the two documented loosenesses (a re-sent `TEST_RUNNING` is a no-op on the
-/// client; the server's end-of-test loop tolerates intervening bytes) — rather
-/// than a stricter ideal. It is consulted ONLY to emit diagnostics
-/// (`log::debug!`, off by default). It is NEVER used to reject or error on a
-/// sequence: iperf3 itself is loose here, and a stricter riperf3 would break
-/// interop. Default-tolerant by design (#145).
+/// iperf3's *actual* tolerances — derived from the server's send sequence
+/// plus its one documented looseness (a re-sent `TEST_RUNNING` is a no-op on
+/// the client) — rather than a stricter ideal. (#325 established that GT's
+/// server end-of-test loop does NOT tolerate intervening bytes — its switch
+/// IEMESSAGEs everything but TEST_START/TEST_END/IPERF_DONE/CLIENT_TERMINATE
+/// — so the server end loop no longer consults this table at all.) It is
+/// consulted ONLY to emit diagnostics (`log::debug!`, off by default). It is
+/// NEVER used to reject or error on a sequence: iperf3 itself is loose in
+/// the surviving rows, and a stricter riperf3 would break interop.
+/// Default-tolerant by design (#145).
 ///
 /// `ServerTerminate`/`ServerError` can arrive in any client state (the client
 /// adopts them via their own dispatch arms, and `watch_control` returns on
@@ -135,9 +138,9 @@ pub(crate) fn legal_next(current: TestState, role: Role) -> &'static [TestState]
             _ => &[],
         },
         Role::Server => match current {
-            // The server only READS peer state in two phases.
+            // The server consults this in ONE phase now: the end-of-test
+            // loop dropped its row with #325 (GT IEMESSAGEs strays there).
             TestRunning => &[TestEnd, ClientTerminate], // data phase
-            DisplayResults => &[IperfDone, ClientTerminate], // end-of-test loop
             _ => &[],
         },
     }
@@ -1635,11 +1638,16 @@ mod transition_table_tests {
     }
 
     #[test]
-    fn server_end_loop_tolerates_client_terminate() {
-        // The server's end-of-test loop tolerates intervening bytes; the
-        // table reflects CLIENT_TERMINATE as legal there.
-        assert!(is_legal_next(DisplayResults, ClientTerminate, Role::Server));
+    fn server_data_phase_accepts_client_terminate() {
+        // The data phase is the one surviving server consult (#325 dropped
+        // the end-loop row: GT IEMESSAGEs strays there); CLIENT_TERMINATE
+        // stays legal mid-test.
         assert!(is_legal_next(TestRunning, ClientTerminate, Role::Server));
+        assert!(!is_legal_next(
+            DisplayResults,
+            ClientTerminate,
+            Role::Server
+        ));
     }
 
     #[test]

@@ -244,12 +244,18 @@ struct TestRunCtx {
     /// #210: a peer-terminated or interrupted test skips the results
     /// exchange (the peer is gone) but still dumps local results.
     client_terminated: bool,
-    /// #325: an unhandled control byte in the end loop — GT's IEMESSAGE
-    /// class (iperf_server_api.c:309-311). The dump still renders (the
-    /// exchange already completed); the doc carries the `error - `-prefixed
-    /// sentence and the run counts as a failed test (rc -1 in GT — which
-    /// main.c does NOT errexit on, so one-off still exits 0).
+    /// #325: an unhandled control byte — GT's IEMESSAGE class
+    /// (iperf_server_api.c:309-311; ONE switch serves every phase). The doc
+    /// carries the `error - `-prefixed sentence and the run counts as a
+    /// failed test (rc -1 in GT — which main.c does NOT errexit on, so
+    /// one-off still exits 0).
     unknown_message: bool,
+    /// #325 r2 F1: the final stats dump never ran (a mid-test IEMESSAGE
+    /// fires before GT's TEST_END processing) — the -J doc keeps the
+    /// accumulated intervals with a BARE `end: {}` (live-verified), and
+    /// text prints no summary block, only the stderr line. The end-loop
+    /// IEMESSAGE keeps its populated end: there the exchange completed.
+    bare_end: bool,
     interrupted: Option<String>,
 }
 
@@ -624,6 +630,7 @@ impl Server {
             server_error: None,
             client_terminated: false,
             unknown_message: false,
+            bare_end: false,
             interrupted: None,
         };
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
@@ -1337,9 +1344,9 @@ impl Server {
         loop {
             tokio::select! {
                 state = protocol::recv_state(&mut ctx.ctrl) => {
-                    match state? {
-                        TestState::TestEnd => break,
-                        TestState::ClientTerminate => {
+                    match state {
+                        Ok(TestState::TestEnd) => break,
+                        Ok(TestState::ClientTerminate) => {
                             // iperf_got_sigend's peer half (#210): dump the
                             // partial results in the finalize phases (the old
                             // early return leaked the reporter — the #147
@@ -1348,9 +1355,11 @@ impl Server {
                             break;
                         }
                         // #145: AUDITABILITY ONLY — log an out-of-sequence
-                        // control byte during the data phase, then STILL
-                        // swallow it (behavior unchanged, default-tolerant).
-                        other => {
+                        // KNOWN control byte during the data phase, then
+                        // STILL swallow it. GT's single message switch would
+                        // IEMESSAGE these too — tracked with the rest of the
+                        // generic-surface parity in #330.
+                        Ok(other) => {
                             if !protocol::is_legal_next(
                                 TestState::TestRunning,
                                 other,
@@ -1362,6 +1371,17 @@ impl Server {
                                 );
                             }
                         }
+                        // #325 r2 F1: an UNMAPPED byte during the data phase
+                        // is the same IEMESSAGE default — GT's end processing
+                        // never runs, so the doc keeps the accumulated
+                        // intervals with a bare end{} and text skips the
+                        // summary (live-verified against GT 3.21).
+                        Err(RiperfError::UnknownControlMessage) => {
+                            ctx.unknown_message = true;
+                            ctx.bare_end = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 msg = crate::client::wait_interrupt(interrupt_rx.as_mut()) => {
@@ -1650,7 +1670,7 @@ impl Server {
         end: &EndState,
         collected: crate::reporter::CollectedIntervals,
     ) -> crate::json_report::Report {
-        self.build_report(
+        let mut input = self.build_report_input(
             &ctx.streams,
             &ctx.cfg,
             &ctx.params,
@@ -1662,7 +1682,12 @@ impl Server {
             ctx.test_start_millis,
             collected,
             end.report_error.as_deref(),
-        )
+        );
+        // #325 r2 F1: the mid-test IEMESSAGE doc renders GT's bare end{}
+        // (the final stats dump never ran); every other path keeps the
+        // populated structure the input builder assembled.
+        input.bare_end = ctx.bare_end;
+        input.build()
     }
 
     /// ExchangeResults + the DisplayResults / IperfDone end-of-test loop.
@@ -1676,7 +1701,11 @@ impl Server {
         server_output_text: Option<String>,
         server_output_json: Option<serde_json::Value>,
     ) -> Result<()> {
-        if !ctx.client_terminated && ctx.interrupted.is_none() && ctx.server_error.is_none() {
+        if !ctx.client_terminated
+            && !ctx.unknown_message
+            && ctx.interrupted.is_none()
+            && ctx.server_error.is_none()
+        {
             // Built only when the exchange actually runs — it was dead work
             // on every terminate path (#224).
             let server_results = TestResultsJson {
@@ -1747,8 +1776,13 @@ impl Server {
                     // #325: GT honors CLIENT_TERMINATE at ANY message point
                     // (iperf_server_api.c:289-308: dump under
                     // DISPLAY_RESULTS + IECLIENTTERM) — the finalize phases
-                    // render the terminated shape exactly like the mid-test
-                    // arm.
+                    // render the terminated shape like the mid-test arm.
+                    // RECORDED DEVIATION (r2 F2, text mode only): GT prints
+                    // the summary TWICE here — its TEST_END arm already ran
+                    // reporter_callback (:276) and the terminate arm re-runs
+                    // it under DISPLAY_RESULTS (:293-297, live-verified two
+                    // full blocks). riperf3 prints one dump; -J is identical
+                    // on both (single doc, error key).
                     Ok(TestState::ClientTerminate) => {
                         ctx.client_terminated = true;
                         return Ok(());
@@ -1805,7 +1839,7 @@ impl Server {
         } else if self.json_output {
             // Emit the iperf3-schema JSON report on stdout (#50).
             self.print_results_json(report);
-        } else if !was_captured && ctx.server_error.is_none() {
+        } else if !was_captured && ctx.server_error.is_none() && !ctx.bare_end {
             // Print summary: per-stream lines plus aggregate [SUM] row(s) for
             // parallel streams (issue #4), via the shared path the client uses.
             // Also skipped on self-terminate: iperf3 prints NO summary there
