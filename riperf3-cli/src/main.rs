@@ -59,7 +59,8 @@ fn main() -> std::process::ExitCode {
     // its getopt loop, ahead of the client-flag-on-server class (r1 F5).
     // RECORDED DEVIATION (r1 F4): with TWO violating flags GT reports the
     // command-line-FIRST one (per-flag getopt checks); riperf3 checks in a
-    // fixed order (duration, then idle-timeout) — clap's derive parse has no
+    // fixed order (duration, idle-timeout, format, reverse+bidir) — clap's
+    // derive parse has no
     // cheap arg-position access, and the divergence needs two simultaneously
     // invalid flags. The u32 arg types make GT's negative arms
     // unrepresentable.
