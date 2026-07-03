@@ -480,7 +480,7 @@ pub struct IntervalSum {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct End {
-    /// #261/#281: true ONLY on the upfront-refusal path — the whole object
+    /// #261/#281: true on the upfront-refusal path and the mid-test IEMESSAGE dump (#325) — the whole object
     /// serializes as GT's bare `{}`. Every other dump (success, mid-test or
     /// pre-TestStart interrupt, SERVER_TERMINATE) renders the full structure,
     /// including `streams: []` when no stream ever existed.
@@ -823,7 +823,7 @@ pub(crate) struct ReportInput {
     /// the three-stage `start` field gating (see [`StartStage`]). The client
     /// derives it from its run stage; the server always builds at `Started`.
     pub start_stage: StartStage,
-    /// True ONLY on the upfront server-refusal path (#261): the `end` object
+    /// True on the upfront server-refusal path (#261) and the mid-test IEMESSAGE dump (#325 — GT's final stats never ran): the `end` object
     /// serializes bare (`{}`). Interrupt dumps — mid-test OR pre-TestStart —
     /// keep the full end structure (GT emits zeroed sums + `streams: []`
     /// there, #281).

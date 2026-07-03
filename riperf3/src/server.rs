@@ -502,6 +502,12 @@ impl Server {
     /// accept loop. Unlike `run`, it does not print the "Server listening"
     /// banner — it is a library entry point, not the daemon. The test report is
     /// still printed to stdout in `-J` / text mode, like `Client::run`.
+    ///
+    /// Peer-caused test failures surface as errors AFTER the report was
+    /// rendered to the active sink: a CLIENT_TERMINATE returns
+    /// [`RiperfError::ClientTerminated`] and an unhandled control byte
+    /// returns [`RiperfError::UnknownControlMessage`] (#325) — both mirror
+    /// GT's failed-test rc, which its one-off still exits 0 on.
     pub async fn run_once(&self) -> Result<crate::json_report::Report> {
         let listener = self.listen().await?;
         self.serve_once(&listener).await
@@ -725,7 +731,8 @@ impl Server {
         // Join stream tasks (best-effort, they should be done).
         // #322 r1 F1: a mid-EXCHANGE interrupt postdates shutdown_and_flush's
         // abort gate — abort here so a wedged peer can't park the joins.
-        if ctx.interrupted.is_some() {
+        // #325 r3 F1: an END-LOOP IEMESSAGE postdates it the same way.
+        if ctx.interrupted.is_some() || ctx.unknown_message {
             for s in &ctx.streams {
                 s.task.abort();
             }
@@ -1376,6 +1383,10 @@ impl Server {
                         // never runs, so the doc keeps the accumulated
                         // intervals with a bare end{} and text skips the
                         // summary (live-verified against GT 3.21).
+                        // RECORDED DEVIATION (r3 F3): riperf3's flush adds
+                        // one partial catch-up interval (the #210 terminate
+                        // convention); GT's reporter dies with only whole
+                        // ticks in the doc.
                         Err(RiperfError::UnknownControlMessage) => {
                             ctx.unknown_message = true;
                             ctx.bare_end = true;
@@ -1436,10 +1447,15 @@ impl Server {
         // the next await); the UDP runners are spawn_blocking, where abort
         // is a no-op once running — their joins stay bounded anyway by the
         // 500 ms read-timeout + `done` polling in the blocking loops.
-        if ctx.server_error.is_some() || ctx.interrupted.is_some() {
+        if ctx.server_error.is_some() || ctx.interrupted.is_some() || ctx.unknown_message {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its
             // data sockets at TEST_END and sigend exits in milliseconds).
+            // #325 r3 F1: the mid-test IEMESSAGE too — GT cleanup_servers
+            // immediately on a failed handle_message (iperf_server_api.c:
+            // 764-767); without the abort a hostile peer holding its
+            // sockets open parks the joins (and, persistent, the accept
+            // loop) for the whole hold.
             for s in &ctx.streams {
                 s.task.abort();
             }
@@ -1597,7 +1613,12 @@ impl Server {
         collected: crate::reporter::CollectedIntervals,
     ) -> (Option<String>, Option<serde_json::Value>, ReportSource) {
         let mut report_source = ReportSource::Pending(collected);
-        let (server_output_text, server_output_json) = if let Some(capture) = ctx.capture.take() {
+        // #325 r3 F2: the mid-test IEMESSAGE path renders NO summary — GT's
+        // reporter is dead (live-verified: GT with get_server_output prints
+        // only the stderr line). Dropping the capture un-sets was_captured,
+        // and the exchange skip already discards the relay.
+        let capture = ctx.capture.take().filter(|_| !ctx.bare_end);
+        let (server_output_text, server_output_json) = if let Some(capture) = capture {
             let summaries = Self::text_summaries(&ctx.streams, end.test_duration, &ctx.cfg);
             let with_retr = summaries.iter().any(|s| s.retransmits.is_some());
             crate::reporter::print_separator();

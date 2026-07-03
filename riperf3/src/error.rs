@@ -62,10 +62,11 @@ pub enum RiperfError {
     /// `default: i_errno = IEMESSAGE` (iperf_server_api.c:309-311). The
     /// CLIENT's message handler defaults to the same code
     /// (iperf_client_api.c:409-411), so recv_state surfaces this on both
-    /// roles — the client's text line and -J doc match GT byte-for-byte
-    /// (r2-verified; the client doc carries the BARE sentence, no
-    /// `error - ` prefix). GT's sentence, no "protocol violation" wrapper
-    /// (#151 convention).
+    /// roles — the client's stderr line, -J error key (BARE sentence, no
+    /// `error - ` prefix), and exit 1 match GT (r2/r3-verified); the
+    /// client's -J doc BODY is the skeleton error_document where GT emits
+    /// its accumulated doc — the #330 item-2 gap, tracked there. GT's
+    /// sentence, no "protocol violation" wrapper (#151 convention).
     #[error("received an unknown control message (ensure other side is iperf3 and not iperf)")]
     UnknownControlMessage,
 

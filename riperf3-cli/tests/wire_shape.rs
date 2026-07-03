@@ -104,11 +104,15 @@ const MOCK_RESULTS: &str = r#"{"cpu_util_total":1.0,"cpu_util_user":0.5,"cpu_uti
 /// phase (#325 r2 F1). Otherwise the round runs through DisplayResults and
 /// sends `final_byte` in place of IperfDone(16) — the end loop.
 fn drive_mock_round(port: u16, final_byte: u8, junk_mid_test: bool) {
+    drive_mock_round_params(port, final_byte, junk_mid_test, MOCK_PARAMS);
+}
+
+fn drive_mock_round_params(port: u16, final_byte: u8, junk_mid_test: bool, params: &str) {
     let cookie = [b'x'; 37];
     let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
     ctrl.write_all(&cookie).unwrap();
     assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
-    write_json_blob(&mut ctrl, MOCK_PARAMS);
+    write_json_blob(&mut ctrl, params);
     assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
     let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
     data.write_all(&cookie).unwrap();
@@ -136,6 +140,15 @@ fn run_scenario(
     final_byte: u8,
     junk_mid_test: bool,
 ) -> (String, String, std::process::ExitStatus) {
+    run_scenario_params(json, final_byte, junk_mid_test, MOCK_PARAMS)
+}
+
+fn run_scenario_params(
+    json: bool,
+    final_byte: u8,
+    junk_mid_test: bool,
+    params: &'static str,
+) -> (String, String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -159,7 +172,9 @@ fn run_scenario(
         riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    let mock = std::thread::spawn(move || drive_mock_round(port, final_byte, junk_mid_test));
+    let mock = std::thread::spawn(move || {
+        drive_mock_round_params(port, final_byte, junk_mid_test, params)
+    });
     mock.join().expect("mock");
     let status =
         riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
@@ -360,8 +375,10 @@ fn persistent_server_keeps_serving_after_iemessage() {
     for _ in 0..2 {
         drive_mock_round(port, 99, false);
     }
-    // Grace for the second round's finalize + print before the kill.
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Grace for the second round's finalize + print before the kill —
+    // the file's 5 s bound convention (r3 F5: 1 s was the tightest margin
+    // in the file and the likeliest 2-core-runner flake).
+    std::thread::sleep(std::time::Duration::from_secs(5));
     server.0.kill().expect("kill persistent server");
     let _ = server.0.wait();
     let serr = serr_reader.join().expect("stderr");
@@ -370,6 +387,84 @@ fn persistent_server_keeps_serving_after_iemessage() {
         serr.lines().filter(|l| *l == line).count(),
         2,
         "one IEMESSAGE line per failed round: {serr}"
+    );
+}
+
+const MOCK_PARAMS_GSO: &str = r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":1,"len":131072,"pacing_timer":1000,"get_server_output":1,"client_version":"riperf3 0.0.0"}"#;
+
+/// #325 r3 F2: --get-server-output's text capture must not render the
+/// summary block on the mid-test IEMESSAGE path — GT prints only the
+/// stderr line there (its reporter is dead; live-verified with
+/// get_server_output: 1 in params).
+#[test]
+fn mid_test_unknown_byte_with_get_server_output_prints_no_summary() {
+    let (sout, serr, status) = run_scenario_params(false, 99, true, MOCK_PARAMS_GSO);
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IEMESSAGE}"),
+        "GT's single IEMESSAGE line"
+    );
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        0,
+        "the capture render must not resurrect the summary (r3 F2): {sout}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #325 r3 F1: a hostile peer that sends the junk byte and then HOLDS its
+/// sockets open must not park the server — GT cleanup_servers immediately
+/// when handle_message fails (iperf_server_api.c:764-767). Pre-fix the
+/// stream-task joins waited out the peer's whole hold (live: a 30 s hold
+/// held the one-off 33 s and blocked the stderr line with it).
+#[test]
+fn mid_test_unknown_byte_exits_bounded_while_peer_holds() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // The holding mock: full protocol to the data phase, junk byte, then
+    // KEEP both sockets open far past the assertion window. Detached — the
+    // sockets close when the test binary exits.
+    std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[99u8]).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        drop((ctrl, data));
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits while the peer still holds (r3 F1)");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IEMESSAGE}"),
+        "the line prints NOW, not after the peer relents"
     );
 }
 
