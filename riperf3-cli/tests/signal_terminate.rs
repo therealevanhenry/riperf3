@@ -779,6 +779,89 @@ fn mid_exchange_wedge_still_exits_on_signal() {
     );
 }
 
+/// #322 r1 F3: the SECOND server read — the IperfDone wait — takes the
+/// same interrupt surface. The mock completes the results exchange, reads
+/// DisplayResults, then never sends IperfDone.
+#[test]
+fn server_survives_a_client_that_never_sends_iperf_done() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps, "-J"]);
+    std::thread::sleep(Duration::from_millis(400));
+
+    let parked = Arc::new(AtomicBool::new(false));
+    let parked_w = parked.clone();
+    let _mock = std::thread::spawn(move || {
+        let read_exact = |s: &mut std::net::TcpStream, n: usize| -> Vec<u8> {
+            let mut b = vec![0u8; n];
+            s.read_exact(&mut b).expect("mock read");
+            b
+        };
+        let read_json = |s: &mut std::net::TcpStream| {
+            let len = u32::from_be_bytes(read_exact(s, 4).try_into().unwrap()) as usize;
+            read_exact(s, len)
+        };
+        let write_json = |s: &mut std::net::TcpStream, payload: &str| {
+            s.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+            s.write_all(payload.as_bytes()).unwrap();
+        };
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json(
+            &mut ctrl,
+            r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":1,"len":131072,"pacing_timer":1000,"client_version":"riperf3 0.0.0"}"#,
+        );
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1, "TestStart");
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2, "TestRunning");
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13, "ExchangeResults");
+        write_json(
+            &mut ctrl,
+            r#"{"cpu_util_total":1.0,"cpu_util_user":0.5,"cpu_util_system":0.5,"sender_has_retransmits":1,"streams":[{"id":1,"bytes":4096,"retransmits":0,"jitter":0,"errors":0,"packets":0,"start_time":0,"end_time":1}]}"#,
+        );
+        read_json(&mut ctrl); // the server's results
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 14, "DisplayResults");
+        parked_w.store(true, Ordering::SeqCst);
+        // Never send IperfDone; hold both sockets open.
+        std::thread::sleep(Duration::from_secs(15));
+        drop(data);
+    });
+
+    let t0 = Instant::now();
+    while !parked.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "mock never parked the server"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe {
+        libc::kill(server.0.id() as i32, libc::SIGTERM);
+    }
+    let (sout, _serr, scode) =
+        wait_with_output_bounded(server, Duration::from_secs(2), "server IperfDone wedge");
+    assert_eq!(scode, 0, "signal-normal exit despite the missing IperfDone");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("terminated")),
+        "the sigend dump carries the interrupt error key: {doc}"
+    );
+}
+
 /// #319 (sibling of #268): the SERVER's exchange reads must not outlive a
 /// signal when the CLIENT wedges mid-results-payload. Pre-fix the server
 /// hung in recv_results past SIGTERM.
@@ -841,8 +924,10 @@ fn server_survives_a_mid_exchange_client_wedge() {
     unsafe {
         libc::kill(server.0.id() as i32, libc::SIGTERM);
     }
+    // #322 r1 F2: 2s pins the GRACEFUL exit — the CLI's #211 bailout is 5s,
+    // so a revert that only exits via the bailout goes red here.
     let (sout, _serr, scode) =
-        wait_with_output_bounded(server, Duration::from_secs(5), "server mid-exchange wedge");
+        wait_with_output_bounded(server, Duration::from_secs(2), "server mid-exchange wedge");
     assert_eq!(scode, 0, "signal-normal exit despite the wedged read");
     let doc: serde_json::Value =
         serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));

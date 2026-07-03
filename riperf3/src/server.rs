@@ -636,13 +636,31 @@ impl Server {
         // post-exchange build. handle_one_test returns it (run discards it;
         // run_once hands it back to the library caller).
         let report = match report_source {
-            ReportSource::Built(report) => *report,
+            ReportSource::Built(mut report) => {
+                // #322 r1 F4: a mid-exchange interrupt postdates the
+                // pre-exchange --get-server-output build — carry the key
+                // like GT's exit-time json_finish.
+                if report.error.is_none() {
+                    report.error = end.report_error.clone();
+                }
+                *report
+            }
             ReportSource::Pending(collected) => self.build_ctx_report(&ctx, &end, collected),
         };
 
         self.emit_final_output(&ctx, &end, &report, was_captured);
 
-        // Join stream tasks (best-effort, they should be done)
+        // Join stream tasks (best-effort, they should be done).
+        // #322 r1 F1: a mid-EXCHANGE interrupt postdates shutdown_and_flush's
+        // abort gate — abort here so a wedged peer can't park the joins.
+        if ctx.interrupted.is_some() {
+            for s in &ctx.streams {
+                s.task.abort();
+            }
+            if let Some(h) = &ctx.udp_demux_handle {
+                h.abort();
+            }
+        }
         for s in ctx.streams {
             let _ = s.task.await;
         }
@@ -1319,7 +1337,10 @@ impl Server {
         // the next await); the UDP runners are spawn_blocking, where abort
         // is a no-op once running — their joins stay bounded anyway by the
         // 500 ms read-timeout + `done` polling in the blocking loops.
-        if ctx.server_error.is_some() {
+        if ctx.server_error.is_some() || ctx.interrupted.is_some() {
+            // #322 r1 F1: interrupts take the same abort — a wedged peer
+            // holding sockets open must not park the joins (GT closes its
+            // data sockets at TEST_END and sigend exits in milliseconds).
             for s in &ctx.streams {
                 s.task.abort();
             }
