@@ -23,8 +23,10 @@ mod custom_sockopt {
     pub struct MaxPacingRate;
 
     impl SetSockOpt for MaxPacingRate {
-        type Val = u32;
-        fn set<F: AsFd>(&self, fd: &F, val: &u32) -> nix::Result<()> {
+        // GT passes uint64_t (kernel >= 5.1 honors 8 bytes); a u32 payload
+        // silently wrapped --fq-rate above ~34.36 Gbit/s (#302 r1 F3).
+        type Val = u64;
+        fn set<F: AsFd>(&self, fd: &F, val: &u64) -> nix::Result<()> {
             // SAFETY: setsockopt on a valid fd with correct level/optname/size.
             unsafe {
                 let res = libc::setsockopt(
@@ -32,7 +34,7 @@ mod custom_sockopt {
                     libc::SOL_SOCKET,
                     libc::SO_MAX_PACING_RATE,
                     val as *const _ as *const libc::c_void,
-                    std::mem::size_of::<u32>() as libc::socklen_t,
+                    std::mem::size_of::<u64>() as libc::socklen_t,
                 );
                 nix::errno::Errno::result(res).map(drop)
             }
@@ -741,7 +743,7 @@ pub fn set_dont_fragment<F>(_fd: &F) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub fn set_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) -> Result<()> {
     use nix::sys::socket;
-    let rate_bytes = (rate_bits_per_sec / 8) as u32;
+    let rate_bytes = rate_bits_per_sec / 8;
     socket::setsockopt(fd, custom_sockopt::MaxPacingRate, &rate_bytes)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
@@ -749,6 +751,21 @@ pub fn set_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) ->
 #[cfg(not(target_os = "linux"))]
 pub fn set_fq_rate<F>(_fd: &F, _rate: u64) -> Result<()> {
     Ok(())
+}
+
+/// Apply `--fq-rate` the way GT does at all four of its sites
+/// (iperf_tcp.c:138/:565, iperf_udp.c:581/:704, #302): nonzero → set the
+/// sockopt; failure is GT's `warning: Unable to set socket pacing`, never
+/// fatal — the server arm is remotely triggered (any peer's --fq-rate), so
+/// a sandboxed runtime filtering setsockopt must degrade like GT, not
+/// abort the test.
+pub fn apply_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) {
+    if rate_bits_per_sec == 0 {
+        return;
+    }
+    if set_fq_rate(fd, rate_bits_per_sec).is_err() {
+        eprintln!("warning: Unable to set socket pacing");
+    }
 }
 
 /// Bind socket to a specific network device. Must be applied BEFORE

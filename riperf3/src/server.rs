@@ -962,10 +962,8 @@ impl Server {
                     // #302: GT enables fair-queue pacing on the server's
                     // ACCEPTED data sockets too (iperf_tcp.c:138-153) — the
                     // exchanged --fq-rate paces the reverse/bidir send path.
-                    // Linux sockopt; no-op elsewhere (like the client site).
-                    if ctx.cfg.fq_rate > 0 {
-                        net::set_fq_rate(&data_stream, ctx.cfg.fq_rate)?;
-                    }
+                    // Warn-only like GT's four sites; Linux sockopt.
+                    net::apply_fq_rate(&data_stream, ctx.cfg.fq_rate);
 
                     let stream_id = iperf3_stream_id(i);
                     let is_sender = i >= recv_count;
@@ -1806,6 +1804,8 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
+        // #302: GT paces its UDP accept path too (iperf_udp.c:581-595).
+        net::apply_fq_rate(&udp_listener, cfg.fq_rate);
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -1962,6 +1962,8 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
+        // #302: the demux shared socket IS the data socket — pace it too.
+        net::apply_fq_rate(&udp_sock, cfg.fq_rate);
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
