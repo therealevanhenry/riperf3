@@ -509,6 +509,12 @@ pub(crate) struct StreamMeta {
     /// `congestion_used` report field (#37). `None` for UDP and on platforms
     /// without TCP_CONGESTION.
     pub congestion_used: Option<String>,
+    /// #316: `(gso_active, gro_active)` — whether UDP_SEGMENT/UDP_GRO
+    /// actually took on this stream's socket. GT zeroes `settings->gso/gro`
+    /// on a failed setsockopt (iperf_udp.c:459-515) and its `test_start`
+    /// echo reads the POST-probe state; the report folds these the same way
+    /// (`congestion_used` precedent). `None` for TCP streams.
+    pub udp_offload: Option<(bool, bool)>,
 }
 
 impl DataStream {

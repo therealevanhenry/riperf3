@@ -1278,6 +1278,7 @@ impl Client {
                             raw_fd,
                             sock,
                             congestion_used,
+                            udp_offload: None,
                         },
                         task,
                         udp_recv_stats: None,
@@ -1303,6 +1304,10 @@ impl Client {
                 // thread, spawned through the gate so the barrier below can
                 // hold this side's test window until the data plane exists.
                 let mut thread_gate = stream::StreamThreadGate::new();
+                // #316: --gsro probes per socket below; once a probe fails,
+                // GT zeroes the setting and later sockets don't retry
+                // (iperf_udp.c:459-515), and the report echoes POST-probe.
+                let (mut gso_on, mut gro_on) = (self.gsro, self.gsro);
                 for i in 0..total {
                     let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
                     if let Some(ref dev) = self.bind_dev {
@@ -1315,13 +1320,16 @@ impl Client {
                     net::apply_fq_rate(&udp_sock, self.fq_rate.unwrap_or(0));
 
                     // GSO/GRO is deliberately best-effort (#45), matching
-                    // iperf3 3.20+'s --gsro: its iperf_udp_gso/iperf_udp_gro
-                    // disable the feature and continue when the setsockopt
-                    // fails, so a kernel lacking UDP_SEGMENT/UDP_GRO degrades
-                    // to plain sends rather than failing the test.
-                    if self.gsro {
-                        let _ = net::set_udp_gso(&udp_sock, blksize as u16);
-                        let _ = net::set_udp_gro(&udp_sock);
+                    // GT's iperf_udp_connect probes (iperf_udp.c:681-684):
+                    // iperf_udp_gso/iperf_udp_gro disable the feature and
+                    // continue when the setsockopt fails, so a kernel
+                    // lacking UDP_SEGMENT/UDP_GRO degrades to plain sends
+                    // rather than failing the test (#316).
+                    if gso_on {
+                        gso_on = net::set_udp_gso(&udp_sock, blksize as u16).is_ok();
+                    }
+                    if gro_on {
+                        gro_on = net::set_udp_gro(&udp_sock).is_ok();
                     }
                     if self.tos != 0 {
                         // Fatal like the TCP path (#45): iperf3's
@@ -1394,6 +1402,7 @@ impl Client {
                                 raw_fd: None,
                                 sock,
                                 congestion_used: None,
+                                udp_offload: Some((gso_on, gro_on)),
                             },
                             task,
                             udp_recv_stats: Some(stats),
@@ -1409,6 +1418,7 @@ impl Client {
                             raw_fd: None,
                             sock,
                             congestion_used: None,
+                            udp_offload: Some((gso_on, gro_on)),
                         },
                         task,
                         udp_recv_stats: None,
@@ -2330,8 +2340,25 @@ impl Client {
             bare_end: start_meta.bare_end,
             interval: self.interval.unwrap_or(1.0),
             // riperf3's single --gsro flag drives both GSO and GRO.
-            gso: i32::from(self.gsro),
-            gro: i32::from(self.gsro),
+            // #316: POST-probe like GT — iperf_udp_connect's failed probes
+            // zero settings->gso/gro before the test_start echo
+            // (iperf_udp.c:459-515, :681-684). Folded across streams; no
+            // streams yet (pre-connect error report) → the request, which
+            // is GT's pre-probe state at that point too.
+            gso: i32::from(
+                self.gsro
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(g, _)| g),
+            ),
+            gro: i32::from(
+                self.gsro
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(_, g)| g),
+            ),
             // #261/#286: the stage's wall-clock — TestStart's once started; on
             // the upfront-refusal path the connect-time clock (GT stamps
             // start.timestamp at on_connect, after the param exchange, BEFORE
@@ -3722,6 +3749,7 @@ mod tests {
                     rcvbuf_actual: None,
                 },
                 congestion_used: None,
+                udp_offload: None,
             },
             udp_recv_stats: None,
             task: tokio::spawn(async { Ok(()) }),
@@ -3771,6 +3799,7 @@ mod tests {
                     rcvbuf_actual: None,
                 },
                 congestion_used: None,
+                udp_offload: None,
             },
             udp_recv_stats: None,
             task: tokio::spawn(async { Ok(()) }),
@@ -3815,6 +3844,7 @@ mod tests {
                     rcvbuf_actual: None,
                 },
                 congestion_used: None,
+                udp_offload: None,
             },
             udp_recv_stats: None,
             task: tokio::spawn(async { Ok(()) }),

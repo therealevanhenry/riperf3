@@ -1039,6 +1039,7 @@ impl Server {
                             raw_fd,
                             sock,
                             congestion_used,
+                            udp_offload: None,
                         },
                         task,
                         udp_recv_stats: None,
@@ -1821,17 +1822,12 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
-        // #316: honor the client's GSO/GRO request on the server's UDP
-        // sockets — best-effort like the client's #45 posture (a kernel
-        // without UDP_SEGMENT/UDP_GRO degrades to plain sends).
-        if cfg.gso {
-            let _ = net::set_udp_gso(&udp_listener, cfg.gso_dg_size.clamp(1, 65507) as u16);
-        }
-        if cfg.gro {
-            let _ = net::set_udp_gro(&udp_listener);
-        }
-
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
+
+        // #316: the client's GSO/GRO request, probed per accepted socket
+        // below. Once a probe fails, GT zeroes the setting and later
+        // sockets don't retry (iperf_udp.c:459-515).
+        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
 
         // #178: each stream's spawn_blocking data thread is spawned through
         // the gate; the barrier below holds TestStart until the data plane
@@ -1848,6 +1844,18 @@ impl Server {
                     .await?;
             // The listener is now locked to this client — use it as the data socket
             let data_sock = udp_listener;
+            // #316: per-accept like GT's iperf_udp_accept (iperf_udp.c:
+            // 576-579) — the #320-class placement: the loop recycles a
+            // FRESH listener per stream, so a pre-loop call covered
+            // stream 0 only. Best-effort like GT (failure zeroes, never
+            // fatal).
+            if gso_on {
+                gso_on =
+                    net::set_udp_gso(&data_sock, cfg.gso_dg_size.clamp(1, 65507) as u16).is_ok();
+            }
+            if gro_on {
+                gro_on = net::set_udp_gro(&data_sock).is_ok();
+            }
             // #302 r2: pace EVERY accepted stream — GT's block lives in
             // iperf_udp_accept (iperf_udp.c:581-595), once per stream; the
             // pre-loop listener call covered stream 0 only.
@@ -1915,6 +1923,7 @@ impl Server {
                         raw_fd: None,
                         sock,
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: None,
@@ -1937,6 +1946,7 @@ impl Server {
                         raw_fd: None,
                         sock,
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: Some(stats),
@@ -1997,12 +2007,13 @@ impl Server {
         // opt-in via RIPERF3_UDP_SERVER_DEMUX.
         net::apply_fq_rate(&udp_sock, cfg.fq_rate);
         // #316: the demux shared socket IS the data socket — same GSO/GRO
-        // honor, best-effort.
-        if cfg.gso {
-            let _ = net::set_udp_gso(&udp_sock, cfg.gso_dg_size.clamp(1, 65507) as u16);
+        // honor, best-effort, probed once for every stream's meta.
+        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
+        if gso_on {
+            gso_on = net::set_udp_gso(&udp_sock, cfg.gso_dg_size.clamp(1, 65507) as u16).is_ok();
         }
-        if cfg.gro {
-            let _ = net::set_udp_gro(&udp_sock);
+        if gro_on {
+            gro_on = net::set_udp_gro(&udp_sock).is_ok();
         }
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
@@ -2175,6 +2186,7 @@ impl Server {
                             rcvbuf_actual,
                         },
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: None,
@@ -2205,6 +2217,7 @@ impl Server {
                             rcvbuf_actual,
                         },
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: Some(stats),
@@ -2218,9 +2231,10 @@ impl Server {
             let s = shared.clone();
             let d = done.clone();
             let bs = cfg.blksize;
-            *demux_handle = Some(thread_gate.spawn(move || {
-                stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
-            }));
+            *demux_handle =
+                Some(thread_gate.spawn(move || {
+                    stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
+                }));
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun
@@ -2494,9 +2508,24 @@ impl Server {
             // The server reports at its 1s default; it has no -i.
             interval: 1.0,
             // #316: the GSO/GRO request IS exchanged now — GT's server
-            // test_start carries the adopted values (live-probed gso:1).
-            gso: i32::from(cfg.gso),
-            gro: i32::from(cfg.gro),
+            // test_start carries the adopted values POST-probe (a failed
+            // setsockopt zeroes settings->gso/gro, iperf_udp.c:459-515;
+            // live-probed gso:1). Folded across streams like GT's
+            // settings zeroing; no UDP streams → the request as-is.
+            gso: i32::from(
+                cfg.gso
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(g, _)| g),
+            ),
+            gro: i32::from(
+                cfg.gro
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(_, g)| g),
+            ),
             start_time_millis,
             // The client sends --extra-data via the parameter exchange; echo it
             // into the server's -J output too, like iperf3 (#35).

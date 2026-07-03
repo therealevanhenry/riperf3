@@ -930,9 +930,14 @@ pub fn set_udp_gso(fd: &impl std::os::unix::io::AsFd, segment_size: u16) -> Resu
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
+/// GT's `#else` stub returns -1 and zeroes `settings->gso`
+/// (iperf_udp.c:479-486) — the probe must FAIL here so the adopted state
+/// and the `test_start` echo read 0, not a phantom 1 (#316 r1 F5).
 #[cfg(not(target_os = "linux"))]
 pub fn set_udp_gso<F>(_fd: &F, _segment_size: u16) -> Result<()> {
-    Ok(())
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "UDP GSO not supported on this platform".to_string(),
+    )))
 }
 
 /// Enable UDP GRO (Generic Receive Offload) on a UDP socket.
@@ -943,9 +948,13 @@ pub fn set_udp_gro(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
+/// GT's `#else` stub returns -1 and zeroes `settings->gro`
+/// (iperf_udp.c:508-515) — the probe must FAIL here (#316 r1 F5).
 #[cfg(not(target_os = "linux"))]
 pub fn set_udp_gro<F>(_fd: &F) -> Result<()> {
-    Ok(())
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "UDP GRO not supported on this platform".to_string(),
+    )))
 }
 
 /// Set the TOS/traffic-class byte on a socket, family-aware like iperf3's
