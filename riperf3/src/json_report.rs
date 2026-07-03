@@ -2551,6 +2551,102 @@ mod tests {
         }
     }
 
+    /// #266: an exchanged 0 is the peer's REAL figure (extreme throttle) and
+    /// must win like any other exchanged value — GT's total is a plain sum of
+    /// exchanged bytes_sent, no graft (iperf_api.c:4447 feed). Pre-fix the
+    /// `p > 0` guard sent it down the absent-side graft, so the same zero
+    /// meant two different things at the sum vs per-stream levels.
+    #[test]
+    fn sum_sent_respects_the_exchanged_zero() {
+        let mut input = base_input();
+        input.reverse = true;
+        input.streams = vec![tcp_stream_retr(1, false, 5_000_000, 0, None)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["sum_sent"]["bytes"],
+            serde_json::json!(0u64),
+            "exchanged 0 wins over the graft: {v}"
+        );
+    }
+
+    /// #266 companion: a genuinely ABSENT peer side (odd peer skipped the
+    /// stream; no #170 error) keeps the #214 graft — only Some(0) changed.
+    #[test]
+    fn absent_peer_side_still_takes_the_graft() {
+        let mut input = base_input();
+        input.reverse = true;
+        let mut s = tcp_stream_retr(1, false, 5_000_000, 0, None);
+        s.remote_bytes = None;
+        input.streams = vec![s];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["sum_sent"]["bytes"],
+            serde_json::json!(5_000_000u64),
+            "absent peer side grafts local_recv (#214): {v}"
+        );
+    }
+
+    /// #265: a pure-receiver client gates the per-stream sender sub-object's
+    /// TCP_INFO extras on the PEER's exchanged sender_has_retransmits (GT
+    /// overwrites its own flag in RECEIVER mode, iperf_api.c:2856, then
+    /// picks the BARE variant at :4262/:4276) — a flag-off peer gets
+    /// socket..bits_per_second only, never zero-filled extras.
+    #[test]
+    fn reverse_sender_objects_go_bare_when_the_peer_flag_is_off() {
+        let mut input = base_input();
+        input.reverse = true;
+        input.peer_sender_has_retransmits = Some(0);
+        input.streams = vec![tcp_stream_retr(1, false, 5_000_000, 6_000_000, Some(2))];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let sender = &v["end"]["streams"][0]["sender"];
+        for gone in [
+            "retransmits",
+            "max_snd_cwnd",
+            "max_snd_wnd",
+            "max_rtt",
+            "min_rtt",
+            "mean_rtt",
+            "reorder",
+        ] {
+            assert!(
+                sender.get(gone).is_none(),
+                "flag-off peer: `{gone}` must be ABSENT (GT bare variant): {sender}"
+            );
+        }
+        for kept in [
+            "socket",
+            "start",
+            "end",
+            "seconds",
+            "bytes",
+            "bits_per_second",
+            "sender",
+        ] {
+            assert!(
+                sender.get(kept).is_some(),
+                "the bare variant keeps `{kept}`: {sender}"
+            );
+        }
+    }
+
+    /// #265 polarity: the flag ON (or missing results) keeps today's
+    /// full-extras shape — Linux↔Linux output is byte-identical pre/post.
+    #[test]
+    fn reverse_sender_objects_keep_extras_when_the_peer_flag_is_on() {
+        for flag in [Some(1), None] {
+            let mut input = base_input();
+            input.reverse = true;
+            input.peer_sender_has_retransmits = flag;
+            input.streams = vec![tcp_stream_retr(1, false, 5_000_000, 6_000_000, Some(2))];
+            let v = serde_json::to_value(input.build()).unwrap();
+            let sender = &v["end"]["streams"][0]["sender"];
+            assert!(
+                sender.get("max_snd_cwnd").is_some() && sender.get("retransmits").is_some(),
+                "flag {flag:?}: extras stay (GT full variant): {sender}"
+            );
+        }
+    }
+
     /// #236: in TCP bidir, GT's results loop runs once per direction with a
     /// PER-PASS total_retransmits (iperf_api.c:4138 reset, :4235 accumulate)
     /// — `sum_sent` carries the local senders' total; `sum_sent_bidir_
