@@ -142,6 +142,14 @@ impl TestConfig {
 /// test accumulates as it advances. One instance per served test; the
 /// phase-local variables the old monolithic `handle_one_test` mutated in
 /// place are now named fields with one owner.
+/// INVARIANT (#296): `build_result_streams` runs before
+/// `finish_server_output` — both read the same live stream counters, and
+/// the pipeline preserves the monolith's read order (the exchange figures
+/// are captured first; with live counters either order carries a small
+/// freshness skew — GT sidesteps it by snapshotting at TEST_END — so the
+/// order itself is the contract). No suite can pin an inversion
+/// deterministically (post-flush counters are settled); this doc and the
+/// pipeline comment at the call site are the guard.
 struct TestRunCtx {
     ctrl: tokio::net::TcpStream,
     /// The control-socket peer, for `start.accepted_connection` (#50):
@@ -211,12 +219,6 @@ struct EndState {
     test_duration: f64,
 }
 
-/// INVARIANT (#296): `build_result_streams` runs before
-/// `finish_server_output` — the exchange figures are captured before the
-/// capture-finish renders text summaries from the same live counters. No
-/// suite can pin the inversion deterministically (post-flush counters are
-/// settled); the pipeline comment at the call site is the guard.
-///
 /// Where the test's rich report stands after `finish_server_output` (#287):
 /// either already built (the JSON-mode --get-server-output pre-exchange build,
 /// #33 — the drained collections are inside) or still pending, carrying the
