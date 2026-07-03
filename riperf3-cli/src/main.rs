@@ -25,6 +25,13 @@ fn main() -> std::process::ExitCode {
                 ErrorKind::MissingRequiredArgument
                     if e.to_string().contains("--server") && e.to_string().contains("--client") =>
                 {
+                    // RECORDED DEVIATION (#332 r2 N2): GT's IENOROLE fires
+                    // LAST in its post-loop sequence (iperf_api.c:2001-2004),
+                    // so its in-loop/blksize/end-conditions checks all beat
+                    // it on a role-less command line (live: `-l -1` → GT
+                    // "block size too large", riperf3 this sentence). clap's
+                    // required mode group fires first by construction (#198);
+                    // same reject class + exit either way.
                     eprintln!(
                         "riperf3: parameter error - must either be a client (-c) or server (-s)"
                     );
@@ -94,6 +101,61 @@ fn main() -> std::process::ExitCode {
         // #309: GT's IEREVERSEBIDIR — the second of the pair is rejected
         // inside the getopt loop (iperf_api.c:1423/:1431), either order.
         Some("cannot be both reverse and bidirectional")
+    } else if cli.port.is_some_and(|p| !(1..=65535).contains(&p))
+        || cli.cport.is_some_and(|p| !(1..=65535).contains(&p))
+    {
+        // #328: GT's IEBADPORT — atoi then `< 1 || > 65535`, for both -p
+        // (iperf_api.c:1229-1234) and --cport (:1479-1484). `abc` atoi's to
+        // 0 and lands here too (live-probed).
+        Some("port number must be between 1 and 65535 inclusive")
+    } else if cli.parallel.is_some_and(|n| n > 128) {
+        // #328: GT's IENUMSTREAMS (iperf_api.c:1415-1420; MAX_STREAMS 128,
+        // iperf.h:476). Upper bound ONLY — GT has no lower check at parse
+        // (live-probed: `-P 0` runs empty, `-P -1` proceeds).
+        Some("number of parallel streams too large (maximum = 128)")
+    } else if cli.mss.is_some_and(|m| m > 32 * 1024 - 1) {
+        // #328: GT's IEMSS (iperf_api.c:1487-1492; MAX_MSS 32*1024-1,
+        // iperf.h:475). Upper bound only; negatives fail at setsockopt.
+        Some("TCP MSS too large (maximum = 32767 bytes)")
+    } else if cli
+        .rcv_timeout
+        .is_some_and(|ms| !(100..=MAX_TIME_SECS * 1000).contains(&ms))
+    {
+        // #328: GT's IERCVTIMEOUT (iperf_api.c:1603-1608;
+        // MIN_NO_MSG_RCVD_TIMEOUT 100 ms, iperf_api.h:71; MAX_TIME*SEC_TO_mS).
+        // The sentence carries perr=1, so iperf_strerror appends ": " — and
+        // errno is 0 at parse time, so NOTHING follows: the trailing
+        // colon-space is part of the live-probed line.
+        Some("receive timeout value is incorrect or not in range: ")
+    } else if cli
+        .snd_timeout
+        .is_some_and(|ms| !(0..=MAX_TIME_SECS * 1000).contains(&ms))
+    {
+        // #328: GT's IESNDTIMEOUT (iperf_api.c:1614-1618), perr-shaped like
+        // IERCVTIMEOUT above.
+        Some("send timeout value is incorrect or not in range: ")
+    } else if cli.time_skew_threshold.is_some_and(|s| s <= 0) {
+        // #328: GT's IESKEWTHRESHOLD (iperf_api.c:1761-1766) — the in-loop
+        // `<= 0` check, which fires BEFORE the post-loop server-only role
+        // check (live-probed: `-c ... --time-skew-threshold 0` gives this
+        // sentence, `--time-skew-threshold 5x` the server-only one).
+        Some("skew threshold must be a positive number")
+    } else if cli
+        .interval
+        .is_some_and(|i| !(0.1..=60.0).contains(&i) && i != 0.0)
+    {
+        // #328: GT's IEINTERVAL (iperf_api.c:1260-1265; MIN/MAX_INTERVAL
+        // iperf.h:470-471) — -i is C atof, so `-i 2x` is 2.0 (accepted) and
+        // `-i x` is 0.0 ("default", accepted); the sentence renders %g
+        // (0.1 / 60, live-probed).
+        Some("invalid report interval (min = 0.1, max = 60 seconds)")
+    } else if cli.cntl_ka.as_deref().is_some_and(cli::cntl_ka_violation) {
+        // #328: GT's IECNTLKA (iperf_api.c:1647-1652) — perr-shaped, so the
+        // trailing ": " is part of the live-probed line (errno 0 at parse).
+        Some(
+            "control connection Keepalive period should be larger than the \
+             full retry period (interval * count): ",
+        )
     } else {
         None
     };
@@ -103,10 +165,58 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    // #328: the unit_atoi family (-n/-k/-l/--pacing-timer/--connect-timeout)
+    // fails parse with IEUNITVAL's exact line (units.c:196-198 sets errarg,
+    // iperf_error.c:399-401 renders `invalid unit value or suffix: '%s'`),
+    // in-loop — BEFORE the role checks (live: `-s -n 10x` is IEUNITVAL, not
+    // client-only). GT echoes the RAW argv bytes in the quotes (live-probed
+    // with a lone 0xA0 byte), so the line is written byte-for-byte.
+    for arg in [
+        &cli.bytes,
+        &cli.blockcount,
+        &cli.length,
+        &cli.pacing_timer,
+        &cli.connect_timeout,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if cli::unit_atoi_like_bytes(arg.as_encoded_bytes()).is_err() {
+            print_unit_val_error(arg.as_encoded_bytes());
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
+    // #328: --server-bitrate-limit's `rate[/interval]` (iperf_api.c:
+    // 1366-1385): the interval piece is C atof + the IETOTALINTERVAL range
+    // check (same 0.1..60 bounds as -i), checked BEFORE the rate's
+    // unit_atof_rate → IEUNITVAL; both in-loop, ahead of the role checks
+    // (live-probed: `-c ... --server-bitrate-limit 10x` is IEUNITVAL, not
+    // server-only; `10x/0.01` reports the interval first).
+    if let Some(spec) = cli.server_bitrate_limit.as_deref() {
+        let (rate, interval) = cli::split_rate_interval(spec);
+        if let Some(iv) = interval.map(cli::atof_like_bytes) {
+            if iv != 0.0 && !(0.1..=60.0).contains(&iv) {
+                eprintln!(
+                    "riperf3: parameter error - invalid time interval for \
+                     calculating average data rate"
+                );
+                print_usage_trailer();
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        if cli::unit_atof_rate_like_bytes(rate).is_err() {
+            // GT's errarg is the rate part only (the slash was NUL'd).
+            print_unit_val_error(rate);
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
     if let Some(msg) = parse_class_rejection(&cli) {
         // #270: GT routes the parse-error class through 'parameter error - '
         // with the usage trailer (live-probed for all three classes here:
-        // end-conditions, client-only, server-only).
+        // end-conditions, client-only, server-only). #328: the -l range
+        // checks live INSIDE parse_class_rejection at GT's post-loop slot.
         eprintln!("riperf3: parameter error - {msg}");
         print_usage_trailer();
         return std::process::ExitCode::FAILURE;
@@ -207,6 +317,19 @@ fn print_usage_trailer() {
     eprintln!("Try `riperf3 --help' for more information.");
 }
 
+/// #328: IEUNITVAL's exact line + trailer, with the RAW argv bytes echoed
+/// inside the quotes like GT's errarg (units.c:196-198, iperf_error.c:
+/// 399-401; live-probed with a lone 0xA0 byte — GT prints it verbatim).
+fn print_unit_val_error(arg: &[u8]) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(b"riperf3: parameter error - invalid unit value or suffix: '");
+    let _ = err.write_all(arg);
+    let _ = err.write_all(b"'\n");
+    drop(err);
+    print_usage_trailer();
+}
+
 /// The parse-class rejections (#65 client-only-on-server, #100
 /// server-only-on-client, #140 conflicting end conditions): iperf3 raises
 /// these in parse_arguments, before any output sink exists, so they print to
@@ -228,6 +351,46 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
                  {flag} cannot be used with -c/--client"
             ));
         }
+        // #328: GT's IERVRSONLYRCVTIMEOUT (iperf_api.c:1880-1882) — a
+        // sending-mode client (neither -R nor --bidir) rejects
+        // --rcv-timeout post-loop, after the role checks and before the
+        // end-conditions check (:1992). perr-shaped: the trailing ": " is
+        // part of the live-probed line (errno 0 at parse time).
+        if cli.rcv_timeout.is_some() && !cli.reverse && !cli.bidir {
+            return Some("client receive timeout is valid only in receiving mode: ".to_string());
+        }
+        // #328 (r1 F1): GT's -l range checks sit BETWEEN the rvrs-rcv check
+        // (:1881) and the end-conditions check (:1992) in the parse
+        // post-loop (iperf_api.c:1926-1944) — live-probed both ways:
+        // `-s -l 2M` is IECLIENTONLY (role checks first), and
+        // `-t 5 -n 5 -l -1` is IEBLOCKSIZE, not IEENDCONDITIONS. The value
+        // GT checks is unit_atoi through an int, post the
+        // 0-means-protocol-default step, so only NEGATIVE (wrapped)
+        // explicit values can trip the `<= 0` arm.
+        if let Some(v) = cli
+            .length
+            .as_deref()
+            .and_then(|s| cli::unit_atoi_like_bytes(s.as_encoded_bytes()).ok())
+            .map(|n| cli::c_u64_to_int(cli::c_double_to_u64(n)))
+        {
+            // MAX_BLOCKSIZE 1 MiB (iperf.h:465); MIN/MAX_UDP_BLOCKSIZE
+            // 16/65507 (iperf.h:467/:469). RECORDED DEVIATION: GT's UDP arm
+            // only fires for blksize > 0 (:1939-1941), so `-u -l -5`
+            // PROCEEDS into a negative datagram size; riperf3 rejects it
+            // with the UDP sentence instead of reproducing the garbage run.
+            // Corollary (#332 r2 N3): in combined cells GT may still reject
+            // via a LATER post-loop check where this arm preempts with a
+            // different sentence (live: `-u -l -5 -t 5 -n 5` → GT
+            // IEENDCONDITIONS vs our IEUDPBLOCKSIZE — same class + exit).
+            if (!cli.udp && v < 0) || v > 1_048_576 {
+                return Some("block size too large (maximum = 1048576 bytes)".to_string());
+            }
+            if cli.udp && v != 0 && !(16..=65_507).contains(&v) {
+                return Some(
+                    "block size invalid (minimum = 16 bytes, maximum = 65507 bytes)".to_string(),
+                );
+            }
+        }
         if cli.end_conditions_conflict() {
             return Some(cli::END_CONDITIONS_MSG.to_string());
         }
@@ -236,7 +399,9 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
 }
 
 fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    configure_log4rs(cli.debug.unwrap_or(0));
+    // #328: GT levels are open-ended (--debug=100 runs); everything past 4
+    // is max verbosity here, matching the `_ => Trace` arm.
+    configure_log4rs(u8::try_from(cli.debug.unwrap_or(0)).unwrap_or(u8::MAX));
 
     // Reject client-only options on the server (#65) before any side effects
     // (pidfile/logfile writes, CPU affinity, runtime build), mirroring iperf3,
