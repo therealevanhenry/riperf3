@@ -56,6 +56,14 @@ pub enum RiperfError {
     #[error("unable to receive results")]
     RecvResultsFailed,
 
+    /// iperf3's IEMESSAGE (#325): an unhandled control byte. GT's end-loop
+    /// switch has arms for only TEST_START / TEST_END / IPERF_DONE /
+    /// CLIENT_TERMINATE — every other value, known state or not, hits
+    /// `default: i_errno = IEMESSAGE` (iperf_server_api.c:309-311). GT's
+    /// sentence, no "protocol violation" wrapper (#151 convention).
+    #[error("received an unknown control message (ensure other side is iperf3 and not iperf)")]
+    UnknownControlMessage,
+
     /// iperf3's IESERVERTERM: the server sent SERVER_TERMINATE mid-test; a
     /// partial summary is rendered from local data before this surfaces (#170).
     #[error("the server has terminated")]

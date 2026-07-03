@@ -244,6 +244,12 @@ struct TestRunCtx {
     /// #210: a peer-terminated or interrupted test skips the results
     /// exchange (the peer is gone) but still dumps local results.
     client_terminated: bool,
+    /// #325: an unhandled control byte in the end loop — GT's IEMESSAGE
+    /// class (iperf_server_api.c:309-311). The dump still renders (the
+    /// exchange already completed); the doc carries the `error - `-prefixed
+    /// sentence and the run counts as a failed test (rc -1 in GT — which
+    /// main.c does NOT errexit on, so one-off still exits 0).
+    unknown_message: bool,
     interrupted: Option<String>,
 }
 
@@ -430,16 +436,20 @@ impl Server {
                         eprintln!("riperf3: {}", RiperfError::ClientTerminated);
                     }
                 }
+                Err(RiperfError::UnknownControlMessage) => {
+                    // #325: GT main.c:174 prints `iperf3: error - <IEMESSAGE
+                    // sentence>` once and keeps serving; a failed test is
+                    // rc -1, which main errexits on only below -1 (setup
+                    // failures), so one-off still exits 0 (r1 F1, #224).
+                    // Under -J iperf_err's sink carried it in the doc —
+                    // stderr stays silent, like the terminate arm above.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!("riperf3: error - {}", RiperfError::UnknownControlMessage);
+                    }
+                }
                 Err(e) => {
                     if !crate::macros::output_quiet() {
                         eprintln!("riperf3: error - {e}");
-                    }
-                    // #325: GT's one-off errexits on a failed test (main.c
-                    // runs the server once and exits 1 on <0); persistent
-                    // servers print and keep serving (GT caps at 5
-                    // consecutive errors — untracked here).
-                    if self.one_off {
-                        return Err(e);
                     }
                 }
             }
@@ -613,6 +623,7 @@ impl Server {
             interval_handle: None,
             server_error: None,
             client_terminated: false,
+            unknown_message: false,
             interrupted: None,
         };
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
@@ -675,6 +686,12 @@ impl Server {
                 // #325: an end-loop CLIENT_TERMINATE postdates EndState's
                 // resolution exactly like the #322 mid-exchange interrupt.
                 end.report_error = Some("the client has terminated".to_string());
+            } else if ctx.unknown_message {
+                // #325: GT's IEMESSAGE reaches the doc through main.c:174's
+                // `iperf_err(test, "error - %s", ...)` json sink — the
+                // in-doc value carries the prefix (live-captured), unlike
+                // IECLIENTTERM's bare sentence above.
+                end.report_error = Some(format!("error - {}", RiperfError::UnknownControlMessage));
             }
         }
 
@@ -722,6 +739,14 @@ impl Server {
             // The dump above already rendered; the caller prints iperf3's
             // "the client has terminated" (no "error - " prefix) (#210).
             return Err(RiperfError::ClientTerminated);
+        }
+        if ctx.unknown_message {
+            // #325: the dump above rendered with the in-doc `error - ` form;
+            // the caller prints GT's single stderr line (text mode only) and
+            // keeps serving. A failed TEST is rc -1 in GT, which main.c does
+            // NOT errexit on even for one-off (`if (rc < -1)` — setup
+            // failures only), so this must not become a process error (#224).
+            return Err(RiperfError::UnknownControlMessage);
         }
         Ok(Some(report))
     }
@@ -1716,6 +1741,9 @@ impl Server {
                 };
                 match next {
                     Ok(TestState::IperfDone) => break,
+                    // GT's TEST_START arm is a bare no-op
+                    // (iperf_server_api.c:266-267).
+                    Ok(TestState::TestStart) => continue,
                     // #325: GT honors CLIENT_TERMINATE at ANY message point
                     // (iperf_server_api.c:289-308: dump under
                     // DISPLAY_RESULTS + IECLIENTTERM) — the finalize phases
@@ -1725,22 +1753,22 @@ impl Server {
                         ctx.client_terminated = true;
                         return Ok(());
                     }
-                    // #145: log an out-of-sequence KNOWN control byte, then
-                    // continue — GT's switch has an arm for every known
-                    // state at this point (unknown BYTES error as IEMESSAGE
-                    // in recv_state, #325).
-                    Ok(other) => {
-                        if !protocol::is_legal_next(
-                            TestState::DisplayResults,
-                            other,
-                            protocol::Role::Server,
-                        ) {
-                            log::debug!(
-                                "server: out-of-sequence control state {other:?} \
-                                 in the end-of-test loop (ignored)"
-                            );
-                        }
-                        continue;
+                    // GT's switch has arms for only TEST_START / TEST_END /
+                    // IPERF_DONE / CLIENT_TERMINATE — every OTHER byte,
+                    // known state or not, is `default: IEMESSAGE`
+                    // (iperf_server_api.c:265-311; r1 F3 — live-verified:
+                    // GT errors on bytes 2/9/14 here). The old #145
+                    // tolerance is gone. RECORDED DEVIATION for TEST_END
+                    // only: GT re-runs the whole end block — stats, stream
+                    // close, a SECOND results exchange (:268-286) — but a
+                    // conforming client can't resend 4 from this window
+                    // (it only sends TEST_END from TEST_RUNNING), and
+                    // re-entering the exchange against a peer that didn't
+                    // would wedge both sides; it takes the IEMESSAGE class
+                    // instead.
+                    Ok(_) | Err(RiperfError::UnknownControlMessage) => {
+                        ctx.unknown_message = true;
+                        return Ok(());
                     }
                     Err(RiperfError::PeerDisconnected) => break,
                     Err(e) => return Err(e),

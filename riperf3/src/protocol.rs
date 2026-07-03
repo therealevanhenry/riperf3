@@ -239,13 +239,11 @@ pub async fn recv_state(stream: &mut TcpStream) -> Result<TestState> {
     }
     // #325: GT's IEMESSAGE — an unmapped control byte fails with its exact
     // sentence (iperf_error.c:302; the server's state switch has no
-    // tolerant default, iperf_server_api.c:309-311).
+    // tolerant default, iperf_server_api.c:309-311). Dedicated variant so
+    // the sentence prints bare, not "protocol violation: "-wrapped (r1 F2).
     TestState::from_wire(buf[0] as i8).map_err(|u| {
         log::debug!("control byte {} is not a known state", u.0);
-        RiperfError::Protocol(
-            "received an unknown control message (ensure other side is iperf3 and not iperf)"
-                .to_string(),
-        )
+        RiperfError::UnknownControlMessage
     })
 }
 
