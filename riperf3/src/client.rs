@@ -1005,11 +1005,12 @@ impl Client {
         }
         p.mss = self.mss;
         p.window = self.window;
-        // Always carry the resolved rate (incl. 0 = unlimited) so the server
-        // paces correctly in reverse/bidir; matches iperf3, which always sends
-        // it. `bandwidth` is the effective rate after the build-time default
-        // (UDP unset → 1 Mbit/s), so 0 here unambiguously means unlimited (#17).
-        p.bandwidth = Some(self.bandwidth);
+        // GT sends `bandwidth` only when nonzero (iperf_api.c:2456, #303) —
+        // absent reads as 0 = unlimited on both sides, so `-b 0` stays
+        // unlimited server-side while the raw param JSON matches GT
+        // byte-wise. The UDP build-time default (unset → 1 Mbit/s) is
+        // nonzero and rides the wire like GT's UDP_RATE default.
+        p.bandwidth = (self.bandwidth > 0).then_some(self.bandwidth);
         // #260 r1 F2: GT sends `fqrate` whenever nonzero (iperf_api.c:2457-8)
         // — the server needs it for its upfront total-rate check AND for
         // fq-paced reverse/bidir sending. riperf3 never serialized it.
@@ -1035,12 +1036,12 @@ impl Client {
             p.udp_counters_64bit = Some(1);
         }
         p.client_version = Some(format!("riperf3 {}", env!("CARGO_PKG_VERSION")));
-        if let Some(bytes) = self.bytes_to_send {
-            p.num = Some(bytes);
-        }
-        if let Some(blocks) = self.blocks_to_send {
-            p.blockcount = Some(blocks);
-        }
+        // GT serializes num/blockcount UNCONDITIONALLY (iperf_api.c:
+        // 2436-2437), sending 0 for a plain -t run — the read side's
+        // normalize_unlimited already treats Some(0) as no-limit (#119),
+        // so the wire now matches GT byte-wise too (#303).
+        p.num = Some(self.bytes_to_send.unwrap_or(0));
+        p.blockcount = Some(self.blocks_to_send.unwrap_or(0));
 
         // Auth: encrypt credentials if username and public key are set
         if let (Some(ref username), Some(ref pubkey_path)) =
@@ -4214,15 +4215,27 @@ mod tests {
         }
 
         #[test]
-        fn udp_build_params_carries_bandwidth_including_zero() {
-            // The negotiated rate must reach the server (in `len`/`bandwidth`)
-            // so reverse-mode -b 0 is unlimited server-side, not throttled.
+        fn build_params_matches_gt_wire_gates() {
+            // #303: GT sends `bandwidth` only when nonzero (iperf_api.c:2456)
+            // — absent reads as 0 = unlimited on both sides, so reverse -b 0
+            // stays unlimited server-side with a GT-identical raw param doc.
             let c = ClientBuilder::new("h")
                 .protocol(TransportProtocol::Udp)
                 .bandwidth(0)
                 .build()
                 .unwrap();
-            assert_eq!(c.build_params(1460).bandwidth, Some(0));
+            let p = c.build_params(1460);
+            assert_eq!(p.bandwidth, None, "-b 0 omits the key like GT");
+            // GT sends num/blockcount unconditionally (:2436-2437) — 0 for
+            // a plain -t run; the read side normalizes Some(0) to no-limit.
+            assert_eq!(p.num, Some(0));
+            assert_eq!(p.blockcount, Some(0));
+
+            let c = ClientBuilder::new("h")
+                .bandwidth(5_000_000)
+                .build()
+                .unwrap();
+            assert_eq!(c.build_params(1460).bandwidth, Some(5_000_000));
         }
 
         // #32: iperf3 ALWAYS sends pacing_timer in the param exchange (default
