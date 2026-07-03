@@ -102,19 +102,24 @@ fn peer_half_summary(
     peer_has_retransmits: bool,
     end: f64,
     role_tag: Option<&'static str>,
+    local_omitted_sent: i64,
 ) -> crate::reporter::StreamSummary {
     let peer_is_sender = !local_is_sender;
+    // #271: an old peer (iperf3 <= 3.12) exchanges no omitted_* keys — GT's
+    // all-omitted posture substitutes the baselines before netting.
+    let (omitted_errors, omitted_packets) =
+        protocol::resolve_peer_omitted(x, local_is_sender, local_omitted_sent);
     let (jitter, lost, total) = if !is_udp {
         (None, None, None)
     } else if peer_is_sender {
         // Peer sent: zero jitter/loss over its sent count.
-        (Some(0.0), Some(0), Some(x.packets - x.omitted_packets))
+        (Some(0.0), Some(0), Some(x.packets - omitted_packets))
     } else {
         // Peer received: its measured stats.
         (
             Some(x.jitter),
-            Some(x.errors - x.omitted_errors),
-            Some(x.packets - x.omitted_packets),
+            Some(x.errors - omitted_errors),
+            Some(x.packets - omitted_packets),
         )
     };
     // A TCP peer sender renders the retransmit total it exchanged (#156/#184),
@@ -1673,9 +1678,9 @@ impl Client {
                     retransmits,
                     jitter,
                     errors,
-                    omitted_errors,
+                    omitted_errors: Some(omitted_errors),
                     packets,
-                    omitted_packets,
+                    omitted_packets: Some(omitted_packets),
                     start_time: 0.0,
                     end_time: test_duration,
                 }
@@ -1920,6 +1925,11 @@ impl Client {
                         peer_has_retr,
                         test_duration,
                         role_tag,
+                        // #271: the sender-arm substitution needs this host's
+                        // own omitted SENT count (0 without -O; TCP harmless —
+                        // the arm only feeds UDP figures).
+                        (s.meta.counters.datagrams_sent() - s.meta.counters.datagrams_sent_net())
+                            as i64,
                     )
                 });
 
@@ -2069,12 +2079,22 @@ impl Client {
                     // peer's receiver and live only in the results it returned
                     // — attach them to the sender entry, in bidir exactly as
                     // in forward mode (#25, #182; iperf3 does the same).
-                    // Peer's gross counts minus its omitted_* baselines (#31).
-                    server_stream.map(|x| UdpStreamStats {
-                        jitter_secs: x.jitter,
-                        lost_packets: x.errors - x.omitted_errors,
-                        packets: x.packets - x.omitted_packets,
-                        out_of_order: 0,
+                    // Peer's gross counts minus its omitted_* baselines (#31);
+                    // an old peer sends none — GT's all-omitted substitution
+                    // applies (#271; the local sender's own omitted count and
+                    // the -1 unknown-errors sentinel, faithfully off-by-one).
+                    server_stream.map(|x| {
+                        let local_omitted_sent = (s.meta.counters.datagrams_sent()
+                            - s.meta.counters.datagrams_sent_net())
+                            as i64;
+                        let (omitted_errors, omitted_packets) =
+                            protocol::resolve_peer_omitted(x, true, local_omitted_sent);
+                        UdpStreamStats {
+                            jitter_secs: x.jitter,
+                            lost_packets: x.errors - omitted_errors,
+                            packets: x.packets - omitted_packets,
+                            out_of_order: 0,
+                        }
                     })
                 } else {
                     None
@@ -2141,8 +2161,14 @@ impl Client {
                     // bytes-derived figures until #235's counter half.
                     // saturating: the #24 sentinel-hardening posture for
                     // adversarial gross/omitted pairs.
-                    remote_packets: server_stream
-                        .map(|x| x.packets.saturating_sub(x.omitted_packets)),
+                    remote_packets: server_stream.map(|x| {
+                        let local_omitted_sent = (s.meta.counters.datagrams_sent()
+                            - s.meta.counters.datagrams_sent_net())
+                            as i64;
+                        let (_, omitted_packets) =
+                            protocol::resolve_peer_omitted(x, s.meta.is_sender, local_omitted_sent);
+                        x.packets.saturating_sub(omitted_packets)
+                    }),
                     retransmits,
                     tcp_end,
                     udp,
@@ -4179,14 +4205,14 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.000_03,
                 errors: 4258,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 267_190,
-                omitted_packets: 0,
+                omitted_packets: Some(0),
                 start_time: 0.0,
                 end_time: 5.0,
             };
 
-            let recv = peer_half_summary(&x, true, true, false, 5.0, None);
+            let recv = peer_half_summary(&x, true, true, false, 5.0, None, 0);
             assert!(!recv.is_sender, "server is the receiver in forward mode");
             assert_eq!(recv.lost, Some(4258));
             assert_eq!(recv.total_packets, Some(267_190));
@@ -4198,7 +4224,7 @@ mod tests {
             assert!(line.contains("4258/267190"), "{line}");
 
             // TCP forward: no datagram-loss columns, just a receiver byte line.
-            let tcp = peer_half_summary(&x, true, false, false, 5.0, None);
+            let tcp = peer_half_summary(&x, true, false, false, 5.0, None, 0);
             assert_eq!(tcp.lost, None);
             assert_eq!(tcp.total_packets, None);
             assert_eq!(tcp.jitter, None);
@@ -4215,13 +4241,13 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.5, // a peer sender reports no meaningful jitter
                 errors: 0,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 30,
-                omitted_packets: 5,
+                omitted_packets: Some(5),
                 start_time: 0.0,
                 end_time: 5.0,
             };
-            let snd = peer_half_summary(&x, false, true, false, 5.0, Some("RX-C"));
+            let snd = peer_half_summary(&x, false, true, false, 5.0, Some("RX-C"), 0);
             assert!(snd.is_sender, "peer half of a local receiver is the sender");
             assert_eq!(snd.jitter, Some(0.0), "sender line shows zero jitter");
             assert_eq!(snd.lost, Some(0), "sender line shows zero loss");

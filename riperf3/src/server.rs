@@ -1430,9 +1430,9 @@ impl Server {
                 retransmits,
                 jitter,
                 errors,
-                omitted_errors,
+                omitted_errors: Some(omitted_errors),
                 packets,
-                omitted_packets,
+                omitted_packets: Some(omitted_packets),
                 start_time: 0.0,
                 end_time: end.test_duration,
             });

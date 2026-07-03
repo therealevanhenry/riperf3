@@ -433,13 +433,59 @@ pub struct StreamResultJson {
     pub jitter: f64,
     pub errors: i64,
     // iperf 3.12 omits the omitted_* fields from the stream object (#24).
-    #[serde(default)]
-    pub omitted_errors: i64,
+    // `None` = the keys were ABSENT (an old peer) — distinct from an
+    // exchanged 0, because GT's old-peer posture substitutes all-omitted
+    // baselines (#271, iperf_api.c:2914-2950); resolve via
+    // [`resolve_peer_omitted`] before netting. riperf3 itself always sends
+    // both keys (the serializer skips None, which riperf3 never produces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_errors: Option<i64>,
     pub packets: i64,
-    #[serde(default)]
-    pub omitted_packets: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_packets: Option<i64>,
     pub start_time: f64,
     pub end_time: f64,
+}
+
+/// GT's old-peer substitution for the exchanged omit baselines (#271,
+/// iperf_api.c:2914-2926 sender arm / :2946-2950 receiver arm): when the
+/// peer sent no `omitted_*` keys (iperf3 <= 3.12), GT treats the affected
+/// figures as ALL-OMITTED rather than zero-omitted.
+///
+/// Returns `(omitted_errors, omitted_packets)` ready for the net
+/// subtraction the render sites do:
+/// - Local SENDER (the peer received; its entry carries receiver stats):
+///   `omitted_packets` := this host's own omitted SENT count; with an omit
+///   window, `omitted_errors` is GT's `-1` "unknown" sentinel when any
+///   errors arrived (net renders `errors + 1` at the stream level — the
+///   live 3.21↔3.12 probe shows the off-by-one against the sum) else 0;
+///   with NO omit window it swallows the whole count (`:= errors`, net 0 —
+///   live-probed: fwd no-omit loss renders 0/417713).
+/// - Local RECEIVER (the peer sent): `omitted_packets` := the peer's whole
+///   packet count (net sent figure 0 — live-probed: the reverse stream's
+///   lost_percent collapses to 0 while the sum keeps the true figure).
+pub fn resolve_peer_omitted(
+    x: &StreamResultJson,
+    local_is_sender: bool,
+    local_omitted_sent: i64,
+) -> (i64, i64) {
+    match (x.omitted_errors, x.omitted_packets) {
+        (Some(e), Some(p)) => (e, p),
+        _ if local_is_sender => {
+            let omitted_packets = local_omitted_sent;
+            let omitted_errors = if omitted_packets > 0 {
+                if x.errors > 0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                x.errors
+            };
+            (omitted_errors, omitted_packets)
+        }
+        _ => (0, x.packets),
+    }
 }
 
 /// Top-level results JSON exchanged between client and server.
@@ -491,6 +537,19 @@ pub async fn send_results(stream: &mut TcpStream, results: &TestResultsJson) -> 
 pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
     let value = json_read(stream, 0).await?;
     let results: TestResultsJson = serde_json::from_value(value)?;
+    // #271: GT accepts BOTH omitted_* keys (>=3.14 peer) or NEITHER (old
+    // peer), and fails the exchange with IERECVRESULTS when exactly one is
+    // present (iperf_api.c:2888-2892 — "For backward compatibility allow to
+    // not receive 'omitted' statistics").
+    if results
+        .streams
+        .iter()
+        .any(|x| x.omitted_errors.is_some() != x.omitted_packets.is_some())
+    {
+        return Err(crate::error::RiperfError::Protocol(
+            "unable to receive results".to_string(),
+        ));
+    }
     Ok(results)
 }
 
@@ -809,9 +868,9 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.0,
                 errors: 0,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 0,
-                omitted_packets: 0,
+                omitted_packets: Some(0),
                 start_time: 0.0,
                 end_time: 10.0,
             }],
@@ -835,11 +894,56 @@ mod tests {
         assert_eq!(r.sender_has_retransmits, -1, "u64::MAX sentinel maps to -1");
         assert_eq!(r.streams[0].retransmits, -1, "u64::MAX sentinel maps to -1");
         assert_eq!(r.streams[0].bytes, 25_371_082_752);
-        assert_eq!(r.streams[0].omitted_errors, 0, "absent field defaults to 0");
+        // #271 refined the #24 posture: absence is preserved as None so
+        // GT's all-omitted substitution can distinguish it from a real 0.
         assert_eq!(
-            r.streams[0].omitted_packets, 0,
-            "absent field defaults to 0"
+            r.streams[0].omitted_errors, None,
+            "absent field decodes as None (old peer)"
         );
+        assert_eq!(
+            r.streams[0].omitted_packets, None,
+            "absent field decodes as None (old peer)"
+        );
+    }
+
+    /// #271: GT's old-peer substitution arms (iperf_api.c:2914-2950),
+    /// pinned on the LIVE 3.21↔3.12 probe shapes (2026-07-02): the sender
+    /// arm swallows loss without an omit window, renders the -1 unknown
+    /// sentinel with one, and the receiver arm treats the peer's whole
+    /// packet count as omitted.
+    #[test]
+    fn resolve_peer_omitted_mirrors_gt_arms() {
+        let mk = |errors: i64, packets: i64, oe: Option<i64>, op: Option<i64>| StreamResultJson {
+            id: 1,
+            bytes: 0,
+            retransmits: -1,
+            jitter: 0.0,
+            errors,
+            omitted_errors: oe,
+            packets,
+            omitted_packets: op,
+            start_time: 0.0,
+            end_time: 2.0,
+        };
+        // Present keys pass through untouched for BOTH arms.
+        let x = mk(9, 100, Some(2), Some(10));
+        assert_eq!(resolve_peer_omitted(&x, true, 5), (2, 10));
+        assert_eq!(resolve_peer_omitted(&x, false, 0), (2, 10));
+        // Sender arm, no local omit: the swallow (net errors render 0 —
+        // live: fwd no-omit lost=0/417713 despite real loss).
+        let x = mk(643, 417_713, None, None);
+        assert_eq!(resolve_peer_omitted(&x, true, 0), (643, 0));
+        // Sender arm, local omit window: -1 unknown sentinel when errors
+        // arrived (net = errors + 1 — live: stream 2852 vs sum 2851)...
+        let x = mk(2851, 416_693, None, None);
+        assert_eq!(resolve_peer_omitted(&x, true, 1_020), (-1, 1_020));
+        // ...and 0 when none did.
+        let x = mk(0, 416_693, None, None);
+        assert_eq!(resolve_peer_omitted(&x, true, 1_020), (0, 1_020));
+        // Receiver arm: the peer's whole count is omitted (net sent 0 —
+        // live: the reverse stream's figures collapse).
+        let x = mk(0, 417_573, None, None);
+        assert_eq!(resolve_peer_omitted(&x, false, 0), (0, 417_573));
     }
 
     #[test]
@@ -861,9 +965,9 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.0,
                 errors: 0,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 0,
-                omitted_packets: 0,
+                omitted_packets: Some(0),
                 start_time: 0.0,
                 end_time: 1.0,
             }],
@@ -1214,9 +1318,9 @@ mod protocol_tests {
                     retransmits: 3,
                     jitter: 0.0,
                     errors: 0,
-                    omitted_errors: 0,
+                    omitted_errors: Some(0),
                     packets: 0,
-                    omitted_packets: 0,
+                    omitted_packets: Some(0),
                     start_time: 0.0,
                     end_time: 10.0,
                 },
@@ -1226,9 +1330,9 @@ mod protocol_tests {
                     retransmits: 0,
                     jitter: 0.0,
                     errors: 0,
-                    omitted_errors: 0,
+                    omitted_errors: Some(0),
                     packets: 0,
-                    omitted_packets: 0,
+                    omitted_packets: Some(0),
                     start_time: 0.0,
                     end_time: 10.0,
                 },
@@ -1358,9 +1462,9 @@ mod protocol_tests {
                 retransmits: 5,
                 jitter: 0.001,
                 errors: 2,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 10000,
-                omitted_packets: 0,
+                omitted_packets: Some(0),
                 start_time: 0.0,
                 end_time: 10.0,
             }],
