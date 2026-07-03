@@ -1093,7 +1093,11 @@ impl Client {
         // sender stops itself at `-t` so termination never depends on `done`
         // being set by a CPU-starved runtime. Only in duration mode;
         // byte/block-limited tests stop on `done`.
-        let max_duration = (self.bytes_to_send.is_none() && self.blocks_to_send.is_none())
+        let max_duration = (self.bytes_to_send.is_none()
+            && self.blocks_to_send.is_none()
+            // #321: GT arms NO end timer for -t 0 (iperf_client_api.c:229)
+            // — the run is unbounded until a signal or the peer ends it.
+            && self.duration > 0)
             .then(|| Duration::from_secs((self.duration + self.omit) as u64));
 
         // `-n`/`-k` shared byte budget for the sending streams: they collectively
@@ -1565,7 +1569,10 @@ impl Client {
                 // post-omit `-t` (its timeline restarts at the boundary).
                 let wall = dur + Duration::from_secs(self.omit as u64);
                 tokio::select! {
-                    _ = tokio::time::sleep(wall) => dur.as_secs_f64(),
+                    // #321: -t 0 arms no deadline, like GT's
+                    // `if (test->duration != 0)` timer gate — the run ends
+                    // only on a signal or a control-channel event.
+                    _ = tokio::time::sleep(wall), if !dur.is_zero() => dur.as_secs_f64(),
                     ev = watch_control(ctrl) => {
                         control_event = Some(ev);
                         watch_end_secs(report_start.elapsed().as_secs_f64())

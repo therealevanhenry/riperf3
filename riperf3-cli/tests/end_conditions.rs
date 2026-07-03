@@ -5,6 +5,8 @@
 
 use std::process::Command;
 
+mod common;
+
 #[test]
 fn conflicting_end_conditions_exit_before_side_effects() {
     let bin = env!("CARGO_BIN_EXE_riperf3");
@@ -46,4 +48,47 @@ fn conflicting_end_conditions_exit_before_side_effects() {
         "the rejection must fire BEFORE side effects (iperf3 creates no pidfile); found {pidfile:?}"
     );
     let _ = std::fs::remove_file(&pidfile);
+}
+
+/// #321: GT arms NO end timer for `-t 0` (iperf_client_api.c:229's
+/// `if (duration != 0)` gate) — the run is unbounded until signaled.
+/// Pre-fix riperf3 completed instantly (a zero-length sleep).
+#[cfg(unix)]
+#[test]
+fn time_zero_runs_until_signaled() {
+    let port = common::free_port();
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let client = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", &ps, "-t", "0", "-J"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn client"),
+    );
+    // The client must STILL be running well past any instant-complete
+    // window (pre-fix it exited in <1s).
+    std::thread::sleep(std::time::Duration::from_millis(2_500));
+    let mut client = client;
+    assert!(
+        client.0.try_wait().expect("try_wait").is_none(),
+        "-t 0 runs unbounded like GT"
+    );
+    unsafe {
+        libc::kill(client.0.id() as i32, libc::SIGTERM);
+    }
+    let out = riperf3_test_support::wait_bounded(&mut client.0, std::time::Duration::from_secs(8))
+        .expect("client exits on signal");
+    assert!(out.success(), "signal-normal exit like GT's sigend");
+    let _ = server.0.kill();
 }
