@@ -3306,11 +3306,12 @@ impl ClientBuilder {
                     "TCP congestion control is not supported on this platform".into(),
                 ));
             }
-            if self.gsro {
-                return Err(ConfigError::Unsupported(
-                    "UDP GSO/GRO is not supported on this platform".into(),
-                ));
-            }
+            // --gsro deliberately NOT rejected here (#316): GT keeps the
+            // flag "available regardless of local support to allow client
+            // to request server to use it" (iperf_api.c:1799-1804) — the
+            // params block still carries gso/gro=1, the local probes fail
+            // and zero the adopted state, and the CLI warns at parse time
+            // (iperf_api.c:1830-1839).
         }
 
         // --bind-dev needs SO_BINDTODEVICE (Linux) or IP_BOUND_IF (macOS). The
