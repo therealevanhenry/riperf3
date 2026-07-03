@@ -776,6 +776,14 @@ fn blocksize_range_validations_match_gt() {
             &["-c", "127.0.0.1", "-u", "-l", "-5"],
             "parameter error - block size invalid (minimum = 16 bytes, maximum = 65507 bytes)",
         ),
+        // #328 r1 F1: the blksize checks (iperf_api.c:1926-1944) fire
+        // BEFORE the end-conditions check (:1992) in GT's post-loop —
+        // live-probed: `-t 5 -n 5 -l -1` reports IEBLOCKSIZE, not
+        // IEENDCONDITIONS.
+        (
+            &["-c", "127.0.0.1", "-t", "5", "-n", "5", "-l", "-1"],
+            "parameter error - block size too large (maximum = 1048576 bytes)",
+        ),
     ];
     for (args, want) in cases {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
@@ -995,6 +1003,34 @@ fn cntl_ka_parses_pieces_like_gt() {
             "the usage trailer rides parameter errors: {stderr}"
         );
     }
+}
+
+/// #328 r1 F3: GT's --cntl-ka is optional_argument, so a SEPARATE token is
+/// never the spec — `--cntl-ka 5/5/1` leaves optarg NULL (keepalive with
+/// defaults) and "5/5/1" is a stray operand GT silently ignores
+/// (live-probed: it proceeds). With require_equals, riperf3 matches the
+/// =-only attachment exactly; the stray token then falls into the
+/// PRE-EXISTING stray-operand divergence class. KNOWN-DIVERGENT: riperf3
+/// rejects stray operands (clap's unexpected-argument error) where GT
+/// ignores them — the load-bearing part is that the spec is NOT honored
+/// (clap must not consume it and fire IECNTLKA on it, which would flip a
+/// GT-accept into a spec-driven reject).
+#[test]
+fn cntl_ka_separate_token_is_a_stray_operand() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", "9", "--cntl-ka", "5/5/1"])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Keepalive period"),
+        "the separate token must NOT be parsed as the spec (GT ignores it): {stderr}"
+    );
+    assert!(
+        stderr.contains("unexpected argument"),
+        "the stray token takes the pre-existing stray-operand rejection: {stderr}"
+    );
 }
 
 /// #328: -d/--debug's optional level is C atoi with negative ->

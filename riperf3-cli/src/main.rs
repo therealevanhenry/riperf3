@@ -208,41 +208,11 @@ fn main() -> std::process::ExitCode {
     if let Some(msg) = parse_class_rejection(&cli) {
         // #270: GT routes the parse-error class through 'parameter error - '
         // with the usage trailer (live-probed for all three classes here:
-        // end-conditions, client-only, server-only).
+        // end-conditions, client-only, server-only). #328: the -l range
+        // checks live INSIDE parse_class_rejection at GT's post-loop slot.
         eprintln!("riperf3: parameter error - {msg}");
         print_usage_trailer();
         return std::process::ExitCode::FAILURE;
-    }
-
-    // #328: GT's -l range checks sit in the parse post-loop AFTER the role
-    // checks (iperf_api.c:1926-1944; live: `-s -l 2M` is IECLIENTONLY, not
-    // IEBLOCKSIZE — hence this block runs after parse_class_rejection).
-    // The value GT checks is unit_atoi through an int, post the
-    // 0-means-protocol-default step, so only NEGATIVE (wrapped) explicit
-    // values can trip the `<= 0` arm.
-    if let Some(v) = cli
-        .length
-        .as_deref()
-        .and_then(|s| cli::unit_atoi_like_bytes(s.as_encoded_bytes()).ok())
-        .map(|n| cli::c_u64_to_int(cli::c_double_to_u64(n)))
-    {
-        // MAX_BLOCKSIZE 1 MiB (iperf.h:465); MIN/MAX_UDP_BLOCKSIZE 16/65507
-        // (iperf.h:467/:469). RECORDED DEVIATION: GT's UDP arm only fires
-        // for blksize > 0 (:1939-1941), so `-u -l -5` PROCEEDS into a
-        // negative datagram size; riperf3 rejects it with the UDP sentence
-        // instead of reproducing the garbage run.
-        let msg = if (!cli.udp && v < 0) || v > 1_048_576 {
-            Some("block size too large (maximum = 1048576 bytes)")
-        } else if cli.udp && v != 0 && !(16..=65_507).contains(&v) {
-            Some("block size invalid (minimum = 16 bytes, maximum = 65507 bytes)")
-        } else {
-            None
-        };
-        if let Some(msg) = msg {
-            eprintln!("riperf3: parameter error - {msg}");
-            print_usage_trailer();
-            return std::process::ExitCode::FAILURE;
-        }
     }
 
     // #263: GT warns when an explicit -f rides JSON output — end of
@@ -381,6 +351,34 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
         // part of the live-probed line (errno 0 at parse time).
         if cli.rcv_timeout.is_some() && !cli.reverse && !cli.bidir {
             return Some("client receive timeout is valid only in receiving mode: ".to_string());
+        }
+        // #328 (r1 F1): GT's -l range checks sit BETWEEN the rvrs-rcv check
+        // (:1881) and the end-conditions check (:1992) in the parse
+        // post-loop (iperf_api.c:1926-1944) — live-probed both ways:
+        // `-s -l 2M` is IECLIENTONLY (role checks first), and
+        // `-t 5 -n 5 -l -1` is IEBLOCKSIZE, not IEENDCONDITIONS. The value
+        // GT checks is unit_atoi through an int, post the
+        // 0-means-protocol-default step, so only NEGATIVE (wrapped)
+        // explicit values can trip the `<= 0` arm.
+        if let Some(v) = cli
+            .length
+            .as_deref()
+            .and_then(|s| cli::unit_atoi_like_bytes(s.as_encoded_bytes()).ok())
+            .map(|n| cli::c_u64_to_int(cli::c_double_to_u64(n)))
+        {
+            // MAX_BLOCKSIZE 1 MiB (iperf.h:465); MIN/MAX_UDP_BLOCKSIZE
+            // 16/65507 (iperf.h:467/:469). RECORDED DEVIATION: GT's UDP arm
+            // only fires for blksize > 0 (:1939-1941), so `-u -l -5`
+            // PROCEEDS into a negative datagram size; riperf3 rejects it
+            // with the UDP sentence instead of reproducing the garbage run.
+            if (!cli.udp && v < 0) || v > 1_048_576 {
+                return Some("block size too large (maximum = 1048576 bytes)".to_string());
+            }
+            if cli.udp && v != 0 && !(16..=65_507).contains(&v) {
+                return Some(
+                    "block size invalid (minimum = 16 bytes, maximum = 65507 bytes)".to_string(),
+                );
+            }
         }
         if cli.end_conditions_conflict() {
             return Some(cli::END_CONDITIONS_MSG.to_string());

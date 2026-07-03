@@ -355,8 +355,20 @@ pub struct Cli {
     // `--cntl-ka` enables keepalive with the 0-defaults (:3311-3313, filled
     // at socket time :5590-5600); the spec pieces are each C atoi and the
     // sanity check → IECNTLKA lives in main.rs. Raw OsString: garbage
-    // pieces atoi to 0 like GT.
-    #[arg(long, value_name = "idle/intv/cnt", num_args = 0..=1, default_missing_value = "")]
+    // pieces atoi to 0 like GT. require_equals (r1 F3): getopt's
+    // optional_argument only ever attaches via `=` — GT treats a separate
+    // `--cntl-ka 5/5/1` token as a stray operand it silently ignores
+    // (live-probed: keepalive defaults, spec dropped, run proceeds), so the
+    // spec must never be consumed from the next token. KNOWN-DIVERGENT:
+    // the stray token then hits riperf3's pre-existing stray-operand
+    // rejection (clap unexpected-argument) instead of being ignored.
+    #[arg(
+        long,
+        value_name = "idle/intv/cnt",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true
+    )]
     pub cntl_ka: Option<std::ffi::OsString>,
 
     /// Username for authentication
@@ -1142,6 +1154,9 @@ pub fn cntl_ka_violation(spec: &std::ffi::OsStr) -> bool {
     let keepidle = piece(Some(p0));
     let interval = piece(p1);
     let count = piece(p2);
+    // C signed-int overflow in `count * interval` is UB; wrapping_mul pins
+    // the observed GT binary's two's-complement wrap deterministically,
+    // like c_double_to_u64 does for its conversion UB.
     keepidle != 0 && keepidle <= count.wrapping_mul(interval)
 }
 
@@ -2422,7 +2437,9 @@ mod cli_tests {
         #[test]
         fn cntl_ka_wired() {
             // 20 > 5*3, so the spec also passes GT's IECNTLKA sanity check.
-            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka", "20/5/3"]);
+            // =-attached: the only spec form GT's optional_argument takes
+            // (require_equals, #328 r1 F3).
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka=20/5/3"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").cntl_ka("20/5/3").build().unwrap());
         }
