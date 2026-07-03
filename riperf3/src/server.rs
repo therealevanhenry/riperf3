@@ -434,6 +434,13 @@ impl Server {
                     if !crate::macros::output_quiet() {
                         eprintln!("riperf3: error - {e}");
                     }
+                    // #325: GT's one-off errexits on a failed test (main.c
+                    // runs the server once and exits 1 on <0); persistent
+                    // servers print and keep serving (GT caps at 5
+                    // consecutive errors — untracked here).
+                    if self.one_off {
+                        return Err(e);
+                    }
                 }
             }
 
@@ -664,6 +671,10 @@ impl Server {
         if end.report_error.is_none() {
             if let Some(msg) = &ctx.interrupted {
                 end.report_error = Some(msg.clone());
+            } else if ctx.client_terminated {
+                // #325: an end-loop CLIENT_TERMINATE postdates EndState's
+                // resolution exactly like the #322 mid-exchange interrupt.
+                end.report_error = Some("the client has terminated".to_string());
             }
         }
 
@@ -1705,10 +1716,19 @@ impl Server {
                 };
                 match next {
                     Ok(TestState::IperfDone) => break,
-                    // #145: AUDITABILITY ONLY — log an out-of-table control
-                    // byte in the end-of-test loop, then STILL continue
-                    // (behavior unchanged, default-tolerant; iperf3's
-                    // end-loop tolerates intervening bytes).
+                    // #325: GT honors CLIENT_TERMINATE at ANY message point
+                    // (iperf_server_api.c:289-308: dump under
+                    // DISPLAY_RESULTS + IECLIENTTERM) — the finalize phases
+                    // render the terminated shape exactly like the mid-test
+                    // arm.
+                    Ok(TestState::ClientTerminate) => {
+                        ctx.client_terminated = true;
+                        return Ok(());
+                    }
+                    // #145: log an out-of-sequence KNOWN control byte, then
+                    // continue — GT's switch has an arm for every known
+                    // state at this point (unknown BYTES error as IEMESSAGE
+                    // in recv_state, #325).
                     Ok(other) => {
                         if !protocol::is_legal_next(
                             TestState::DisplayResults,
