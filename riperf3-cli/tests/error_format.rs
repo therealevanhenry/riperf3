@@ -431,3 +431,219 @@ fn reverse_plus_bidir_rejects_like_gt() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #328: the rest of GT's atoi option surface (-p/--cport/-P/-M/--rcv-timeout/
+// --snd-timeout/--time-skew-threshold). Every expectation below was
+// live-probed against iperf 3.21 (/tmp gt build, 2026-07-03).
+// ---------------------------------------------------------------------------
+
+/// #328: the atoi-set flags parse with C atoi semantics — suffixed garbage
+/// takes the leading digits and the run proceeds to CONNECT (port 9), never
+/// a parse error. Live-probed: GT accepts `-P 5x`, `-p 17299x`, `-M 1400x`,
+/// `--cport 12345x`, `--snd-timeout 5000x`, `-R --rcv-timeout 5000x`,
+/// `-P 0`, `-P -1`, `-M -100` (all "unable to connect" on a dead port).
+#[test]
+fn atoi_family_flags_parse_like_atoi() {
+    for args in [
+        &["-c", "127.0.0.1", "-p", "9", "-P", "5x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-P", "0"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-P", "-1"][..],
+        &["-c", "127.0.0.1", "-p", "17299x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-M", "1400x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-M", "-100"][..],
+        &["-c", "127.0.0.1", "-p", "9", "--cport", "12345x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-R", "--rcv-timeout", "5000x"][..],
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            "9",
+            "-R",
+            "--rcv-timeout",
+            "86400000",
+        ][..],
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            "9",
+            "--bidir",
+            "--rcv-timeout",
+            "5000",
+        ][..],
+        &["-c", "127.0.0.1", "-p", "9", "--snd-timeout", "5000x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "--snd-timeout", "0"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect")
+                && !stderr.contains("parameter error")
+                && !stderr.contains("error: invalid value"),
+            "{args:?} parses via atoi semantics and proceeds: {stderr}"
+        );
+    }
+}
+
+/// #328: GT's in-loop range checks for the atoi set, exact sentences +
+/// usage trailer + exit 1 (live-probed, iperf_api.c:1229/:1479 IEBADPORT,
+/// :1415 IENUMSTREAMS, :1487 IEMSS, :1603 IERCVTIMEOUT, :1614 IESNDTIMEOUT,
+/// :1761 IESKEWTHRESHOLD). IERCVTIMEOUT/IESNDTIMEOUT/IESKEWTHRESHOLD notes:
+/// the first two carry perr=1, so iperf_strerror appends ": " (errno is 0 at
+/// parse time, so nothing follows — the trailing colon-space is part of the
+/// live-probed line). `abc` rows pin atoi's garbage->0 falling into the same
+/// range checks.
+#[test]
+fn atoi_family_range_validations_match_gt() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-c", "127.0.0.1", "-p", "0"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "-p", "65536"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "-p", "-1"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "-p", "abc"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-s", "-p", "0"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "--cport", "0"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "--cport", "65536"],
+            "parameter error - port number must be between 1 and 65535 inclusive",
+        ),
+        (
+            &["-c", "127.0.0.1", "-P", "129"],
+            "parameter error - number of parallel streams too large (maximum = 128)",
+        ),
+        (
+            &["-c", "127.0.0.1", "-M", "32768"],
+            "parameter error - TCP MSS too large (maximum = 32767 bytes)",
+        ),
+        (
+            &["-c", "127.0.0.1", "--rcv-timeout", "10"],
+            "parameter error - receive timeout value is incorrect or not in range: ",
+        ),
+        (
+            &["-c", "127.0.0.1", "--rcv-timeout", "99"],
+            "parameter error - receive timeout value is incorrect or not in range: ",
+        ),
+        (
+            &["-c", "127.0.0.1", "--rcv-timeout", "86400001"],
+            "parameter error - receive timeout value is incorrect or not in range: ",
+        ),
+        (
+            &["-c", "127.0.0.1", "--snd-timeout", "-1"],
+            "parameter error - send timeout value is incorrect or not in range: ",
+        ),
+        (
+            &["-c", "127.0.0.1", "--snd-timeout", "86400001"],
+            "parameter error - send timeout value is incorrect or not in range: ",
+        ),
+        (
+            &["-s", "--time-skew-threshold", "0"],
+            "parameter error - skew threshold must be a positive number",
+        ),
+        (
+            &["-s", "--time-skew-threshold", "-3"],
+            "parameter error - skew threshold must be a positive number",
+        ),
+        (
+            &["-s", "--time-skew-threshold", "abc"],
+            "parameter error - skew threshold must be a positive number",
+        ),
+        // GT's in-loop <=0 check beats the post-loop IESERVERONLY role check
+        // (live-probed: `-c ... --time-skew-threshold 0` gives the skew
+        // sentence, `--time-skew-threshold 5x` the server-only one).
+        (
+            &["-c", "127.0.0.1", "--time-skew-threshold", "0"],
+            "parameter error - skew threshold must be a positive number",
+        ),
+        (
+            &["-c", "127.0.0.1", "--time-skew-threshold", "5x"],
+            "parameter error - some option you are trying to set is server only",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {want}")),
+            "{args:?}: GT wording expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors (GT shape): {stderr}"
+        );
+    }
+}
+
+/// #328: GT's IERVRSONLYRCVTIMEOUT (iperf_api.c:1880-1882) — a plain
+/// sending-mode client rejects --rcv-timeout post-loop with the perr-shaped
+/// sentence (live-probed: `-c ... --rcv-timeout 5000` errors; with -R or
+/// --bidir it proceeds — those accept legs ride
+/// atoi_family_flags_parse_like_atoi).
+#[test]
+fn client_rcv_timeout_requires_receiving_mode() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", "9", "--rcv-timeout", "5000"])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1), "exits 1 like GT");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with(
+            "riperf3: parameter error - client receive timeout is valid only in receiving mode: "
+        ),
+        "IERVRSONLYRCVTIMEOUT sentence (with perr's trailing colon-space) expected: {stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("--help"),
+        "the usage trailer rides parameter errors: {stderr}"
+    );
+}
+
+/// #328 (issue comment): raw invalid-UTF-8 argv bytes. GT's atoi on a lone
+/// 0xA0 byte yields 0 and the run PROCEEDS (live-probed: `-P $'\xa0'` runs
+/// a 0-stream test; `-t $'\xa0'` runs with duration 0). riperf3 died at
+/// clap's OsStr->str conversion ("invalid UTF-8 was detected"). The value
+/// parsers for the atoi set now work on raw bytes. Unix-only: the invalid
+/// byte sequence is an OS-string concept (Windows argv is WTF-16).
+#[cfg(unix)]
+#[test]
+fn raw_invalid_utf8_argv_parses_like_gt_atoi() {
+    use std::os::unix::ffi::OsStringExt as _;
+    for flag in ["-P", "-t", "-M"] {
+        let raw = std::ffi::OsString::from_vec(vec![0xA0]);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9", flag])
+            .arg(&raw)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect") && !stderr.contains("invalid UTF-8"),
+            "{flag} <0xA0> parses as 0 like GT's atoi and proceeds: {stderr}"
+        );
+    }
+}

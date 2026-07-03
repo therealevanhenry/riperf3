@@ -32,8 +32,11 @@ pub struct Cli {
     pub client: Option<String>,
 
     /// Server port to listen on/connect to
-    #[arg(short, long)]
-    pub port: Option<u16>,
+    // #328: GT parses -p with atoi (iperf_api.c:1229) — `17299x` is 17299,
+    // garbage is 0 — then range-checks 1..=65535 (IEBADPORT); the pre-sink
+    // chain in main.rs rejects with GT's wording.
+    #[arg(short, long, allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub port: Option<i64>,
 
     /// [kmgtKMGT] format to report: Kbits, Mbits, Gbits, Tbits
     // iperf3 has NO default -f: absent, every figure auto-scales
@@ -105,7 +108,10 @@ pub struct Cli {
     /// Restart idle server after # seconds
     // i64 + negatives accepted at parse (#303): GT's atoi wraps them into
     // its range checks; the pre-sink chain rejects with GT's wording.
-    #[arg(long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
+    // (#328: value_parser moved to the OsString level so raw invalid-UTF-8
+    // argv bytes parse like C atoi — garbage → 0 — instead of dying at
+    // clap's UTF-8 conversion. Same for -t/-O/--server-max-duration.)
+    #[arg(long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like_os())]
     pub idle_timeout: Option<i64>,
 
     /// Server's total bit rate limit
@@ -117,7 +123,7 @@ pub struct Cli {
         long = "server-max-duration",
         value_name = "secs",
         allow_hyphen_values = true,
-        value_parser = atoi_like
+        value_parser = atoi_like_os()
     )]
     pub server_max_duration: Option<i64>,
 
@@ -129,7 +135,7 @@ pub struct Cli {
     pub udp: bool,
 
     /// Time in seconds to transmit for (default 10 secs)
-    #[arg(short = 't', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
+    #[arg(short = 't', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like_os())]
     pub time: Option<i64>,
 
     /// Number of bytes to transmit (instead of -t)
@@ -145,8 +151,12 @@ pub struct Cli {
     pub length: Option<String>,
 
     /// Number of parallel client streams to run
-    #[arg(short = 'P', long, value_name = "num")]
-    pub parallel: Option<u32>,
+    // #328: GT parses -P with atoi (iperf_api.c:1415) and checks ONLY the
+    // upper bound (> MAX_STREAMS → IENUMSTREAMS, in main.rs); there is no
+    // lower-bound check at parse — live-probed: GT runs `-P 0` as an
+    // instantly-complete 0-stream test and `-P -1` proceeds too.
+    #[arg(short = 'P', long, value_name = "num", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub parallel: Option<i64>,
 
     /// Reverse mode (server sends, client receives)
     #[arg(short = 'R', long)]
@@ -165,8 +175,11 @@ pub struct Cli {
     pub congestion: Option<String>,
 
     /// Set TCP/SCTP maximum segment size (MTU - 40 bytes)
-    #[arg(short = 'M', long = "set-mss", value_name = "mss")]
-    pub mss: Option<i32>,
+    // #328: GT parses -M with atoi (iperf_api.c:1487) and checks ONLY the
+    // upper bound (> MAX_MSS → IEMSS, in main.rs); negatives proceed to a
+    // runtime setsockopt failure (live-probed: `-M -100` connects first).
+    #[arg(short = 'M', long = "set-mss", value_name = "mss", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub mss: Option<i64>,
 
     /// Disable Nagle's algorithm (set TCP_NODELAY)
     #[arg(short = 'N', long = "no-delay")]
@@ -183,7 +196,7 @@ pub struct Cli {
     pub tos: Option<String>,
 
     /// Omit the first N seconds of the test
-    #[arg(short = 'O', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
+    #[arg(short = 'O', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like_os())]
     pub omit: Option<i64>,
 
     /// Prefix every output line with this string
@@ -215,8 +228,10 @@ pub struct Cli {
     pub dont_fragment: bool,
 
     /// Bind to a specific client port
-    #[arg(long, value_name = "port")]
-    pub cport: Option<u16>,
+    // #328: GT parses --cport with atoi (iperf_api.c:1479) then the same
+    // 1..=65535 IEBADPORT range check as -p (in main.rs).
+    #[arg(long, value_name = "port", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub cport: Option<i64>,
 
     /// Set the server timing for pacing in microseconds (deprecated)
     // String, parsed by the builder's `pacing_timer_str`: iperf3 reads it
@@ -266,12 +281,16 @@ pub struct Cli {
     pub skip_rx_copy: bool,
 
     /// Idle timeout for receiving data (ms)
-    #[arg(long, value_name = "ms")]
-    pub rcv_timeout: Option<u64>,
+    // #328: GT parses --rcv-timeout with atoi (iperf_api.c:1603), then
+    // MIN_NO_MSG_RCVD_TIMEOUT..=MAX_TIME*1000 → IERCVTIMEOUT (in main.rs).
+    #[arg(long, value_name = "ms", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub rcv_timeout: Option<i64>,
 
     /// Timeout for unacknowledged TCP data (ms)
-    #[arg(long, value_name = "ms")]
-    pub snd_timeout: Option<u64>,
+    // #328: GT parses --snd-timeout with atoi (iperf_api.c:1614), then
+    // 0..=MAX_TIME*1000 → IESNDTIMEOUT (in main.rs).
+    #[arg(long, value_name = "ms", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub snd_timeout: Option<i64>,
 
     /// Transmit/receive the specified file
     #[arg(short = 'F', long, value_name = "name")]
@@ -319,8 +338,12 @@ pub struct Cli {
     pub authorized_users_path: Option<String>,
 
     /// Time skew threshold for authentication (seconds)
-    #[arg(long, value_name = "secs")]
-    pub time_skew_threshold: Option<u32>,
+    // #328: GT parses --time-skew-threshold with atoi (iperf_api.c:1761)
+    // then rejects <= 0 with IESKEWTHRESHOLD (in main.rs) — so `abc` (atoi
+    // 0) takes the skew sentence, in-loop, BEFORE the post-loop
+    // server-only role check (live-probed).
+    #[arg(long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like_os())]
+    pub time_skew_threshold: Option<i64>,
 
     /// Use PKCS#1 padding for authentication
     #[arg(long)]
@@ -499,7 +522,9 @@ impl Cli {
         }
 
         if let Some(port) = self.port {
-            builder = builder.port(Some(port));
+            // 1..=65535 enforced pre-sink in main.rs (IEBADPORT, #328);
+            // saturating glue for direct callers, like duration below.
+            builder = builder.port(Some(u16::try_from(port).unwrap_or(u16::MAX)));
         }
         if self.udp {
             builder = builder.protocol(riperf3::TransportProtocol::Udp);
@@ -520,7 +545,13 @@ impl Cli {
             builder = builder.blksize_str(s)?;
         }
         if let Some(n) = self.parallel {
-            builder = builder.num_streams(n);
+            // RECORDED DEVIATION (#328): GT's num_streams is a plain int with
+            // no lower bound at parse — live-probed, `-P 0` runs an
+            // instantly-complete 0-stream test while `-P -1` WEDGES (the test
+            // never finishes). riperf3's builder takes u32, so negatives fold
+            // to 0 — the 0-stream instant-complete behavior — rather than
+            // reproducing GT's hang.
+            builder = builder.num_streams(u32::try_from(n).unwrap_or(0));
         }
         if self.reverse {
             builder = builder.reverse(true);
@@ -535,7 +566,9 @@ impl Cli {
             builder = builder.congestion(algo);
         }
         if let Some(mss) = self.mss {
-            builder = builder.mss(mss);
+            // atoi_like output always fits i32 (the (int) truncation); the
+            // MAX_MSS upper bound is enforced pre-sink in main.rs (#328).
+            builder = builder.mss(mss as i32);
         }
         if self.no_delay {
             builder = builder.no_delay(true);
@@ -592,7 +625,8 @@ impl Cli {
             builder = builder.dont_fragment(true);
         }
         if let Some(port) = self.cport {
-            builder = builder.cport(port);
+            // 1..=65535 enforced pre-sink in main.rs (IEBADPORT, #328).
+            builder = builder.cport(u16::try_from(port).unwrap_or(u16::MAX));
         }
         if self.get_server_output {
             builder = builder.get_server_output(true);
@@ -628,10 +662,13 @@ impl Cli {
             builder = builder.skip_rx_copy(true);
         }
         if let Some(ms) = self.rcv_timeout {
-            builder = builder.rcv_timeout(ms);
+            // IERCVTIMEOUT range (100..=86_400_000) enforced pre-sink in
+            // main.rs (#328); negatives cannot reach here via the binary.
+            builder = builder.rcv_timeout(u64::try_from(ms).unwrap_or(0));
         }
         if let Some(ms) = self.snd_timeout {
-            builder = builder.snd_timeout(ms);
+            // IESNDTIMEOUT range (0..=86_400_000) enforced pre-sink (#328).
+            builder = builder.snd_timeout(u64::try_from(ms).unwrap_or(0));
         }
         if let Some(ref path) = self.file {
             builder = builder.file(path);
@@ -672,7 +709,8 @@ impl Cli {
             builder = builder.format_char(c);
         }
         if let Some(port) = self.port {
-            builder = builder.port(Some(port));
+            // 1..=65535 enforced pre-sink in main.rs (IEBADPORT, #328).
+            builder = builder.port(Some(u16::try_from(port).unwrap_or(u16::MAX)));
         }
         if self.one_off {
             builder = builder.one_off(true);
@@ -723,7 +761,9 @@ impl Cli {
             builder = builder.authorized_users_path(path);
         }
         if let Some(secs) = self.time_skew_threshold {
-            builder = builder.time_skew_threshold(secs);
+            // IESKEWTHRESHOLD (> 0) enforced pre-sink in main.rs (#328);
+            // atoi_like output fits u32 once positive.
+            builder = builder.time_skew_threshold(u32::try_from(secs).unwrap_or(0));
         }
         if self.use_pkcs1_padding {
             builder = builder.use_pkcs1_padding(true);
@@ -733,40 +773,52 @@ impl Cli {
     }
 }
 
-/// #317: GT parses its duration-like flags with `atoi` — mirror it so the
+/// #317/#328: GT parses its integer flags with `atoi` — mirror it so the
 /// drop-in accepts what GT accepts: leading whitespace skipped, optional
 /// sign, leading digits (0 when none — `abc`, `-abc`), and C's overflow
 /// shape (`strtol` saturates at LONG_MAX, then the `(int)` cast truncates:
 /// 2^32 → 0 runs, 2^31 → INT_MIN → the range error). Never a parse error.
-pub fn atoi_like(s: &str) -> Result<i64, std::convert::Infallible> {
+///
+/// Works on raw bytes (#328 issue comment): C atoi never converts to UTF-8,
+/// so an invalid-UTF-8 argv byte like 0xA0 is simply "garbage" → 0 and GT
+/// proceeds (live-probed: `iperf3 -P $'\xa0'` runs a 0-stream test). The
+/// C-locale whitespace/sign/digit sets are all ASCII, so byte-wise scanning
+/// is exact.
+pub fn atoi_like_bytes(s: &[u8]) -> i64 {
     // C-locale isspace only (GT never calls setlocale): Rust's trim_start
     // would also eat NBSP/NEL/U+2028/U+3000, which glibc atoi does not
-    // (r1 F2 — live: GT rejects `--idle-timeout <NBSP>5`, we accepted).
-    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (neg, rest) = match t.as_bytes().first() {
-        Some(b'-') => (true, &t[1..]),
-        Some(b'+') => (false, &t[1..]),
+    // (#317 r1 F2 — live: GT rejects `--idle-timeout <NBSP>5`, we accepted).
+    let mut t = s;
+    while let [b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r', rest @ ..] = t {
+        t = rest;
+    }
+    let (neg, rest) = match t {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
         _ => (false, t),
     };
-    let digits: &str = {
-        let end = rest
-            .as_bytes()
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        &rest[..end]
-    };
+    let end = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let digits = std::str::from_utf8(&rest[..end]).expect("ASCII digits");
     if digits.is_empty() {
-        return Ok(0);
+        return 0;
     }
-    // strtol saturates DIRECTIONALLY (r1 F1: magnitude-then-negate gave
+    // strtol saturates DIRECTIONALLY (#317 r1 F1: magnitude-then-negate gave
     // LONG_MIN+1 — (int) 1 — where C parses -2^63 exactly and (int)s to 0).
     let long = if neg {
         format!("-{digits}").parse::<i64>().unwrap_or(i64::MIN)
     } else {
         digits.parse::<i64>().unwrap_or(i64::MAX)
     };
-    Ok(i64::from(long as i32)) // the (int) truncation
+    i64::from(long as i32) // the (int) truncation
+}
+
+/// A clap value parser applying [`atoi_like_bytes`] at the `OsString` level,
+/// so invalid-UTF-8 argv bytes parse like GT's C atoi instead of dying at
+/// clap's UTF-8 conversion (#328).
+fn atoi_like_os() -> impl clap::builder::TypedValueParser<Value = i64> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new()
+        .map(|s: std::ffi::OsString| atoi_like_bytes(s.as_encoded_bytes()))
 }
 
 /// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
@@ -875,7 +927,30 @@ mod cli_tests {
                 ("--bidir", 0),
                 ("-R", 0),
             ] {
-                assert_eq!(atoi_like(input).unwrap(), want, "atoi_like({input:?})");
+                assert_eq!(
+                    atoi_like_bytes(input.as_bytes()),
+                    want,
+                    "atoi_like({input:?})"
+                );
+            }
+        }
+
+        #[test]
+        fn atoi_like_bytes_handles_raw_non_utf8() {
+            // #328 (issue comment): C atoi never converts to UTF-8 — raw
+            // invalid bytes are garbage (0) or trailing junk, exactly like
+            // any other non-digit (live-probed: GT runs `-P $'\xa0'` as 0
+            // streams). The C-locale space/sign/digit sets are pure ASCII.
+            for (input, want) in [
+                (&b"\xa0"[..], 0),
+                (&b"\xa05"[..], 0),
+                (&b" \xff"[..], 0),
+                (&b"5\xa0"[..], 5),
+                (&b"-12\xff"[..], -12),
+                (&b"\t-12\xff"[..], -12),
+                (&b"+\xa0"[..], 0),
+            ] {
+                assert_eq!(atoi_like_bytes(input), want, "atoi_like_bytes({input:?})");
             }
         }
 
@@ -1253,6 +1328,60 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-M", "1400"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("host").mss(1400).build().unwrap());
+        }
+
+        // #328: the atoi set parses suffixed garbage to the leading digits
+        // and wires the SAME value the plain form would (GT: atoi).
+        #[test]
+        fn atoi_suffixed_values_wire_like_plain() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-M", "1400x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").mss(1400).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-P", "5x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").num_streams(5).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cport", "12345x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").cport(12345).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-R", "--rcv-timeout", "5000x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h")
+                    .reverse(true)
+                    .rcv_timeout(5000)
+                    .build()
+                    .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--snd-timeout", "3000x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").snd_timeout(3000).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-p", "5201x"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").port(Some(5201)).build().unwrap()
+            );
+        }
+
+        // #328 RECORDED DEVIATION: GT's -P has no lower bound at parse
+        // (live-probed: `-P 0` completes an empty test instantly; `-P -1`
+        // wedges). riperf3's u32 builder folds negatives to 0 — the
+        // instant-empty-test behavior — instead of reproducing the hang.
+        #[test]
+        fn parallel_negative_folds_to_zero_streams() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-P", "-1"]);
+            assert_eq!(cli.parallel, Some(-1), "atoi keeps the negative");
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").num_streams(0).build().unwrap()
+            );
         }
 
         #[test]

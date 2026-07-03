@@ -94,6 +94,45 @@ fn main() -> std::process::ExitCode {
         // #309: GT's IEREVERSEBIDIR — the second of the pair is rejected
         // inside the getopt loop (iperf_api.c:1423/:1431), either order.
         Some("cannot be both reverse and bidirectional")
+    } else if cli.port.is_some_and(|p| !(1..=65535).contains(&p))
+        || cli.cport.is_some_and(|p| !(1..=65535).contains(&p))
+    {
+        // #328: GT's IEBADPORT — atoi then `< 1 || > 65535`, for both -p
+        // (iperf_api.c:1229-1234) and --cport (:1479-1484). `abc` atoi's to
+        // 0 and lands here too (live-probed).
+        Some("port number must be between 1 and 65535 inclusive")
+    } else if cli.parallel.is_some_and(|n| n > 128) {
+        // #328: GT's IENUMSTREAMS (iperf_api.c:1415-1420; MAX_STREAMS 128,
+        // iperf.h:476). Upper bound ONLY — GT has no lower check at parse
+        // (live-probed: `-P 0` runs empty, `-P -1` proceeds).
+        Some("number of parallel streams too large (maximum = 128)")
+    } else if cli.mss.is_some_and(|m| m > 32 * 1024 - 1) {
+        // #328: GT's IEMSS (iperf_api.c:1487-1492; MAX_MSS 32*1024-1,
+        // iperf.h:475). Upper bound only; negatives fail at setsockopt.
+        Some("TCP MSS too large (maximum = 32767 bytes)")
+    } else if cli
+        .rcv_timeout
+        .is_some_and(|ms| !(100..=MAX_TIME_SECS * 1000).contains(&ms))
+    {
+        // #328: GT's IERCVTIMEOUT (iperf_api.c:1603-1608;
+        // MIN_NO_MSG_RCVD_TIMEOUT 100 ms, iperf_api.h:71; MAX_TIME*SEC_TO_mS).
+        // The sentence carries perr=1, so iperf_strerror appends ": " — and
+        // errno is 0 at parse time, so NOTHING follows: the trailing
+        // colon-space is part of the live-probed line.
+        Some("receive timeout value is incorrect or not in range: ")
+    } else if cli
+        .snd_timeout
+        .is_some_and(|ms| !(0..=MAX_TIME_SECS * 1000).contains(&ms))
+    {
+        // #328: GT's IESNDTIMEOUT (iperf_api.c:1614-1618), perr-shaped like
+        // IERCVTIMEOUT above.
+        Some("send timeout value is incorrect or not in range: ")
+    } else if cli.time_skew_threshold.is_some_and(|s| s <= 0) {
+        // #328: GT's IESKEWTHRESHOLD (iperf_api.c:1761-1766) — the in-loop
+        // `<= 0` check, which fires BEFORE the post-loop server-only role
+        // check (live-probed: `-c ... --time-skew-threshold 0` gives this
+        // sentence, `--time-skew-threshold 5x` the server-only one).
+        Some("skew threshold must be a positive number")
     } else {
         None
     };
@@ -227,6 +266,14 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
                 "some option you are trying to set is server only: \
                  {flag} cannot be used with -c/--client"
             ));
+        }
+        // #328: GT's IERVRSONLYRCVTIMEOUT (iperf_api.c:1880-1882) — a
+        // sending-mode client (neither -R nor --bidir) rejects
+        // --rcv-timeout post-loop, after the role checks and before the
+        // end-conditions check (:1992). perr-shaped: the trailing ": " is
+        // part of the live-probed line (errno 0 at parse time).
+        if cli.rcv_timeout.is_some() && !cli.reverse && !cli.bidir {
+            return Some("client receive timeout is valid only in receiving mode: ".to_string());
         }
         if cli.end_conditions_conflict() {
             return Some(cli::END_CONDITIONS_MSG.to_string());
