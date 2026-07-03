@@ -181,11 +181,15 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
     let port = free_port();
     let port_s = port.to_string();
 
+    // TEMP DEBUG (#305 FreeBSD hang): capture server stderr to a file so a
+    // hung-but-panicked server is visible on timeout. Reverted before merge.
+    let errfile =
+        std::env::temp_dir().join(format!("riperf3-demux-dbg-{}.err", std::process::id()));
     let server = Command::new(bin)
         .args(["-s", "-1", "-p", &port_s, "-J"])
         .env("RIPERF3_UDP_SERVER_DEMUX", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&errfile).expect("errfile"))
         .spawn()
         .expect("spawn server");
     let mut server = ChildGuard(server);
@@ -229,6 +233,28 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
     // Server exits after the one test (-1); read its whole doc.
     let deadline = Instant::now() + Duration::from_secs(10);
     while server.0.try_wait().expect("try_wait").is_none() {
+        // TEMP DEBUG (#305 FreeBSD hang): on timeout, dump the hung server's
+        // kernel/user stacks and its captured stderr before failing.
+        if Instant::now() >= deadline {
+            let pid = server.0.id().to_string();
+            for cmd in [
+                &["procstat", "-kk", &pid][..],
+                &["ps", "-o", "pid,state,wchan,command", "-p", &pid][..],
+            ] {
+                if let Ok(o) = Command::new(cmd[0]).args(&cmd[1..]).output() {
+                    eprintln!(
+                        "--- {:?} ---\n{}{}",
+                        cmd,
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                }
+            }
+            eprintln!(
+                "--- server stderr ---\n{}",
+                std::fs::read_to_string(&errfile).unwrap_or_default()
+            );
+        }
         assert!(Instant::now() < deadline, "server did not exit");
         std::thread::sleep(Duration::from_millis(50));
     }
