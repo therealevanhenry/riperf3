@@ -2313,6 +2313,7 @@ impl Server {
             // #265: never consulted server-side (the server gates on its own
             // capability; its received streams are bare regardless).
             peer_sender_has_retransmits: None,
+            local_has_retransmit_info: crate::tcp_info::has_retransmit_info(),
             duration: cfg.duration as f64,
             elapsed: test_duration,
             num_streams: cfg.num_streams as i32,

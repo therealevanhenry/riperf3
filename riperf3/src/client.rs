@@ -2158,6 +2158,7 @@ impl Client {
             // #265: the peer's exchanged flag, consulted by the report only
             // in pure-receiver mode (GT's :2856 overwrite).
             peer_sender_has_retransmits: remote_cpu.map(|r| r.sender_has_retransmits),
+            local_has_retransmit_info: crate::tcp_info::has_retransmit_info(),
             duration: self.duration as f64,
             elapsed: test_duration,
             num_streams: self.num_streams as i32,

@@ -762,6 +762,13 @@ pub(crate) struct ReportInput {
     /// before gating the per-stream sender sub-object's TCP_INFO extras —
     /// a flag-off peer gets GT's BARE variant, not zero-fill (#265).
     pub peer_sender_has_retransmits: Option<i64>,
+    /// This host's retransmit capability (`tcp_info::has_retransmit_info`),
+    /// resolved by the caller so the builder stays pure and the pins stay
+    /// deterministic on flag-less platforms (#265: Windows sends 0 on the
+    /// wire, and GT's shape with the flag off is BARE — the zero-filled
+    /// extras the old Windows pins encoded were the divergence this issue
+    /// fixes).
+    pub local_has_retransmit_info: bool,
     /// The requested `-t` duration parameter, reported under `test_start`. Stays
     /// the nominal value even for a byte/block-limited (`-n`/`-k`) run.
     pub duration: f64,
@@ -1640,7 +1647,7 @@ impl ReportInput {
         let sender_extras = if !self.is_server && self.reverse && !self.bidir {
             self.peer_sender_has_retransmits.is_none_or(|f| f != 0)
         } else {
-            crate::tcp_info::has_retransmit_info()
+            self.local_has_retransmit_info
         };
         let emit_extras = (!self.is_server || s.is_sender) && sender_extras;
         let e = s.tcp_end.unwrap_or_default();
@@ -1725,8 +1732,8 @@ impl ReportInput {
             && !matches!(self.protocol, TransportProtocol::Udp)
             && !self.reverse
             && !self.is_server
-            && crate::tcp_info::has_retransmit_info())
-        .then_some(0)
+            && self.local_has_retransmit_info)
+            .then_some(0)
     }
 
     fn local_sent_packets(&self) -> i64 {
@@ -1919,6 +1926,7 @@ mod tests {
             reverse: false,
             bidir: false,
             peer_sender_has_retransmits: None,
+            local_has_retransmit_info: true,
             duration: 10.0,
             elapsed: 10.0,
             num_streams: 1,
@@ -2627,6 +2635,28 @@ mod tests {
                 "the bare variant keeps `{kept}`: {sender}"
             );
         }
+    }
+
+    /// #265: with the LOCAL capability off (Windows production shape — the
+    /// wire flag riperf3 sends there is already 0), forward-mode sender
+    /// sub-objects take GT's BARE variant too. Deterministic everywhere via
+    /// the resolved ReportInput field; the pre-fix Windows pins encoded the
+    /// zero-filled divergence this kills.
+    #[test]
+    fn forward_sender_objects_go_bare_without_local_retransmit_info() {
+        let mut input = base_input();
+        input.local_has_retransmit_info = false;
+        input.streams = vec![tcp_stream_retr(1, true, 6_000_000, 5_000_000, Some(2))];
+        let v = serde_json::to_value(input.build()).unwrap();
+        let sender = &v["end"]["streams"][0]["sender"];
+        assert!(
+            sender.get("max_snd_cwnd").is_none() && sender.get("retransmits").is_none(),
+            "local flag off: GT bare variant: {sender}"
+        );
+        assert!(
+            sender.get("bytes").is_some() && sender.get("bits_per_second").is_some(),
+            "bare keeps the core keys: {sender}"
+        );
     }
 
     /// #265 polarity: the flag ON (or missing results) keeps today's
