@@ -1658,12 +1658,13 @@ impl Server {
         (server_output_text, server_output_json, report_source)
     }
 
-    /// The one `build_report` plumbing site for the pipeline (#289). The
-    /// drained collections arrive BY VALUE and move into the report, so the
-    /// old "must be built exactly once" comment-invariant is structural
-    /// (#287): the pre-exchange --get-server-output build consumes them into
-    /// `ReportSource::Built` (#33/#137), else they ride `Pending` to the
-    /// single post-exchange build.
+    /// The one report-build plumbing site for the pipeline (#289), split
+    /// from the printer so `--get-server-output` (#33) can build ONCE
+    /// pre-exchange and reuse at print time. The drained collections arrive
+    /// BY VALUE and move into the report, so the "must be built exactly
+    /// once" invariant is structural (#287): the pre-exchange build consumes
+    /// them into `ReportSource::Built` (#33/#137), else they ride `Pending`
+    /// to the single post-exchange build.
     fn build_ctx_report(
         &self,
         ctx: &TestRunCtx,
@@ -2638,41 +2639,6 @@ impl Server {
         };
 
         input
-    }
-
-    /// Build the server's full `-J` report. Split from the printer so
-    /// `--get-server-output` (#33) can build it ONCE pre-exchange (attaching it
-    /// to the results) and reuse it at print time — `build_report_input`
-    /// drains the interval collector destructively, so it must run once.
-    #[allow(clippy::too_many_arguments)]
-    fn build_report(
-        &self,
-        streams: &[DataStream],
-        cfg: &TestConfig,
-        params: &TestParams,
-        cpu_util: &crate::cpu::CpuUtilization,
-        test_duration: f64,
-        cookie: &[u8; protocol::COOKIE_SIZE],
-        accepted_host: &str,
-        accepted_port: u16,
-        start_time_millis: u64,
-        collected: crate::reporter::CollectedIntervals,
-        error: Option<&str>,
-    ) -> crate::json_report::Report {
-        self.build_report_input(
-            streams,
-            cfg,
-            params,
-            cpu_util,
-            test_duration,
-            cookie,
-            accepted_host,
-            accepted_port,
-            start_time_millis,
-            collected,
-            error,
-        )
-        .build()
     }
 
     /// `-J`: pretty-print the server's single batched report blob (#50), or a

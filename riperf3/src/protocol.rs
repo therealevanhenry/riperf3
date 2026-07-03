@@ -1589,7 +1589,7 @@ mod transition_table_tests {
         assert_eq!(legal_next(IperfDone, Role::Client), &[]);
     }
 
-    // -- Role::Server: the server only reads peer state in two phases --
+    // -- Role::Server: the data phase is the one surviving consult (#325) --
 
     #[test]
     fn server_legal_sets_are_exact() {
@@ -1597,17 +1597,16 @@ mod transition_table_tests {
             legal_next(TestRunning, Role::Server),
             &[TestEnd, ClientTerminate]
         );
-        assert_eq!(
-            legal_next(DisplayResults, Role::Server),
-            &[IperfDone, ClientTerminate]
-        );
+        // #325 dropped the DisplayResults row: GT's end loop IEMESSAGEs
+        // strays instead of tolerating them, so nothing consults it.
+        assert_eq!(legal_next(DisplayResults, Role::Server), &[]);
     }
 
     #[test]
     fn server_other_currents_have_no_successors() {
         // Exhaustive over the remaining variants — the server consults the
-        // table only in the data phase (TestRunning) and the end loop
-        // (DisplayResults); everything else is the empty set.
+        // table only in the data phase (TestRunning); everything else is
+        // the empty set (#325 dropped the end-loop row).
         for current in [
             TestStart,
             TestEnd,
