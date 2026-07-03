@@ -81,6 +81,10 @@ fn main() -> std::process::ExitCode {
         // #263: GT's IEBADFORMAT — only the FIRST character of the argument
         // is inspected (iperf_api.c:1241), and [kmgtKMGT] is the whole set.
         Some("bad format specifier (valid formats are in the set [kmgtKMGT])")
+    } else if cli.reverse && cli.bidir {
+        // #309: GT's IEREVERSEBIDIR — the second of the pair is rejected
+        // inside the getopt loop (iperf_api.c:1423/:1431), either order.
+        Some("cannot be both reverse and bidirectional")
     } else {
         None
     };

@@ -311,3 +311,31 @@ fn format_specifier_rejections_match_gt() {
         "-f kilobits parses as -f k (optarg[0]): {stderr}"
     );
 }
+
+/// #309: GT rejects `-R --bidir` in the getopt loop with IEREVERSEBIDIR —
+/// `cannot be both reverse and bidirectional` (iperf_api.c:1423/:1431),
+/// both flag orders, parameter-error class (trailer + exit 1). riperf3
+/// used to accept the pair and run a reverse-flagged bidir test.
+#[test]
+fn reverse_plus_bidir_rejects_like_gt() {
+    for args in [
+        &["-c", "127.0.0.1", "-R", "--bidir"][..],
+        &["-c", "127.0.0.1", "--bidir", "-R"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .starts_with("riperf3: parameter error - cannot be both reverse and bidirectional"),
+            "{args:?}: IEREVERSEBIDIR sentence expected: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+}
