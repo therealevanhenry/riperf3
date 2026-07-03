@@ -181,18 +181,30 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
     let port = free_port();
     let port_s = port.to_string();
 
-    // TEMP DEBUG (#305 FreeBSD hang): capture server stderr to a file so a
-    // hung-but-panicked server is visible on timeout. Reverted before merge.
-    let errfile =
-        std::env::temp_dir().join(format!("riperf3-demux-dbg-{}.err", std::process::id()));
     let server = Command::new(bin)
         .args(["-s", "-1", "-p", &port_s, "-J"])
         .env("RIPERF3_UDP_SERVER_DEMUX", "1")
         .stdout(Stdio::piped())
-        .stderr(std::fs::File::create(&errfile).expect("errfile"))
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn server");
     let mut server = ChildGuard(server);
+
+    // Drain the server's stdout from a reader thread, NOT after exit: the
+    // doc for a bidir -P 2 UDP run exceeds FreeBSD's 16 KiB pipe buffer, so
+    // a wait-for-exit-then-read sequence deadlocks — the server blocks in
+    // write(2) on the full pipe (procstat: pipe_direct_write) while the
+    // test waits for it to exit (#305 r0: deterministic FreeBSD-CI hang;
+    // Linux's 64 KiB pipes masked it locally).
+    let sdoc_reader = {
+        let mut stdout = server.0.stdout.take().expect("piped server stdout");
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s);
+            s
+        })
+    };
 
     let retry_deadline = Instant::now() + Duration::from_secs(10);
     let out = loop {
@@ -230,43 +242,14 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
         break String::from_utf8_lossy(&client.stdout).into_owned();
     };
 
-    // Server exits after the one test (-1); read its whole doc.
+    // Server exits after the one test (-1); the reader thread hits EOF as it
+    // does and hands back the whole doc.
     let deadline = Instant::now() + Duration::from_secs(10);
     while server.0.try_wait().expect("try_wait").is_none() {
-        // TEMP DEBUG (#305 FreeBSD hang): on timeout, dump the hung server's
-        // kernel/user stacks and its captured stderr before failing.
-        if Instant::now() >= deadline {
-            let pid = server.0.id().to_string();
-            for cmd in [
-                &["procstat", "-kk", &pid][..],
-                &["ps", "-o", "pid,state,wchan,command", "-p", &pid][..],
-            ] {
-                if let Ok(o) = Command::new(cmd[0]).args(&cmd[1..]).output() {
-                    eprintln!(
-                        "--- {:?} ---\n{}{}",
-                        cmd,
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    );
-                }
-            }
-            eprintln!(
-                "--- server stderr ---\n{}",
-                std::fs::read_to_string(&errfile).unwrap_or_default()
-            );
-        }
         assert!(Instant::now() < deadline, "server did not exit");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let mut sdoc = String::new();
-    use std::io::Read;
-    server
-        .0
-        .stdout
-        .take()
-        .expect("piped")
-        .read_to_string(&mut sdoc)
-        .expect("read server doc");
+    let sdoc = sdoc_reader.join().expect("server stdout reader");
 
     let cv: Value = serde_json::from_str(&out).expect("client doc parses");
     let sv: Value = serde_json::from_str(&sdoc).expect("server doc parses");
