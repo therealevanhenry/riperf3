@@ -193,6 +193,25 @@ fn json_output_is_setup_only(stdout: &str) -> bool {
     stdout.contains("{\"event\":") && !stdout.contains("{\"event\":\"interval\"")
 }
 
+/// Drain a piped child stream on a reader thread, returning the collected
+/// text at `join()`. Start this at SPAWN time, never after waiting for the
+/// child: FreeBSD routes any single unread pipe write(2) of >= 8 KiB
+/// (PIPE_MINDIRECT) through `pipe_direct_write`, which sleeps until the
+/// reader consumes it — and Rust's stdout `LineWriter` flushes a multi-line
+/// `println!` (a whole pretty-printed -J document) as ONE write. A
+/// wait-for-exit-then-read sequence therefore deadlocks the moment the doc
+/// crosses 8 KiB (#305: deterministic FreeBSD-CI hangs; Linux's 64 KiB
+/// buffered pipes masked it locally). Concurrent draining is what
+/// `Command::output()` does; this is the primitive for harnesses that need
+/// a deadline around `try_wait` as well.
+pub fn drain_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = pipe.read_to_string(&mut s);
+        s
+    })
+}
+
 /// Run a riperf3 CLI binary to completion with a hard timeout, retrying while
 /// the run is REFUSED for up to a bounded retry window. This replaces fixed
 /// server-bind sleeps: on loaded CI runners the (debug, cold) server can take
@@ -219,6 +238,9 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
             .spawn()
             .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
 
+        let out_reader = drain_reader(child.stdout.take().expect("piped stdout"));
+        let err_reader = drain_reader(child.stderr.take().expect("piped stderr"));
+
         let deadline = Instant::now() + timeout;
         let status = loop {
             match child.try_wait().expect("try_wait") {
@@ -226,16 +248,10 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Post-kill the pipes are EOF — drain what the child got
-                    // out before dying, for the panic message.
-                    let mut out = String::new();
-                    let mut err = String::new();
-                    if let Some(mut s) = child.stdout.take() {
-                        let _ = s.read_to_string(&mut out);
-                    }
-                    if let Some(mut s) = child.stderr.take() {
-                        let _ = s.read_to_string(&mut err);
-                    }
+                    // The kill EOFs the pipes; the readers hand back what the
+                    // child got out before dying, for the panic message.
+                    let out = out_reader.join().unwrap_or_default();
+                    let err = err_reader.join().unwrap_or_default();
                     panic!("{who}: timed out; stdout so far: {out}; stderr so far: {err}");
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
@@ -243,20 +259,8 @@ pub fn run_client_with(bin: &str, args: &[&str], timeout: Duration, who: &str) -
         };
         let elapsed = started.elapsed();
 
-        let mut stdout = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut stdout)
-            .unwrap();
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
+        let stdout = out_reader.join().expect("stdout reader");
+        let stderr = err_reader.join().expect("stderr reader");
 
         // #198 moved -J/--json-stream error text into STDOUT (the document /
         // the error event) with stderr empty — scan both sinks for the

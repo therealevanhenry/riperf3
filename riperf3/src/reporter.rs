@@ -182,64 +182,77 @@ fn interval_cells(bytes: u64, start: f64, end: f64, format_char: char) -> (Strin
     (transfer, units::format_rate(bits_per_sec, format_char))
 }
 
-/// Print one interval line.
-pub fn print_interval(interval: &StreamInterval, format_char: char) {
+/// Render one interval line (no trailing newline). Pure, so the exact row
+/// bytes are pinnable against live GT captures (#264).
+///
+/// Each branch is a 1:1 port of an iperf_locale.c template — time columns
+/// `%6.2f-%-6.2f`, cells joined by exactly two spaces with NO cell-level
+/// alignment (the figure pad inside unit_snprintf IS the alignment), and
+/// each template's literal tail spacing before the final %s (the omit
+/// marker here; the role word in [`format_summary_line`]).
+pub fn format_interval_line(interval: &StreamInterval, format_char: char) -> String {
     let id = fmt_id_role(interval.stream_id, interval.role_tag);
     let (transfer, rate) =
         interval_cells(interval.bytes, interval.start, interval.end, format_char);
 
-    let omit_tag = if interval.omitted { "(omitted) " } else { "" };
+    // iperf_locale.c:429 — the marker fills the template's final %s bare.
+    let omit_tag = if interval.omitted { "(omitted)" } else { "" };
 
     if let (Some(jitter), Some(lost), Some(total)) =
         (interval.jitter, interval.lost, interval.total_packets)
     {
-        let pct = lost_percent(lost, total);
-        titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
+        // report_bw_udp_format: `%5.3f ms  %d/%d (%.2g%%)  %s`.
+        let pct = units::g2(lost_percent(lost, total));
+        format!(
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}  {:5.3} ms  {lost}/{total} ({pct}%)  {omit_tag}",
             interval.start,
             interval.end,
-            transfer,
-            rate,
             jitter * 1000.0,
-            lost,
-            total,
-            pct,
-            omit_tag,
-        ));
+        )
     } else if let Some(sent) = interval.sent_packets {
-        // UDP sender row: the sent-datagram count, with the blank jitter/loss
-        // pad ONLY in bidir — iperf3's zbuf is 10 spaces in bidir and empty
-        // otherwise (report_bw_udp_sender_format; #187 review r1 n4).
+        // report_bw_udp_sender_format: `/sec %s %d  %s` — the blank
+        // jitter/loss zbuf is 10 spaces in bidir and empty otherwise
+        // (#187 review r1 n4).
         let pad = if interval.role_tag.is_some() {
             "          " // iperf3's zbuf: exactly 10 spaces
         } else {
             ""
         };
-        titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {pad}{sent}  {}",
-            interval.start, interval.end, transfer, rate, omit_tag,
-        ));
+        format!(
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate} {pad} {sent}  {omit_tag}",
+            interval.start, interval.end,
+        )
     } else if let (Some(retr), None) = (interval.retransmits, interval.snd_cwnd) {
-        // TCP [SUM] with retransmits: iperf3's report_sum_bw_retrans_format
-        // carries Retr but no Cwnd (a SUM has no single congestion window) —
-        // without this branch the populated Retr fell through to the bare
-        // format and vanished (#143 review r1 n3).
-        titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}            {}",
-            interval.start, interval.end, transfer, rate, retr, omit_tag,
-        ));
+        // TCP [SUM] with retransmits: report_sum_bw_retrans_format carries
+        // Retr (`%3ld` + THIRTEEN spaces) but no Cwnd (a SUM has no single
+        // congestion window) — without this branch the populated Retr fell
+        // through to the bare format and vanished (#143 review r1 n3).
+        format!(
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}  {retr:3}             {omit_tag}",
+            interval.start, interval.end,
+        )
     } else if let (Some(retr), Some(cwnd)) = (interval.retransmits, interval.snd_cwnd) {
+        // report_bw_retrans_cwnd_format: `%3ld   %ss       %s`.
         let cwnd_str = units::format_bytes(cwnd as f64, 'A');
-        titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}   {:>10}  {}",
-            interval.start, interval.end, transfer, rate, retr, cwnd_str, omit_tag,
-        ));
+        format!(
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}  {retr:3}   {cwnd_str}       {omit_tag}",
+            interval.start, interval.end,
+        )
     } else {
-        titled(format_args!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {}",
-            interval.start, interval.end, transfer, rate, omit_tag,
-        ));
+        // report_bw_format: eighteen spaces before the final %s.
+        format!(
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}                  {omit_tag}",
+            interval.start, interval.end,
+        )
     }
+}
+
+/// Print one interval line.
+pub fn print_interval(interval: &StreamInterval, format_char: char) {
+    titled(format_args!(
+        "{}",
+        format_interval_line(interval, format_char)
+    ));
 }
 
 /// Print the separator line.
@@ -247,6 +260,16 @@ pub fn print_separator() {
     titled(format_args!(
         "- - - - - - - - - - - - - - - - - - - - - - - - -"
     ));
+}
+
+/// GT's final-partial-interval keep rule (iperf_print_intermediate,
+/// iperf_api.c:3853-3880, #264): a run's trailing sub-interval survives iff
+/// it spans at least 10% of the stats interval OR it actually moved bytes —
+/// GT drops only the short empty tail its comment attributes to control
+/// messages queuing behind data. With `-i 0` the threshold is zero, so the
+/// whole-run flush is unconditionally kept.
+fn keep_final_interval(len_secs: f64, interval_secs: f64, residual_bytes: u64) -> bool {
+    len_secs >= interval_secs * 0.10 || residual_bytes > 0
 }
 
 /// UDP loss as a percentage of total datagrams, guarding the zero-total case
@@ -281,28 +304,31 @@ pub fn format_summary_line(summary: &StreamSummary, format_char: char) -> String
     if let (Some(jitter), Some(lost), Some(total)) =
         (summary.jitter, summary.lost, summary.total_packets)
     {
-        let pct = lost_percent(lost, total);
+        // report_bw_udp_format with the role word in the final %s (#264).
+        let pct = units::g2(lost_percent(lost, total));
         format!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:7.3} ms  {}/{} ({:.2}%)  {}",
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}  {:5.3} ms  {lost}/{total} ({pct}%)  {role}",
             summary.start,
             summary.end,
-            transfer,
-            rate,
             jitter * 1000.0,
-            lost,
-            total,
-            pct,
-            role,
         )
     } else if let Some(retr) = summary.retransmits {
+        // Per-stream rows take report_bw_retrans_format (`%3ld` + TWELVE
+        // spaces); [SUM] rows take report_sum_bw_retrans_format (THIRTEEN).
+        let tail = if summary.stream_id < 0 {
+            "             "
+        } else {
+            "            "
+        };
         format!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}  {:4}             {}",
-            summary.start, summary.end, transfer, rate, retr, role,
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}  {retr:3}{tail}{role}",
+            summary.start, summary.end,
         )
     } else {
+        // report_bw_format / report_sum_bw_format: eighteen spaces.
         format!(
-            "[{id}] {:5.2}-{:<5.2} sec  {:>10}  {:>12}                    {}",
-            summary.start, summary.end, transfer, rate, role,
+            "[{id}] {:6.2}-{:<6.2} sec  {transfer}  {rate}                  {role}",
+            summary.start, summary.end,
         )
     }
 }
@@ -1321,12 +1347,13 @@ pub fn spawn_interval_reporter(
                     // final interval `[last_boundary, end_secs]` using the
                     // driver's authoritative end time, then stop.
                     //
-                    // Skip a remainder that is zero-length (the run ended on a
-                    // boundary — the sender driver passes the exact `-t`, so this
-                    // is exact) OR carries no residual bytes (the receiver side:
-                    // the peer has stopped, so its boundary-aligned tail is empty
-                    // even though `end_secs` trails the boundary by the control
-                    // round-trip).
+                    // The keep/skip decision is GT's iperf_print_intermediate
+                    // rule (#264): keep iff the tail spans >= 10% of the stats
+                    // interval or moved bytes. The previous ad-hoc `>1ms AND
+                    // bytes>0` both invented rows GT suppresses and hid the
+                    // long empty tails GT prints. `len > 0.0` guards the
+                    // boundary-aligned end (and any clock inversion) — GT
+                    // can't construct a zero-length gather at all.
                     let last_end = interval_num as f64 * config.interval_secs;
                     let end_secs = reporter_end.end_secs();
                     let residual_bytes: u64 = streams
@@ -1339,7 +1366,9 @@ pub fn spawn_interval_reporter(
                             }
                         })
                         .sum();
-                    if end_secs > last_end + 1e-3 && residual_bytes > 0 {
+                    let len = end_secs - last_end;
+                    if len > 0.0 && keep_final_interval(len, config.interval_secs, residual_bytes)
+                    {
                         // Normal final partial flush; `in_warmup` is only true
                         // here when the run died before the boundary
                         // (error/abort path), tagging the flush omitted.
@@ -1489,6 +1518,239 @@ mod tests {
         };
         // Should print [SUM] instead of a number
         print_interval(&interval, 'm');
+    }
+
+    // ---- #264: byte-exact row pins vs GT's locale templates ----------------
+    //
+    // Every expected string below is derived from iperf_locale.c's format
+    // strings (iperf 3.21 @ d39cf41) and cross-checked against live captures
+    // (2026-07-02, loopback): time columns are `%6.2f-%-6.2f sec`, cells are
+    // unit_snprintf output (figure %4.2f/%4.1f/%4.0f — right-padded to 4)
+    // joined by exactly two spaces with NO cell-level alignment, and each
+    // template carries its own literal tail spacing before the final %s
+    // (omit marker or role word).
+
+    fn tcp_interval(bytes: u64, retr: Option<i64>, cwnd: Option<u64>) -> StreamInterval {
+        StreamInterval {
+            stream_id: 5,
+            start: 0.0,
+            end: 1.0,
+            bytes,
+            retransmits: retr,
+            snd_cwnd: cwnd,
+            jitter: None,
+            lost: None,
+            total_packets: None,
+            sent_packets: None,
+            role_tag: None,
+            omitted: false,
+        }
+    }
+
+    /// report_bw_retrans_cwnd_format: `%3ld` Retr, three spaces, Cwnd cell,
+    /// SEVEN trailing spaces (live: `...  0   1.12 MBytes       $`).
+    #[test]
+    fn interval_row_retr_cwnd_matches_gt_bytes() {
+        let iv = tcp_interval(36 * 1024 * 1024, Some(0), Some(1_174_405));
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[  5]   0.00-1.00   sec  36.0 MBytes   302 Mbits/sec    0   1.12 MBytes       "
+        );
+    }
+
+    /// report_bw_format: retr-less rows end in EIGHTEEN spaces (the empty
+    /// omit slot keeps the tail — live reverse rows end `...Gbits/sec` + 18sp).
+    #[test]
+    fn interval_row_bare_matches_gt_bytes() {
+        let iv = tcp_interval(1024 * 1024 * 1024, None, None);
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[  5]   0.00-1.00   sec  1.00 GBytes  8.59 Gbits/sec                  "
+        );
+    }
+
+    /// The omit marker fills the template's final %s — "(omitted)", no
+    /// surrounding spaces of its own (iperf_locale.c:429).
+    #[test]
+    fn interval_row_omitted_marker_in_gt_slot() {
+        let mut iv = tcp_interval(1024 * 1024 * 1024, None, None);
+        iv.omitted = true;
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[  5]   0.00-1.00   sec  1.00 GBytes  8.59 Gbits/sec                  (omitted)"
+        );
+    }
+
+    /// `%6.2f-%-6.2f`: two-digit seconds eat the pad — ` 10.00-11.00  sec`
+    /// (live p2 row 14: `[  5]  10.00-11.01  sec`).
+    #[test]
+    fn interval_row_time_columns_are_width_six() {
+        let mut iv = tcp_interval(1024 * 1024 * 1024, None, None);
+        iv.start = 10.0;
+        iv.end = 11.0;
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[  5]  10.00-11.00  sec  1.00 GBytes  8.59 Gbits/sec                  "
+        );
+    }
+
+    fn udp_recv_interval(lost: i64, total: i64) -> StreamInterval {
+        StreamInterval {
+            stream_id: 5,
+            start: 0.0,
+            end: 1.0,
+            bytes: 393_216,
+            retransmits: None,
+            snd_cwnd: None,
+            jitter: Some(0.000_016),
+            lost: Some(lost),
+            total_packets: Some(total),
+            sent_packets: None,
+            role_tag: None,
+            omitted: false,
+        }
+    }
+
+    /// report_bw_udp_format: jitter `%5.3f ms`, loss `(%.2g%%)`, two trailing
+    /// spaces (live: `0.016 ms  0/12 (0%)  `). The zero-loss row prints
+    /// `(0%)`, never `(0.00%)`.
+    #[test]
+    fn udp_interval_row_matches_gt_bytes() {
+        assert_eq!(
+            format_interval_line(&udp_recv_interval(0, 12), 'a'),
+            "[  5]   0.00-1.00   sec   384 KBytes  3.15 Mbits/sec  0.016 ms  0/12 (0%)  "
+        );
+    }
+
+    /// `%.2g` is two SIGNIFICANT digits with C's %g trailing-zero strip and
+    /// e-notation switch: 25 → `25`, 1/12 → `8.3`, full loss → `1e+02`.
+    #[test]
+    fn udp_loss_percent_uses_c_percent_2g() {
+        let row = |lost, total| format_interval_line(&udp_recv_interval(lost, total), 'a');
+        assert!(row(3, 12).contains("3/12 (25%)  "), "{}", row(3, 12));
+        assert!(row(1, 12).contains("1/12 (8.3%)  "), "{}", row(1, 12));
+        assert!(row(12, 12).contains("12/12 (1e+02%)  "), "{}", row(12, 12));
+    }
+
+    /// report_bw_udp_sender_format: `/sec %s %d  ` — empty zbuf outside
+    /// bidir, the sent count, two trailing spaces (live: `1.05 Mbits/sec  4  `).
+    #[test]
+    fn udp_sender_interval_row_matches_gt_bytes() {
+        let iv = StreamInterval {
+            stream_id: 5,
+            start: 0.0,
+            end: 1.0,
+            bytes: 131_072,
+            retransmits: None,
+            snd_cwnd: None,
+            jitter: None,
+            lost: None,
+            total_packets: None,
+            sent_packets: Some(4),
+            role_tag: None,
+            omitted: false,
+        };
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[  5]   0.00-1.00   sec   128 KBytes  1.05 Mbits/sec  4  "
+        );
+    }
+
+    /// report_sum_bw_retrans_format: [SUM] retr rows pad `%3ld` then
+    /// THIRTEEN spaces (one more than the per-stream twelve).
+    #[test]
+    fn sum_interval_retr_row_matches_gt_bytes() {
+        let mut iv = tcp_interval(1_000_000, Some(3), None);
+        iv.stream_id = -1;
+        assert_eq!(
+            format_interval_line(&iv, 'a'),
+            "[SUM]   0.00-1.00   sec   977 KBytes  8.00 Mbits/sec    3             "
+        );
+    }
+
+    fn tcp_final(id: i32, is_sender: bool, bytes: u64, retr: Option<i64>) -> StreamSummary {
+        StreamSummary {
+            stream_id: id,
+            start: 0.0,
+            end: 3.0,
+            bytes,
+            is_sender,
+            retransmits: retr,
+            jitter: None,
+            lost: None,
+            total_packets: None,
+            role_tag: None,
+        }
+    }
+
+    /// report_bw_retrans_format (per-stream summary): `%3ld` + TWELVE spaces
+    /// + role (live: `...  0            sender$`).
+    #[test]
+    fn summary_sender_retr_row_matches_gt_bytes() {
+        assert_eq!(
+            format_summary_line(&tcp_final(5, true, 108 * 1024 * 1024, Some(0)), 'a'),
+            "[  5]   0.00-3.00   sec   108 MBytes   302 Mbits/sec    0            sender"
+        );
+    }
+
+    /// report_bw_format (receiver summary): EIGHTEEN spaces + role
+    /// (live: `...Mbits/sec                  receiver$`).
+    #[test]
+    fn summary_receiver_row_matches_gt_bytes() {
+        assert_eq!(
+            format_summary_line(&tcp_final(5, false, 108 * 1024 * 1024, None), 'a'),
+            "[  5]   0.00-3.00   sec   108 MBytes   302 Mbits/sec                  receiver"
+        );
+    }
+
+    /// report_sum_bw_retrans_format ([SUM] summary): THIRTEEN spaces after
+    /// the retr cell — one wider than the per-stream row above.
+    #[test]
+    fn sum_summary_retr_row_matches_gt_bytes() {
+        assert_eq!(
+            format_summary_line(&tcp_final(-1, true, 216 * 1024 * 1024, Some(0)), 'a'),
+            "[SUM]   0.00-3.00   sec   216 MBytes   604 Mbits/sec    0             sender"
+        );
+    }
+
+    /// report_bw_udp_format as a summary: `%5.3f ms`, `(%.2g%%)`, role in the
+    /// final slot (live: `0.000 ms  0/12 (0%)  receiver`).
+    #[test]
+    fn udp_summary_row_matches_gt_bytes() {
+        let s = StreamSummary {
+            stream_id: 5,
+            start: 0.0,
+            end: 3.0,
+            bytes: 393_216,
+            is_sender: false,
+            retransmits: None,
+            jitter: Some(0.0),
+            lost: Some(0),
+            total_packets: Some(12),
+            role_tag: None,
+        };
+        assert_eq!(
+            format_summary_line(&s, 'a'),
+            "[  5]   0.00-3.00   sec   384 KBytes  1.05 Mbits/sec  0.000 ms  0/12 (0%)  receiver"
+        );
+    }
+
+    // ---- #264: GT's final-partial-interval keep rule ------------------------
+
+    /// iperf_print_intermediate's rule (iperf_api.c:3853-3880): keep the
+    /// final partial interval iff it spans >= 10% of the stats interval OR
+    /// it moved bytes. Today's ad-hoc `>1ms AND bytes>0` both invents rows
+    /// GT suppresses and hides long empty tails GT prints.
+    #[test]
+    fn final_flush_follows_gt_keep_rule() {
+        // GT's skip case: a sub-10% empty tail (control-lag artifact).
+        assert!(!keep_final_interval(0.004, 1.0, 0));
+        // Bytes force a keep at any length.
+        assert!(keep_final_interval(0.004, 1.0, 4096));
+        // A long EMPTY tail is kept — GT prints the zero row.
+        assert!(keep_final_interval(0.5, 1.0, 0));
+        // -i 0: interval_secs 0 keeps the whole-run flush unconditionally.
+        assert!(keep_final_interval(0.0, 0.0, 0));
     }
 
     // ---- sum_summaries (issue #4: final [SUM] row for -P > 1) ----------------
@@ -2377,12 +2639,13 @@ mod interval_reporter_tests {
         );
     }
 
-    /// #55 receiver-side guard: a receiver whose `end_secs` trails the last
-    /// boundary (the control round-trip that delivers TEST_END) but whose tail
-    /// has no residual bytes (the peer already stopped) must not emit a trailing
-    /// empty interval. Mirrors the server's situation.
+    /// #55/#264 receiver-side guard, GT's shape: a receiver whose `end_secs`
+    /// trails the last boundary by LESS than 10% of the interval (the control
+    /// round-trip that delivers TEST_END) with no residual bytes must not
+    /// emit a trailing empty interval — iperf_print_intermediate's exact
+    /// skip case (iperf_api.c:3853-3880).
     #[tokio::test]
-    async fn no_partial_for_receiver_with_no_residual() {
+    async fn no_partial_for_sub_ten_percent_empty_tail() {
         use crate::reporter::{CollectedIntervals, IntervalStreamRef};
         use crate::stream::StreamCounters;
         use std::sync::Mutex;
@@ -2430,9 +2693,74 @@ mod interval_reporter_tests {
         counters.record_received(1000);
         tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5 -> [0,0.5]=1000
 
-        // end_secs trails the 0.5 boundary (as TEST_END would), but the tail is
-        // empty — the residual-bytes guard must drop it.
+        // end_secs trails the 0.5 boundary by 0.02s — 4% of the interval,
+        // inside GT's 10% suppression window — and the tail is empty.
         // #159 invariant: done precedes finish (the driver order).
+        done.store(true, Ordering::Relaxed);
+        reporter_end.finish(0.52);
+        let _ = handle.await;
+
+        let g = collector.lock().unwrap();
+        assert_eq!(
+            g.intervals.len(),
+            1,
+            "no trailing empty interval for a sub-10% idle tail; got {} intervals",
+            g.intervals.len()
+        );
+    }
+
+    /// #264, the other half of GT's rule: an empty tail that spans at least
+    /// 10% of the stats interval IS reported — GT prints the zero row (only
+    /// the short control-lag artifact is suppressed). The old ad-hoc guard
+    /// (`bytes > 0` unconditionally) hid these.
+    #[tokio::test]
+    async fn long_empty_tail_is_kept_like_gt() {
+        use crate::reporter::{CollectedIntervals, IntervalStreamRef};
+        use crate::stream::StreamCounters;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let interval = 0.5_f64;
+        let counters = Arc::new(StreamCounters::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = Arc::new(Mutex::new(CollectedIntervals::default()));
+
+        let stream_ref = IntervalStreamRef {
+            id: 1,
+            is_sender: false,
+            counters: counters.clone(),
+            udp_recv_stats: None,
+            raw_fd: None,
+        };
+        let config = IntervalReporterConfig {
+            interval_secs: interval,
+            protocol: TransportProtocol::Tcp,
+            format_char: 'a',
+            omit_secs: 0,
+            forceflush: false,
+            json_stream: false,
+            print: false,
+            blksize: 128 * 1024,
+            keep_intervals: false,
+            bidir: false,
+            is_server: false,
+        };
+        let reporter_end = Arc::new(ReporterEnd::new());
+        let handle = spawn_interval_reporter(
+            config,
+            vec![stream_ref],
+            done.clone(),
+            reporter_end.clone(),
+            Some(collector.clone()),
+            None,
+            None,
+        )
+        .expect("reporter spawns for a positive interval");
+
+        counters.record_received(1000);
+        tokio::time::sleep(Duration::from_millis(650)).await; // tick @0.5 -> [0,0.5]=1000
+
+        // A 0.12s empty tail — 24% of the interval, past GT's 10% line.
         done.store(true, Ordering::Relaxed);
         reporter_end.finish(0.62);
         let _ = handle.await;
@@ -2440,9 +2768,14 @@ mod interval_reporter_tests {
         let g = collector.lock().unwrap();
         assert_eq!(
             g.intervals.len(),
-            1,
-            "no trailing empty interval for an idle receiver tail; got {} intervals",
+            2,
+            "a >=10% empty tail is reported like GT; got {} intervals",
             g.intervals.len()
+        );
+        assert_eq!(
+            g.intervals.last().unwrap().sum.bytes,
+            0,
+            "the tail is the zero row"
         );
     }
 }

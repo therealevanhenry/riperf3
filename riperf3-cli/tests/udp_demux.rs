@@ -190,6 +190,13 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
         .expect("spawn server");
     let mut server = ChildGuard(server);
 
+    // Drain the server's stdout from a reader thread, NOT after exit: the
+    // bidir -P 2 doc is a single >= 8 KiB write, which FreeBSD's
+    // pipe_direct_write blocks until read — wait-for-exit-then-read
+    // deadlocked FreeBSD CI (#305; see drain_reader's doc for the class).
+    let sdoc_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped server stdout"));
+
     let retry_deadline = Instant::now() + Duration::from_secs(10);
     let out = loop {
         let client = Command::new(bin)
@@ -226,21 +233,14 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
         break String::from_utf8_lossy(&client.stdout).into_owned();
     };
 
-    // Server exits after the one test (-1); read its whole doc.
+    // Server exits after the one test (-1); the reader thread hits EOF as it
+    // does and hands back the whole doc.
     let deadline = Instant::now() + Duration::from_secs(10);
     while server.0.try_wait().expect("try_wait").is_none() {
         assert!(Instant::now() < deadline, "server did not exit");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let mut sdoc = String::new();
-    use std::io::Read;
-    server
-        .0
-        .stdout
-        .take()
-        .expect("piped")
-        .read_to_string(&mut sdoc)
-        .expect("read server doc");
+    let sdoc = sdoc_reader.join().expect("server stdout reader");
 
     let cv: Value = serde_json::from_str(&out).expect("client doc parses");
     let sv: Value = serde_json::from_str(&sdoc).expect("server doc parses");
