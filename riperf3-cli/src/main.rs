@@ -142,6 +142,34 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    // #328: the unit_atoi family (-n/-k/-l/--pacing-timer/--connect-timeout)
+    // fails parse with IEUNITVAL's exact line (units.c:196-198 sets errarg,
+    // iperf_error.c:399-401 renders `invalid unit value or suffix: '%s'`),
+    // in-loop — BEFORE the role checks (live: `-s -n 10x` is IEUNITVAL, not
+    // client-only). GT echoes the RAW argv bytes in the quotes (live-probed
+    // with a lone 0xA0 byte), so the line is written byte-for-byte.
+    for arg in [
+        &cli.bytes,
+        &cli.blockcount,
+        &cli.length,
+        &cli.pacing_timer,
+        &cli.connect_timeout,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if cli::unit_atoi_like_bytes(arg.as_encoded_bytes()).is_err() {
+            use std::io::Write as _;
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(b"riperf3: parameter error - invalid unit value or suffix: '");
+            let _ = err.write_all(arg.as_encoded_bytes());
+            let _ = err.write_all(b"'\n");
+            drop(err);
+            print_usage_trailer();
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
     if let Some(msg) = parse_class_rejection(&cli) {
         // #270: GT routes the parse-error class through 'parameter error - '
         // with the usage trailer (live-probed for all three classes here:
@@ -149,6 +177,37 @@ fn main() -> std::process::ExitCode {
         eprintln!("riperf3: parameter error - {msg}");
         print_usage_trailer();
         return std::process::ExitCode::FAILURE;
+    }
+
+    // #328: GT's -l range checks sit in the parse post-loop AFTER the role
+    // checks (iperf_api.c:1926-1944; live: `-s -l 2M` is IECLIENTONLY, not
+    // IEBLOCKSIZE — hence this block runs after parse_class_rejection).
+    // The value GT checks is unit_atoi through an int, post the
+    // 0-means-protocol-default step, so only NEGATIVE (wrapped) explicit
+    // values can trip the `<= 0` arm.
+    if let Some(v) = cli
+        .length
+        .as_deref()
+        .and_then(|s| cli::unit_atoi_like_bytes(s.as_encoded_bytes()).ok())
+        .map(|n| cli::c_u64_to_int(cli::c_double_to_u64(n)))
+    {
+        // MAX_BLOCKSIZE 1 MiB (iperf.h:465); MIN/MAX_UDP_BLOCKSIZE 16/65507
+        // (iperf.h:467/:469). RECORDED DEVIATION: GT's UDP arm only fires
+        // for blksize > 0 (:1939-1941), so `-u -l -5` PROCEEDS into a
+        // negative datagram size; riperf3 rejects it with the UDP sentence
+        // instead of reproducing the garbage run.
+        let msg = if (!cli.udp && v < 0) || v > 1_048_576 {
+            Some("block size too large (maximum = 1048576 bytes)")
+        } else if cli.udp && v != 0 && !(16..=65_507).contains(&v) {
+            Some("block size invalid (minimum = 16 bytes, maximum = 65507 bytes)")
+        } else {
+            None
+        };
+        if let Some(msg) = msg {
+            eprintln!("riperf3: parameter error - {msg}");
+            print_usage_trailer();
+            return std::process::ExitCode::FAILURE;
+        }
     }
 
     // #263: GT warns when an explicit -f rides JSON output — end of

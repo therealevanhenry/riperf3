@@ -139,16 +139,23 @@ pub struct Cli {
     pub time: Option<i64>,
 
     /// Number of bytes to transmit (instead of -t)
-    #[arg(short = 'n', long, value_name = "bytes")]
-    pub bytes: Option<String>,
+    // #328: raw OsString — GT parses -n with unit_atoi (iperf_api.c:1394);
+    // the pre-sink chain in main.rs validates and IEUNITVAL echoes the raw
+    // argv bytes. allow_hyphen: `-n -5` (uint64)-wraps huge and GT RUNS it.
+    #[arg(short = 'n', long, value_name = "bytes", allow_hyphen_values = true)]
+    pub bytes: Option<std::ffi::OsString>,
 
     /// Number of blocks (packets) to transmit (instead of -t or -n)
-    #[arg(short = 'k', long, value_name = "count")]
-    pub blockcount: Option<String>,
+    // #328: unit_atoi like -n (iperf_api.c:1401).
+    #[arg(short = 'k', long, value_name = "count", allow_hyphen_values = true)]
+    pub blockcount: Option<std::ffi::OsString>,
 
     /// Length of buffer to read or write (default 128 KB for TCP; UDP tracks the connection MSS, else 1460)
-    #[arg(short = 'l', long, value_name = "size")]
-    pub length: Option<String>,
+    // #328: unit_atoi through an int (iperf_api.c:1408) — 3G wraps
+    // negative; GT's post-loop IEBLOCKSIZE/IEUDPBLOCKSIZE range checks
+    // (:1926-1944) live in main.rs.
+    #[arg(short = 'l', long, value_name = "size", allow_hyphen_values = true)]
+    pub length: Option<std::ffi::OsString>,
 
     /// Number of parallel client streams to run
     // #328: GT parses -P with atoi (iperf_api.c:1415) and checks ONLY the
@@ -208,8 +215,13 @@ pub struct Cli {
     pub extra_data: Option<String>,
 
     /// Timeout for control connection setup (ms)
-    #[arg(long, value_name = "ms")]
-    pub connect_timeout: Option<u64>,
+    // #328: GT parses --connect-timeout with unit_atoi through an int
+    // (iperf_api.c:1787) — `1K` is 1024 ms — and hands it to netdial;
+    // poll(2) with a negative timeout waits forever (net.c:272-289), so
+    // negatives mean "no timeout" (live-probed: `--connect-timeout -100`
+    // connects fine).
+    #[arg(long, value_name = "ms", allow_hyphen_values = true)]
+    pub connect_timeout: Option<std::ffi::OsString>,
 
     /// Get results from server
     #[arg(long)]
@@ -234,11 +246,13 @@ pub struct Cli {
     pub cport: Option<i64>,
 
     /// Set the server timing for pacing in microseconds (deprecated)
-    // String, parsed by the builder's `pacing_timer_str`: iperf3 reads it
-    // with unit_atoi, so KMG suffixes (1024-based) work; the i32::MAX wire
-    // cap (review r1) is enforced there too (#160).
-    #[arg(long, value_name = "usec")]
-    pub pacing_timer: Option<String>,
+    // #328: GT parses --pacing-timer with unit_atoi through an int
+    // (iperf_api.c:1780), so KMG suffixes (1024-based) work and `3G` wraps
+    // negative — GT proceeds (live-probed); see build_client for the
+    // recorded deviation on the wrapped values. (#160's lib-level
+    // `pacing_timer_str` cap remains for embedders.)
+    #[arg(long, value_name = "usec", allow_hyphen_values = true)]
+    pub pacing_timer: Option<std::ffi::OsString>,
 
     /// Only use IPv4
     #[arg(short = '4', long, conflicts_with = "version6")]
@@ -462,24 +476,16 @@ impl Cli {
     }
 
     /// Whether a `-n`/`-k` argument carries a non-zero value. iperf3's
-    /// IEENDCONDITIONS legs test the PARSED value, not flag presence, and
-    /// `unit_atoi` scales the suffix then TRUNCATES to an integer — so
+    /// IEENDCONDITIONS legs test the PARSED value, not flag presence — so
     /// `-n 0`, `-n 0K`, and even `-n 0.5` (truncates to 0) all mean "not
-    /// set" and run a plain duration test (review r2). A string that doesn't
-    /// parse returns false so the real parse error surfaces from
-    /// `bytes_str`/`blocks_str`, not as a bogus conflict.
-    fn end_condition_set(arg: Option<&str>) -> bool {
+    /// set" and run a plain duration test (review r2). #328: the value is
+    /// GT's own unit_atoi + (uint64) conversion, so `-n -5` (huge wrap)
+    /// counts as set. An arg that doesn't parse returns false so the real
+    /// IEUNITVAL error surfaces first, not a bogus conflict.
+    fn end_condition_set(arg: Option<&std::ffi::OsStr>) -> bool {
         arg.is_some_and(|s| {
-            let s = s.trim();
-            let (num, mult) = match s.as_bytes().last() {
-                Some(b'k' | b'K') => (&s[..s.len() - 1], 1024f64),
-                Some(b'm' | b'M') => (&s[..s.len() - 1], 1024f64 * 1024.0),
-                Some(b'g' | b'G') => (&s[..s.len() - 1], 1024f64 * 1024.0 * 1024.0),
-                Some(b't' | b'T') => (&s[..s.len() - 1], 1024f64 * 1024.0 * 1024.0 * 1024.0),
-                _ => (s, 1.0),
-            };
-            num.parse::<f64>()
-                .map(|n| (n * mult) as u64 != 0)
+            unit_atoi_like_bytes(s.as_encoded_bytes())
+                .map(|n| c_double_to_u64(n) != 0)
                 .unwrap_or(false)
         })
     }
@@ -533,16 +539,41 @@ impl Cli {
             builder = builder.duration(u32::try_from(t).unwrap_or(u32::MAX));
         }
         if let Some(ref s) = self.pacing_timer {
-            builder = builder.pacing_timer_str(s)?;
+            // #328: GT stores unit_atoi through an int (iperf_api.c:1780) —
+            // `3G` wraps negative and GT proceeds, pacing effectively
+            // continuously. RECORDED DEVIATION: the u32 builder cannot hold
+            // negatives, so wrapped/zero values keep riperf3's default
+            // pacing instead (the flag is deprecated; sane inputs match).
+            let v = c_u64_to_int(c_double_to_u64(unit_atoi_os(s)?));
+            if v > 0 {
+                builder = builder.pacing_timer(v as u32);
+            }
         }
         if let Some(ref s) = self.bytes {
-            builder = builder.bytes_str(s)?;
+            // #328: GT's `settings->bytes = unit_atoi(optarg)`
+            // (iperf_api.c:1394) — an iperf_size_t (uint64), so negatives
+            // wrap huge and RUN (live-probed `-n -5`); 0 means "not set"
+            // (the end-condition legs test the value).
+            builder = builder.bytes(c_double_to_u64(unit_atoi_os(s)?));
         }
         if let Some(ref s) = self.blockcount {
-            builder = builder.blocks_str(s)?;
+            // #328: unit_atoi like -n (iperf_api.c:1401).
+            builder = builder.blocks(c_double_to_u64(unit_atoi_os(s)?));
         }
         if let Some(ref s) = self.length {
-            builder = builder.blksize_str(s)?;
+            // #328: GT's `blksize = unit_atoi(optarg)` through an int
+            // (iperf_api.c:1408); 0 keeps the protocol default
+            // (:1926-1933). Ranges are enforced pre-sink in main.rs with
+            // GT's IEBLOCKSIZE/IEUDPBLOCKSIZE sentences; the guard here
+            // covers direct callers (negatives cannot become a usize).
+            let v = c_u64_to_int(c_double_to_u64(unit_atoi_os(s)?));
+            match v.cmp(&0) {
+                std::cmp::Ordering::Greater => builder = builder.blksize(v as usize),
+                std::cmp::Ordering::Equal => {}
+                std::cmp::Ordering::Less => {
+                    return Err("block size too large (maximum = 1048576 bytes)".into())
+                }
+            }
         }
         if let Some(n) = self.parallel {
             // RECORDED DEVIATION (#328): GT's num_streams is a plain int with
@@ -591,8 +622,17 @@ impl Cli {
         if let Some(ref d) = self.extra_data {
             builder = builder.extra_data(d);
         }
-        if let Some(ms) = self.connect_timeout {
-            builder = builder.connect_timeout(std::time::Duration::from_millis(ms));
+        if let Some(ref s) = self.connect_timeout {
+            // #328: GT stores unit_atoi through an int (iperf_api.c:1787)
+            // and hands it to netdial → timeout_connect (net.c:272-289),
+            // where poll(2) treats a NEGATIVE timeout as infinite — so
+            // negatives (incl. 3G's int wrap) mean "no timeout" and are
+            // skipped here; 0 keeps riperf3's existing zero-duration
+            // semantics.
+            let v = c_u64_to_int(c_double_to_u64(unit_atoi_os(s)?));
+            if v >= 0 {
+                builder = builder.connect_timeout(std::time::Duration::from_millis(v as u64));
+            }
         }
         if self.verbose {
             builder = builder.verbose(true);
@@ -821,6 +861,205 @@ fn atoi_like_os() -> impl clap::builder::TypedValueParser<Value = i64> {
         .map(|s: std::ffi::OsString| atoi_like_bytes(s.as_encoded_bytes()))
 }
 
+/// #328: the longest C-double prefix of `s`, consumed the way GT's
+/// `sscanf(s, "%lf%c", ...)` (units.c:196) reads it: C-locale leading
+/// whitespace, optional sign, then a decimal mantissa with optional
+/// fraction/e-exponent, a strtod 0x hex mantissa with optional p-exponent,
+/// or inf/infinity/nan. Returns the value and the byte index just past the
+/// number (where `%c` reads the suffix); `None` on a matching failure.
+///
+/// scanf can't push back more than one byte, so it FAILS outright where
+/// strtod would back up (`1e`, `0x`); modeling with strtod's backed-up
+/// prefix instead is outcome-identical for unit_atoi, because the leftover
+/// byte at the prefix boundary ('e', 'x', '.') is never in [tTgGmMkK] —
+/// both roads end at IEUNITVAL (live-probed: `-n 1e`, `-n 1ex`, `-n 0x`
+/// all reject; `-n 0x10` parses as 16).
+fn c_strtod_prefix(s: &[u8]) -> Option<(f64, usize)> {
+    let mut i = 0;
+    while matches!(
+        s.get(i),
+        Some(b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+    ) {
+        i += 1;
+    }
+    let sign_start = i;
+    let neg = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let rest = &s[i..];
+    let starts = |p: &[u8]| rest.len() >= p.len() && rest[..p.len()].eq_ignore_ascii_case(p);
+    // strtod's special forms (C99 7.20.1.3), case-insensitive.
+    if starts(b"infinity") {
+        let v = if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        return Some((v, i + 8));
+    }
+    if starts(b"inf") {
+        let v = if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        return Some((v, i + 3));
+    }
+    if starts(b"nan") {
+        return Some((f64::NAN, i + 3));
+    }
+    // strtod hex floats: 0x hexdigits [. hexdigits] [pP [sign] digits].
+    if rest.len() >= 2 && rest[0] == b'0' && (rest[1] | 0x20) == b'x' {
+        let mut j = 2;
+        let mut mant = 0f64;
+        let mut any = false;
+        while let Some(d) = rest.get(j).and_then(|b| (*b as char).to_digit(16)) {
+            mant = mant * 16.0 + f64::from(d);
+            any = true;
+            j += 1;
+        }
+        if rest.get(j) == Some(&b'.') {
+            let mut scale = 1.0 / 16.0;
+            let mut k = j + 1;
+            while let Some(d) = rest.get(k).and_then(|b| (*b as char).to_digit(16)) {
+                mant += f64::from(d) * scale;
+                scale /= 16.0;
+                any = true;
+                k += 1;
+            }
+            if k > j + 1 {
+                j = k;
+            }
+        }
+        if !any {
+            // "0x<junk>": strtod backs up to the plain "0".
+            return Some((0.0, i + 1));
+        }
+        if matches!(rest.get(j), Some(b'p' | b'P')) {
+            let mut k = j + 1;
+            let eneg = match rest.get(k) {
+                Some(b'-') => {
+                    k += 1;
+                    true
+                }
+                Some(b'+') => {
+                    k += 1;
+                    false
+                }
+                _ => false,
+            };
+            let estart = k;
+            let mut e = 0i32;
+            while let Some(d) = rest.get(k).and_then(|b| (*b as char).to_digit(10)) {
+                e = e.saturating_mul(10).saturating_add(d as i32);
+                k += 1;
+            }
+            if k > estart {
+                mant *= 2f64.powi(if eneg { -e } else { e });
+                j = k;
+            }
+        }
+        return Some((if neg { -mant } else { mant }, i + j));
+    }
+    // Decimal: digits [. digits] [eE [sign] digits].
+    let mut j = 0;
+    let mut any = false;
+    while rest.get(j).is_some_and(u8::is_ascii_digit) {
+        any = true;
+        j += 1;
+    }
+    if rest.get(j) == Some(&b'.') {
+        j += 1;
+        while rest.get(j).is_some_and(u8::is_ascii_digit) {
+            any = true;
+            j += 1;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mant_end = j;
+    if matches!(rest.get(j), Some(b'e' | b'E')) {
+        let mut k = j + 1;
+        if matches!(rest.get(k), Some(b'+' | b'-')) {
+            k += 1;
+        }
+        let estart = k;
+        while rest.get(k).is_some_and(u8::is_ascii_digit) {
+            k += 1;
+        }
+        j = if k > estart { k } else { mant_end };
+    }
+    let text = std::str::from_utf8(&s[sign_start..i + j]).expect("ASCII number");
+    Some((text.parse::<f64>().expect("valid double prefix"), i + j))
+}
+
+/// #328: GT's `unit_atoi` (units.c:190-227) minus the final integer cast —
+/// the scaled double, so each call site can apply ITS C target-type
+/// conversion (`iperf_size_t` for -n/-k, `int` for -l/--pacing-timer/
+/// --connect-timeout). Suffix ∈ [tTgGmMkK] scales by 1024^n; end-of-string
+/// means no scaling; any OTHER byte right after the number — junk after a
+/// valid suffix is IGNORED (`10Kx` is 10240: sscanf never reads the x) —
+/// or an unparseable number is Err (IEUNITVAL).
+pub fn unit_atoi_like_bytes(s: &[u8]) -> Result<f64, ()> {
+    let (n, consumed) = c_strtod_prefix(s).ok_or(())?;
+    match s.get(consumed) {
+        None => Ok(n),
+        Some(b't' | b'T') => Ok(n * 1024f64.powi(4)),
+        Some(b'g' | b'G') => Ok(n * 1024f64.powi(3)),
+        Some(b'm' | b'M') => Ok(n * 1024f64.powi(2)),
+        Some(b'k' | b'K') => Ok(n * 1024.0),
+        Some(_) => Err(()),
+    }
+}
+
+/// #328: C's `(iperf_size_t)` — i.e. `(uint64_t)` — conversion of a double,
+/// as gcc emits it on x86-64 (the GT reference build): values below 2^63 go
+/// through cvttsd2si (truncate toward zero; unrepresentable → INT64_MIN,
+/// reinterpreted unsigned — so `-n -5` becomes a huge byte target, which GT
+/// RUNS, live-probed); values at/above 2^63 are converted with the top bit
+/// folded, so 2^63..2^64 map exactly and +inf/1e300 land on 0. NaN → 2^63.
+/// (The C conversion is UB for negatives/overflow; this pins the observed
+/// GT binary's arithmetic deterministically on every platform.)
+pub fn c_double_to_u64(n: f64) -> u64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if n.is_nan() {
+        return 1 << 63;
+    }
+    if n < TWO63 {
+        // Rust's saturating `as i64` matches cvttsd2si's INT64_MIN floor.
+        (n as i64) as u64
+    } else {
+        let d = n - TWO63;
+        let i = if d < TWO63 { d as i64 } else { i64::MIN };
+        (i as u64) ^ (1 << 63)
+    }
+}
+
+/// #328: C's `int` conversion of the `iperf_size_t` unit_atoi result (the
+/// `-l`/`--pacing-timer`/`--connect-timeout` assignments): uint64 → int32
+/// keeps the low 32 bits, reinterpreted signed — `-l 3G` wraps negative,
+/// exactly the value GT's post-loop range checks then see.
+pub fn c_u64_to_int(v: u64) -> i32 {
+    v as u32 as i32
+}
+
+/// unit_atoi over an argv value, erring with IEUNITVAL's sentence (lossy
+/// rendering — the binary's pre-sink path in main.rs writes the RAW bytes
+/// instead; this face serves direct `build_client`/`build_server` callers).
+fn unit_atoi_os(arg: &std::ffi::OsStr) -> Result<f64, String> {
+    unit_atoi_like_bytes(arg.as_encoded_bytes())
+        .map_err(|()| format!("invalid unit value or suffix: '{}'", arg.to_string_lossy()))
+}
+
 /// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
 /// FIRST character only, so `-f kilobits` is `-f k` — and accepts exactly
 /// [kmgtKMGT]; anything else is IEBADFORMAT. 'B'/'b' stay lib-only in both
@@ -955,6 +1194,86 @@ mod cli_tests {
         }
 
         #[test]
+        fn unit_atoi_like_matches_units_c() {
+            // #328: exact-value table pinned from units.c:190-227 + live GT
+            // probes (2026-07-03), with the (uint64) conversion applied like
+            // the -n/-k call sites. Suffix rules: ONE char, [tTgGmMkK],
+            // 1024-based; junk AFTER a valid suffix is ignored (sscanf never
+            // reads past %c); junk INSTEAD of a suffix — or an unparseable
+            // number — is IEUNITVAL (the Err rows).
+            let ok: &[(&[u8], u64)] = &[
+                (b"10", 10),
+                (b"0", 0),
+                (b"10K", 10240),
+                (b"10k", 10240),
+                (b"10Kx", 10240), // live: GT runs -n 10Kx
+                (b"10KK", 10240), // the second K is junk AFTER the suffix
+                (b"1.5K", 1536),
+                (b"1M", 1 << 20),
+                (b"1G", 1 << 30),
+                (b"1T", 1 << 40),
+                (b".5m", 524_288), // live: GT runs -n .5m
+                (b"1e3", 1000),    // live: GT runs -n 1e3
+                (b"1.5e2K", 153_600),
+                (b"0x10", 16), // strtod hex — live: GT runs -n 0x10
+                (b"0x1p3", 8), // strtod hex p-exponent
+                (b" 10K", 10240),
+                (b"\t7", 7),
+                (b"007", 7),
+                (b"+5", 5),
+                // The C (uint64) conversion edges (the x86-64 GT build):
+                (b"-5", u64::MAX - 4), // live: GT runs -n -5 as a huge target
+                (b"-1K", u64::MAX - 1023),
+                (b"1e300", 0),                     // overflow folds to 0
+                (b"inf", 0),                       // (uint64)inf is 0 too
+                (b"nan", 1 << 63),                 // live: GT runs -n nan
+                (b"9223372036854775808", 1 << 63), // 2^63 maps exactly
+                (b"8388608T", 1 << 63),            // 2^23 * 1024^4 = 2^63
+                (b"18446744073709551616", 0),      // 2^64 overflows to 0
+            ];
+            for (input, want) in ok {
+                assert_eq!(
+                    unit_atoi_like_bytes(input).map(c_double_to_u64),
+                    Ok(*want),
+                    "unit_atoi({input:?})"
+                );
+            }
+            let err: &[&[u8]] = &[
+                b"10x",  // live: IEUNITVAL '10x'
+                b"abc",  // live: IEUNITVAL 'abc'
+                b"1e",   // live: IEUNITVAL (scanf %lf fails outright)
+                b"1ex",  // live: IEUNITVAL (prefix "1", suffix 'e')
+                b"",     // live: IEUNITVAL ''
+                b".",    // live: IEUNITVAL '.'
+                b"0x",   // live: IEUNITVAL (strtod backs up to "0", 'x' left)
+                b"10 K", // live: IEUNITVAL (%c reads the space, not the K)
+                b"+", b"-", b"\xa0", // raw invalid UTF-8 is garbage like any other byte
+            ];
+            for input in err {
+                assert_eq!(
+                    unit_atoi_like_bytes(input),
+                    Err(()),
+                    "unit_atoi({input:?}) is IEUNITVAL"
+                );
+            }
+        }
+
+        #[test]
+        fn c_u64_to_int_wraps_like_c() {
+            // #328: the -l/--pacing-timer/--connect-timeout assignments run
+            // unit_atoi's uint64 through a C int — low 32 bits, signed.
+            for (input, want) in [
+                (1024u64, 1024i32),
+                (3_221_225_472, -1_073_741_824), // 3G wraps negative
+                (2_147_483_648, i32::MIN),       // 2^31
+                (u64::MAX - 4, -5),              // -n -5's wrap round-trips
+                (1 << 32, 0),
+            ] {
+                assert_eq!(c_u64_to_int(input), want, "(int)({input})");
+            }
+        }
+
+        #[test]
         fn test_format_chars_match_unit_snprintf() {
             // The CLI→lib glue: each accepted letter maps to the exact
             // unit_snprintf char; uppercase survives (the old ignore_case +
@@ -996,17 +1315,17 @@ mod cli_tests {
             assert!(cli.reverse);
             assert!(cli.bidir);
             assert!(cli.no_delay);
-            assert_eq!(cli.length, Some("1460".to_string()));
+            assert_eq!(cli.length, Some("1460".into()));
             assert_eq!(cli.bitrate, Some("100M".to_string()));
         }
 
         #[test]
         fn test_client_bytes_and_blocks() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-n", "1G"]);
-            assert_eq!(cli.bytes, Some("1G".to_string()));
+            assert_eq!(cli.bytes, Some("1G".into()));
 
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-k", "100K"]);
-            assert_eq!(cli.blockcount, Some("100K".to_string()));
+            assert_eq!(cli.blockcount, Some("100K".into()));
         }
 
         #[test]
@@ -2018,6 +2337,78 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "500"]);
             let c = build_client_from_cli(&cli);
             assert_eq!(c, expected_client("h").pacing_timer(500).build().unwrap());
+        }
+
+        // #328: the unit_atoi family wires GT's parsed VALUE — junk after a
+        // valid suffix is ignored (`10Kx` = 10240), exponents and hex parse
+        // (units.c:196 sscanf %lf), and `-n -5` takes the (uint64) wrap GT
+        // runs with (live-probed).
+        #[test]
+        fn unit_atoi_values_wire_like_gt() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-n", "10Kx"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").bytes(10240).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-n", "-5"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").bytes(u64::MAX - 4).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-k", "1e3"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").blocks(1000).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-l", "10Kx"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").blksize(10240).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--connect-timeout", "1K"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h")
+                    .connect_timeout(std::time::Duration::from_millis(1024))
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        // #328: `-l 0` keeps the protocol default, like GT's post-loop
+        // `if (blksize == 0)` step (iperf_api.c:1926-1933) — NOT an explicit
+        // 0-byte block size.
+        #[test]
+        fn length_zero_keeps_protocol_default() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-l", "0"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").build().unwrap()
+            );
+        }
+
+        // #328: a NEGATIVE --connect-timeout means "no timeout" — GT hands
+        // the int to poll(2), where negative waits forever (net.c:272-289;
+        // live-probed: `--connect-timeout -100` connects fine).
+        #[test]
+        fn connect_timeout_negative_is_no_timeout() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--connect-timeout", "-100"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").build().unwrap()
+            );
+        }
+
+        // #328 RECORDED DEVIATION: GT runs `--pacing-timer 3G` with the
+        // int-wrapped NEGATIVE value (continuous pacing); riperf3's u32
+        // builder cannot hold it, so wrapped values keep the default pacing.
+        #[test]
+        fn pacing_timer_wrapped_keeps_default() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--pacing-timer", "3G"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").build().unwrap()
+            );
         }
 
         #[test]
