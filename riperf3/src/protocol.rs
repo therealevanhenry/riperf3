@@ -890,7 +890,8 @@ mod tests {
         assert_eq!(r.streams[0].retransmits, -1, "u64::MAX sentinel maps to -1");
         assert_eq!(r.streams[0].bytes, 25_371_082_752);
         // #271 refined the #24 posture: absence is preserved as None so
-        // GT's all-omitted substitution can distinguish it from a real 0.
+        // resolve_peer_omitted can distinguish an old peer from an
+        // exchanged 0.
         assert_eq!(
             r.streams[0].omitted_errors, None,
             "absent field decodes as None (old peer)"
