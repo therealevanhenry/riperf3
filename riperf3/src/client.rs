@@ -547,8 +547,22 @@ impl Client {
         })?;
         net::configure_tcp_stream(&ctrl, true)?;
 
+        // Apply control connection options (bind_dev is applied inside
+        // tcp_connect, pre-connect — #88)
+        if let Some(ref spec) = self.cntl_ka {
+            let (idle, intv, cnt) = parse_keepalive(spec);
+            net::set_tcp_keepalive(&ctrl, idle, intv, cnt)?;
+        }
+
+        protocol::send_cookie(&mut ctrl, cookie).await?;
+
         // The control connection's MSS sizes UDP datagrams (issue #6) and feeds
-        // the `-J` start.tcp_mss_default field (#36 PR3).
+        // the `-J` start.tcp_mss_default field (#36 PR3). Read AFTER the cookie
+        // write, exactly where GT reads it (iperf_client_api.c:467→476, #269):
+        // the kernel's MSS estimate settles once traffic has flowed — on Linux
+        // loopback the pre-write read said 32741 (advmss/2 rounding) where GT
+        // reports the settled 32768, and the value is wire-visible in
+        // test_start.blksize.
         let control_mss_opt = net::tcp_maxseg(&ctrl);
         let control_mss = control_mss_opt.unwrap_or(0);
 
@@ -561,15 +575,6 @@ impl Client {
         } else {
             self.blksize
         };
-
-        // Apply control connection options (bind_dev is applied inside
-        // tcp_connect, pre-connect — #88)
-        if let Some(ref spec) = self.cntl_ka {
-            let (idle, intv, cnt) = parse_keepalive(spec);
-            net::set_tcp_keepalive(&ctrl, idle, intv, cnt)?;
-        }
-
-        protocol::send_cookie(&mut ctrl, cookie).await?;
 
         // #222 (-V): GT's iperf_connect prints these right after the cookie
         // write, BEFORE the param exchange (r3 item 2 — a failed exchange
@@ -2150,6 +2155,9 @@ impl Client {
             protocol: self.protocol,
             reverse: self.reverse,
             bidir: self.bidir,
+            // #265: the peer's exchanged flag, consulted by the report only
+            // in pure-receiver mode (GT's :2856 overwrite).
+            peer_sender_has_retransmits: remote_cpu.map(|r| r.sender_has_retransmits),
             duration: self.duration as f64,
             elapsed: test_duration,
             num_streams: self.num_streams as i32,

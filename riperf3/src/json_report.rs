@@ -756,6 +756,12 @@ pub(crate) struct ReportInput {
     pub error: Option<String>,
     pub reverse: bool,
     pub bidir: bool,
+    /// The peer's exchanged `sender_has_retransmits` flag, `None` when no
+    /// results arrived. Only consulted by a pure-receiver client (`-R`),
+    /// where GT overwrites its own flag with the peer's (iperf_api.c:2856)
+    /// before gating the per-stream sender sub-object's TCP_INFO extras —
+    /// a flag-off peer gets GT's BARE variant, not zero-fill (#265).
+    pub peer_sender_has_retransmits: Option<i64>,
     /// The requested `-t` duration parameter, reported under `test_start`. Stays
     /// the nominal value even for a byte/block-limited (`-n`/`-k`) run.
     pub duration: f64,
@@ -917,18 +923,23 @@ impl ReportInput {
             .sum();
         // The peer's reported bytes for each direction (forward → peer received,
         // reverse → peer sent), used to fill the side this host didn't measure.
-        let peer_recv: u64 = self
-            .streams
-            .iter()
-            .filter(|s| s.is_sender)
-            .filter_map(|s| s.remote_bytes)
-            .sum();
-        let peer_sent: u64 = self
-            .streams
-            .iter()
-            .filter(|s| !s.is_sender)
-            .filter_map(|s| s.remote_bytes)
-            .sum();
+        // `None` = NO stream in that direction carried an exchanged figure (odd
+        // peer / terminated run); `Some(total)` keeps an exchanged 0 distinct —
+        // #266: an extreme-throttle 0 from the peer is a real figure and must
+        // not trip the absent-side graft (the per-stream path already emits it).
+        let peer_dir_bytes = |sender: bool| -> Option<u64> {
+            let mut any = false;
+            let total = self
+                .streams
+                .iter()
+                .filter(|s| s.is_sender == sender)
+                .filter_map(|s| s.remote_bytes)
+                .inspect(|_| any = true)
+                .sum();
+            any.then_some(total)
+        };
+        let peer_recv = peer_dir_bytes(true);
+        let peer_sent = peer_dir_bytes(false);
 
         // Receiver-measured UDP loss/jitter, aggregated across measured streams.
         let (udp_lost, udp_packets, udp_jitter) = if is_udp {
@@ -1128,15 +1139,17 @@ impl ReportInput {
             };
             let (fwd_packets, fwd_lost, fwd_jitter) = dir_stats(true);
             let (rev_packets, rev_lost, rev_jitter) = dir_stats(false);
+            // #266: an exchanged Some(0) is a real figure; only ABSENT peer
+            // data grafts (or zeroes on the #170 terminated path).
             let fwd_recv = match (peer_recv, self.error.is_some()) {
-                (p, _) if p > 0 => p,
-                (_, true) => 0,
-                _ => local_sent,
+                (Some(p), _) => p,
+                (None, true) => 0,
+                (None, false) => local_sent,
             };
             let rev_sent = match (peer_sent, self.error.is_some()) {
-                (p, _) if p > 0 => p,
-                (_, true) => 0,
-                _ => local_recv,
+                (Some(p), _) => p,
+                (None, true) => 0,
+                (None, false) => local_recv,
             };
             // SENT-side packet figures derive from the sender's byte counts
             // (r2 review, the packets analog of the r1 bytes blocker —
@@ -1217,15 +1230,16 @@ impl ReportInput {
             // make the two aggregates describe different directions).
             // No cross-graft on a terminated run (#170 review r2 f1): the
             // peer halves never arrived — iperf3's bidir sums carry 0 there.
+            // #266: exchanged Some(0) is honest data, not an absent side.
             let fwd_recv = match (peer_recv, self.error.is_some()) {
-                (p, _) if p > 0 => p,
-                (_, true) => 0,
-                _ => local_sent,
+                (Some(p), _) => p,
+                (None, true) => 0,
+                (None, false) => local_sent,
             };
             let rev_sent = match (peer_sent, self.error.is_some()) {
-                (p, _) if p > 0 => p,
-                (_, true) => 0,
-                _ => local_recv,
+                (Some(p), _) => p,
+                (None, true) => 0,
+                (None, false) => local_recv,
             };
             // #236: per-direction retransmit totals, like GT's per-pass
             // accumulator — the reverse-sent aggregate carries the PEER's
@@ -1252,12 +1266,12 @@ impl ReportInput {
             let sent_bytes = if local_sent > 0 {
                 local_sent
             } else {
-                peer_sent
+                peer_sent.unwrap_or(0)
             };
             let recv_bytes = if local_recv > 0 {
                 local_recv
             } else {
-                peer_recv
+                peer_recv.unwrap_or(0)
             };
             // #235: when the sent side is the PEER's (-R), prefer its
             // exchanged true counts over the bytes-derived figure (same
@@ -1306,16 +1320,20 @@ impl ReportInput {
         } else {
             // TCP single direction (forward or reverse); both aggregates carry the
             // test's sender flag (!reverse), like iperf3.
+            // #266: an exchanged 0 (extreme throttle) is the peer's real
+            // figure and wins like any other exchanged value — GT's total is
+            // a plain sum of exchanged bytes_sent (iperf_api.c:4447 feed).
+            // Only a genuinely ABSENT side takes the #214 graft.
             let sent_bytes = match (local_sent, peer_sent) {
-                (0, p) if p > 0 => p,
+                (0, Some(p)) => p,
                 // No cross-graft on a terminated run (#170): iperf3's
                 // sum_sent/sum_received carry 0 for the half it never got.
-                (0, _) if self.error.is_none() => local_recv,
+                (0, None) if self.error.is_none() => local_recv,
                 (s, _) => s,
             };
             let recv_bytes = match (local_recv, peer_recv) {
-                (0, p) if p > 0 => p,
-                (0, _) if self.error.is_none() => local_sent,
+                (0, Some(p)) => p,
+                (0, None) if self.error.is_none() => local_sent,
                 (r, _) => r,
             };
             (
@@ -1611,7 +1629,20 @@ impl ReportInput {
         // (a forward receiver) and emits them only on a stream it sent
         // (reverse/bidir). Match that asymmetry: emit the extras unless this is a
         // server stream the server received.
-        let emit_extras = !self.is_server || s.is_sender;
+        //
+        // #265: BOTH shapes are additionally gated on the effective
+        // `sender_has_retransmits` (GT iperf_api.c:4262) — when it is off,
+        // GT emits the BARE sender variant (socket..bits_per_second only,
+        // :4276), never zero-filled extras. The effective flag is the local
+        // capability, except for a pure-receiver client, where GT overwrites
+        // it with the peer's exchanged value (:2856; live-probed 2026-07-02:
+        // Linux↔Linux keeps every current shape byte-identical).
+        let sender_extras = if !self.is_server && self.reverse && !self.bidir {
+            self.peer_sender_has_retransmits.is_none_or(|f| f != 0)
+        } else {
+            crate::tcp_info::has_retransmit_info()
+        };
+        let emit_extras = (!self.is_server || s.is_sender) && sender_extras;
         let e = s.tcp_end.unwrap_or_default();
         let sender_side = |bytes: u64, retransmits: Option<i64>| TcpStreamSide {
             socket: s.id,
@@ -1887,6 +1918,7 @@ mod tests {
             protocol: TransportProtocol::Tcp,
             reverse: false,
             bidir: false,
+            peer_sender_has_retransmits: None,
             duration: 10.0,
             elapsed: 10.0,
             num_streams: 1,
