@@ -191,20 +191,11 @@ fn demux_server_connected_block_maps_streams_to_client_ports() {
     let mut server = ChildGuard(server);
 
     // Drain the server's stdout from a reader thread, NOT after exit: the
-    // doc for a bidir -P 2 UDP run exceeds FreeBSD's 16 KiB pipe buffer, so
-    // a wait-for-exit-then-read sequence deadlocks — the server blocks in
-    // write(2) on the full pipe (procstat: pipe_direct_write) while the
-    // test waits for it to exit (#305 r0: deterministic FreeBSD-CI hang;
-    // Linux's 64 KiB pipes masked it locally).
-    let sdoc_reader = {
-        let mut stdout = server.0.stdout.take().expect("piped server stdout");
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut s = String::new();
-            let _ = stdout.read_to_string(&mut s);
-            s
-        })
-    };
+    // bidir -P 2 doc is a single >= 8 KiB write, which FreeBSD's
+    // pipe_direct_write blocks until read — wait-for-exit-then-read
+    // deadlocked FreeBSD CI (#305; see drain_reader's doc for the class).
+    let sdoc_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped server stdout"));
 
     let retry_deadline = Instant::now() + Duration::from_secs(10);
     let out = loop {
