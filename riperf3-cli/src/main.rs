@@ -133,6 +133,22 @@ fn main() -> std::process::ExitCode {
         // check (live-probed: `-c ... --time-skew-threshold 0` gives this
         // sentence, `--time-skew-threshold 5x` the server-only one).
         Some("skew threshold must be a positive number")
+    } else if cli
+        .interval
+        .is_some_and(|i| !(0.1..=60.0).contains(&i) && i != 0.0)
+    {
+        // #328: GT's IEINTERVAL (iperf_api.c:1260-1265; MIN/MAX_INTERVAL
+        // iperf.h:470-471) — -i is C atof, so `-i 2x` is 2.0 (accepted) and
+        // `-i x` is 0.0 ("default", accepted); the sentence renders %g
+        // (0.1 / 60, live-probed).
+        Some("invalid report interval (min = 0.1, max = 60 seconds)")
+    } else if cli.cntl_ka.as_deref().is_some_and(cli::cntl_ka_violation) {
+        // #328: GT's IECNTLKA (iperf_api.c:1647-1652) — perr-shaped, so the
+        // trailing ": " is part of the live-probed line (errno 0 at parse).
+        Some(
+            "control connection Keepalive period should be larger than the \
+             full retry period (interval * count): ",
+        )
     } else {
         None
     };
@@ -159,13 +175,32 @@ fn main() -> std::process::ExitCode {
     .flatten()
     {
         if cli::unit_atoi_like_bytes(arg.as_encoded_bytes()).is_err() {
-            use std::io::Write as _;
-            let mut err = std::io::stderr().lock();
-            let _ = err.write_all(b"riperf3: parameter error - invalid unit value or suffix: '");
-            let _ = err.write_all(arg.as_encoded_bytes());
-            let _ = err.write_all(b"'\n");
-            drop(err);
-            print_usage_trailer();
+            print_unit_val_error(arg.as_encoded_bytes());
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
+    // #328: --server-bitrate-limit's `rate[/interval]` (iperf_api.c:
+    // 1366-1385): the interval piece is C atof + the IETOTALINTERVAL range
+    // check (same 0.1..60 bounds as -i), checked BEFORE the rate's
+    // unit_atof_rate → IEUNITVAL; both in-loop, ahead of the role checks
+    // (live-probed: `-c ... --server-bitrate-limit 10x` is IEUNITVAL, not
+    // server-only; `10x/0.01` reports the interval first).
+    if let Some(spec) = cli.server_bitrate_limit.as_deref() {
+        let (rate, interval) = cli::split_rate_interval(spec);
+        if let Some(iv) = interval.map(cli::atof_like_bytes) {
+            if iv != 0.0 && !(0.1..=60.0).contains(&iv) {
+                eprintln!(
+                    "riperf3: parameter error - invalid time interval for \
+                     calculating average data rate"
+                );
+                print_usage_trailer();
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        if cli::unit_atof_rate_like_bytes(rate).is_err() {
+            // GT's errarg is the rate part only (the slash was NUL'd).
+            print_unit_val_error(rate);
             return std::process::ExitCode::FAILURE;
         }
     }
@@ -305,6 +340,19 @@ fn print_usage_trailer() {
     eprintln!("Try `riperf3 --help' for more information.");
 }
 
+/// #328: IEUNITVAL's exact line + trailer, with the RAW argv bytes echoed
+/// inside the quotes like GT's errarg (units.c:196-198, iperf_error.c:
+/// 399-401; live-probed with a lone 0xA0 byte — GT prints it verbatim).
+fn print_unit_val_error(arg: &[u8]) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(b"riperf3: parameter error - invalid unit value or suffix: '");
+    let _ = err.write_all(arg);
+    let _ = err.write_all(b"'\n");
+    drop(err);
+    print_usage_trailer();
+}
+
 /// The parse-class rejections (#65 client-only-on-server, #100
 /// server-only-on-client, #140 conflicting end conditions): iperf3 raises
 /// these in parse_arguments, before any output sink exists, so they print to
@@ -342,7 +390,9 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
 }
 
 fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    configure_log4rs(cli.debug.unwrap_or(0));
+    // #328: GT levels are open-ended (--debug=100 runs); everything past 4
+    // is max verbosity here, matching the `_ => Trace` arm.
+    configure_log4rs(u8::try_from(cli.debug.unwrap_or(0)).unwrap_or(u8::MAX));
 
     // Reject client-only options on the server (#65) before any side effects
     // (pidfile/logfile writes, CPU affinity, runtime build), mirroring iperf3,

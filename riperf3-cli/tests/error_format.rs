@@ -817,3 +817,212 @@ fn raw_invalid_utf8_unit_arg_is_ieunitval_with_raw_bytes() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// #328: the atof family (-i, --server-bitrate-limit's rate/interval),
+// --cntl-ka's pieces + sanity check, and -d/--debug's level. All
+// expectations live-probed against iperf 3.21.
+// ---------------------------------------------------------------------------
+
+/// #328: -i parses with C atof (iperf_api.c:1260) — strtod's longest
+/// prefix, garbage -> 0.0 — so `-i 2x` is 2.0 and `-i x` is 0.0 (both
+/// proceed, live-probed); the IEINTERVAL range check
+/// `(< MIN_INTERVAL || > MAX_INTERVAL) && != 0` (iperf.h:470-471: 0.1/60)
+/// rejects with the exact %g-rendered sentence.
+#[test]
+fn interval_parses_like_atof_with_ieinterval_range() {
+    for args in [
+        &["-i", "2x"][..],
+        &["-i", "x"][..],
+        &["-i", "0"][..],
+        &["-i", "0.1"][..],
+        &["-i", "60"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9"])
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect")
+                && !stderr.contains("parameter error")
+                && !stderr.contains("error: invalid value")
+                && !stderr.contains("invalid report interval"),
+            "{args:?} parses via atof semantics and proceeds: {stderr}"
+        );
+    }
+    for bad in ["0.01", "-1", "61", "inf"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-i", bad])
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "-i {bad} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(
+                "riperf3: parameter error - invalid report interval (min = 0.1, max = 60 seconds)"
+            ),
+            "-i {bad}: IEINTERVAL's exact sentence expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+}
+
+/// #328: --server-bitrate-limit rate[/interval] (iperf_api.c:1366-1385).
+/// The interval piece is C atof + the IETOTALINTERVAL range check (same
+/// 0.1..60 bounds as -i), checked BEFORE the rate's unit_atof_rate
+/// (live-probed: `10x/0.01` reports the interval, not the unit). The rate
+/// piece errors IEUNITVAL in-loop, which beats the post-loop server-only
+/// check (live-probed on a client); a VALID spec on a client falls through
+/// to IESERVERONLY, proving the parse accepted it without hanging a server.
+#[test]
+fn server_bitrate_limit_parses_like_gt() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-s", "--server-bitrate-limit", "10x"],
+            "parameter error - invalid unit value or suffix: '10x'",
+        ),
+        (
+            &["-s", "--server-bitrate-limit", "abc"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+        (
+            &["-s", "--server-bitrate-limit", "10M/0.01"],
+            "parameter error - invalid time interval for calculating average data rate",
+        ),
+        (
+            &["-s", "--server-bitrate-limit", "10M/61"],
+            "parameter error - invalid time interval for calculating average data rate",
+        ),
+        // The interval check fires before the rate parse (GT's code order).
+        (
+            &["-s", "--server-bitrate-limit", "10x/0.01"],
+            "parameter error - invalid time interval for calculating average data rate",
+        ),
+        // In-loop IEUNITVAL beats the post-loop server-only role check.
+        (
+            &["-c", "127.0.0.1", "--server-bitrate-limit", "10x"],
+            "parameter error - invalid unit value or suffix: '10x'",
+        ),
+        // Valid specs parse clean and only then trip the role check:
+        // suffixed-junk rate, atof-garbage interval (0.0 = fine), and a
+        // negative rate ((uint64) wrap, like GT) all ACCEPT.
+        (
+            &["-c", "127.0.0.1", "--server-bitrate-limit", "10M/2x"],
+            "parameter error - some option you are trying to set is server only",
+        ),
+        (
+            &["-c", "127.0.0.1", "--server-bitrate-limit", "10M/abc"],
+            "parameter error - some option you are trying to set is server only",
+        ),
+        (
+            &["-c", "127.0.0.1", "--server-bitrate-limit", "-5"],
+            "parameter error - some option you are trying to set is server only",
+        ),
+        (
+            &["-c", "127.0.0.1", "--server-bitrate-limit", "10Kx"],
+            "parameter error - some option you are trying to set is server only",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {want}")),
+            "{args:?}: GT wording expected, got: {stderr}"
+        );
+    }
+}
+
+/// #328: --cntl-ka[=keepidle[/interval[/count]]] (iperf_api.c:1626-1653):
+/// optional arg (bare enables keepalive with defaults), slash-separated
+/// pieces each C atoi (empty pieces keep the 0 defaults, :3311-3313), then
+/// the sanity check `keepidle != 0 && keepidle <= count*interval` ->
+/// IECNTLKA with the perr-shaped sentence (trailing ": ", live-probed).
+#[test]
+fn cntl_ka_parses_pieces_like_gt() {
+    // Accept-and-proceed (live-probed against GT).
+    for args in [
+        &["--cntl-ka"][..],
+        &["--cntl-ka=abc"][..],   // keepidle atoi 0 -> no sanity check
+        &["--cntl-ka=10//3"][..], // empty interval keeps default 0
+        &["--cntl-ka=10/5/1"][..],
+        &["--cntl-ka=20/5/3"][..], // 20 > 5*3: passes the sanity check
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9"])
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect") && !stderr.contains("parameter error"),
+            "{args:?} parses and proceeds: {stderr}"
+        );
+    }
+    // IECNTLKA (live-probed): 10 <= 5*2, count "3x" atoi's to 3 (10 <= 15),
+    // 5 <= 5*1, and a negative keepidle is nonzero and <= 0.
+    for args in [
+        &["--cntl-ka=10/5/2"][..],
+        &["--cntl-ka=10/5/3x"][..],
+        &["--cntl-ka=5/5/1"][..],
+        &["--cntl-ka=-5"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9"])
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(
+                "riperf3: parameter error - control connection Keepalive period should \
+                 be larger than the full retry period (interval * count): "
+            ),
+            "{args:?}: IECNTLKA's exact perr-shaped sentence expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+}
+
+/// #328: -d/--debug's optional level is C atoi with negative ->
+/// DEBUG_LEVEL_MAX (iperf_api.c:1692-1697; DEBUG_LEVEL_MAX 4, iperf.h:300)
+/// — GT accepts `--debug=abc` (level 0), `--debug=-1` (4), `--debug=100`
+/// (no upper clamp), all live-probed to proceed. riperf3's 1..=4 clap
+/// range parser rejected them.
+#[test]
+fn debug_level_parses_like_atoi() {
+    for args in [
+        &["-d"][..],
+        &["--debug"][..],
+        &["--debug=abc"][..],
+        &["--debug=-1"][..],
+        &["--debug=0"][..],
+        &["--debug=100"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9"])
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect")
+                && !stderr.contains("parameter error")
+                && !stderr.contains("error: invalid value"),
+            "{args:?} parses via atoi semantics and proceeds: {stderr}"
+        );
+    }
+}

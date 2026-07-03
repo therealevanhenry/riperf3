@@ -54,7 +54,11 @@ pub struct Cli {
     pub format: Option<String>,
 
     /// Seconds between periodic throughput reports
-    #[arg(short, long, value_name = "interval")]
+    // #328: GT parses -i with C atof (iperf_api.c:1260) — strtod's longest
+    // prefix, garbage → 0.0, so `-i 2x` is 2.0 and `-i x` is 0.0 — then the
+    // IEINTERVAL range check (in main.rs). allow_hyphen: `-i -1` takes the
+    // range sentence like GT, not a clap error.
+    #[arg(short, long, value_name = "interval", allow_hyphen_values = true, value_parser = atof_like_os())]
     pub interval: Option<f64>,
 
     /// Enable verbose output
@@ -65,11 +69,18 @@ pub struct Cli {
     #[arg(short = 'J', long)]
     pub json: bool,
 
-    /// Debug level 1-4 (default 4)
+    /// Debug level 0-4 (default 4)
+    // #328: GT's level is C atoi with negative → DEBUG_LEVEL_MAX
+    // (iperf_api.c:1692-1697) and NO upper clamp (`--debug=100` runs), so
+    // the old 1..=4 clap range rejected GT-accepted forms (`--debug=abc` is
+    // level 0 in GT). KNOWN-DIVERGENT: GT's short `-d` takes no value ever
+    // (getopt "d" without a colon — `-d3` is "invalid option -- '3'" and
+    // `-d 3` leaves 3 as an ignored operand); clap's optional-value form
+    // consumes both. Levels above 4 clamp to the max log verbosity.
     #[arg(short, long, value_name = "level", num_args = 0..=1,
-          value_parser = clap::value_parser!(u8).range(1..=4),
+          value_parser = debug_level_like_os(),
           default_missing_value = "4")]
-    pub debug: Option<u8>,
+    pub debug: Option<i64>,
 
     /// Print version
     #[arg(short = 'v', long, group = "meta", action = clap::ArgAction::Version)]
@@ -115,8 +126,16 @@ pub struct Cli {
     pub idle_timeout: Option<i64>,
 
     /// Server's total bit rate limit
-    #[arg(long = "server-bitrate-limit", value_name = "rate")]
-    pub server_bitrate_limit: Option<String>,
+    // #328: GT parses `rate[/interval]` (iperf_api.c:1366-1385) — the
+    // interval piece with C atof + IETOTALINTERVAL, then the rate with
+    // unit_atof_rate (1000-based) + IEUNITVAL, both in main.rs. allow_hyphen:
+    // a negative rate (uint64)-wraps huge and GT proceeds.
+    #[arg(
+        long = "server-bitrate-limit",
+        value_name = "rate",
+        allow_hyphen_values = true
+    )]
+    pub server_bitrate_limit: Option<std::ffi::OsString>,
 
     /// Max time a test can run on the server
     #[arg(
@@ -332,8 +351,13 @@ pub struct Cli {
     pub sendmmsg: bool,
 
     /// Use control connection TCP keepalive
-    #[arg(long, value_name = "idle/intv/cnt")]
-    pub cntl_ka: Option<String>,
+    // #328: GT's --cntl-ka is optional_argument (iperf_api.c:1191) — bare
+    // `--cntl-ka` enables keepalive with the 0-defaults (:3311-3313, filled
+    // at socket time :5590-5600); the spec pieces are each C atoi and the
+    // sanity check → IECNTLKA lives in main.rs. Raw OsString: garbage
+    // pieces atoi to 0 like GT.
+    #[arg(long, value_name = "idle/intv/cnt", num_args = 0..=1, default_missing_value = "")]
+    pub cntl_ka: Option<std::ffi::OsString>,
 
     /// Username for authentication
     #[arg(long)]
@@ -717,7 +741,11 @@ impl Cli {
             builder = builder.dscp(val);
         }
         if let Some(ref spec) = self.cntl_ka {
-            builder = builder.cntl_ka(spec);
+            // #328: the IECNTLKA sanity check runs pre-sink in main.rs; the
+            // lib takes the spec string (empty = bare --cntl-ka = keepalive
+            // with defaults, like GT's optional_argument). Lossy is safe:
+            // invalid-UTF-8 pieces atoi to 0 either way.
+            builder = builder.cntl_ka(&spec.to_string_lossy());
         }
         if let Some(ref name) = self.username {
             builder = builder.username(name);
@@ -771,7 +799,21 @@ impl Cli {
             builder = builder.idle_timeout(u32::try_from(secs).unwrap_or(u32::MAX));
         }
         if let Some(ref s) = self.server_bitrate_limit {
-            builder = builder.server_bitrate_limit_str(s)?;
+            // #328: GT's `bitrate_limit = unit_atof_rate(rate_part)` — an
+            // iperf_size_t (uint64), so a negative rate wraps huge and GT
+            // proceeds (iperf_api.c:1379-1383). The IETOTALINTERVAL check
+            // on the interval part runs pre-sink in main.rs. RECORDED
+            // DEVIATION: the interval VALUE is validated like GT but not
+            // wired — riperf3's limit enforcement keeps its own averaging
+            // window (the lib has no interval knob).
+            let (rate, _interval) = split_rate_interval(s);
+            let n = unit_atof_rate_like_bytes(rate).map_err(|()| {
+                format!(
+                    "invalid unit value or suffix: '{}'",
+                    String::from_utf8_lossy(rate)
+                )
+            })?;
+            builder = builder.server_bitrate_limit(c_double_to_u64(n));
         }
         if let Some(secs) = self.server_max_duration {
             builder = builder.server_max_duration(u32::try_from(secs).unwrap_or(u32::MAX));
@@ -1002,23 +1044,105 @@ fn c_strtod_prefix(s: &[u8]) -> Option<(f64, usize)> {
     Some((text.parse::<f64>().expect("valid double prefix"), i + j))
 }
 
-/// #328: GT's `unit_atoi` (units.c:190-227) minus the final integer cast —
-/// the scaled double, so each call site can apply ITS C target-type
-/// conversion (`iperf_size_t` for -n/-k, `int` for -l/--pacing-timer/
-/// --connect-timeout). Suffix ∈ [tTgGmMkK] scales by 1024^n; end-of-string
-/// means no scaling; any OTHER byte right after the number — junk after a
-/// valid suffix is IGNORED (`10Kx` is 10240: sscanf never reads the x) —
-/// or an unparseable number is Err (IEUNITVAL).
-pub fn unit_atoi_like_bytes(s: &[u8]) -> Result<f64, ()> {
+/// The shared suffix step of GT's unit parsers: the number's C-double
+/// prefix, then AT MOST ONE suffix char in [tTgGmMkK] scaling by base^n;
+/// end-of-string means no scaling; junk AFTER a valid suffix is IGNORED
+/// (`10Kx` is 10240: sscanf never reads the x); any OTHER byte right after
+/// the number — or an unparseable number — is Err (IEUNITVAL).
+fn unit_suffix_scaled(s: &[u8], base: f64) -> Result<f64, ()> {
     let (n, consumed) = c_strtod_prefix(s).ok_or(())?;
     match s.get(consumed) {
         None => Ok(n),
-        Some(b't' | b'T') => Ok(n * 1024f64.powi(4)),
-        Some(b'g' | b'G') => Ok(n * 1024f64.powi(3)),
-        Some(b'm' | b'M') => Ok(n * 1024f64.powi(2)),
-        Some(b'k' | b'K') => Ok(n * 1024.0),
+        Some(b't' | b'T') => Ok(n * base.powi(4)),
+        Some(b'g' | b'G') => Ok(n * base.powi(3)),
+        Some(b'm' | b'M') => Ok(n * base.powi(2)),
+        Some(b'k' | b'K') => Ok(n * base),
         Some(_) => Err(()),
     }
+}
+
+/// #328: GT's `unit_atoi` (units.c:190-227, 1024-based) minus the final
+/// integer cast — the scaled double, so each call site can apply ITS C
+/// target-type conversion (`iperf_size_t` for -n/-k, `int` for
+/// -l/--pacing-timer/--connect-timeout).
+pub fn unit_atoi_like_bytes(s: &[u8]) -> Result<f64, ()> {
+    unit_suffix_scaled(s, 1024.0)
+}
+
+/// #328: GT's `unit_atof_rate` (units.c:136-173) — the RATE sibling with
+/// 1000-based suffixes (--server-bitrate-limit's rate part).
+pub fn unit_atof_rate_like_bytes(s: &[u8]) -> Result<f64, ()> {
+    unit_suffix_scaled(s, 1000.0)
+}
+
+/// #328: C `atof` — strtod's longest-prefix value, garbage → 0.0 (GT's -i
+/// at iperf_api.c:1260 and --server-bitrate-limit's interval at :1372).
+pub fn atof_like_bytes(s: &[u8]) -> f64 {
+    c_strtod_prefix(s).map_or(0.0, |(n, _)| n)
+}
+
+/// A clap value parser applying [`atof_like_bytes`] at the `OsString` level
+/// (#328): raw invalid-UTF-8 argv bytes are strtod garbage → 0.0, like GT.
+fn atof_like_os() -> impl clap::builder::TypedValueParser<Value = f64> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new()
+        .map(|s: std::ffi::OsString| atof_like_bytes(s.as_encoded_bytes()))
+}
+
+/// #328: GT's -d/--debug level parse (iperf_api.c:1692-1697): C atoi, and a
+/// NEGATIVE level means DEBUG_LEVEL_MAX (4, iperf.h:300). No upper clamp —
+/// `--debug=100` is level 100 in GT too.
+fn debug_level_like_os() -> impl clap::builder::TypedValueParser<Value = i64> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new().map(|s: std::ffi::OsString| {
+        let v = atoi_like_bytes(s.as_encoded_bytes());
+        if v < 0 {
+            4
+        } else {
+            v
+        }
+    })
+}
+
+/// #328: --server-bitrate-limit's `rate[/interval]` split
+/// (iperf_api.c:1366-1385): GT strchr's the FIRST '/', atof's everything
+/// after it as the averaging interval, and unit_atof_rate's the part
+/// before it.
+pub fn split_rate_interval(spec: &std::ffi::OsStr) -> (&[u8], Option<&[u8]>) {
+    let b = spec.as_encoded_bytes();
+    match b.iter().position(|&c| c == b'/') {
+        Some(i) => (&b[..i], Some(&b[i + 1..])),
+        None => (b, None),
+    }
+}
+
+/// #328: GT's --cntl-ka sanity check (iperf_api.c:1626-1653): the optarg
+/// is slash-separated `keepidle[/interval[/count]]`, each non-empty piece
+/// C atoi (empty pieces keep the 0 defaults, iperf_api.c:3311-3313; the
+/// third piece's atoi absorbs any further slashes as trailing junk), then
+/// `keepidle != 0 && keepidle <= count * interval` → IECNTLKA. The product
+/// is C int arithmetic (wrapping).
+pub fn cntl_ka_violation(spec: &std::ffi::OsStr) -> bool {
+    let b = spec.as_encoded_bytes();
+    let (p0, rest) = match b.iter().position(|&c| c == b'/') {
+        Some(i) => (&b[..i], Some(&b[i + 1..])),
+        None => (b, None),
+    };
+    let (p1, p2) = match rest {
+        None => (None, None),
+        Some(r) => match r.iter().position(|&c| c == b'/') {
+            Some(i) => (Some(&r[..i]), Some(&r[i + 1..])),
+            None => (Some(r), None),
+        },
+    };
+    let piece = |p: Option<&[u8]>| -> i32 {
+        p.filter(|p| !p.is_empty())
+            .map_or(0, |p| atoi_like_bytes(p) as i32)
+    };
+    let keepidle = piece(Some(p0));
+    let interval = piece(p1);
+    let count = piece(p2);
+    keepidle != 0 && keepidle <= count.wrapping_mul(interval)
 }
 
 /// #328: C's `(iperf_size_t)` — i.e. `(uint64_t)` — conversion of a double,
@@ -2239,6 +2363,41 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").interval(0.5).build().unwrap());
         }
 
+        // #328: -i is C atof — strtod's longest prefix, garbage → 0.0
+        // (iperf_api.c:1260; live-probed: GT runs `-i 2x` at 2.0 and
+        // `-i x` as 0.0).
+        #[test]
+        fn interval_atof_values_wire_like_gt() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-i", "2x"]);
+            assert_eq!(cli.interval, Some(2.0));
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").interval(2.0).build().unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "-i", "x"]);
+            assert_eq!(cli.interval, Some(0.0));
+        }
+
+        // #328: -d/--debug's level is C atoi with negative → 4
+        // (iperf_api.c:1692-1697); garbage is level 0 and there is no
+        // upper clamp, all GT-accepted (live-probed).
+        #[test]
+        fn debug_level_parses_like_gt() {
+            assert_eq!(Cli::parse_from(["riperf3", "-s", "-d"]).debug, Some(4));
+            assert_eq!(
+                Cli::parse_from(["riperf3", "-s", "--debug=abc"]).debug,
+                Some(0)
+            );
+            assert_eq!(
+                Cli::parse_from(["riperf3", "-s", "--debug=-1"]).debug,
+                Some(4)
+            );
+            assert_eq!(
+                Cli::parse_from(["riperf3", "-s", "--debug=100"]).debug,
+                Some(100)
+            );
+        }
+
         // zerocopy (sendfile) is rejected by `build()` on non-unix
         // (cfg(not(unix)) → Unsupported), so its wiring test is gated to
         // unix to match — same as congestion_flag_wired / bind_dev_wired.
@@ -2262,9 +2421,21 @@ mod cli_tests {
 
         #[test]
         fn cntl_ka_wired() {
-            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka", "10/5/3"]);
+            // 20 > 5*3, so the spec also passes GT's IECNTLKA sanity check.
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka", "20/5/3"]);
             let c = build_client_from_cli(&cli);
-            assert_eq!(c, expected_client("h").cntl_ka("10/5/3").build().unwrap());
+            assert_eq!(c, expected_client("h").cntl_ka("20/5/3").build().unwrap());
+        }
+
+        // #328: bare --cntl-ka (GT optional_argument, iperf_api.c:1191)
+        // enables keepalive with the all-defaults spec.
+        #[test]
+        fn cntl_ka_bare_wires_defaults() {
+            let cli = Cli::parse_from(["riperf3", "-c", "h", "--cntl-ka"]);
+            assert_eq!(
+                build_client_from_cli(&cli),
+                expected_client("h").cntl_ka("").build().unwrap()
+            );
         }
 
         // #140: iperf3 permits only ONE test end condition; -t with -n/-k (or
@@ -2557,6 +2728,40 @@ mod cli_tests {
                 riperf3::ServerBuilder::new()
                     .server_bitrate_limit_str("100M")
                     .unwrap()
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        // #328: the rate part is GT's unit_atof_rate (1000-based) with the
+        // /interval piece split off first (iperf_api.c:1366-1385) — junk
+        // after the suffix is ignored, and a negative rate (uint64)-wraps
+        // huge like GT's iperf_size_t assignment. RECORDED DEVIATION: the
+        // interval VALUE is range-checked like GT (IETOTALINTERVAL, in
+        // main.rs) but not wired — the lib keeps its own averaging window.
+        #[test]
+        fn server_bitrate_limit_rate_parses_like_gt() {
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "10M/2"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .server_bitrate_limit(10_000_000)
+                    .build()
+                    .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "10Kx"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .server_bitrate_limit(10_000)
+                    .build()
+                    .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "-5"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .server_bitrate_limit(u64::MAX - 4)
                     .build()
                     .unwrap()
             );
