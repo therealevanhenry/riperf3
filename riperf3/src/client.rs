@@ -95,6 +95,24 @@ pub struct Client {
 /// subtract for the post-omit summary (#31) — this also reads a real iperf3
 /// server's omit results correctly. `is_udp` gates the datagram columns so a
 /// TCP pair line stays a plain byte line.
+/// This host's own omitted count for a stream (#271): omitted SENT
+/// datagrams on sending streams, omitted RECEIVED datagrams on receiving
+/// ones — the local estimate the old-peer resolution nets with. 0 without
+/// `-O`, and harmless for TCP (it only feeds UDP figures).
+fn local_omitted_for(
+    is_sender: bool,
+    counters: &crate::stream::StreamCounters,
+    udp_recv_stats: Option<&std::sync::Mutex<crate::stream::UdpRecvStats>>,
+) -> i64 {
+    if is_sender {
+        (counters.datagrams_sent() - counters.datagrams_sent_net()) as i64
+    } else {
+        udp_recv_stats
+            .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
+            .unwrap_or(0)
+    }
+}
+
 fn peer_half_summary(
     x: &protocol::StreamResultJson,
     local_is_sender: bool,
@@ -1925,20 +1943,11 @@ impl Client {
                         peer_has_retr,
                         test_duration,
                         role_tag,
-                        // #271: this host's own omitted count for the stream
-                        // (0 without -O; TCP harmless — it only feeds UDP
-                        // figures): omitted SENT datagrams on sending streams,
-                        // omitted RECEIVED on receiving ones.
-                        if s.meta.is_sender {
-                            (s.meta.counters.datagrams_sent()
-                                - s.meta.counters.datagrams_sent_net())
-                                as i64
-                        } else {
-                            s.udp_recv_stats
-                                .as_ref()
-                                .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
-                                .unwrap_or(0)
-                        },
+                        local_omitted_for(
+                            s.meta.is_sender,
+                            &s.meta.counters,
+                            s.udp_recv_stats.as_deref(),
+                        ),
                     )
                 });
 
@@ -2089,15 +2098,14 @@ impl Client {
                     // — attach them to the sender entry, in bidir exactly as
                     // in forward mode (#25, #182; iperf3 does the same).
                     // Peer's gross counts minus its omitted_* baselines (#31);
-                    // an old peer sends none — GT's all-omitted substitution
-                    // applies (#271; the local sender's own omitted count and
-                    // the -1 unknown-errors sentinel, faithfully off-by-one).
+                    // an old peer sends none — net by this host's own omitted
+                    // sent count, error total un-netted (#271's clean
+                    // resolution; see resolve_peer_omitted's deviation record).
                     server_stream.map(|x| {
-                        let local_omitted_sent = (s.meta.counters.datagrams_sent()
-                            - s.meta.counters.datagrams_sent_net())
-                            as i64;
-                        let (omitted_errors, omitted_packets) =
-                            protocol::resolve_peer_omitted(x, local_omitted_sent);
+                        let (omitted_errors, omitted_packets) = protocol::resolve_peer_omitted(
+                            x,
+                            local_omitted_for(true, &s.meta.counters, None),
+                        );
                         UdpStreamStats {
                             jitter_secs: x.jitter,
                             lost_packets: x.errors - omitted_errors,
@@ -2171,20 +2179,14 @@ impl Client {
                     // saturating: the #24 sentinel-hardening posture for
                     // adversarial gross/omitted pairs.
                     remote_packets: server_stream.map(|x| {
-                        let local_omitted = if s.meta.is_sender {
-                            (s.meta.counters.datagrams_sent()
-                                - s.meta.counters.datagrams_sent_net())
-                                as i64
-                        } else {
-                            // Receiving stream: our own omitted RECEIVED count
-                            // is the best estimate of the peer's omit-window
-                            // sends (#271; GT collapses to all-omitted here).
-                            s.udp_recv_stats
-                                .as_ref()
-                                .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
-                                .unwrap_or(0)
-                        };
-                        let (_, omitted_packets) = protocol::resolve_peer_omitted(x, local_omitted);
+                        let (_, omitted_packets) = protocol::resolve_peer_omitted(
+                            x,
+                            local_omitted_for(
+                                s.meta.is_sender,
+                                &s.meta.counters,
+                                s.udp_recv_stats.as_deref(),
+                            ),
+                        );
                         x.packets.saturating_sub(omitted_packets)
                     }),
                     retransmits,
@@ -3403,6 +3405,27 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// #271 r1 F3(d): the role selection feeding the old-peer resolution —
+    /// omitted SENT on senders, omitted RECEIVED on receivers; a swap
+    /// degenerates both to the wrong source.
+    #[test]
+    fn local_omitted_for_selects_by_stream_role() {
+        use std::sync::{Arc, Mutex};
+        let counters = crate::stream::StreamCounters::new();
+        counters.record_datagrams_sent(15);
+        counters.snapshot_omit();
+        counters.record_datagrams_sent(5);
+        // Sender: gross 20 - net 5 = 15 omitted sent.
+        assert_eq!(super::local_omitted_for(true, &counters, None), 15);
+
+        let stats = Arc::new(Mutex::new(crate::stream::UdpRecvStats::default()));
+        stats.lock().unwrap().omitted_packet_count = 7;
+        // Receiver: its own omitted RECEIVED count.
+        assert_eq!(super::local_omitted_for(false, &counters, Some(&stats)), 7);
+        // Receiver without UDP stats (TCP): 0.
+        assert_eq!(super::local_omitted_for(false, &counters, None), 0);
+    }
     mod run_stage {
         use crate::client::RunStage;
 

@@ -49,6 +49,13 @@ pub enum RiperfError {
     #[error("control socket has closed unexpectedly")]
     ControlSocketClosed,
 
+    /// iperf3's IERECVRESULTS: the results exchange failed — riperf3 raises
+    /// it for a malformed exchange (#271: exactly one omitted_* key present,
+    /// GT iperf_api.c:2888-2892). GT's sentence, no "protocol violation"
+    /// wrapper (#151 convention).
+    #[error("unable to receive results")]
+    RecvResultsFailed,
+
     /// iperf3's IESERVERTERM: the server sent SERVER_TERMINATE mid-test; a
     /// partial summary is rendered from local data before this surfaces (#170).
     #[error("the server has terminated")]
