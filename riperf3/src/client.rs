@@ -1143,9 +1143,8 @@ impl Client {
                     if self.dont_fragment {
                         net::set_dont_fragment(&data_stream)?;
                     }
-                    if let Some(rate) = self.fq_rate {
-                        net::set_fq_rate(&data_stream, rate)?;
-                    }
+                    // #302: GT warns and continues on a pacing failure.
+                    net::apply_fq_rate(&data_stream, self.fq_rate.unwrap_or(0));
                     if let Some(ms) = self.rcv_timeout {
                         net::set_rcv_timeout(&data_stream, ms)?;
                     }
@@ -1292,6 +1291,9 @@ impl Client {
                     }
                     udp_sock.connect(remote).await?;
                     protocol::udp_connect_client(&udp_sock).await?;
+                    // #302: GT paces its UDP connect path too
+                    // (iperf_udp.c:704-718); fq-qdisc dependent, warn-only.
+                    net::apply_fq_rate(&udp_sock, self.fq_rate.unwrap_or(0));
 
                     // GSO/GRO is deliberately best-effort (#45), matching
                     // iperf3 3.20+'s --gsro: its iperf_udp_gso/iperf_udp_gro

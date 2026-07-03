@@ -2619,3 +2619,40 @@ async fn both_violations_relay_total_rate_like_gt() {
         other => panic!("expected the IETOTALRATE refusal, got {other:?}"),
     }
 }
+
+/// #302: GT enables SO_MAX_PACING_RATE on its ACCEPTED data sockets too
+/// (iperf_tcp.c:138-153), so a client's --fq-rate paces the server's
+/// reverse send path. Live GT reverse --fq-rate 5M ≈ 6.3 Mbps where the
+/// unpaced loopback runs ~100 Gbps — pre-fix riperf3 measured 95 Gbps.
+/// Linux-gated: the sockopt (and kernel-side TCP pacing) is Linux-only.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn server_paces_reverse_with_the_client_fq_rate() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .reverse(true)
+        .fq_rate(5_000_000)
+        .duration(2)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(25), client.run())
+        .await
+        .expect("client hung")
+        .expect("client errored");
+    let bps = report.end.sum_received.as_ref().unwrap().bits_per_second;
+    assert!(
+        bps < 20_000_000.0,
+        "the server's reverse send is fq-paced at ~5 Mbps like GT, got {bps}"
+    );
+    let _ = server_task.await;
+}
