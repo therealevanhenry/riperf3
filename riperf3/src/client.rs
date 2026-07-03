@@ -1948,7 +1948,8 @@ impl Client {
             // (an odd peer): the pair just collapses to the local line. The
             // peer's sender line shows its retransmits only when the peer
             // reported having them (#156 sender_has_retransmits).
-            let peer_has_retr = server_results.is_some_and(|r| r.sender_has_retransmits == 1);
+            // GT's END-report gates are C-truthy (iperf_api.c:4261/:4444, #308).
+            let peer_has_retr = server_results.is_some_and(|r| r.sender_has_retransmits != 0);
             let peer = server_results
                 .and_then(|r| r.streams.iter().find(|x| x.id == s.meta.id))
                 .map(|x| {
@@ -2166,7 +2167,7 @@ impl Client {
                     is_udp,
                     s.meta.is_sender,
                     ext.and_then(|e| e.total_retransmits),
-                    remote_cpu.is_some_and(|r| r.sender_has_retransmits == 1),
+                    remote_cpu.is_some_and(|r| r.sender_has_retransmits != 0),
                     server_stream.map(|x| x.retransmits),
                 );
 
@@ -2220,6 +2221,8 @@ impl Client {
             // #265: the peer's exchanged flag, consulted by the report only
             // in pure-receiver mode (GT's :2856 overwrite).
             peer_sender_has_retransmits: remote_cpu.map(|r| r.sender_has_retransmits),
+            // #310: the remote side of GT's congestion swap.
+            peer_congestion_used: remote_cpu.and_then(|r| r.congestion_used.clone()),
             local_has_retransmit_info: crate::tcp_info::has_retransmit_info(),
             duration: self.duration as f64,
             elapsed: test_duration,
