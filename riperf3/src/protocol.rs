@@ -452,7 +452,7 @@ pub struct StreamResultJson {
 /// 3.21 — iperf_api.c:3141 `omitted_packet_count = packet_count` — but
 /// never exchanges the baselines, so its `errors`/`packets` arrive GROSS).
 ///
-/// RECORDED DEVIATION (upstream bug, filed against esnet/iperf): GT's own
+/// RECORDED DEVIATION (upstream: esnet/iperf#2055): GT's own
 /// substitution (iperf_api.c:2914-2950) renders self-inconsistent figures
 /// against old peers — it swallows real loss entirely on no-omit runs
 /// (omitted_cnt_error := cnt_error), leaks its "-1 unknown" sentinel into
