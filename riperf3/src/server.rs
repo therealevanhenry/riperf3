@@ -25,6 +25,9 @@ pub(crate) struct TestConfig {
     pub bandwidth: u64,
     /// `-b rate/burst` block count from the client (0 = unset) (#160).
     pub burst: u32,
+    /// The client's `--fq-rate` (0 = unset): GT paces its ACCEPTED data
+    /// sockets with it too (iperf_tcp.c:138-153, #302).
+    pub fq_rate: u64,
     pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
@@ -118,6 +121,7 @@ impl TestConfig {
             // 1 Mbit/s throttled an iperf3 -b 0 reverse/bidir sender (#21). The
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
+            fq_rate: params.fqrate.unwrap_or(0),
             burst,
             // The client's --pacing-timer quantum (#32); iperf3 always sends
             // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
@@ -954,6 +958,13 @@ impl Server {
                         // iperf_common_sockopts errors (IESETTOS) when IP_TOS
                         // can't be applied, on both roles and both protocols.
                         net::set_tos(&data_stream, ctx.cfg.tos as u32)?;
+                    }
+                    // #302: GT enables fair-queue pacing on the server's
+                    // ACCEPTED data sockets too (iperf_tcp.c:138-153) — the
+                    // exchanged --fq-rate paces the reverse/bidir send path.
+                    // Linux sockopt; no-op elsewhere (like the client site).
+                    if ctx.cfg.fq_rate > 0 {
+                        net::set_fq_rate(&data_stream, ctx.cfg.fq_rate)?;
                     }
 
                     let stream_id = iperf3_stream_id(i);
