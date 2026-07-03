@@ -496,6 +496,20 @@ fn end_loop_client_terminate_exits_bounded_while_peer_holds() {
     );
 }
 
+/// #325 r5 nit: the mid-test terminate hold, pinned explicitly (the gates
+/// are shared with the two cells above, but a pin per cell keeps a silent
+/// regression impossible).
+#[test]
+fn mid_test_client_terminate_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario(12, true);
+    assert!(status.success(), "terminate ends cleanly like GT");
+    assert_eq!(
+        serr.trim(),
+        "riperf3: the client has terminated",
+        "GT's bare IECLIENTTERM line, printed while the peer still holds"
+    );
+}
+
 /// #325 r2 F6: the CLIENT side of the same default — GT's client message
 /// handler IEMESSAGEs an unmapped byte too (iperf_client_api.c:409-411).
 /// The byte replaces ExchangeResults(13) at the client's direct state wait
