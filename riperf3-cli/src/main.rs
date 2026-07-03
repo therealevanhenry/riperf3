@@ -59,7 +59,8 @@ fn main() -> std::process::ExitCode {
     // its getopt loop, ahead of the client-flag-on-server class (r1 F5).
     // RECORDED DEVIATION (r1 F4): with TWO violating flags GT reports the
     // command-line-FIRST one (per-flag getopt checks); riperf3 checks in a
-    // fixed order (duration, then idle-timeout) — clap's derive parse has no
+    // fixed order (duration, idle-timeout, format, reverse+bidir) — clap's
+    // derive parse has no
     // cheap arg-position access, and the divergence needs two simultaneously
     // invalid flags. The u32 arg types make GT's negative arms
     // unrepresentable.
@@ -81,6 +82,10 @@ fn main() -> std::process::ExitCode {
         // #263: GT's IEBADFORMAT — only the FIRST character of the argument
         // is inspected (iperf_api.c:1241), and [kmgtKMGT] is the whole set.
         Some("bad format specifier (valid formats are in the set [kmgtKMGT])")
+    } else if cli.reverse && cli.bidir {
+        // #309: GT's IEREVERSEBIDIR — the second of the pair is rejected
+        // inside the getopt loop (iperf_api.c:1423/:1431), either order.
+        Some("cannot be both reverse and bidirectional")
     } else {
         None
     };
