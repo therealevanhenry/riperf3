@@ -447,44 +447,35 @@ pub struct StreamResultJson {
     pub end_time: f64,
 }
 
-/// GT's old-peer substitution for the exchanged omit baselines (#271,
-/// iperf_api.c:2914-2926 sender arm / :2946-2950 receiver arm): when the
-/// peer sent no `omitted_*` keys (iperf3 <= 3.12), GT treats the affected
-/// figures as ALL-OMITTED rather than zero-omitted.
+/// Resolve the exchanged omit baselines when the peer sent none (#271:
+/// iperf3 <= 3.12 baselines its counters at the omit boundary exactly like
+/// 3.21 — iperf_api.c:3141 `omitted_packet_count = packet_count` — but
+/// never exchanges the baselines, so its `errors`/`packets` arrive GROSS).
 ///
-/// Returns `(omitted_errors, omitted_packets)` ready for the net
-/// subtraction the render sites do:
-/// - Local SENDER (the peer received; its entry carries receiver stats):
-///   `omitted_packets` := this host's own omitted SENT count; with an omit
-///   window, `omitted_errors` is GT's `-1` "unknown" sentinel when any
-///   errors arrived (net renders `errors + 1` at the stream level — the
-///   live 3.21↔3.12 probe shows the off-by-one against the sum) else 0;
-///   with NO omit window it swallows the whole count (`:= errors`, net 0 —
-///   live-probed: fwd no-omit loss renders 0/417713).
-/// - Local RECEIVER (the peer sent): `omitted_packets` := the peer's whole
-///   packet count (net sent figure 0 — live-probed: the reverse stream's
-///   lost_percent collapses to 0 while the sum keeps the true figure).
-pub fn resolve_peer_omitted(
-    x: &StreamResultJson,
-    local_is_sender: bool,
-    local_omitted_sent: i64,
-) -> (i64, i64) {
+/// RECORDED DEVIATION (upstream bug, filed against esnet/iperf): GT's own
+/// substitution (iperf_api.c:2914-2950) renders self-inconsistent figures
+/// against old peers — it swallows real loss entirely on no-omit runs
+/// (omitted_cnt_error := cnt_error), leaks its "-1 unknown" sentinel into
+/// the per-stream subtraction (stream lost = cnt_error + 1 while the sum
+/// skips the sentinel at :4246-4248 — the same document disagrees with
+/// itself by one), and marks the peer's WHOLE packet count omitted on the
+/// receiver arm (:4288: lost_percent renders 0 beside a nonzero
+/// lost_packets). All three live-verified 3.21<->3.12 (2026-07-02).
+/// riperf3 instead nets with the best estimate available on this side:
+///
+/// - `omitted_packets` := this host's own omitted count for the stream —
+///   the sender's omitted SENT datagrams (the peer received at most that
+///   many in the window; GT's sender arm uses the same estimate) or the
+///   receiver's omitted RECEIVED count (GT collapses instead). 0 without
+///   `-O`, where gross == net and the figures are exact.
+/// - `omitted_errors` := 0 always — the error split is unknowable from a
+///   gross total, so the honest figure is the un-netted count (under `-O`
+///   this can slightly overstate loss by errors from the omit window;
+///   consistent across the stream, sum, and percent surfaces).
+pub fn resolve_peer_omitted(x: &StreamResultJson, local_omitted: i64) -> (i64, i64) {
     match (x.omitted_errors, x.omitted_packets) {
         (Some(e), Some(p)) => (e, p),
-        _ if local_is_sender => {
-            let omitted_packets = local_omitted_sent;
-            let omitted_errors = if omitted_packets > 0 {
-                if x.errors > 0 {
-                    -1
-                } else {
-                    0
-                }
-            } else {
-                x.errors
-            };
-            (omitted_errors, omitted_packets)
-        }
-        _ => (0, x.packets),
+        _ => (0, local_omitted),
     }
 }
 
@@ -906,13 +897,14 @@ mod tests {
         );
     }
 
-    /// #271: GT's old-peer substitution arms (iperf_api.c:2914-2950),
-    /// pinned on the LIVE 3.21↔3.12 probe shapes (2026-07-02): the sender
-    /// arm swallows loss without an omit window, renders the -1 unknown
-    /// sentinel with one, and the receiver arm treats the peer's whole
-    /// packet count as omitted.
+    /// #271: the clean old-peer resolution — present keys pass through;
+    /// absent keys net by this host's own omitted count for the stream and
+    /// never net the error total (the split is unknowable from a gross
+    /// count). Deliberately NOT GT's substitution, whose rendered figures
+    /// are self-inconsistent (see resolve_peer_omitted's deviation record;
+    /// upstream bug filed).
     #[test]
-    fn resolve_peer_omitted_mirrors_gt_arms() {
+    fn resolve_peer_omitted_uses_clean_local_estimates() {
         let mk = |errors: i64, packets: i64, oe: Option<i64>, op: Option<i64>| StreamResultJson {
             id: 1,
             bytes: 0,
@@ -925,27 +917,19 @@ mod tests {
             start_time: 0.0,
             end_time: 2.0,
         };
-        // Present keys pass through untouched for BOTH arms.
+        // Present keys pass through untouched.
         let x = mk(9, 100, Some(2), Some(10));
-        assert_eq!(resolve_peer_omitted(&x, true, 5), (2, 10));
-        assert_eq!(resolve_peer_omitted(&x, false, 0), (2, 10));
-        // Sender arm, no local omit: the swallow (net errors render 0 —
-        // live: fwd no-omit lost=0/417713 despite real loss).
+        assert_eq!(resolve_peer_omitted(&x, 5), (2, 10));
+        // Absent, no local omit: gross == net — exact figures (GT swallows
+        // the loss here; live 3.21<->3.12 fwd rendered 0/417713).
         let x = mk(643, 417_713, None, None);
-        assert_eq!(resolve_peer_omitted(&x, true, 0), (643, 0));
-        // Sender arm, local omit window: -1 unknown sentinel when errors
-        // arrived (net = errors + 1 — live: stream 2852 vs sum 2851)...
+        assert_eq!(resolve_peer_omitted(&x, 0), (0, 0));
+        // Absent, with a local omit window: net packets by OUR omitted
+        // count; error total stays un-netted (no -1 sentinel arithmetic —
+        // GT's stream and sum disagree by one here, live 2852 vs 2851).
         let x = mk(2851, 416_693, None, None);
-        assert_eq!(resolve_peer_omitted(&x, true, 1_020), (-1, 1_020));
-        // ...and 0 when none did.
-        let x = mk(0, 416_693, None, None);
-        assert_eq!(resolve_peer_omitted(&x, true, 1_020), (0, 1_020));
-        // Receiver arm: the peer's whole count is omitted (net sent 0 —
-        // live: the reverse stream's figures collapse).
-        let x = mk(0, 417_573, None, None);
-        assert_eq!(resolve_peer_omitted(&x, false, 0), (0, 417_573));
+        assert_eq!(resolve_peer_omitted(&x, 1_020), (0, 1_020));
     }
-
     #[test]
     fn results_json_serializes_sentinel_as_signed_minus_one() {
         // When riperf3 is the server sending results to an (older) iperf3 client,

@@ -102,13 +102,13 @@ fn peer_half_summary(
     peer_has_retransmits: bool,
     end: f64,
     role_tag: Option<&'static str>,
-    local_omitted_sent: i64,
+    local_omitted: i64,
 ) -> crate::reporter::StreamSummary {
     let peer_is_sender = !local_is_sender;
-    // #271: an old peer (iperf3 <= 3.12) exchanges no omitted_* keys — GT's
-    // all-omitted posture substitutes the baselines before netting.
-    let (omitted_errors, omitted_packets) =
-        protocol::resolve_peer_omitted(x, local_is_sender, local_omitted_sent);
+    // #271: an old peer (iperf3 <= 3.12) exchanges no omitted_* keys —
+    // net by this host's own omitted count for the stream (the clean
+    // estimate; see resolve_peer_omitted's upstream-deviation record).
+    let (omitted_errors, omitted_packets) = protocol::resolve_peer_omitted(x, local_omitted);
     let (jitter, lost, total) = if !is_udp {
         (None, None, None)
     } else if peer_is_sender {
@@ -1925,11 +1925,20 @@ impl Client {
                         peer_has_retr,
                         test_duration,
                         role_tag,
-                        // #271: the sender-arm substitution needs this host's
-                        // own omitted SENT count (0 without -O; TCP harmless —
-                        // the arm only feeds UDP figures).
-                        (s.meta.counters.datagrams_sent() - s.meta.counters.datagrams_sent_net())
-                            as i64,
+                        // #271: this host's own omitted count for the stream
+                        // (0 without -O; TCP harmless — it only feeds UDP
+                        // figures): omitted SENT datagrams on sending streams,
+                        // omitted RECEIVED on receiving ones.
+                        if s.meta.is_sender {
+                            (s.meta.counters.datagrams_sent()
+                                - s.meta.counters.datagrams_sent_net())
+                                as i64
+                        } else {
+                            s.udp_recv_stats
+                                .as_ref()
+                                .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
+                                .unwrap_or(0)
+                        },
                     )
                 });
 
@@ -2088,7 +2097,7 @@ impl Client {
                             - s.meta.counters.datagrams_sent_net())
                             as i64;
                         let (omitted_errors, omitted_packets) =
-                            protocol::resolve_peer_omitted(x, true, local_omitted_sent);
+                            protocol::resolve_peer_omitted(x, local_omitted_sent);
                         UdpStreamStats {
                             jitter_secs: x.jitter,
                             lost_packets: x.errors - omitted_errors,
@@ -2162,11 +2171,20 @@ impl Client {
                     // saturating: the #24 sentinel-hardening posture for
                     // adversarial gross/omitted pairs.
                     remote_packets: server_stream.map(|x| {
-                        let local_omitted_sent = (s.meta.counters.datagrams_sent()
-                            - s.meta.counters.datagrams_sent_net())
-                            as i64;
-                        let (_, omitted_packets) =
-                            protocol::resolve_peer_omitted(x, s.meta.is_sender, local_omitted_sent);
+                        let local_omitted = if s.meta.is_sender {
+                            (s.meta.counters.datagrams_sent()
+                                - s.meta.counters.datagrams_sent_net())
+                                as i64
+                        } else {
+                            // Receiving stream: our own omitted RECEIVED count
+                            // is the best estimate of the peer's omit-window
+                            // sends (#271; GT collapses to all-omitted here).
+                            s.udp_recv_stats
+                                .as_ref()
+                                .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
+                                .unwrap_or(0)
+                        };
+                        let (_, omitted_packets) = protocol::resolve_peer_omitted(x, local_omitted);
                         x.packets.saturating_sub(omitted_packets)
                     }),
                     retransmits,
