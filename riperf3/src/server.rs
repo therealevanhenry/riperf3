@@ -588,7 +588,7 @@ impl Server {
         self.await_test_end(&mut ctx).await?;
 
         // ---- Shut down streams + flush the reporter ----
-        let end = self.shutdown_and_flush(&mut ctx).await;
+        let mut end = self.shutdown_and_flush(&mut ctx).await;
 
         // ORDER CONSTRAINT (#296): built BEFORE the --get-server-output
         // finish. Both read live stream counters; the exchange figures must
@@ -618,6 +618,17 @@ impl Server {
             server_output_json,
         )
         .await?;
+
+        // #319: an interrupt landing INSIDE the exchange phase fires after
+        // EndState froze report_error — re-resolve so the sigend dump
+        // carries the interrupt key like the mid-test arms. (A pre-exchange
+        // --get-server-output capture keeps its frozen shape: it was built
+        // before the signal by definition.)
+        if end.report_error.is_none() {
+            if let Some(msg) = &ctx.interrupted {
+                end.report_error = Some(msg.clone());
+            }
+        }
 
         // #137/#287: the report is built exactly ONCE per test, by
         // construction — the collections moved either into the pre-exchange
@@ -1594,11 +1605,25 @@ impl Server {
             };
 
             protocol::send_state(&mut ctx.ctrl, TestState::ExchangeResults).await?;
+            // #319 (sibling of #268): both post-test reads race the
+            // interrupt watch — a client wedging mid-results (or never
+            // sending IperfDone) must not hold the server past a signal.
+            // GT's server sigend longjmps out of the same reads. On fire:
+            // tell the client (best-effort), record the interrupt, and let
+            // the finalize phases render the sigend dump.
+            let mut exchange_interrupt = self.interrupt.clone().map(|w| w.0);
             // iperf3 protocol: server reads client results first, then sends its
             // own. The client's results are not used in the server's own report —
             // iperf3's server reports only its own measured bytes and a 0 remote
             // CPU (#50).
-            let _client_results = protocol::recv_results(&mut ctx.ctrl).await?;
+            let _client_results = tokio::select! {
+                r = protocol::recv_results(&mut ctx.ctrl) => r?,
+                msg = crate::client::wait_interrupt(exchange_interrupt.as_mut()) => {
+                    let _ = protocol::send_state(&mut ctx.ctrl, TestState::ServerTerminate).await;
+                    ctx.interrupted = Some(msg);
+                    return Ok(());
+                }
+            };
             protocol::send_results(&mut ctx.ctrl, &server_results).await?;
 
             // ---- DisplayResults / IperfDone ----
@@ -1606,7 +1631,15 @@ impl Server {
 
             // Wait for client to send IperfDone
             loop {
-                match protocol::recv_state(&mut ctx.ctrl).await {
+                let next = tokio::select! {
+                    r = protocol::recv_state(&mut ctx.ctrl) => r,
+                    msg = crate::client::wait_interrupt(exchange_interrupt.as_mut()) => {
+                        let _ = protocol::send_state(&mut ctx.ctrl, TestState::ServerTerminate).await;
+                        ctx.interrupted = Some(msg);
+                        return Ok(());
+                    }
+                };
+                match next {
                     Ok(TestState::IperfDone) => break,
                     // #145: AUDITABILITY ONLY — log an out-of-table control
                     // byte in the end-of-test loop, then STILL continue
