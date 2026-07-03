@@ -40,9 +40,13 @@ pub(crate) struct TestConfig {
     pub udp_counters_64bit: bool,
 }
 
-/// i64→i32 like cJSON's `valueint` saturation (#316 r2 F3): GT adopts the
-/// wire number through cJSON's int (INT_MAX/INT_MIN capped) and hands it
-/// RAW to setsockopt — the kernel is the validator.
+/// i64→i32 for the adopted dg (#316 r2 F3 / r3 nit): GT's bundled cjson
+/// carries `int64_t valueint` (cjson.h:119) and the narrowing happens at
+/// the C `int` field assignment (iperf_api.c:2602) — an
+/// implementation-defined mod-2^32 WRAP. riperf3 saturates instead;
+/// divergence needs a wrap-aliased |dg| >= 2^31 (unreachable from any
+/// real iperf3 build — int settings, blksize <= 65507). Either way the
+/// value then goes RAW to setsockopt — the kernel is the validator.
 fn saturate_i32(v: i64) -> i32 {
     v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
