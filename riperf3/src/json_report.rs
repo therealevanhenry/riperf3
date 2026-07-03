@@ -798,6 +798,12 @@ pub(crate) struct ReportInput {
     pub system_info: String,
     pub cpu: CpuUtilization,
     pub congestion_used: Option<String>,
+    /// The peer's exchanged `congestion_used`, `None` when no results
+    /// arrived or the peer has no TCP_CONGESTION. Fills the remote side of
+    /// GT's sender/receiver congestion swap on the CLIENT (iperf_api.c:
+    /// 4544-4559; the un-exchanged side's key is OMITTED, #310). The server
+    /// renders before its exchange, so its remote side is always absent.
+    pub peer_congestion_used: Option<String>,
     // start{} metadata (PR3).
     pub cookie: String,
     /// The control-socket MSS, emitted as `start.tcp_mss_default` for a TCP test
@@ -1252,8 +1258,16 @@ impl ReportInput {
             // accumulator — the reverse-sent aggregate carries the PEER's
             // exchanged counts (riding this host's receiving streams;
             // live-observed 2), the forward one ONLY the local senders'.
-            sum_sent_bidir_reverse =
-                Some(self.tcp_sum(rev_sent, false, self.retransmits_for(Some(false))));
+            sum_sent_bidir_reverse = Some(
+                self.tcp_sum(
+                    rev_sent,
+                    false,
+                    // #308: the reverse pass is the peer's direction — its
+                    // exchanged flag gates the key (GT's :4168-4171 swap).
+                    self.retransmits_for(Some(false))
+                        .filter(|_| self.effective_sender_flag(false)),
+                ),
+            );
             sum_received_bidir_reverse = Some(self.tcp_sum(local_recv, false, None));
             (
                 // #300 r2 F1: the bidir forward pass takes the same role-level
@@ -1262,7 +1276,8 @@ impl ReportInput {
                     local_sent,
                     true,
                     self.retransmits_for(Some(true))
-                        .or_else(|| self.stream_less_sender_retransmits()),
+                        .or_else(|| self.stream_less_sender_retransmits())
+                        .filter(|_| self.effective_sender_flag(true)),
                 ),
                 self.tcp_sum(fwd_recv, true, None),
             )
@@ -1344,7 +1359,14 @@ impl ReportInput {
                 (r, _) => r,
             };
             (
-                self.tcp_sum(sent_bytes, fwd_sender, retransmits),
+                // #308: the sum retransmits key follows the direction's
+                // effective flag (GT :4444) — off means the BARE variant,
+                // never the -1 sentinel collapse.
+                self.tcp_sum(
+                    sent_bytes,
+                    fwd_sender,
+                    retransmits.filter(|_| self.effective_sender_flag(!self.reverse)),
+                ),
                 self.tcp_sum(recv_bytes, fwd_sender, None),
             )
         };
@@ -1365,7 +1387,18 @@ impl ReportInput {
                 (None, local)
             }
         } else {
-            (self.congestion_used.clone(), self.congestion_used.clone())
+            // #310: GT swaps local/remote by the send direction at its
+            // upper pass (iperf_api.c:4544-4559) — forward AND bidir are
+            // sender-perspective (live-probed), pure reverse inverts — and
+            // OMITS an un-exchanged side (terminated runs, peers without
+            // TCP_CONGESTION) instead of fabricating the local value.
+            let local = self.congestion_used.clone();
+            let remote = self.peer_congestion_used.clone();
+            if self.reverse && !self.bidir {
+                (remote, local)
+            } else {
+                (local, remote)
+            }
         };
 
         // #261/#281: the refusal's `end` is bare `{}` (every key omitted, the
@@ -1648,15 +1681,13 @@ impl ReportInput {
         // no results arrived (r1 F1: GT's terminated -R dump is BARE — the
         // check_sender_has_retransmits default only rises on a successful
         // exchange). Server received-streams stay bare outright: GT's server
-        // report renders BEFORE its exchange (iperf_server_api.c:276→280).
+        // report renders BEFORE its exchange (iperf_server_api.c:277→280).
         // Live-probed 2026-07-02: Linux↔Linux keeps every healthy shape
         // byte-identical.
-        let emit_extras = if s.is_sender {
-            self.local_has_retransmit_info
-        } else if self.is_server {
+        let emit_extras = if self.is_server && !s.is_sender {
             false
         } else {
-            self.peer_sender_has_retransmits.is_some_and(|f| f != 0)
+            self.effective_sender_flag(s.is_sender)
         };
         let e = s.tcp_end.unwrap_or_default();
         let sender_side = |bytes: u64, retransmits: Option<i64>| TcpStreamSide {
@@ -1762,6 +1793,21 @@ impl ReportInput {
     /// every stream). Collapses the -1 "unavailable" sentinel rather than
     /// summing it (summing N sentinels would emit a nonsensical -N that
     /// iperf3 never produces).
+    /// The direction's effective sender_has_retransmits (#307/#308): the
+    /// local capability for a direction this host sends, the peer's
+    /// exchanged flag for one it receives — GT's per-pass swap
+    /// (iperf_api.c:4168-4171; the :2856 pure-receiver overwrite is the
+    /// single-direction special case of the same rule). Gates both the
+    /// per-stream sender extras (:4262) and the sum-level retransmits key
+    /// (:4444 emission, :4234 accumulation).
+    fn effective_sender_flag(&self, local_sends: bool) -> bool {
+        if local_sends {
+            self.local_has_retransmit_info
+        } else {
+            self.peer_sender_has_retransmits.is_some_and(|f| f != 0)
+        }
+    }
+
     fn retransmits_for(&self, want_sender: Option<bool>) -> Option<i64> {
         let vals: Vec<i64> = self
             .streams
@@ -1933,7 +1979,12 @@ mod tests {
             protocol: TransportProtocol::Tcp,
             reverse: false,
             bidir: false,
-            peer_sender_has_retransmits: None,
+            // The fixture models a HEALTHY completed exchange (#308/#310):
+            // real peers always return their flag and algorithm, so the
+            // frozen wire shapes are unchanged on any completed run. Pins
+            // for absent/flag-off exchanges override these explicitly.
+            peer_sender_has_retransmits: Some(1),
+            peer_congestion_used: Some("cubic".into()),
             local_has_retransmit_info: true,
             duration: 10.0,
             elapsed: 10.0,
@@ -2784,6 +2835,112 @@ mod tests {
             v["end"]["sum_sent_bidir_reverse"]["bytes"],
             serde_json::json!(0u64),
             "UDP bidir rev_sent arm: {v}"
+        );
+    }
+
+    /// #310: the client fills the congestion keys by GT's direction swap
+    /// (iperf_api.c:4544-4559) — its own algorithm on the side it drives,
+    /// the peer's EXCHANGED one on the other — and OMITS an un-exchanged
+    /// side instead of fabricating the local value (terminated runs,
+    /// no-TCP_CONGESTION peers). -C propagates via params, so live iperf3
+    /// pairs always agree; the swap is visible exactly when the exchange
+    /// is absent or the peer reports a different algorithm.
+    #[test]
+    fn client_congestion_keys_follow_gt_direction_swap() {
+        // Forward: sender = local, receiver = the peer's exchanged value.
+        let mut input = base_input();
+        input.congestion_used = Some("cubic".into());
+        input.peer_congestion_used = Some("bbr".into());
+        input.streams = vec![tcp_stream(1, true, 1_000, 1_000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["sender_tcp_congestion"], "cubic", "{v}");
+        assert_eq!(v["end"]["receiver_tcp_congestion"], "bbr", "{v}");
+
+        // Forward, no exchange: the remote side's key is OMITTED.
+        let mut input = base_input();
+        input.congestion_used = Some("cubic".into());
+        input.peer_congestion_used = None;
+        input.streams = vec![tcp_stream(1, true, 1_000, 1_000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["sender_tcp_congestion"], "cubic", "{v}");
+        assert!(
+            v["end"].get("receiver_tcp_congestion").is_none(),
+            "un-exchanged side omitted like GT: {v}"
+        );
+
+        // Reverse: the swap inverts; absent exchange omits the SENDER side.
+        let mut input = base_input();
+        input.reverse = true;
+        input.congestion_used = Some("cubic".into());
+        input.peer_congestion_used = Some("bbr".into());
+        input.streams = vec![tcp_stream(1, false, 1_000, 1_000)];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["sender_tcp_congestion"], "bbr", "{v}");
+        assert_eq!(v["end"]["receiver_tcp_congestion"], "cubic", "{v}");
+
+        // Bidir: GT's upper-mode pass is sender-perspective (live probe:
+        // snd = local, rcv = remote).
+        let mut input = base_input();
+        input.bidir = true;
+        input.congestion_used = Some("cubic".into());
+        input.peer_congestion_used = Some("bbr".into());
+        input.streams = vec![
+            tcp_stream(1, true, 1_000, 1_000),
+            tcp_stream(3, false, 1_000, 1_000),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(v["end"]["sender_tcp_congestion"], "cubic", "{v}");
+        assert_eq!(v["end"]["receiver_tcp_congestion"], "bbr", "{v}");
+    }
+
+    /// #308: GT gates the sum-level retransmits key on the direction's
+    /// effective sender_has_retransmits (emission :4444, accumulation
+    /// :4234 with the bidir per-pass swap :4168-4171) — flag off means the
+    /// BARE sum variant, never a -1. The per-stream objects took this gate
+    /// in #307; the sums must agree with them.
+    #[test]
+    fn sum_retransmits_follow_the_effective_flag() {
+        // Flag-off LOCAL platform (the Windows shape): streams carry the
+        // -1 platform sentinel; the sum key must be ABSENT, not -1.
+        let mut input = base_input();
+        input.local_has_retransmit_info = false;
+        input.streams = vec![tcp_stream_retr(1, true, 1_000, 1_000, Some(-1))];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert!(
+            v["end"]["sum_sent"].get("retransmits").is_none(),
+            "flag-off local: GT's bare sum variant: {v}"
+        );
+
+        // Reverse with a flag-off peer: same omission on the peer's side.
+        let mut input = base_input();
+        input.reverse = true;
+        input.peer_sender_has_retransmits = Some(0);
+        input.streams = vec![tcp_stream_retr(1, false, 1_000, 1_000, Some(2))];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert!(
+            v["end"]["sum_sent"].get("retransmits").is_none(),
+            "flag-off peer: no exchanged-retransmit sum: {v}"
+        );
+
+        // Bidir split: local flag on keeps sum_sent's key; a flag-off peer
+        // strips sum_sent_bidir_reverse's.
+        let mut input = base_input();
+        input.bidir = true;
+        input.peer_sender_has_retransmits = Some(0);
+        input.streams = vec![
+            tcp_stream_retr(1, true, 1_000, 1_000, Some(3)),
+            tcp_stream_retr(3, false, 1_000, 1_000, Some(5)),
+        ];
+        let v = serde_json::to_value(input.build()).unwrap();
+        assert_eq!(
+            v["end"]["sum_sent"]["retransmits"], 3,
+            "local direction keeps its total: {v}"
+        );
+        assert!(
+            v["end"]["sum_sent_bidir_reverse"]
+                .get("retransmits")
+                .is_none(),
+            "peer direction gated by the exchanged flag: {v}"
         );
     }
 
