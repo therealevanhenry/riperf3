@@ -104,10 +104,12 @@ const MOCK_RESULTS: &str = r#"{"cpu_util_total":1.0,"cpu_util_user":0.5,"cpu_uti
 /// phase (#325 r2 F1). Otherwise the round runs through DisplayResults and
 /// sends `final_byte` in place of IperfDone(16) — the end loop.
 fn drive_mock_round(port: u16, final_byte: u8, junk_mid_test: bool) {
-    drive_mock_round_params(port, final_byte, junk_mid_test, MOCK_PARAMS);
+    drive_mock_round_full(port, Some(final_byte), junk_mid_test, MOCK_PARAMS);
 }
 
-fn drive_mock_round_params(port: u16, final_byte: u8, junk_mid_test: bool, params: &str) {
+/// `final_action`: Some(byte) sends the byte; None closes both sockets —
+/// the abrupt-EOF cells (#330).
+fn drive_mock_round_full(port: u16, final_action: Option<u8>, mid_test: bool, params: &str) {
     let cookie = [b'x'; 37];
     let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
     ctrl.write_all(&cookie).unwrap();
@@ -119,17 +121,17 @@ fn drive_mock_round_params(port: u16, final_byte: u8, junk_mid_test: bool, param
     assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
     assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
     data.write_all(&[0u8; 4096]).unwrap();
-    if junk_mid_test {
-        ctrl.write_all(&[final_byte]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        return;
+    if !mid_test {
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
+        write_json_blob(&mut ctrl, MOCK_RESULTS);
+        read_json_blob(&mut ctrl); // server results
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
     }
-    ctrl.write_all(&[4u8]).unwrap(); // TestEnd
-    assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
-    write_json_blob(&mut ctrl, MOCK_RESULTS);
-    read_json_blob(&mut ctrl); // server results
-    assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
-    ctrl.write_all(&[final_byte]).unwrap();
+    match final_action {
+        Some(b) => ctrl.write_all(&[b]).unwrap(),
+        None => drop((ctrl, data)), // abrupt EOF, both sockets (#330)
+    }
     std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
@@ -147,6 +149,15 @@ fn run_scenario_params(
     json: bool,
     final_byte: u8,
     junk_mid_test: bool,
+    params: &'static str,
+) -> (String, String, std::process::ExitStatus) {
+    run_scenario_full(json, Some(final_byte), junk_mid_test, params)
+}
+
+fn run_scenario_full(
+    json: bool,
+    final_action: Option<u8>,
+    mid_test: bool,
     params: &'static str,
 ) -> (String, String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -172,9 +183,8 @@ fn run_scenario_params(
         riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    let mock = std::thread::spawn(move || {
-        drive_mock_round_params(port, final_byte, junk_mid_test, params)
-    });
+    let mock =
+        std::thread::spawn(move || drive_mock_round_full(port, final_action, mid_test, params));
     mock.join().expect("mock");
     let status =
         riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
@@ -507,6 +517,151 @@ fn mid_test_client_terminate_exits_bounded_while_peer_holds() {
         serr.trim(),
         "riperf3: the client has terminated",
         "GT's bare IECLIENTTERM line, printed while the peer still holds"
+    );
+}
+
+const CTRL_CLOSED: &str = "the client has unexpectedly closed the connection";
+
+/// #330: an abrupt EOF DURING the data phase is GT's IECTRLCLOSE read-site
+/// surface (iperf_server_api.c:249-254, live-probed): the doc carries the
+/// BARE sentence (direct iperf_err — no `error - ` prefix) over the
+/// accumulated intervals + bare end{}, stderr silent under -J, clean exit.
+#[test]
+fn mid_test_eof_takes_gt_ctrl_closed_shape_in_json() {
+    let (sout, serr, status) = run_scenario_full(true, None, true, MOCK_PARAMS);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(CTRL_CLOSED),
+        "GT's bare read-site sentence: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().is_some_and(|o| o.is_empty()),
+        "the final stats dump never ran — GT's end is bare {{}}: {doc}"
+    );
+    assert!(serr.trim().is_empty(), "-J stderr silent: {serr}");
+    assert!(status.success(), "GT sets IPERF_DONE — clean exit");
+}
+
+/// #330, text half: the single line, no summary block, exit 0
+/// (live-probed).
+#[test]
+fn mid_test_eof_prints_the_line_and_no_summary_in_text() {
+    let (sout, serr, status) = run_scenario_full(false, None, true, MOCK_PARAMS);
+    assert_eq!(serr.trim(), format!("riperf3: {CTRL_CLOSED}"));
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        0,
+        "no summary mid-test: {sout}"
+    );
+    assert!(status.success(), "clean exit like GT");
+}
+
+/// #330: EOF in the END loop — the fast-close-instead-of-IperfDone cell.
+/// GT prints the same sentence with the POPULATED end (its reporter ran at
+/// TEST_END; live-probed doc has sum_sent/sum_received/streams), where the
+/// old arm broke silently clean with no error key at all.
+#[test]
+fn end_loop_eof_takes_gt_ctrl_closed_shape_in_json() {
+    let (sout, serr, status) = run_scenario_full(true, None, false, MOCK_PARAMS);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(CTRL_CLOSED),
+        "GT's bare sentence rides the completed doc: {doc}"
+    );
+    assert!(
+        doc["end"]["streams"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "the exchange completed — end stays populated: {doc}"
+    );
+    assert!(serr.trim().is_empty(), "-J stderr silent: {serr}");
+    assert!(status.success(), "clean exit like GT");
+}
+
+/// #330, text half of the end-loop EOF: one summary dump + the line.
+#[test]
+fn end_loop_eof_prints_summary_and_the_line_in_text() {
+    let (sout, serr, status) = run_scenario_full(false, None, false, MOCK_PARAMS);
+    assert_eq!(serr.trim(), format!("riperf3: {CTRL_CLOSED}"));
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        1,
+        "the completed round prints its summary: {sout}"
+    );
+    assert!(status.success(), "clean exit like GT");
+}
+
+/// #330: a KNOWN state (ParamExchange=9) landing mid-test is GT's same
+/// IEMESSAGE default — its ONE message switch serves every phase
+/// (live-probed: byte 9 mid-test = the prefixed doc key + exit 0). The old
+/// #145 arm tolerated it as clean success.
+#[test]
+fn mid_test_known_stray_state_is_iemessage_like_gt() {
+    let (_sout, serr, status) = run_scenario_full(false, Some(9), true, MOCK_PARAMS);
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IEMESSAGE}"),
+        "GT's IEMESSAGE default covers known strays mid-test"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #330: TEST_START (1) mid-test stays GT's no-op arm
+/// (iperf_server_api.c:266-267) — the round completes clean after it.
+#[test]
+fn mid_test_test_start_byte_is_a_gt_noop() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[1u8]).unwrap(); // stray TEST_START: GT no-op
+        ctrl.write_all(&[4u8]).unwrap(); // then the real TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
+        write_json_blob(&mut ctrl, MOCK_RESULTS);
+        read_json_blob(&mut ctrl);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 14);
+        ctrl.write_all(&[16u8]).unwrap(); // IperfDone — clean round
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+
+    mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
+            .expect("server exits");
+    let serr = serr_reader.join().expect("stderr");
+    assert!(status.success(), "clean round");
+    assert!(
+        serr.trim().is_empty(),
+        "no error surface for GT's no-op arm: {serr}"
     );
 }
 

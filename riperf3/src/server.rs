@@ -40,6 +40,12 @@ pub(crate) struct TestConfig {
     pub udp_counters_64bit: bool,
 }
 
+/// GT's IECTRLCLOSE read-site sentence (iperf_server_api.c:249-254,
+/// live-probed #330): any post-accept control EOF prints/docs this BARE
+/// (direct iperf_err — no `error - ` prefix), sets IPERF_DONE, and the
+/// round ends CLEAN (exit 0, persistent keeps serving).
+const CTRL_CLOSED_MSG: &str = "the client has unexpectedly closed the connection";
+
 /// i64→i32 for the adopted dg (#316 r2 F3 / r3 nit): GT's bundled cjson
 /// carries `int64_t valueint` (cjson.h:119) and the narrowing happens at
 /// the C `int` field assignment (iperf_api.c:2602) — an
@@ -256,6 +262,11 @@ struct TestRunCtx {
     /// text prints no summary block, only the stderr line. The end-loop
     /// IEMESSAGE keeps its populated end: there the exchange completed.
     bare_end: bool,
+    /// #330: a control-connection EOF mid-test or in the end loop — GT's
+    /// IECTRLCLOSE read-site surface ([`CTRL_CLOSED_MSG`], clean round).
+    /// Mid-test rides bare_end (no final dump); end-loop keeps the
+    /// populated end (the exchange completed) — both live-probed.
+    ctrl_closed: bool,
     interrupted: Option<String>,
 }
 
@@ -430,6 +441,16 @@ impl Server {
                 Err(RiperfError::PeerDisconnected) => {
                     if self.verbose {
                         vprintln!("Client disconnected.");
+                    }
+                }
+                Err(RiperfError::ControlSocketClosed) => {
+                    // #330: the mid-test / end-loop control EOF — GT prints
+                    // its read-site sentence once (iperf_server_api.c:
+                    // 249-254) and keeps serving; under -J the doc carried
+                    // it (sink rule). Pre-test EOFs (port scans) stay on
+                    // the quiet PeerDisconnected arm above.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!("riperf3: {CTRL_CLOSED_MSG}");
                     }
                 }
                 Err(RiperfError::ClientTerminated) => {
@@ -636,6 +657,7 @@ impl Server {
             server_error: None,
             client_terminated: false,
             unknown_message: false,
+            ctrl_closed: false,
             bare_end: false,
             interrupted: None,
         };
@@ -705,6 +727,10 @@ impl Server {
                 // in-doc value carries the prefix (live-captured), unlike
                 // IECLIENTTERM's bare sentence above.
                 end.report_error = Some(format!("error - {}", RiperfError::UnknownControlMessage));
+            } else if ctx.ctrl_closed {
+                // #330: IECTRLCLOSE's read-site line is a DIRECT iperf_err
+                // — bare, no prefix (live-probed both windows).
+                end.report_error = Some(CTRL_CLOSED_MSG.to_string());
             }
         }
 
@@ -737,7 +763,13 @@ impl Server {
         // a peer that sends 12 and then holds its sockets must not park the
         // joins (it held the process for the peer's whole hold; GT exits on
         // its own clock). Covers the pre-existing mid-test terminate too.
-        if ctx.interrupted.is_some() || ctx.unknown_message || ctx.client_terminated {
+        // #330: ctrl_closed joins — a peer may EOF the control socket
+        // while holding the DATA sockets open; GT's cleanup closes them.
+        if ctx.interrupted.is_some()
+            || ctx.unknown_message
+            || ctx.client_terminated
+            || ctx.ctrl_closed
+        {
             for s in &ctx.streams {
                 s.task.abort();
             }
@@ -766,6 +798,12 @@ impl Server {
             // NOT errexit on even for one-off (`if (rc < -1)` — setup
             // failures only), so this must not become a process error (#224).
             return Err(RiperfError::UnknownControlMessage);
+        }
+        if ctx.ctrl_closed {
+            // #330: distinct from the broad PeerDisconnected so the serve
+            // loop prints GT's read-site line for exactly this class (the
+            // doc'd mid/end-loop EOF), while pre-test EOFs stay quiet.
+            return Err(RiperfError::ControlSocketClosed);
         }
         Ok(Some(report))
     }
@@ -1366,22 +1404,18 @@ impl Server {
                             ctx.client_terminated = true;
                             break;
                         }
-                        // #145: AUDITABILITY ONLY — log an out-of-sequence
-                        // KNOWN control byte during the data phase, then
-                        // STILL swallow it. GT's single message switch would
-                        // IEMESSAGE these too — tracked with the rest of the
-                        // generic-surface parity in #330.
-                        Ok(other) => {
-                            if !protocol::is_legal_next(
-                                TestState::TestRunning,
-                                other,
-                                protocol::Role::Server,
-                            ) {
-                                log::debug!(
-                                    "server: out-of-sequence control state {other:?} \
-                                     during the data phase (ignored)"
-                                );
-                            }
+                        // GT's TEST_START arm is a bare no-op mid-test too
+                        // (iperf_server_api.c:266-267) — ONE switch serves
+                        // every phase.
+                        Ok(TestState::TestStart) => {}
+                        // #330: every OTHER known state mid-test hits GT's
+                        // same IEMESSAGE default (live-probed: byte 9 = the
+                        // prefixed doc key, exit 0). The #145 tolerance is
+                        // gone on this loop like the end loop's (#329).
+                        Ok(_) => {
+                            ctx.unknown_message = true;
+                            ctx.bare_end = true;
+                            break;
                         }
                         // #325 r2 F1: an UNMAPPED byte during the data phase
                         // is the same IEMESSAGE default — GT's end processing
@@ -1394,6 +1428,14 @@ impl Server {
                         // ticks in the doc.
                         Err(RiperfError::UnknownControlMessage) => {
                             ctx.unknown_message = true;
+                            ctx.bare_end = true;
+                            break;
+                        }
+                        // #330: control EOF mid-test — GT's IECTRLCLOSE
+                        // read-site surface, a CLEAN round (IPERF_DONE):
+                        // bare sentence in the doc, no summary, exit 0.
+                        Err(RiperfError::PeerDisconnected) => {
+                            ctx.ctrl_closed = true;
                             ctx.bare_end = true;
                             break;
                         }
@@ -1456,6 +1498,7 @@ impl Server {
             || ctx.interrupted.is_some()
             || ctx.unknown_message
             || ctx.client_terminated
+            || ctx.ctrl_closed
         {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its
@@ -1734,6 +1777,7 @@ impl Server {
     ) -> Result<()> {
         if !ctx.client_terminated
             && !ctx.unknown_message
+            && !ctx.ctrl_closed
             && ctx.interrupted.is_none()
             && ctx.server_error.is_none()
         {
@@ -1835,7 +1879,14 @@ impl Server {
                         ctx.unknown_message = true;
                         return Ok(());
                     }
-                    Err(RiperfError::PeerDisconnected) => break,
+                    // #330: EOF instead of IperfDone — the fast-close
+                    // cell. GT prints its read-site sentence and the doc
+                    // keeps the error key over the POPULATED end (the
+                    // exchange completed; live-probed).
+                    Err(RiperfError::PeerDisconnected) => {
+                        ctx.ctrl_closed = true;
+                        break;
+                    }
                     Err(e) => return Err(e),
                 }
             }
