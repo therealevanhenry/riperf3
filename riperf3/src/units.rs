@@ -55,6 +55,16 @@ fn ladder(n: f64) -> String {
 /// e-notation when the ROUNDED exponent falls outside [-4, 2) — C99
 /// fprintf's %g rules, decided after rounding (99.6 → 100 → `1e+02`).
 pub(crate) fn g2(v: f64) -> String {
+    if !v.is_finite() {
+        // C's %g renders these as words; {:.1e} has no exponent to split on.
+        return if v.is_nan() {
+            "nan".to_string()
+        } else if v > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
     if v == 0.0 {
         return "0".to_string();
     }
@@ -356,5 +366,11 @@ mod tests {
         assert_eq!(g2(100.0), "1e+02");
         // Rounding happens BEFORE the notation switch: 99.6 → 100 → 1e+02.
         assert_eq!(g2(99.6), "1e+02");
+        // Non-finite inputs render like C's %g instead of panicking on the
+        // missing exponent (r1 n2 — unreachable from lost_percent, but g2
+        // is pub(crate) and a future caller must not hit the expect()).
+        assert_eq!(g2(f64::NAN), "nan");
+        assert_eq!(g2(f64::INFINITY), "inf");
+        assert_eq!(g2(f64::NEG_INFINITY), "-inf");
     }
 }

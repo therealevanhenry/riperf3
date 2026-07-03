@@ -164,6 +164,14 @@ fn usage_errors_exit_one() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
+    // #263 r1 n1: dropping the ValueEnum must not cost -f's accepted-charset
+    // discoverability — GT's help names the set: `[kmgtKMGT] format to
+    // report: Kbits, Mbits, Gbits, Tbits`.
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("[kmgtKMGT] format to report"),
+        "-f help names the accepted charset like GT: {help}"
+    );
     let out = std::process::Command::new(bin)
         .arg("--version")
         .output()
