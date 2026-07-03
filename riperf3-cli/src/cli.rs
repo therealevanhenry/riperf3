@@ -290,8 +290,8 @@ pub struct Cli {
     #[arg(long = "json-stream-full-output")]
     pub json_stream_full_output: bool,
 
-    /// Enable UDP GSO/GRO
-    #[arg(long)]
+    /// enable UDP GSO/GRO on both client and server (client-only option)
+    #[arg(long, verbatim_doc_comment)]
     pub gsro: bool,
 
     /// Use sendmmsg for batched UDP sends (experimental, Linux/FreeBSD/NetBSD)
