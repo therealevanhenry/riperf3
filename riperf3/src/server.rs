@@ -211,6 +211,12 @@ struct EndState {
     test_duration: f64,
 }
 
+/// INVARIANT (#296): `build_result_streams` runs before
+/// `finish_server_output` — the exchange figures are captured before the
+/// capture-finish renders text summaries from the same live counters. No
+/// suite can pin the inversion deterministically (post-flush counters are
+/// settled); the pipeline comment at the call site is the guard.
+///
 /// Where the test's rich report stands after `finish_server_output` (#287):
 /// either already built (the JSON-mode --get-server-output pre-exchange build,
 /// #33 — the drained collections are inside) or still pending, carrying the
@@ -582,8 +588,13 @@ impl Server {
         // ---- Shut down streams + flush the reporter ----
         let end = self.shutdown_and_flush(&mut ctx).await;
 
-        // Built BEFORE the --get-server-output finish, preserving the
-        // monolith's counter read order.
+        // ORDER CONSTRAINT (#296): built BEFORE the --get-server-output
+        // finish. Both read live stream counters; the exchange figures must
+        // be captured before the capture-finish renders text summaries, or
+        // a still-draining receiver could send the peer fresher numbers
+        // than its own rendered rows. Post-flush the counters are usually
+        // settled, so no deterministic pin can catch an inversion — this
+        // comment (and TestRunCtx's docs) are the guard.
         let result_streams = self.build_result_streams(&ctx, &end);
 
         // The ONE drain of the reporter's collections (#287): the reporter was
