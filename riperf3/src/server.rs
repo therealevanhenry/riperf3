@@ -142,6 +142,14 @@ impl TestConfig {
 /// test accumulates as it advances. One instance per served test; the
 /// phase-local variables the old monolithic `handle_one_test` mutated in
 /// place are now named fields with one owner.
+/// INVARIANT (#296): `build_result_streams` runs before
+/// `finish_server_output` — both read the same live stream counters, and
+/// the pipeline preserves the monolith's read order (the exchange figures
+/// are captured first; with live counters either order carries a small
+/// freshness skew — GT sidesteps it by snapshotting at TEST_END — so the
+/// order itself is the contract). No suite can pin an inversion
+/// deterministically (post-flush counters are settled); this doc and the
+/// pipeline comment at the call site are the guard.
 struct TestRunCtx {
     ctrl: tokio::net::TcpStream,
     /// The control-socket peer, for `start.accepted_connection` (#50):
@@ -582,8 +590,13 @@ impl Server {
         // ---- Shut down streams + flush the reporter ----
         let end = self.shutdown_and_flush(&mut ctx).await;
 
-        // Built BEFORE the --get-server-output finish, preserving the
-        // monolith's counter read order.
+        // ORDER CONSTRAINT (#296): built BEFORE the --get-server-output
+        // finish. Both read live stream counters; the exchange figures must
+        // be captured before the capture-finish renders text summaries, or
+        // a still-draining receiver could send the peer fresher numbers
+        // than its own rendered rows. Post-flush the counters are usually
+        // settled, so no deterministic pin can catch an inversion — this
+        // comment (and TestRunCtx's docs) are the guard.
         let result_streams = self.build_result_streams(&ctx, &end);
 
         // The ONE drain of the reporter's collections (#287): the reporter was
