@@ -1007,9 +1007,10 @@ impl Client {
         p.window = self.window;
         // GT sends `bandwidth` only when nonzero (iperf_api.c:2456, #303) —
         // absent reads as 0 = unlimited on both sides, so `-b 0` stays
-        // unlimited server-side while the raw param JSON matches GT
-        // byte-wise. The UDP build-time default (unset → 1 Mbit/s) is
-        // nonzero and rides the wire like GT's UDP_RATE default.
+        // unlimited server-side with a key-set-identical raw param doc
+        // (key ORDER differs; JSON receivers are order-blind). The UDP
+        // build-time default (unset → 1 Mbit/s) is nonzero and rides the
+        // wire like GT's UDP_RATE default.
         p.bandwidth = (self.bandwidth > 0).then_some(self.bandwidth);
         // #260 r1 F2: GT sends `fqrate` whenever nonzero (iperf_api.c:2457-8)
         // — the server needs it for its upfront total-rate check AND for
@@ -1039,7 +1040,7 @@ impl Client {
         // GT serializes num/blockcount UNCONDITIONALLY (iperf_api.c:
         // 2436-2437), sending 0 for a plain -t run — the read side's
         // normalize_unlimited already treats Some(0) as no-limit (#119),
-        // so the wire now matches GT byte-wise too (#303).
+        // so the key sets now match GT too (#303).
         p.num = Some(self.bytes_to_send.unwrap_or(0));
         p.blockcount = Some(self.blocks_to_send.unwrap_or(0));
 

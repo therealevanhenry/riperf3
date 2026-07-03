@@ -62,8 +62,7 @@ fn main() -> std::process::ExitCode {
     // fixed order (duration, idle-timeout, format, reverse+bidir) — clap's
     // derive parse has no
     // cheap arg-position access, and the divergence needs two simultaneously
-    // invalid flags. The u32 arg types make GT's negative arms
-    // unrepresentable.
+    // invalid flags.
     const MAX_TIME_SECS: i64 = 86_400;
     // #303 item 3: the args parse as i64 with negatives allowed, so GT's
     // atoi-wrapped negative arms land in the SAME range checks and wordings
