@@ -103,16 +103,22 @@ pub struct Cli {
     pub daemon: bool,
 
     /// Restart idle server after # seconds
-    #[arg(long, value_name = "secs")]
-    pub idle_timeout: Option<u32>,
+    // i64 + negatives accepted at parse (#303): GT's atoi wraps them into
+    // its range checks; the pre-sink chain rejects with GT's wording.
+    #[arg(long, value_name = "secs", allow_negative_numbers = true)]
+    pub idle_timeout: Option<i64>,
 
     /// Server's total bit rate limit
     #[arg(long = "server-bitrate-limit", value_name = "rate")]
     pub server_bitrate_limit: Option<String>,
 
     /// Max time a test can run on the server
-    #[arg(long = "server-max-duration", value_name = "secs")]
-    pub server_max_duration: Option<u32>,
+    #[arg(
+        long = "server-max-duration",
+        value_name = "secs",
+        allow_negative_numbers = true
+    )]
+    pub server_max_duration: Option<i64>,
 
     // -----------------------------------------------------------------------
     // Client-specific arguments
@@ -122,8 +128,8 @@ pub struct Cli {
     pub udp: bool,
 
     /// Time in seconds to transmit for (default 10 secs)
-    #[arg(short = 't', long, value_name = "secs")]
-    pub time: Option<u32>,
+    #[arg(short = 't', long, value_name = "secs", allow_negative_numbers = true)]
+    pub time: Option<i64>,
 
     /// Number of bytes to transmit (instead of -t)
     #[arg(short = 'n', long, value_name = "bytes")]
@@ -176,8 +182,8 @@ pub struct Cli {
     pub tos: Option<String>,
 
     /// Omit the first N seconds of the test
-    #[arg(short = 'O', long, value_name = "secs")]
-    pub omit: Option<u32>,
+    #[arg(short = 'O', long, value_name = "secs", allow_negative_numbers = true)]
+    pub omit: Option<i64>,
 
     /// Prefix every output line with this string
     #[arg(short = 'T', long, value_name = "title")]
@@ -498,7 +504,7 @@ impl Cli {
             builder = builder.protocol(riperf3::TransportProtocol::Udp);
         }
         if let Some(t) = self.time {
-            builder = builder.duration(t);
+            builder = builder.duration(u32::try_from(t).unwrap_or(u32::MAX));
         }
         if let Some(ref s) = self.pacing_timer {
             builder = builder.pacing_timer_str(s)?;
@@ -540,7 +546,7 @@ impl Cli {
             builder = builder.tos_str(s)?;
         }
         if let Some(o) = self.omit {
-            builder = builder.omit(o);
+            builder = builder.omit(u32::try_from(o).unwrap_or(u32::MAX));
         }
         if let Some(i) = self.interval {
             builder = builder.interval(i);
@@ -683,13 +689,13 @@ impl Cli {
             builder = builder.json_stream_full_output(true);
         }
         if let Some(secs) = self.idle_timeout {
-            builder = builder.idle_timeout(secs);
+            builder = builder.idle_timeout(u32::try_from(secs).unwrap_or(u32::MAX));
         }
         if let Some(ref s) = self.server_bitrate_limit {
             builder = builder.server_bitrate_limit_str(s)?;
         }
         if let Some(secs) = self.server_max_duration {
-            builder = builder.server_max_duration(secs);
+            builder = builder.server_max_duration(u32::try_from(secs).unwrap_or(u32::MAX));
         }
         if self.forceflush {
             builder = builder.forceflush(true);

@@ -62,11 +62,16 @@ fn main() -> std::process::ExitCode {
     // fixed order (duration, idle-timeout, format, reverse+bidir) — clap's
     // derive parse has no
     // cheap arg-position access, and the divergence needs two simultaneously
-    // invalid flags. The u32 arg types make GT's negative arms
-    // unrepresentable.
-    const MAX_TIME_SECS: u32 = 86_400;
-    let range_violation = if cli.time.is_some_and(|t| t > MAX_TIME_SECS)
-        || cli.server_max_duration.is_some_and(|d| d > MAX_TIME_SECS)
+    // invalid flags.
+    const MAX_TIME_SECS: i64 = 86_400;
+    // #303 item 3: the args parse as i64 with negatives allowed, so GT's
+    // atoi-wrapped negative arms land in the SAME range checks and wordings
+    // (live-probed: `-t -1` → the duration sentence, `--idle-timeout -5` →
+    // the idle sentence, `-O -3`/`-O 700` → IEOMIT's bogus-value sentence).
+    let range_violation = if cli.time.is_some_and(|t| !(0..=MAX_TIME_SECS).contains(&t))
+        || cli
+            .server_max_duration
+            .is_some_and(|d| !(0..=MAX_TIME_SECS).contains(&d))
     {
         Some("test duration valid values are 0 to 86400 seconds")
     } else if cli
@@ -74,6 +79,9 @@ fn main() -> std::process::ExitCode {
         .is_some_and(|t| !(1..=MAX_TIME_SECS).contains(&t))
     {
         Some("idle timeout parameter is not positive or larger than allowed limit")
+    } else if cli.omit.is_some_and(|o| !(0..=600).contains(&o)) {
+        // GT's IEOMIT (MAX_OMIT_TIME 600, iperf.h:473), in-loop like the rest.
+        Some("bogus value for --omit (maximum = 600 seconds)")
     } else if cli
         .format
         .as_deref()

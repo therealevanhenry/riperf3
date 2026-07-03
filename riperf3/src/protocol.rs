@@ -376,8 +376,8 @@ pub struct TestParams {
 impl TestParams {
     /// Normalize a `0` byte/block limit to `None` (= no limit). iperf3
     /// *unconditionally* serializes `num`/`blockcount`, sending `0` for a plain
-    /// `-t` run, whereas riperf3 omits them — and serde `default` only fills a
-    /// *missing* field, so a real iperf3 client arrives as `Some(0)`. Without
+    /// `-t` run — and since #303 riperf3 sends them the same way — while serde
+    /// `default` only fills a *missing* field, so the pair arrives `Some(0)`. Without
     /// this, the server's `is_none()`/`is_some()` limit checks misread a duration
     /// run as byte-limited: it disables the UDP-sender `-t` deadline (#5 hang
     /// risk) and skews the summary window (#103). Call once at param ingest. #119

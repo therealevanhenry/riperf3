@@ -257,6 +257,58 @@ fn duration_range_validations_match_gt() {
             "the usage trailer rides parameter errors (GT shape): {stderr}"
         );
     }
+    // #303 item 3: NEGATIVE args take GT's parameter-error class — its
+    // atoi wraps them into the same range checks (live-probed wordings) —
+    // and -O has GT's own bounds check (MAX_OMIT_TIME 600, in-loop).
+    let neg_cases: &[(&[&str], &str)] = &[
+        (
+            &["-c", "127.0.0.1", "-t", "-1"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
+        (
+            &["-s", "--idle-timeout", "-5"],
+            "parameter error - idle timeout parameter is not positive or larger than allowed limit",
+        ),
+        (
+            &["-c", "127.0.0.1", "-O", "-3"],
+            "parameter error - bogus value for --omit (maximum = 600 seconds)",
+        ),
+        (
+            &["-c", "127.0.0.1", "-O", "700"],
+            "parameter error - bogus value for --omit (maximum = 600 seconds)",
+        ),
+        (
+            &["-s", "--server-max-duration", "-2"],
+            "parameter error - test duration valid values are 0 to 86400 seconds",
+        ),
+    ];
+    for (args, want) in neg_cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {want}")),
+            "{args:?}: GT wording expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+    // -O 600 is the legal boundary (fails later on connect, not at parse).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", "9", "-O", "600"])
+        .output()
+        .expect("spawn riperf3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("parameter error"),
+        "-O 600 is legal (0..=600): {stderr}"
+    );
+
     // The boundary VALUES are legal: -t 86400 must not be rejected at parse
     // time (it fails later on connect, not with a parameter error).
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
