@@ -95,6 +95,24 @@ pub struct Client {
 /// subtract for the post-omit summary (#31) — this also reads a real iperf3
 /// server's omit results correctly. `is_udp` gates the datagram columns so a
 /// TCP pair line stays a plain byte line.
+/// This host's own omitted count for a stream (#271): omitted SENT
+/// datagrams on sending streams, omitted RECEIVED datagrams on receiving
+/// ones — the local estimate the old-peer resolution nets with. 0 without
+/// `-O`, and harmless for TCP (it only feeds UDP figures).
+fn local_omitted_for(
+    is_sender: bool,
+    counters: &crate::stream::StreamCounters,
+    udp_recv_stats: Option<&std::sync::Mutex<crate::stream::UdpRecvStats>>,
+) -> i64 {
+    if is_sender {
+        (counters.datagrams_sent() - counters.datagrams_sent_net()) as i64
+    } else {
+        udp_recv_stats
+            .and_then(|l| l.lock().ok().map(|st| st.omitted_packet_count))
+            .unwrap_or(0)
+    }
+}
+
 fn peer_half_summary(
     x: &protocol::StreamResultJson,
     local_is_sender: bool,
@@ -102,19 +120,24 @@ fn peer_half_summary(
     peer_has_retransmits: bool,
     end: f64,
     role_tag: Option<&'static str>,
+    local_omitted: i64,
 ) -> crate::reporter::StreamSummary {
     let peer_is_sender = !local_is_sender;
+    // #271: an old peer (iperf3 <= 3.12) exchanges no omitted_* keys —
+    // net by this host's own omitted count for the stream (the clean
+    // estimate; see resolve_peer_omitted's upstream-deviation record).
+    let (omitted_errors, omitted_packets) = protocol::resolve_peer_omitted(x, local_omitted);
     let (jitter, lost, total) = if !is_udp {
         (None, None, None)
     } else if peer_is_sender {
         // Peer sent: zero jitter/loss over its sent count.
-        (Some(0.0), Some(0), Some(x.packets - x.omitted_packets))
+        (Some(0.0), Some(0), Some(x.packets - omitted_packets))
     } else {
         // Peer received: its measured stats.
         (
             Some(x.jitter),
-            Some(x.errors - x.omitted_errors),
-            Some(x.packets - x.omitted_packets),
+            Some(x.errors - omitted_errors),
+            Some(x.packets - omitted_packets),
         )
     };
     // A TCP peer sender renders the retransmit total it exchanged (#156/#184),
@@ -1673,9 +1696,9 @@ impl Client {
                     retransmits,
                     jitter,
                     errors,
-                    omitted_errors,
+                    omitted_errors: Some(omitted_errors),
                     packets,
-                    omitted_packets,
+                    omitted_packets: Some(omitted_packets),
                     start_time: 0.0,
                     end_time: test_duration,
                 }
@@ -1920,6 +1943,11 @@ impl Client {
                         peer_has_retr,
                         test_duration,
                         role_tag,
+                        local_omitted_for(
+                            s.meta.is_sender,
+                            &s.meta.counters,
+                            s.udp_recv_stats.as_deref(),
+                        ),
                     )
                 });
 
@@ -2069,12 +2097,21 @@ impl Client {
                     // peer's receiver and live only in the results it returned
                     // — attach them to the sender entry, in bidir exactly as
                     // in forward mode (#25, #182; iperf3 does the same).
-                    // Peer's gross counts minus its omitted_* baselines (#31).
-                    server_stream.map(|x| UdpStreamStats {
-                        jitter_secs: x.jitter,
-                        lost_packets: x.errors - x.omitted_errors,
-                        packets: x.packets - x.omitted_packets,
-                        out_of_order: 0,
+                    // Peer's gross counts minus its omitted_* baselines (#31);
+                    // an old peer sends none — net by this host's own omitted
+                    // sent count, error total un-netted (#271's clean
+                    // resolution; see resolve_peer_omitted's deviation record).
+                    server_stream.map(|x| {
+                        let (omitted_errors, omitted_packets) = protocol::resolve_peer_omitted(
+                            x,
+                            local_omitted_for(true, &s.meta.counters, None),
+                        );
+                        UdpStreamStats {
+                            jitter_secs: x.jitter,
+                            lost_packets: x.errors - omitted_errors,
+                            packets: x.packets - omitted_packets,
+                            out_of_order: 0,
+                        }
                     })
                 } else {
                     None
@@ -2141,8 +2178,17 @@ impl Client {
                     // bytes-derived figures until #235's counter half.
                     // saturating: the #24 sentinel-hardening posture for
                     // adversarial gross/omitted pairs.
-                    remote_packets: server_stream
-                        .map(|x| x.packets.saturating_sub(x.omitted_packets)),
+                    remote_packets: server_stream.map(|x| {
+                        let (_, omitted_packets) = protocol::resolve_peer_omitted(
+                            x,
+                            local_omitted_for(
+                                s.meta.is_sender,
+                                &s.meta.counters,
+                                s.udp_recv_stats.as_deref(),
+                            ),
+                        );
+                        x.packets.saturating_sub(omitted_packets)
+                    }),
                     retransmits,
                     tcp_end,
                     udp,
@@ -3359,6 +3405,27 @@ impl ClientBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// #271 r1 F3(d): the role selection feeding the old-peer resolution —
+    /// omitted SENT on senders, omitted RECEIVED on receivers; a swap
+    /// degenerates both to the wrong source.
+    #[test]
+    fn local_omitted_for_selects_by_stream_role() {
+        use std::sync::{Arc, Mutex};
+        let counters = crate::stream::StreamCounters::new();
+        counters.record_datagrams_sent(15);
+        counters.snapshot_omit();
+        counters.record_datagrams_sent(5);
+        // Sender: gross 20 - net 5 = 15 omitted sent.
+        assert_eq!(super::local_omitted_for(true, &counters, None), 15);
+
+        let stats = Arc::new(Mutex::new(crate::stream::UdpRecvStats::default()));
+        stats.lock().unwrap().omitted_packet_count = 7;
+        // Receiver: its own omitted RECEIVED count.
+        assert_eq!(super::local_omitted_for(false, &counters, Some(&stats)), 7);
+        // Receiver without UDP stats (TCP): 0.
+        assert_eq!(super::local_omitted_for(false, &counters, None), 0);
+    }
     mod run_stage {
         use crate::client::RunStage;
 
@@ -4179,14 +4246,14 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.000_03,
                 errors: 4258,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 267_190,
-                omitted_packets: 0,
+                omitted_packets: Some(0),
                 start_time: 0.0,
                 end_time: 5.0,
             };
 
-            let recv = peer_half_summary(&x, true, true, false, 5.0, None);
+            let recv = peer_half_summary(&x, true, true, false, 5.0, None, 0);
             assert!(!recv.is_sender, "server is the receiver in forward mode");
             assert_eq!(recv.lost, Some(4258));
             assert_eq!(recv.total_packets, Some(267_190));
@@ -4198,7 +4265,7 @@ mod tests {
             assert!(line.contains("4258/267190"), "{line}");
 
             // TCP forward: no datagram-loss columns, just a receiver byte line.
-            let tcp = peer_half_summary(&x, true, false, false, 5.0, None);
+            let tcp = peer_half_summary(&x, true, false, false, 5.0, None, 0);
             assert_eq!(tcp.lost, None);
             assert_eq!(tcp.total_packets, None);
             assert_eq!(tcp.jitter, None);
@@ -4215,13 +4282,13 @@ mod tests {
                 retransmits: -1,
                 jitter: 0.5, // a peer sender reports no meaningful jitter
                 errors: 0,
-                omitted_errors: 0,
+                omitted_errors: Some(0),
                 packets: 30,
-                omitted_packets: 5,
+                omitted_packets: Some(5),
                 start_time: 0.0,
                 end_time: 5.0,
             };
-            let snd = peer_half_summary(&x, false, true, false, 5.0, Some("RX-C"));
+            let snd = peer_half_summary(&x, false, true, false, 5.0, Some("RX-C"), 0);
             assert!(snd.is_sender, "peer half of a local receiver is the sender");
             assert_eq!(snd.jitter, Some(0.0), "sender line shows zero jitter");
             assert_eq!(snd.lost, Some(0), "sender line shows zero loss");
