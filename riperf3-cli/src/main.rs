@@ -121,6 +121,20 @@ fn main() -> std::process::ExitCode {
         eprintln!("warning: Report format (-f) flag ignored with JSON output (-J)");
     }
 
+    // #316: GT warns at parse end when --gsro rides a client build without
+    // local GSO/GRO support (iperf_api.c:1830-1839 — the flag still travels
+    // in params so the server may enable its side). riperf3 has both on
+    // Linux and neither elsewhere, so only GT's both-missing arm is
+    // reachable. Same bare warning() shape as -f above. The server-role
+    // reject (iperf_api.c:1825-1828, IECLIENTONLY) already fired above.
+    #[cfg(not(target_os = "linux"))]
+    if cli.gsro {
+        eprintln!(
+            "warning: --gsro requested but UDP GSO/GRO not supported on this client; \
+             will only be enabled on server if supported"
+        );
+    }
+
     // The error SINK is chosen by mode, like iperf_errexit (#198): -J puts
     // the message in a JSON document on stdout (nothing on stderr),
     // --json-stream emits an error event + empty end event, --logfile gets

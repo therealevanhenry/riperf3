@@ -290,8 +290,8 @@ pub struct Cli {
     #[arg(long = "json-stream-full-output")]
     pub json_stream_full_output: bool,
 
-    /// Enable UDP GSO/GRO
-    #[arg(long)]
+    /// enable UDP GSO/GRO on both client and server (client-only option)
+    #[arg(long, verbatim_doc_comment)]
     pub gsro: bool,
 
     /// Use sendmmsg for batched UDP sends (experimental, Linux/FreeBSD/NetBSD)
@@ -1791,8 +1791,8 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").interval(0.5).build().unwrap());
         }
 
-        // zerocopy (sendfile) and gsro (UDP GSO/GRO) are rejected by `build()` on
-        // non-unix (cfg(not(unix)) → Unsupported), so gate these wiring tests to
+        // zerocopy (sendfile) is rejected by `build()` on non-unix
+        // (cfg(not(unix)) → Unsupported), so its wiring test is gated to
         // unix to match — same as congestion_flag_wired / bind_dev_wired.
         #[cfg(unix)]
         #[test]
@@ -1802,7 +1802,9 @@ mod cli_tests {
             assert_eq!(c, expected_client("h").zerocopy(true).build().unwrap());
         }
 
-        #[cfg(unix)]
+        // --gsro builds on EVERY platform (#316): GT keeps the flag
+        // available regardless of local support so the request still
+        // reaches the server (iperf_api.c:1799-1804).
         #[test]
         fn gsro_wired() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--gsro"]);

@@ -28,10 +28,27 @@ pub(crate) struct TestConfig {
     /// The client's `--fq-rate` (0 = unset): GT paces its ACCEPTED data
     /// sockets with it too (iperf_tcp.c:138-153, #302).
     pub fq_rate: u64,
+    /// The client's GSO/GRO request (#316, GT iperf_api.c:2599-2619): the
+    /// server enables UDP_SEGMENT/UDP_GRO on its UDP sockets when asked —
+    /// best-effort like the client's #45 posture.
+    pub gso: bool,
+    pub gso_dg_size: i64,
+    pub gro: bool,
     pub pacing_timer: u32,
     pub tos: i32,
     pub congestion: Option<String>,
     pub udp_counters_64bit: bool,
+}
+
+/// i64→i32 for the adopted dg (#316 r2 F3 / r3 nit): GT's bundled cjson
+/// carries `int64_t valueint` (cjson.h:119) and the narrowing happens at
+/// the C `int` field assignment (iperf_api.c:2602) — an
+/// implementation-defined mod-2^32 WRAP. riperf3 saturates instead;
+/// divergence needs a wrap-aliased |dg| >= 2^31 (unreachable from any
+/// real iperf3 build — int settings, blksize <= 65507). Either way the
+/// value then goes RAW to setsockopt — the kernel is the validator.
+fn saturate_i32(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 impl TestConfig {
@@ -122,6 +139,22 @@ impl TestConfig {
             // 1 Mbit/s UDP default is a client-side concern, resolved at build.
             bandwidth: params.bandwidth.unwrap_or(0),
             fq_rate: params.fqrate.unwrap_or(0),
+            gso: params.gso.unwrap_or(0) != 0,
+            // GT recomputes a zero dg_size from the negotiated blksize
+            // (iperf_api.c:2607-2613). The len-absent arm (1460) is our
+            // choice for a hand-rolled peer: GT's own :2612
+            // DEFAULT_UDP_BLKSIZE arm is unreachable there — it would use
+            // its stale server-default blksize and let the probe EINVAL
+            // (r2 F5) — so 1460 is healthier and equally unreachable from
+            // conforming peers.
+            gso_dg_size: match params.gso_dg_size.unwrap_or(0) {
+                0 if params.gso.unwrap_or(0) != 0 => match params.len.unwrap_or(0) {
+                    blk if blk > 0 => i64::from(blk),
+                    _ => 1460,
+                },
+                v => v,
+            },
+            gro: params.gro.unwrap_or(0) != 0,
             burst,
             // The client's --pacing-timer quantum (#32); iperf3 always sends
             // it. Absent/non-positive (older peers) → iperf3's 1000 µs default.
@@ -1022,6 +1055,7 @@ impl Server {
                             raw_fd,
                             sock,
                             congestion_used,
+                            udp_offload: None,
                         },
                         task,
                         udp_recv_stats: None,
@@ -1804,8 +1838,12 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
-
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
+
+        // #316: the client's GSO/GRO request, probed per accepted socket
+        // below. Once a probe fails, GT zeroes the setting and later
+        // sockets don't retry (iperf_udp.c:459-515).
+        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
 
         // #178: each stream's spawn_blocking data thread is spawned through
         // the gate; the barrier below holds TestStart until the data plane
@@ -1822,6 +1860,21 @@ impl Server {
                     .await?;
             // The listener is now locked to this client — use it as the data socket
             let data_sock = udp_listener;
+            // #316: per-accept like GT's iperf_udp_accept (iperf_udp.c:
+            // 576-579) — the #320-class placement: the loop recycles a
+            // FRESH listener per stream, so a pre-loop call covered
+            // stream 0 only. Best-effort like GT (failure zeroes, never
+            // fatal). The dg value saturates i64→i32 like cJSON's valueint
+            // and passes RAW — the kernel EINVALs nonsense exactly like it
+            // does for GT (r2 F3). (GT probes BEFORE its 4-byte connect
+            // reply, riperf3 after — no observable delta, the reply is
+            // never segmented; r2 F4.)
+            if gso_on {
+                gso_on = net::set_udp_gso(&data_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
+            }
+            if gro_on {
+                gro_on = net::set_udp_gro(&data_sock).is_ok();
+            }
             // #302 r2: pace EVERY accepted stream — GT's block lives in
             // iperf_udp_accept (iperf_udp.c:581-595), once per stream; the
             // pre-loop listener call covered stream 0 only.
@@ -1889,6 +1942,7 @@ impl Server {
                         raw_fd: None,
                         sock,
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: None,
@@ -1911,6 +1965,7 @@ impl Server {
                         raw_fd: None,
                         sock,
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: Some(stats),
@@ -1970,6 +2025,15 @@ impl Server {
         // which is Windows-default (where the sockopt no-ops) and Linux
         // opt-in via RIPERF3_UDP_SERVER_DEMUX.
         net::apply_fq_rate(&udp_sock, cfg.fq_rate);
+        // #316: the demux shared socket IS the data socket — same GSO/GRO
+        // honor, best-effort, probed once for every stream's meta.
+        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
+        if gso_on {
+            gso_on = net::set_udp_gso(&udp_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
+        }
+        if gro_on {
+            gro_on = net::set_udp_gro(&udp_sock).is_ok();
+        }
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -2141,6 +2205,7 @@ impl Server {
                             rcvbuf_actual,
                         },
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: None,
@@ -2171,6 +2236,7 @@ impl Server {
                             rcvbuf_actual,
                         },
                         congestion_used: None,
+                        udp_offload: Some((gso_on, gro_on)),
                     },
                     task,
                     udp_recv_stats: Some(stats),
@@ -2183,10 +2249,11 @@ impl Server {
         if !routes.is_empty() {
             let s = shared.clone();
             let d = done.clone();
-            *demux_handle = Some(
-                thread_gate
-                    .spawn(move || stream::run_udp_server_demux_receiver(s, routes, d, u64bit)),
-            );
+            let bs = cfg.blksize;
+            *demux_handle =
+                Some(thread_gate.spawn(move || {
+                    stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
+                }));
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun
@@ -2459,9 +2526,25 @@ impl Server {
             bare_end: false,
             // The server reports at its 1s default; it has no -i.
             interval: 1.0,
-            // GSO/GRO are client-side knobs, not exchanged; iperf3's server emits 0.
-            gso: 0,
-            gro: 0,
+            // #316: the GSO/GRO request IS exchanged now — GT's server
+            // test_start carries the adopted values POST-probe (a failed
+            // setsockopt zeroes settings->gso/gro, iperf_udp.c:459-515;
+            // live-probed gso:1). Folded across streams like GT's
+            // settings zeroing; no UDP streams → the request as-is.
+            gso: i32::from(
+                cfg.gso
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(g, _)| g),
+            ),
+            gro: i32::from(
+                cfg.gro
+                    && streams
+                        .iter()
+                        .filter_map(|s| s.meta.udp_offload)
+                        .all(|(_, g)| g),
+            ),
             start_time_millis,
             // The client sends --extra-data via the parameter exchange; echo it
             // into the server's -J output too, like iperf3 (#35).
@@ -2980,6 +3063,33 @@ impl ServerBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// #316: the server adopts the client's exchanged GSO/GRO request
+    /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
+    /// from the negotiated blksize (:2607-2613).
+    #[test]
+    fn test_config_adopts_the_gsro_block() {
+        let params = crate::protocol::TestParams {
+            udp: Some(true),
+            len: Some(1200),
+            gso: Some(1),
+            gso_dg_size: Some(0), // old/odd peer: recompute from blksize
+            gro: Some(1),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        assert!(cfg.gso && cfg.gro);
+        assert_eq!(cfg.gso_dg_size, 1200, "zero dg_size recomputes from len");
+
+        // Absent block (old peer): everything off.
+        let params = crate::protocol::TestParams {
+            udp: Some(true),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        assert!(!cfg.gso && !cfg.gro);
+    }
+
     use super::*;
 
     /// Receive one datagram and return the IP_TOS control message byte, via

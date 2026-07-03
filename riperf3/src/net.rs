@@ -923,16 +923,25 @@ pub fn set_ipv6_flowlabel<F>(_fd: &F, _label: i32) -> Result<()> {
 
 /// Enable UDP GSO (Generic Segmentation Offload) on a UDP socket.
 /// Sets UDP_SEGMENT to the datagram size so the kernel can batch sends.
+/// The value passes through RAW like GT's `int gso` (iperf_udp.c:464-466,
+/// #316 r2 F3): the KERNEL is the validator — an out-of-range dg_size
+/// EINVALs, the probe fails, and the caller zeroes the setting exactly
+/// like GT. No clamp may invent a success GT would not have.
 #[cfg(target_os = "linux")]
-pub fn set_udp_gso(fd: &impl std::os::unix::io::AsFd, segment_size: u16) -> Result<()> {
+pub fn set_udp_gso(fd: &impl std::os::unix::io::AsFd, segment_size: i32) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
-    socket::setsockopt(fd, sockopt::UdpGsoSegment, &(segment_size as i32))
+    socket::setsockopt(fd, sockopt::UdpGsoSegment, &segment_size)
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
+/// GT's `#else` stub returns -1 and zeroes `settings->gso`
+/// (iperf_udp.c:479-486) — the probe must FAIL here so the adopted state
+/// and the `test_start` echo read 0, not a phantom 1 (#316 r1 F5).
 #[cfg(not(target_os = "linux"))]
-pub fn set_udp_gso<F>(_fd: &F, _segment_size: u16) -> Result<()> {
-    Ok(())
+pub fn set_udp_gso<F>(_fd: &F, _segment_size: i32) -> Result<()> {
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "UDP GSO not supported on this platform".to_string(),
+    )))
 }
 
 /// Enable UDP GRO (Generic Receive Offload) on a UDP socket.
@@ -943,9 +952,13 @@ pub fn set_udp_gro(fd: &impl std::os::unix::io::AsFd) -> Result<()> {
         .map_err(|e| RiperfError::Io(std::io::Error::from(e)))
 }
 
+/// GT's `#else` stub returns -1 and zeroes `settings->gro`
+/// (iperf_udp.c:508-515) — the probe must FAIL here (#316 r1 F5).
 #[cfg(not(target_os = "linux"))]
 pub fn set_udp_gro<F>(_fd: &F) -> Result<()> {
-    Ok(())
+    Err(RiperfError::Config(crate::error::ConfigError::Unsupported(
+        "UDP GRO not supported on this platform".to_string(),
+    )))
 }
 
 /// Set the TOS/traffic-class byte on a socket, family-aware like iperf3's
@@ -1051,6 +1064,57 @@ mod fq_rate_tests {
         };
         assert_eq!(rc, 0);
         assert_eq!(val, 5_000_000_000, "u64 payload survives (u32 wrapped)");
+    }
+}
+
+#[cfg(test)]
+mod gsro_sockopt_tests {
+    /// #316 r2 F2: readback pins that the probes actually TAKE on a socket
+    /// (the e2e -P 2 run exercises but cannot discriminate the per-accept
+    /// placement — a regressed pre-loop probe still walks to zero loss).
+    /// Also pins the raw-pass-through posture: the kernel EINVALs an
+    /// out-of-range dg like it does for GT (iperf_udp.c:464-470), so the
+    /// probe FAILS rather than a clamp inventing success (r2 F3).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_gso_gro_round_trip_and_kernel_validation() {
+        use std::os::fd::AsRawFd;
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        super::set_udp_gso(&sock, 1200).unwrap();
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_UDP,
+                libc::UDP_SEGMENT,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(val, 1200, "UDP_SEGMENT took the dg size");
+
+        super::set_udp_gro(&sock).unwrap();
+        let mut val: libc::c_int = 0;
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_UDP,
+                libc::UDP_GRO,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_ne!(val, 0, "UDP_GRO took");
+
+        // The kernel is the validator (GT's design): out-of-range dg fails
+        // the probe — no clamp turns it into success. (0 is NOT an error:
+        // the kernel takes it as GSO-off, and GT inherits the same.)
+        assert!(super::set_udp_gso(&sock, 999_999).is_err());
+        assert!(super::set_udp_gso(&sock, -1).is_err());
     }
 }
 
