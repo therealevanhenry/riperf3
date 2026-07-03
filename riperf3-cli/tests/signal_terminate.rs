@@ -702,3 +702,79 @@ fn predata_ctrl_close_emits_one_staged_doc() {
         "{doc}"
     );
 }
+
+/// #268: a peer that WEDGES mid-results-payload (length prefix + partial
+/// JSON, then nothing) must not outlive a signal — the bulk recv_results
+/// read joins the #231 interrupt surface. Pre-fix the client hung in the
+/// uninterruptible read until the CLI's #211 second-signal hard exit.
+#[test]
+fn mid_exchange_wedge_still_exits_on_signal() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let wedged = Arc::new(AtomicBool::new(false));
+    let wedged_w = wedged.clone();
+
+    let _mock = std::thread::spawn(move || {
+        let read_exact = |s: &mut std::net::TcpStream, n: usize| -> Vec<u8> {
+            let mut b = vec![0u8; n];
+            s.read_exact(&mut b).expect("mock read");
+            b
+        };
+        let read_json = |s: &mut std::net::TcpStream| {
+            let len = u32::from_be_bytes(read_exact(s, 4).try_into().unwrap()) as usize;
+            read_exact(s, len)
+        };
+
+        let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+        read_exact(&mut ctrl, 37); // cookie
+        ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+        read_json(&mut ctrl); // params
+        ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
+        let (mut data, _) = listener.accept().expect("data accept");
+        read_exact(&mut data, 37); // data-stream cookie
+        ctrl.write_all(&[1u8]).unwrap(); // TestStart
+        ctrl.write_all(&[2u8]).unwrap(); // TestRunning
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while data.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 4, "TestEnd");
+        ctrl.write_all(&[13u8]).unwrap(); // ExchangeResults
+        read_json(&mut ctrl); // the client's results
+                              // The wedge: a 500-byte payload announced, 40 bytes delivered.
+        ctrl.write_all(&500u32.to_be_bytes()).unwrap();
+        ctrl.write_all(&[b'{'; 40]).unwrap();
+        wedged_w.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(15)); // stall mid-payload
+        drop(drain);
+    });
+
+    let client = spawn(&["-c", "127.0.0.1", "-p", &port, "-n", "100K", "-J"]);
+    let t0 = Instant::now();
+    while !wedged.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "mock never reached the wedge"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(300)); // park in the bulk read
+    unsafe {
+        libc::kill(client.0.id() as i32, libc::SIGTERM);
+    }
+    let (cout, _cerr, ccode) =
+        wait_with_output_bounded(client, Duration::from_secs(5), "client mid-exchange wedge");
+    assert_eq!(ccode, 0, "signal-normal exit despite the wedged read");
+    let doc: serde_json::Value =
+        serde_json::from_str(cout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {cout}"));
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("terminated")),
+        "the sigend dump carries the interrupt error key: {doc}"
+    );
+}
