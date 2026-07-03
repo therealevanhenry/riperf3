@@ -322,6 +322,46 @@ fn duration_range_validations_match_gt() {
     );
 }
 
+/// #317: GT parses duration-like flags with atoi — suffixed garbage takes
+/// the leading digits, non-numerics are 0, and overflow wraps through int
+/// truncation (strtol-saturate then (int) cast: 2^32 → 0, 2^31 → INT_MIN →
+/// the range error). riperf3 rejected all of these with clap shapes.
+#[test]
+fn duration_like_flags_parse_like_atoi() {
+    // Parse-and-proceed cases: the value lands, the run fails on CONNECT
+    // (port 9), never on a parse error.
+    for args in [
+        &["-c", "127.0.0.1", "-p", "9", "-t", "5x"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-t", "abc"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-t", "-abc"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-t", "4294967296"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-t", " 7"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-O", "5x"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect") && !stderr.contains("parameter error"),
+            "{args:?} parses via atoi semantics and proceeds: {stderr}"
+        );
+    }
+    // The int-truncation edge: 2^31 wraps negative -> the range sentence.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-t", "2147483648"])
+        .output()
+        .expect("spawn riperf3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with(
+            "riperf3: parameter error - test duration valid values are 0 to 86400 seconds"
+        ),
+        "2^31 truncates to INT_MIN like GT's atoi: {stderr}"
+    );
+}
+
 /// #263: GT's -f parse (iperf_api.c:1236-1256) takes `*optarg` — the FIRST
 /// character only — and rejects anything outside [kmgtKMGT] with
 /// IEBADFORMAT's exact sentence. 'b'/'B' are CLI-unreachable in GT too

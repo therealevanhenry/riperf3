@@ -105,7 +105,7 @@ pub struct Cli {
     /// Restart idle server after # seconds
     // i64 + negatives accepted at parse (#303): GT's atoi wraps them into
     // its range checks; the pre-sink chain rejects with GT's wording.
-    #[arg(long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub idle_timeout: Option<i64>,
 
     /// Server's total bit rate limit
@@ -116,7 +116,8 @@ pub struct Cli {
     #[arg(
         long = "server-max-duration",
         value_name = "secs",
-        allow_negative_numbers = true
+        allow_hyphen_values = true,
+        value_parser = atoi_like
     )]
     pub server_max_duration: Option<i64>,
 
@@ -128,7 +129,7 @@ pub struct Cli {
     pub udp: bool,
 
     /// Time in seconds to transmit for (default 10 secs)
-    #[arg(short = 't', long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(short = 't', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub time: Option<i64>,
 
     /// Number of bytes to transmit (instead of -t)
@@ -182,7 +183,7 @@ pub struct Cli {
     pub tos: Option<String>,
 
     /// Omit the first N seconds of the test
-    #[arg(short = 'O', long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(short = 'O', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub omit: Option<i64>,
 
     /// Prefix every output line with this string
@@ -732,6 +733,42 @@ impl Cli {
     }
 }
 
+/// #317: GT parses its duration-like flags with `atoi` — mirror it so the
+/// drop-in accepts what GT accepts: leading whitespace skipped, optional
+/// sign, leading digits (0 when none — `abc`, `-abc`), and C's overflow
+/// shape (`strtol` saturates at LONG_MAX, then the `(int)` cast truncates:
+/// 2^32 → 0 runs, 2^31 → INT_MIN → the range error). Never a parse error.
+pub fn atoi_like(s: &str) -> Result<i64, std::convert::Infallible> {
+    // C-locale isspace only (GT never calls setlocale): Rust's trim_start
+    // would also eat NBSP/NEL/U+2028/U+3000, which glibc atoi does not
+    // (r1 F2 — live: GT rejects `--idle-timeout <NBSP>5`, we accepted).
+    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, rest) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let digits: &str = {
+        let end = rest
+            .as_bytes()
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        &rest[..end]
+    };
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    // strtol saturates DIRECTIONALLY (r1 F1: magnitude-then-negate gave
+    // LONG_MIN+1 — (int) 1 — where C parses -2^63 exactly and (int)s to 0).
+    let long = if neg {
+        format!("-{digits}").parse::<i64>().unwrap_or(i64::MIN)
+    } else {
+        digits.parse::<i64>().unwrap_or(i64::MAX)
+    };
+    Ok(i64::from(long as i32)) // the (int) truncation
+}
+
 /// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
 /// FIRST character only, so `-f kilobits` is `-f k` — and accepts exactly
 /// [kmgtKMGT]; anything else is IEBADFORMAT. 'B'/'b' stay lib-only in both
@@ -795,6 +832,50 @@ mod cli_tests {
                 assert_eq!(cli.format.as_deref(), Some(letter), "-f {letter} (server)");
                 let cli = Cli::parse_from(["riperf3", "--client", "localhost", "--format", letter]);
                 assert_eq!(cli.format.as_deref(), Some(letter), "-f {letter} (client)");
+            }
+        }
+
+        #[test]
+        fn atoi_like_matches_glibc_atoi() {
+            // #317 r1 F3: exact-value table pinned against real glibc atoi
+            // (the r1 differential harness), incl. the two r1 mismatch
+            // classes: DIRECTIONAL strtol saturation (-2^63 parses exactly,
+            // (int)-truncates to 0 — magnitude-negate gave 1) and C-locale
+            // isspace (NBSP must NOT be trimmed).
+            for (input, want) in [
+                ("", 0),
+                ("+", 0),
+                ("-", 0),
+                ("+-5", 0),
+                ("  -12x", -12),
+                ("\t-12x", -12),
+                ("0x10", 0),
+                ("abc", 0),
+                ("-abc", 0),
+                ("1e3", 1),
+                ("5x", 5),
+                ("+5", 5),
+                ("007", 7),
+                (" 7", 7),
+                ("9999999999999999999999", -1),
+                ("9223372036854775807", -1),
+                ("-9223372036854775808", 0),
+                ("-9223372036854775809", 0),
+                ("2147483647", 2147483647),
+                ("-2147483648", -2147483648),
+                ("2147483648", -2147483648),
+                ("-2147483649", 2147483647),
+                ("4294967295", -1),
+                ("4294967296", 0),
+                ("6442450941", 2147483645),
+                ("\u{00a0}5", 0), // NBSP is not C-locale isspace
+                ("\u{3000}5", 0),
+                ("\x0b5", 5),
+                ("\r5", 5),
+                ("--bidir", 0),
+                ("-R", 0),
+            ] {
+                assert_eq!(atoi_like(input).unwrap(), want, "atoi_like({input:?})");
             }
         }
 
