@@ -105,7 +105,7 @@ pub struct Cli {
     /// Restart idle server after # seconds
     // i64 + negatives accepted at parse (#303): GT's atoi wraps them into
     // its range checks; the pre-sink chain rejects with GT's wording.
-    #[arg(long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub idle_timeout: Option<i64>,
 
     /// Server's total bit rate limit
@@ -116,7 +116,8 @@ pub struct Cli {
     #[arg(
         long = "server-max-duration",
         value_name = "secs",
-        allow_negative_numbers = true
+        allow_hyphen_values = true,
+        value_parser = atoi_like
     )]
     pub server_max_duration: Option<i64>,
 
@@ -128,7 +129,7 @@ pub struct Cli {
     pub udp: bool,
 
     /// Time in seconds to transmit for (default 10 secs)
-    #[arg(short = 't', long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(short = 't', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub time: Option<i64>,
 
     /// Number of bytes to transmit (instead of -t)
@@ -182,7 +183,7 @@ pub struct Cli {
     pub tos: Option<String>,
 
     /// Omit the first N seconds of the test
-    #[arg(short = 'O', long, value_name = "secs", allow_negative_numbers = true)]
+    #[arg(short = 'O', long, value_name = "secs", allow_hyphen_values = true, value_parser = atoi_like)]
     pub omit: Option<i64>,
 
     /// Prefix every output line with this string
@@ -730,6 +731,35 @@ impl Cli {
 
         Ok(builder.build()?)
     }
+}
+
+/// #317: GT parses its duration-like flags with `atoi` — mirror it so the
+/// drop-in accepts what GT accepts: leading whitespace skipped, optional
+/// sign, leading digits (0 when none — `abc`, `-abc`), and C's overflow
+/// shape (`strtol` saturates at LONG_MAX, then the `(int)` cast truncates:
+/// 2^32 → 0 runs, 2^31 → INT_MIN → the range error). Never a parse error.
+pub fn atoi_like(s: &str) -> Result<i64, std::convert::Infallible> {
+    let t = s.trim_start();
+    let (neg, rest) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let digits: &str = {
+        let end = rest
+            .as_bytes()
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        &rest[..end]
+    };
+    let mag = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i64>().unwrap_or(i64::MAX) // strtol saturation
+    };
+    let long = if neg { mag.wrapping_neg() } else { mag };
+    Ok(i64::from(long as i32)) // the (int) truncation
 }
 
 /// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
