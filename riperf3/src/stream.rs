@@ -1640,11 +1640,13 @@ pub(crate) fn run_udp_server_demux_sender(
 /// other segments as sequence-gap loss (the 97% phantom-loss failure from
 /// the #327 r1 review).
 ///
-/// RECORDED DEVIATION (short datagrams only): a single datagram >= one
-/// header but < blksize still parses here — GT's full-stride guard
+/// RECORDED DEVIATION (short datagrams only): a buffer tail >= one header
+/// but < blksize still parses here — a lone short datagram OR the short
+/// tail segment of a coalesced train — where GT's full-stride guard
 /// (`buf_sz >= dgram_sz`) skips it and books the gap as loss. Unreachable
-/// from conforming senders (both tools send whole-blksize datagrams), and
-/// parsing is the pre-GSO iperf3 behavior riperf3 always matched.
+/// from conforming senders (both tools send whole-blksize datagrams; GT
+/// floors gso_bf_size to a dg multiple), and parsing is the pre-GSO
+/// iperf3 behavior riperf3 always matched.
 fn walk_udp_headers(buf: &[u8], blksize: usize, use_64bit: bool, stats: &Mutex<UdpRecvStats>) {
     let hdr = UdpHeader::wire_size(use_64bit);
     // Guard degenerate blksize < header (params floor it in practice):
@@ -3251,7 +3253,10 @@ mod tests {
         let h = std::thread::spawn(move || run_udp_receiver_blocking(recv, c, s, 1024, d, false));
 
         send.send(&gro_train(1024, &[1, 2, 3])).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        // Bounded poll, not a fixed sleep (r2 F1): a stalled thread start
+        // (the #178/#176 2-core-runner class) would otherwise see `done`
+        // first and DISCARD the queued train in the drain.
+        wait_for_bytes(&counters, 3072);
         done.store(true, Ordering::Relaxed);
         h.join().unwrap().unwrap();
 
@@ -3262,6 +3267,14 @@ mod tests {
             "all three train headers walked, not just the first"
         );
         assert_eq!(st.cnt_error, 0, "no phantom sequence-gap loss");
+    }
+
+    /// Bounded readiness poll for the train tests (r2 F1).
+    fn wait_for_bytes(counters: &StreamCounters, want: u64) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while counters.bytes_received() < want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -3287,7 +3300,8 @@ mod tests {
             std::thread::spawn(move || run_udp_server_demux_receiver(sock, routes, 1024, d, false));
 
         send.send(&gro_train(1024, &[1, 2, 3])).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        // Bounded poll, not a fixed sleep (r2 F1) — see the connected twin.
+        wait_for_bytes(&counters, 3072);
         done.store(true, Ordering::Relaxed);
         h.join().unwrap().unwrap();
 

@@ -40,6 +40,13 @@ pub(crate) struct TestConfig {
     pub udp_counters_64bit: bool,
 }
 
+/// i64→i32 like cJSON's `valueint` saturation (#316 r2 F3): GT adopts the
+/// wire number through cJSON's int (INT_MAX/INT_MIN capped) and hands it
+/// RAW to setsockopt — the kernel is the validator.
+fn saturate_i32(v: i64) -> i32 {
+    v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 impl TestConfig {
     // Crate-internal: takes the wire `TestParams` (now `pub(crate)` per #67),
     // so it cannot be part of the public API.
@@ -130,7 +137,12 @@ impl TestConfig {
             fq_rate: params.fqrate.unwrap_or(0),
             gso: params.gso.unwrap_or(0) != 0,
             // GT recomputes a zero dg_size from the negotiated blksize
-            // (iperf_api.c:2607-2613); DEFAULT_UDP_BLKSIZE guards blksize 0.
+            // (iperf_api.c:2607-2613). The len-absent arm (1460) is our
+            // choice for a hand-rolled peer: GT's own :2612
+            // DEFAULT_UDP_BLKSIZE arm is unreachable there — it would use
+            // its stale server-default blksize and let the probe EINVAL
+            // (r2 F5) — so 1460 is healthier and equally unreachable from
+            // conforming peers.
             gso_dg_size: match params.gso_dg_size.unwrap_or(0) {
                 0 if params.gso.unwrap_or(0) != 0 => match params.len.unwrap_or(0) {
                     blk if blk > 0 => i64::from(blk),
@@ -1848,10 +1860,13 @@ impl Server {
             // 576-579) — the #320-class placement: the loop recycles a
             // FRESH listener per stream, so a pre-loop call covered
             // stream 0 only. Best-effort like GT (failure zeroes, never
-            // fatal).
+            // fatal). The dg value saturates i64→i32 like cJSON's valueint
+            // and passes RAW — the kernel EINVALs nonsense exactly like it
+            // does for GT (r2 F3). (GT probes BEFORE its 4-byte connect
+            // reply, riperf3 after — no observable delta, the reply is
+            // never segmented; r2 F4.)
             if gso_on {
-                gso_on =
-                    net::set_udp_gso(&data_sock, cfg.gso_dg_size.clamp(1, 65507) as u16).is_ok();
+                gso_on = net::set_udp_gso(&data_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
             }
             if gro_on {
                 gro_on = net::set_udp_gro(&data_sock).is_ok();
@@ -2010,7 +2025,7 @@ impl Server {
         // honor, best-effort, probed once for every stream's meta.
         let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
         if gso_on {
-            gso_on = net::set_udp_gso(&udp_sock, cfg.gso_dg_size.clamp(1, 65507) as u16).is_ok();
+            gso_on = net::set_udp_gso(&udp_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
         }
         if gro_on {
             gro_on = net::set_udp_gro(&udp_sock).is_ok();

@@ -1326,7 +1326,7 @@ impl Client {
                     // lacking UDP_SEGMENT/UDP_GRO degrades to plain sends
                     // rather than failing the test (#316).
                     if gso_on {
-                        gso_on = net::set_udp_gso(&udp_sock, blksize as u16).is_ok();
+                        gso_on = net::set_udp_gso(&udp_sock, blksize as i32).is_ok();
                     }
                     if gro_on {
                         gro_on = net::set_udp_gro(&udp_sock).is_ok();

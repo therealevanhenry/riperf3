@@ -18,7 +18,11 @@ use common::{udp_serial, wait_bounded, ChildGuard};
 
 /// One `--gsro` UDP run against a one-off server; returns the client's `-J`
 /// doc. `demux` forces the server's shared-socket path (the recycling path
-/// is the Unix default).
+/// is the Unix default). `-P 2` EXERCISES the per-accept probe path but
+/// cannot discriminate a pre-loop-only regression (r2 F2: a GRO-off second
+/// stream still walks uncoalesced datagrams to zero loss and the echo
+/// still folds 1) — the sockopt round-trip pin in net.rs plus code review
+/// carry the placement.
 fn run_gsro(demux: bool, who: &str) -> Value {
     let _serial = udp_serial();
     let bin = env!("CARGO_BIN_EXE_riperf3");
