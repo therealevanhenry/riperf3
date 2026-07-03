@@ -760,7 +760,9 @@ pub fn set_fq_rate<F>(_fd: &F, _rate: u64) -> Result<()> {
 /// a sandboxed runtime filtering setsockopt must degrade like GT, not
 /// abort the test.
 pub fn apply_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) {
-    if rate_bits_per_sec == 0 {
+    // GT guards the BYTES value after /8 (r2 F2): --fq-rate 1..7 bits/s
+    // makes no syscall there — rate-0 setsockopt semantics vary by kernel.
+    if rate_bits_per_sec / 8 == 0 {
         return;
     }
     if set_fq_rate(fd, rate_bits_per_sec).is_err() {
@@ -1018,6 +1020,33 @@ pub async fn udp_bind_reusable(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fq_rate_tests {
+    /// #302 r2: the sockopt payload is u64 like GT's uint64_t — a u32
+    /// wrapped --fq-rate above ~34.36 Gbit/s (40G → ~5.6G). Readback pin,
+    /// no fq-qdisc dependence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fq_rate_u64_round_trips() {
+        use std::os::fd::AsRawFd;
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        super::set_fq_rate(&sock, 40_000_000_000).unwrap();
+        let mut val: u64 = 0;
+        let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_MAX_PACING_RATE,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(val, 5_000_000_000, "u64 payload survives (u32 wrapped)");
+    }
+}
 
 #[cfg(test)]
 mod tests {

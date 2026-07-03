@@ -1804,8 +1804,6 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
-        // #302: GT paces its UDP accept path too (iperf_udp.c:581-595).
-        net::apply_fq_rate(&udp_listener, cfg.fq_rate);
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
 
@@ -1824,6 +1822,10 @@ impl Server {
                     .await?;
             // The listener is now locked to this client — use it as the data socket
             let data_sock = udp_listener;
+            // #302 r2: pace EVERY accepted stream — GT's block lives in
+            // iperf_udp_accept (iperf_udp.c:581-595), once per stream; the
+            // pre-loop listener call covered stream 0 only.
+            net::apply_fq_rate(&data_sock, cfg.fq_rate);
 
             // Create a fresh listener for the next stream (if any)
             if i + 1 < total {
@@ -1963,6 +1965,10 @@ impl Server {
         )
         .await?;
         // #302: the demux shared socket IS the data socket — pace it too.
+        // NOTE (r2): one shared socket means aggregate pacing = R for -P N
+        // (per-stream sockets pace N×R); inherent to the demux design,
+        // which is Windows-default (where the sockopt no-ops) and Linux
+        // opt-in via RIPERF3_UDP_SERVER_DEMUX.
         net::apply_fq_rate(&udp_sock, cfg.fq_rate);
 
         protocol::send_state(ctrl, TestState::CreateStreams).await?;
