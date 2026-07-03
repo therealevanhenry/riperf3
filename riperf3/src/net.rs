@@ -759,6 +759,7 @@ pub fn set_fq_rate<F>(_fd: &F, _rate: u64) -> Result<()> {
 /// fatal — the server arm is remotely triggered (any peer's --fq-rate), so
 /// a sandboxed runtime filtering setsockopt must degrade like GT, not
 /// abort the test.
+#[cfg(target_os = "linux")]
 pub fn apply_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) {
     // GT guards the BYTES value after /8 (r2 F2): --fq-rate 1..7 bits/s
     // makes no syscall there — rate-0 setsockopt semantics vary by kernel.
@@ -769,6 +770,11 @@ pub fn apply_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) 
         eprintln!("warning: Unable to set socket pacing");
     }
 }
+
+/// Without SO_MAX_PACING_RATE, GT compiles the whole pacing block out
+/// (`#if defined(HAVE_SO_MAX_PACING_RATE)`) — no syscall, no warning.
+#[cfg(not(target_os = "linux"))]
+pub fn apply_fq_rate<F>(_fd: &F, _rate_bits_per_sec: u64) {}
 
 /// Bind socket to a specific network device. Must be applied BEFORE
 /// `connect()` — these options steer the routing decision made at connect
