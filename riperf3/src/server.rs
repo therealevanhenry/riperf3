@@ -731,8 +731,13 @@ impl Server {
         // Join stream tasks (best-effort, they should be done).
         // #322 r1 F1: a mid-EXCHANGE interrupt postdates shutdown_and_flush's
         // abort gate — abort here so a wedged peer can't park the joins.
-        // #325 r3 F1: an END-LOOP IEMESSAGE postdates it the same way.
-        if ctx.interrupted.is_some() || ctx.unknown_message {
+        // #325 r3 F1: an END-LOOP IEMESSAGE postdates it the same way, and
+        // r4 NF-1: so does an end-loop CLIENT_TERMINATE — GT's terminate arm
+        // closes the stream sockets INLINE (iperf_server_api.c:301-305), so
+        // a peer that sends 12 and then holds its sockets must not park the
+        // joins (it held the process for the peer's whole hold; GT exits on
+        // its own clock). Covers the pre-existing mid-test terminate too.
+        if ctx.interrupted.is_some() || ctx.unknown_message || ctx.client_terminated {
             for s in &ctx.streams {
                 s.task.abort();
             }
@@ -1447,7 +1452,11 @@ impl Server {
         // the next await); the UDP runners are spawn_blocking, where abort
         // is a no-op once running — their joins stay bounded anyway by the
         // 500 ms read-timeout + `done` polling in the blocking loops.
-        if ctx.server_error.is_some() || ctx.interrupted.is_some() || ctx.unknown_message {
+        if ctx.server_error.is_some()
+            || ctx.interrupted.is_some()
+            || ctx.unknown_message
+            || ctx.client_terminated
+        {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its
             // data sockets at TEST_END and sigend exits in milliseconds).

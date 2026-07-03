@@ -412,13 +412,12 @@ fn mid_test_unknown_byte_with_get_server_output_prints_no_summary() {
     assert!(status.success(), "one-off exits 0 like GT");
 }
 
-/// #325 r3 F1: a hostile peer that sends the junk byte and then HOLDS its
-/// sockets open must not park the server — GT cleanup_servers immediately
-/// when handle_message fails (iperf_server_api.c:764-767). Pre-fix the
-/// stream-task joins waited out the peer's whole hold (live: a 30 s hold
-/// held the one-off 33 s and blocked the stderr line with it).
-#[test]
-fn mid_test_unknown_byte_exits_bounded_while_peer_holds() {
+/// Holding-peer harness (#325 r3 F1 / r4 NF-1): drive the protocol, send
+/// `final_byte` (mid-test or end-loop), then HOLD both sockets far past
+/// the assertion window. Returns the server's stderr and exit status —
+/// which must arrive while the peer still holds. Detached mock thread;
+/// the sockets close when the test binary exits.
+fn run_holding_scenario(final_byte: u8, junk_mid_test: bool) -> (String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -436,9 +435,6 @@ fn mid_test_unknown_byte_exits_bounded_while_peer_holds() {
         riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    // The holding mock: full protocol to the data phase, junk byte, then
-    // KEEP both sockets open far past the assertion window. Detached — the
-    // sockets close when the test binary exits.
     std::thread::spawn(move || {
         let cookie = [b'x'; 37];
         let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
@@ -451,20 +447,52 @@ fn mid_test_unknown_byte_exits_bounded_while_peer_holds() {
         assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
         assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
         data.write_all(&[0u8; 4096]).unwrap();
-        ctrl.write_all(&[99u8]).unwrap();
+        if !junk_mid_test {
+            ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
+            write_json_blob(&mut ctrl, MOCK_RESULTS);
+            read_json_blob(&mut ctrl); // server results
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
+        }
+        ctrl.write_all(&[final_byte]).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(30));
         drop((ctrl, data));
     });
 
     let status =
         riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
-            .expect("server exits while the peer still holds (r3 F1)");
+            .expect("server exits while the peer still holds");
+    (serr_reader.join().expect("stderr"), status)
+}
+
+/// #325 r3 F1: a hostile peer that sends the junk byte and then HOLDS its
+/// sockets open must not park the server — GT cleanup_servers immediately
+/// when handle_message fails (iperf_server_api.c:764-767). Pre-fix the
+/// stream-task joins waited out the peer's whole hold (live: a 30 s hold
+/// held the one-off 33 s and blocked the stderr line with it).
+#[test]
+fn mid_test_unknown_byte_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario(99, true);
     assert!(status.success(), "one-off exits 0 like GT");
-    let serr = serr_reader.join().expect("stderr");
     assert_eq!(
         serr.trim(),
         format!("riperf3: error - {IEMESSAGE}"),
         "the line prints NOW, not after the peer relents"
+    );
+}
+
+/// #325 r4 NF-1: the same hold one byte over — CLIENT_TERMINATE in the end
+/// loop. GT's terminate arm closes the stream sockets INLINE
+/// (iperf_server_api.c:301-305) and exits on its own clock; the joins must
+/// not wait out the peer's hold.
+#[test]
+fn end_loop_client_terminate_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario(12, false);
+    assert!(status.success(), "terminate ends cleanly like GT");
+    assert_eq!(
+        serr.trim(),
+        "riperf3: the client has terminated",
+        "GT's bare IECLIENTTERM line, printed while the peer still holds"
     );
 }
 
