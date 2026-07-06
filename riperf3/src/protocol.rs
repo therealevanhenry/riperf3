@@ -616,6 +616,11 @@ const NET_HARDERROR: i32 = -2;
 /// per-step reset. Divergence is adversarial-only (a byte-dripping peer:
 /// GT-Linux gives up at ~10 s cumulative, we at up to the 30 s overall) and
 /// the real results blob is one atomic write; both paths stay bounded.
+///
+/// The OTHER direction (#340 audit N6): callers thread one OVERALL deadline
+/// across BOTH the size and blob reads, where GT arms a fresh `ftimeout`
+/// per `Nread` (net.c:485-489) — GT's worst case is ~2×30 s, riperf3's is
+/// strictly tighter at 30 s total. Adversarial-only, same surface.
 async fn nread_step(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -716,30 +721,41 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
         ));
         return Err(crate::error::RiperfError::RecvResultsFailed);
     }
-    // GT calloc's the buffer and NULL-guards it (iperf_api.c:3042-3043),
-    // degrading to IERECVRESULTS with NO warning on alloc failure. `len` is
-    // an unbounded peer-controlled u32 (max_size=0 → no cap, like GT), so a
-    // fallible reserve is the faithful match: an infallible `vec![0u8; len]`
-    // would abort the process on a hostile 4 GB prefix (r2 finding 4).
-    let mut buf = Vec::new();
-    if buf.try_reserve_exact(len).is_err() {
-        return Err(crate::error::RiperfError::RecvResultsFailed);
-    }
-    buf.resize(len, 0);
+    // GT calloc's the buffer upfront and NULL-guards it (iperf_api.c:3042-
+    // 3043), degrading to IERECVRESULTS with NO warning on alloc failure —
+    // and calloc's zero pages are LAZY. The previous try_reserve+resize here
+    // memset every page in, COMMITTING a hostile 4 GiB prefix as real RSS
+    // (#340, unauthenticated). riperf3 instead grows the buffer as bytes
+    // arrive (fallible reserve per chunk = GT's NULL-guard degrade class),
+    // so the hostile prefix costs nothing anywhere — a deliberate
+    // improvement over GT's upfront virtual reservation, same surface.
+    const READ_CHUNK: usize = 64 * 1024;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; READ_CHUNK.min(len)];
     let mut got = 0usize;
     while got < len {
-        match nread_step(stream, &mut buf[got..], deadline).await {
+        let take = chunk.len().min(len - got);
+        match nread_step(stream, &mut chunk[..take], deadline).await {
             // EOF/timeout: GT's Nread returned the partial (rc >= 0) — the
             // expected/received arm (live: "expected 500 bytes but
-            // received 5; errno=0").
+            // received 5; errno=0"). GT prints the uint32_t hsize through
+            // %d (iperf_api.c:3057), so the expected count two's-complement
+            // wraps past INT_MAX (#341: 0xFFFFFFF0 → "expected -16").
             Ok(None) => {
                 gt_warning(format_args!(
                     "JSON size of data read does not correspond to offered length - \
-                     expected {len} bytes but received {got}; errno=0"
+                     expected {} bytes but received {got}; errno=0",
+                    len as u32 as i32
                 ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
-            Ok(Some(n)) => got += n,
+            Ok(Some(n)) => {
+                if buf.try_reserve(n).is_err() {
+                    return Err(crate::error::RiperfError::RecvResultsFailed);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                got += n;
+            }
             // A hard read error is GT's rc<0 arm (iperf_api.c:3061; r1 F1 —
             // live RST probe: "JSON data read failed; errno=104").
             Err(e) => {

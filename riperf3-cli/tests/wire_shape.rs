@@ -1133,6 +1133,89 @@ fn exchange_size_rst_takes_gt_read_failed_size_arm() {
     );
 }
 
+/// #341: GT prints the expected size through `%d` (iperf_api.c:3057 — the
+/// uint32_t hsize two's-complement-wraps), so a hostile 0xFFFFFFF0 prefix
+/// warns "expected -16", not the unsigned 4294967280.
+#[test]
+fn exchange_huge_size_warning_wraps_like_gt_percent_d() {
+    let (_sout, serr, status) = run_exchange_fail_scenario(false, Some((0xFFFF_FFF0, b"")));
+    assert!(
+        serr.contains(
+            "warning: JSON size of data read does not correspond to offered length - \
+             expected -16 bytes but received 0; errno=0"
+        ),
+        "GT's %d wrap on the expected count: {serr}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #340: a hostile 4 GiB size prefix must not COMMIT the memory. GT callocs
+/// (lazy zero pages, ~4 MB RSS through the whole read window); riperf3's
+/// try_reserve+resize memset every page in (~4.2 GB RSS, unauthenticated,
+/// repeatable per round). The read loop must commit pages only as bytes
+/// arrive. Linux-only: samples the child's VmRSS from /proc.
+#[cfg(target_os = "linux")]
+#[test]
+fn exchange_huge_size_prefix_does_not_commit_rss() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let pid = server.0.id();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // The full dance to ExchangeResults, then the hostile prefix + a HOLD so
+    // the blob read window stays open while RSS is sampled.
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        ctrl.write_all(&0xFFFF_FFF0u32.to_be_bytes()).unwrap(); // hostile prefix
+        std::thread::sleep(std::time::Duration::from_secs(3)); // hold the window
+        drop((ctrl, data));
+    });
+
+    // Sample peak RSS while the server sits in the bounded blob read.
+    let mut peak_kb = 0u64;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
+            let kb: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            peak_kb = peak_kb.max(kb);
+        }
+    }
+    mock.join().expect("mock");
+    let _ = riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20));
+    assert!(
+        peak_kb < 262_144, // 256 MB — GT sits at ~4.5 MB, the defect at ~4.2 GB
+        "hostile prefix committed {peak_kb} kB RSS — pages must commit only as bytes arrive"
+    );
+}
+
 /// #325 r2 F6: the CLIENT side of the same default — GT's client message
 /// handler IEMESSAGEs an unmapped byte too (iperf_client_api.c:409-411).
 /// The byte replaces ExchangeResults(13) at the client's direct state wait
