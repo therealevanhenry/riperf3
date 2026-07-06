@@ -193,8 +193,13 @@ pub struct Cli {
     pub bidir: bool,
 
     /// Set socket buffer sizes (indirectly sets TCP window size)
-    #[arg(short = 'w', long, value_name = "size")]
-    pub window: Option<String>,
+    // #334: GT parses -w with unit_atof (iperf_api.c:1438-1452) — a 1024-based
+    // size returning a double, then `> MAX_TCP_BUFFER` (536870912) → IEBUFSIZE,
+    // else `(int) farg`. The IEUNITVAL/IEBUFSIZE surface runs pre-sink in
+    // main.rs; raw OsString so invalid-UTF-8 argv echoes byte-for-byte like GT.
+    // allow_hyphen: a negative casts straight through like GT's (int) farg.
+    #[arg(short = 'w', long, value_name = "size", allow_hyphen_values = true)]
+    pub window: Option<std::ffi::OsString>,
 
     /// Set TCP congestion control algorithm
     #[arg(short = 'C', long, value_name = "algo")]
@@ -212,8 +217,18 @@ pub struct Cli {
     pub no_delay: bool,
 
     /// Target bitrate in bits/sec (0 = unlimited; default: unlimited TCP, 1M UDP)
-    #[arg(short = 'b', long, value_name = "rate[/burst]")]
-    pub bitrate: Option<String>,
+    // #334: GT parses -b `rate[/burst]` (iperf_api.c:1347-1365) — slash-split
+    // FIRST: if a '/' is present, burst = atoi(after) with `<= 0 || >
+    // MAX_BURST` (1000) → IEBURST; THEN rate = unit_atof_rate(before)
+    // (1000-based) → IEUNITVAL. Both run pre-sink in main.rs. allow_hyphen: a
+    // negative rate wraps huge (iperf_size_t) and GT proceeds.
+    #[arg(
+        short = 'b',
+        long,
+        value_name = "rate[/burst]",
+        allow_hyphen_values = true
+    )]
+    pub bitrate: Option<std::ffi::OsString>,
 
     /// Set the IP type of service (0-255; decimal, 0x hex, or 0 octal)
     // String, parsed by the builder's `tos_str` with iperf3's strtol-base-0
@@ -290,8 +305,11 @@ pub struct Cli {
     pub bind_dev: Option<String>,
 
     /// Enable fair-queuing based socket pacing (bits/sec, Linux only)
-    #[arg(long, value_name = "rate")]
-    pub fq_rate: Option<String>,
+    // #334: GT parses --fq-rate with unit_atof_rate (iperf_api.c:1726-1737),
+    // 1000-based → IEUNITVAL pre-sink in main.rs. allow_hyphen: a negative rate
+    // wraps huge (iperf_size_t) and GT proceeds.
+    #[arg(long, value_name = "rate", allow_hyphen_values = true)]
+    pub fq_rate: Option<std::ffi::OsString>,
 
     /// Set the IPv6 flow label (Linux only)
     #[arg(short = 'L', long, value_name = "N")]
@@ -627,7 +645,22 @@ impl Cli {
             builder = builder.bidir(true);
         }
         if let Some(ref s) = self.window {
-            builder = builder.window_str(s)?;
+            // #334: GT's -w is unit_atof (1024-based) → `(int) farg`
+            // (iperf_api.c:1438-1452). The IEUNITVAL parse error and the
+            // `> MAX_TCP_BUFFER` IEBUFSIZE check run pre-sink in main.rs; this
+            // maps the accepted double to the socket_bufsize int. GT's cast is
+            // a DIRECT double→int32 (cvttsd2si), so `farg as i32` matches it
+            // exactly on every reachable value: `-w -5` → -5, and an
+            // out-of-i32-range negative (`-w -3G`) saturates to i32::MIN on
+            // both (GT's cvttsd2si also yields INT_MIN); positive overflow is
+            // unreachable (IEBUFSIZE catches anything > MAX_TCP_BUFFER first).
+            // RECORDED DEVIATION (unobservable): the sole literal that
+            // diverges is `-w nan` — `nan as i32` = 0, GT's `(int)nan` =
+            // INT_MIN. socket_bufsize is not a wire/output field and `-w nan`
+            // never connects, so the value is never observable; not worth a
+            // special-case for an absurd input.
+            let farg = unit_atoi_os(s)?;
+            builder = builder.window(farg as i32);
         }
         if let Some(ref algo) = self.congestion {
             builder = builder.congestion(algo);
@@ -641,7 +674,26 @@ impl Cli {
             builder = builder.no_delay(true);
         }
         if let Some(ref s) = self.bitrate {
-            builder = builder.bandwidth_str(s)?;
+            // #334: GT's -b `rate[/burst]` (iperf_api.c:1347-1365) — burst =
+            // atoi(after the FIRST '/') then rate = unit_atof_rate(before),
+            // 1000-based. The IEBURST/IEUNITVAL surface is enforced pre-sink
+            // in main.rs; here we wire the resolved rate (iperf_size_t) and
+            // burst. A negative rate wraps huge via c_double_to_u64 like GT.
+            let (rate, burst) = split_rate_interval(s);
+            let bps = unit_atof_rate_like_bytes(rate).map_err(|()| {
+                format!(
+                    "invalid unit value or suffix: '{}'",
+                    String::from_utf8_lossy(rate)
+                )
+            })?;
+            builder = builder.bandwidth(c_double_to_u64(bps));
+            if let Some(burst) = burst {
+                // The IEBURST range (1..=1000) is enforced pre-sink; a direct
+                // caller's out-of-range burst folds through u32, and the lib's
+                // build() re-checks `> MAX_BURST` for those callers.
+                let n = atoi_like_bytes(burst);
+                builder = builder.burst(u32::try_from(n).unwrap_or(0));
+            }
         }
         if let Some(ref s) = self.tos {
             builder = builder.tos_str(s)?;
@@ -720,7 +772,12 @@ impl Cli {
             builder = builder.bind_dev(dev);
         }
         if let Some(ref s) = self.fq_rate {
-            builder = builder.fq_rate_str(s)?;
+            // #334: GT's --fq-rate is unit_atof_rate (1000-based),
+            // iperf_api.c:1728 → IEUNITVAL pre-sink in main.rs; wire the
+            // resolved rate (iperf_size_t). A negative wraps huge like GT.
+            let bps = unit_atof_rate_like_bytes(s.as_encoded_bytes())
+                .map_err(|()| format!("invalid unit value or suffix: '{}'", s.to_string_lossy()))?;
+            builder = builder.fq_rate(c_double_to_u64(bps));
         }
         if let Some(label) = self.flowlabel {
             builder = builder.flowlabel(label);
@@ -1455,7 +1512,7 @@ mod cli_tests {
             assert!(cli.bidir);
             assert!(cli.no_delay);
             assert_eq!(cli.length, Some("1460".into()));
-            assert_eq!(cli.bitrate, Some("100M".to_string()));
+            assert_eq!(cli.bitrate, Some("100M".into()));
         }
 
         #[test]
@@ -1472,7 +1529,7 @@ mod cli_tests {
             let cli = Cli::parse_from([
                 "riperf3", "-c", "host", "-w", "512K", "-M", "1400", "-C", "bbr",
             ]);
-            assert_eq!(cli.window, Some("512K".to_string()));
+            assert_eq!(cli.window, Some("512K".into()));
             assert_eq!(cli.mss, Some(1400));
             assert_eq!(cli.congestion, Some("bbr".to_string()));
         }

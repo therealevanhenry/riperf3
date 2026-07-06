@@ -1062,3 +1062,164 @@ fn debug_level_parses_like_atoi() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #334: -w (unit_atof, 1024-based), -b (rate[/burst], unit_atof_rate +
+// atoi), and --fq-rate (unit_atof_rate) wire through GT's own unit parsers
+// with GT's error classes (IEUNITVAL / IEBUFSIZE / IEBURST), all in-loop —
+// before the post-loop client-only role check. Every expectation below was
+// live-probed against iperf 3.21.
+// ---------------------------------------------------------------------------
+
+/// #334: the accept surface — every GT-accepted form parses and the run
+/// proceeds to CONNECT (dead port 9), never a parse error. Live-probed:
+/// `-w 10Kx` (K scales, trailing x ignored, = 10240), `-w 512K`, `-b 1Mx`
+/// (rate 1M, x ignored), `-b 100M`, `-b 10M/5` (burst 5), `--fq-rate 1Mx`,
+/// `--fq-rate 1M`. riperf3 previously rejected the `x`-suffixed forms with
+/// clap's "invalid value for number".
+#[test]
+fn unit_atof_family_accept_gt_forms_and_proceed() {
+    for args in [
+        &["-w", "10Kx"][..],
+        &["-w", "512K"][..],
+        &["-b", "1Mx"][..],
+        &["-b", "100M"][..],
+        &["-b", "10M/5"][..],
+        &["--fq-rate", "1Mx"][..],
+        &["--fq-rate", "1M"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", "9"])
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to connect")
+                && !stderr.contains("parameter error")
+                && !stderr.contains("error: invalid value")
+                && !stderr.contains("invalid value for number"),
+            "{args:?} parses via GT's unit semantics and proceeds: {stderr}"
+        );
+    }
+}
+
+/// #334: the reject surface — GT's exact sentences + usage trailer + exit 1
+/// (live-probed). -w: unit_atof (iperf_api.c:1438-1452) → IEUNITVAL on a bad
+/// unit, then `> MAX_TCP_BUFFER` (536870912) → IEBUFSIZE (`-w 1G` is
+/// 1073741824). -b: slash-split FIRST (iperf_api.c:1347-1365) — burst =
+/// atoi(after) with `<= 0 || > MAX_BURST` (1000) → IEBURST, checked BEFORE
+/// the rate's unit_atof_rate → IEUNITVAL (so `-b abc/0` is IEBURST, not
+/// IEUNITVAL); the IEUNITVAL errarg is the RATE part (before the slash).
+/// --fq-rate: unit_atof_rate (iperf_api.c:1726-1737) → IEUNITVAL.
+#[test]
+fn unit_atof_family_reject_bad_values_with_gt_classes() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-c", "127.0.0.1", "-w", "abc"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+        (
+            &["-c", "127.0.0.1", "-w", "1G"],
+            "parameter error - socket buffer size too large (maximum = 536870912 bytes)",
+        ),
+        (
+            &["-c", "127.0.0.1", "-b", "abc"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+        (
+            &["-c", "127.0.0.1", "-b", "10M/0"],
+            "parameter error - invalid burst count (maximum = 1000)",
+        ),
+        (
+            &["-c", "127.0.0.1", "-b", "10M/1001"],
+            "parameter error - invalid burst count (maximum = 1000)",
+        ),
+        // Burst check precedes the rate parse (GT's code order): a bad rate
+        // WITH a bad burst reports IEBURST, and the IEUNITVAL errarg on a
+        // sliced spec is the rate part only.
+        (
+            &["-c", "127.0.0.1", "-b", "abc/0"],
+            "parameter error - invalid burst count (maximum = 1000)",
+        ),
+        (
+            &["-c", "127.0.0.1", "-b", "abc/5"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+        (
+            &["-c", "127.0.0.1", "--fq-rate", "abc"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+        // In-loop value parse beats the post-loop client-only role check:
+        // `-s -b abc` is IEUNITVAL, not IECLIENTONLY (live-probed).
+        (
+            &["-s", "-b", "abc"],
+            "parameter error - invalid unit value or suffix: 'abc'",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(&format!("riperf3: {want}")),
+            "{args:?}: GT wording expected, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors (GT shape): {stderr}"
+        );
+    }
+}
+
+/// #335: GT rejects `-F <file>` with UDP (`-u`) via IEUDPFILETRANSFER
+/// (iperf_api.c:1919-1923; iperf_error.c:396-397) — `cannot transfer file
+/// using UDP`, a UDP datagram carries its own header so a file can't ride
+/// it. Placement is load-bearing: the check sits AFTER the reverse-only
+/// rcv-timeout leg and BEFORE the blksize block in GT's post-loop, so it
+/// BEATS the -l range rejection. Live-probed: `-u -F x -l 70000` is
+/// IEUDPFILETRANSFER, NOT IEUDPBLOCKSIZE (riperf3's -l check used to win).
+#[test]
+fn udp_file_transfer_rejects_before_blocksize() {
+    let cases: &[&[&str]] = &[
+        &["-c", "127.0.0.1", "-u", "-F", "x"],
+        // The load-bearing ordering cell: a UDP block size that would trip
+        // IEUDPBLOCKSIZE must still report IEUDPFILETRANSFER first.
+        &["-c", "127.0.0.1", "-u", "-F", "x", "-l", "70000"],
+    ];
+    for args in cases {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(*args)
+            .output()
+            .expect("spawn riperf3");
+        assert_eq!(out.status.code(), Some(1), "{args:?} exits 1 like GT");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with("riperf3: parameter error - cannot transfer file using UDP"),
+            "{args:?}: IEUDPFILETRANSFER expected (before the blksize block), got: {stderr}"
+        );
+        assert!(
+            stderr.contains("Usage:") && stderr.contains("--help"),
+            "the usage trailer rides parameter errors: {stderr}"
+        );
+    }
+    // TCP `-F` is fine (no UDP), and UDP without `-F` is fine — neither trips
+    // IEUDPFILETRANSFER (they fail later, on connect).
+    for args in [
+        &["-c", "127.0.0.1", "-p", "9", "-F", "/dev/null"][..],
+        &["-c", "127.0.0.1", "-p", "9", "-u"][..],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(args)
+            .output()
+            .expect("spawn riperf3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("cannot transfer file using UDP"),
+            "{args:?} must not trip IEUDPFILETRANSFER: {stderr}"
+        );
+    }
+}
