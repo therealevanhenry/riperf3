@@ -958,6 +958,156 @@ fn exchange_short_blob_prints_gt_length_warning() {
     assert!(status.success(), "one-off exits 0 like GT");
 }
 
+/// Make the drop of this socket send a real RST. A plain close after the
+/// peer has drained everything sends FIN (a clean EOF); SO_LINGER(0) forces
+/// the abortive close so the server's in-flight read returns ECONNRESET,
+/// not Ok(0). Mirrors setup_retry.rs. (std has no stable `set_linger`.)
+#[cfg(unix)]
+fn force_rst_on_drop(sock: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::from_ref(&linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+}
+#[cfg(not(unix))]
+fn force_rst_on_drop(_sock: &std::net::TcpStream) {}
+
+/// #336 r1 F1: a HARD read error mid-blob (an RST arriving after the SIZE
+/// was read and the server is blocked on the blob) takes GT's rc<0 arm
+/// "JSON data read failed; errno={e}" (iperf_api.c:3078) — NOT the
+/// expected/received short-read arm (that one is for a clean partial+EOF,
+/// where GT's Nread returned rc>=0). The mock promises 500 bytes, lets the
+/// server consume the size and block, then RST-closes.
+#[test]
+fn exchange_blob_rst_takes_gt_read_failed_arm() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        ctrl.write_all(&500u32.to_be_bytes()).unwrap(); // promise 500, send none
+                                                        // Let the server read the size and block in the blob read, THEN abort.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        force_rst_on_drop(&ctrl);
+        drop((ctrl, data));
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(10))
+            .expect("server exits on the reset");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert!(
+        serr.contains("warning: JSON data read failed; errno="),
+        "a hard read error takes GT's rc<0 arm: {serr}"
+    );
+    assert!(
+        !serr.contains("does not correspond to offered length"),
+        "must NOT fall through to the expected/received short-read arm: {serr}"
+    );
+}
+
+/// #336 r1 F4: a zero JSON size fails GT's hsize>0 gate
+/// (iperf_api.c:3038/:3068) and warns the overflow line verbatim.
+#[test]
+fn exchange_zero_size_takes_gt_overflow_warning() {
+    let (_sout, serr, status) = run_exchange_fail_scenario(false, Some((0, b"")));
+    assert!(
+        serr.contains("warning: JSON data length overflow - 0 bytes JSON size is not allowed"),
+        "a zero JSON size warns GT's overflow line: {serr}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #330: a HARD read error during the SIZE read (an RST before the 4-byte
+/// length arrives) takes GT's rc<0 size arm "read returned -1; errno={e}"
+/// — the size-stage twin of the blob rc<0 arm above.
+#[test]
+fn exchange_size_rst_takes_gt_read_failed_size_arm() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+                                                     // No size bytes at all — abort before the length arrives.
+        force_rst_on_drop(&ctrl);
+        drop((ctrl, data));
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(10))
+            .expect("server exits on the reset");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert!(
+        serr.contains("warning: Failed to read JSON data size - read returned -1; errno="),
+        "an RST at the size read takes GT's rc<0 size arm: {serr}"
+    );
+}
+
 /// #325 r2 F6: the CLIENT side of the same default — GT's client message
 /// handler IEMESSAGEs an unmapped byte too (iperf_client_api.c:409-411).
 /// The byte replaces ExchangeResults(13) at the client's direct state wait
