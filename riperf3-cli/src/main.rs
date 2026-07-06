@@ -217,6 +217,14 @@ fn main() -> std::process::ExitCode {
     // client-only flag's bad value beats IECLIENTONLY (live-probed:
     // `-s -b abc` is IEUNITVAL, not client-only). GT echoes the RAW argv
     // bytes in the IEUNITVAL quotes, so those lines are written byte-for-byte.
+    //
+    // RECORDED DEVIATION (systemic, shared with the #328/#270 pre-sinks):
+    // clap fully parses argv before we see it, erasing option order, so
+    // these checks run in FIXED field order (w, then b, then --fq-rate),
+    // not getopt/argv order. With TWO simultaneously-invalid unit flags GT
+    // reports the argv-first one and we report the field-first one — same
+    // class (IEUNITVAL) and exit (1), only the quoted errarg differs. A
+    // single bad flag (the realistic case) is byte-identical.
 
     // -w/--window (iperf_api.c:1438-1452): unit_atof (1024-based) → IEUNITVAL,
     // then `farg > (double) MAX_TCP_BUFFER` (512*MB = 536870912) → IEBUFSIZE,

@@ -648,8 +648,17 @@ impl Cli {
             // #334: GT's -w is unit_atof (1024-based) → `(int) farg`
             // (iperf_api.c:1438-1452). The IEUNITVAL parse error and the
             // `> MAX_TCP_BUFFER` IEBUFSIZE check run pre-sink in main.rs; this
-            // maps the accepted double to the socket_bufsize int. A negative
-            // (via `-w -5`) casts straight through like GT's (int) farg.
+            // maps the accepted double to the socket_bufsize int. GT's cast is
+            // a DIRECT double→int32 (cvttsd2si), so `farg as i32` matches it
+            // exactly on every reachable value: `-w -5` → -5, and an
+            // out-of-i32-range negative (`-w -3G`) saturates to i32::MIN on
+            // both (GT's cvttsd2si also yields INT_MIN); positive overflow is
+            // unreachable (IEBUFSIZE catches anything > MAX_TCP_BUFFER first).
+            // RECORDED DEVIATION (unobservable): the sole literal that
+            // diverges is `-w nan` — `nan as i32` = 0, GT's `(int)nan` =
+            // INT_MIN. socket_bufsize is not a wire/output field and `-w nan`
+            // never connects, so the value is never observable; not worth a
+            // special-case for an absurd input.
             let farg = unit_atoi_os(s)?;
             builder = builder.window(farg as i32);
         }
