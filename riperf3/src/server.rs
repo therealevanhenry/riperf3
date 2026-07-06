@@ -270,12 +270,28 @@ struct TestRunCtx {
     /// #330: the exchange-phase results read failed — GT's IERECVRESULTS
     /// surface (live-probed): the Nread_json warning already printed to
     /// stderr, the doc keeps the POPULATED end (TEST_END processing ran)
-    /// plus `error - unable to receive results: ` (the dangling `: ` is
-    /// the #248 perr form at errno 0 — RECORDED DEVIATION: GT appends
-    /// strerror of a STALE errno here, "Transport endpoint is not
-    /// connected" on Linux, while its own warning reports errno=0; we
-    /// print the honest errno-0 form instead of reproducing the stale
-    /// read), exit 0, persistent keeps serving.
+    /// plus `error - unable to receive results: `, exit 0, persistent keeps
+    /// serving.
+    ///
+    /// RECORDED DEVIATION (the dangling `: ` is the #248 perr form at
+    /// errno 0): GT appends `strerror` of a leftover errno here — on Linux
+    /// deterministically `Transport endpoint is not connected` (ENOTCONN)
+    /// across every clean-close probe — while its own warning reports
+    /// errno=0. The tail is a semantically-meaningless errno from the
+    /// best-effort cleanup path, so we print the honest errno-0 form.
+    ///
+    /// RECORDED DEVIATION (r2 finding 2 — close-type message flip): GT's
+    /// BASE message is not uniformly IERECVRESULTS. On a clean FIN the
+    /// half-closed socket still accepts `cleanup_server`'s best-effort
+    /// `SERVER_ERROR` write, so `i_errno` stays IERECVRESULTS ("unable to
+    /// receive results"). On an RST that write fails and
+    /// `iperf_set_send_state` overwrites `i_errno` to IESENDMESSAGE
+    /// (iperf_server_api.c:466-472), flipping the rendered key to "unable
+    /// to send control message - port may not be available...". That
+    /// message MISDESCRIBES the failure (the receive is what failed, not a
+    /// send), so per the faithful-ethos ruling we keep the honest
+    /// IERECVRESULTS surface for every close-type and file upstream rather
+    /// than reproduce the misleading flip.
     exchange_recv_failed: bool,
     /// #330 r1 F1: a mid-test IPERF_DONE — GT's switch has an EXPLICIT
     /// no-error arm for it (iperf_server_api.c:287-288) and Nread wrote
@@ -1876,9 +1892,12 @@ impl Server {
             let _client_results = tokio::select! {
                 r = protocol::recv_results_server(&mut ctx.ctrl) => match r {
                     Ok(v) => v,
-                    // #330: any malformed results read is GT's
-                    // IERECVRESULTS — the warning printed at the read
-                    // site; the finalize phases render the doc.
+                    // #330: a malformed results read routes to the
+                    // exchange_recv_failed surface — the Nread_json warning
+                    // printed at the read site; the finalize phases render
+                    // the doc. (The rendered error KEY is IERECVRESULTS on
+                    // every close-type here — a deliberate deviation from
+                    // GT's RST→IESENDMESSAGE flip; see the field's docs.)
                     Err(_) => {
                         ctx.exchange_recv_failed = true;
                         return Ok(());

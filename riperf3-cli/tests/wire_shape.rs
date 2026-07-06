@@ -931,9 +931,10 @@ fn exchange_half_size_then_hold_exits_bounded() {
         drop((ctrl, data));
     });
 
-    // The 10 s idle bound fires; well inside the 15 s assert window.
+    // The 10 s idle bound fires; the 20 s assert window leaves slack for a
+    // loaded 2-core CI runner (r2 finding 7).
     let status =
-        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(15))
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20))
             .expect("server exits on GT's read bound while the peer holds");
     assert!(status.success(), "one-off exits 0 like GT");
     let serr = serr_reader.join().expect("stderr");
@@ -1057,8 +1058,9 @@ fn exchange_zero_size_takes_gt_overflow_warning() {
 }
 
 /// #330: a HARD read error during the SIZE read (an RST before the 4-byte
-/// length arrives) takes GT's rc<0 size arm "read returned -1; errno={e}"
-/// — the size-stage twin of the blob rc<0 arm above.
+/// length arrives) takes GT's rc<0 size arm "read returned -2; errno={e}"
+/// (GT's Nrecv returns NET_HARDERROR=-2, echoed raw; r2 finding 1) — the
+/// size-stage twin of the blob rc<0 arm above.
 #[test]
 fn exchange_size_rst_takes_gt_read_failed_size_arm() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1103,7 +1105,7 @@ fn exchange_size_rst_takes_gt_read_failed_size_arm() {
     assert!(status.success(), "one-off exits 0 like GT");
     let serr = serr_reader.join().expect("stderr");
     assert!(
-        serr.contains("warning: Failed to read JSON data size - read returned -1; errno="),
+        serr.contains("warning: Failed to read JSON data size - read returned -2; errno="),
         "an RST at the size read takes GT's rc<0 size arm: {serr}"
     );
 }

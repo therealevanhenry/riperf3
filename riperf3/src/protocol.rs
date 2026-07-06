@@ -591,8 +591,23 @@ fn gt_warning(msg: std::fmt::Arguments<'_>) {
 const NREAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const NREAD_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// GT's `NET_HARDERROR` (net.h:50): the value `Nrecv` returns on a hard read
+/// error, echoed verbatim into the size-read warning's `read returned %d`
+/// (iperf_api.c:3074). It is -2, NOT -1 (`NET_SOFTERROR`, which `Nrecv`
+/// never emits) — r2 finding 1, live-confirmed GT prints `-2`.
+const NET_HARDERROR: i32 = -2;
+
 /// One GT-bounded read step: Ok(Some(n)) = n bytes, Ok(None) = EOF or a
 /// timeout (GT's Nrecv returns the partial), Err = hard read error.
+///
+/// RECORDED DEVIATION (r2 finding 5): the 10 s idle bound is fresh PER read
+/// step (idle-since-last-progress). GT-on-Linux instead threads ONE
+/// `select(2)` timeout that the kernel decrements in place across a single
+/// `Nread` (net.c:422), i.e. a cumulative-per-Nread budget; GT-on-BSD/macOS
+/// (where `select` leaves the timeout untouched, per POSIX) matches our
+/// per-step reset. Divergence is adversarial-only (a byte-dripping peer:
+/// GT-Linux gives up at ~10 s cumulative, we at up to the 30 s overall) and
+/// the real results blob is one atomic write; both paths stay bounded.
 async fn nread_step(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -610,7 +625,7 @@ async fn nread_step(
 }
 
 /// The SERVER's results read (#330): a malformed read gets GT's Nread_json
-/// warning surface (iperf_api.c:3036-3080 — all four arms, deterministic
+/// warning surface (iperf_api.c:3036-3080 — all five arms, deterministic
 /// text and counts, live-probed under -J and text) and maps to the
 /// IERECVRESULTS class the caller renders into the doc. Reads are bounded
 /// like GT's Nrecv. The client keeps the plain [`recv_results`]: its
@@ -630,9 +645,12 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
             Ok(Some(n)) => got += n,
+            // A hard read error: GT's Nrecv returns NET_HARDERROR and the
+            // size warning echoes that raw rc (iperf_api.c:3074) — so the
+            // literal is -2, not -1 (r2 finding 1).
             Err(e) => {
                 gt_warning(format_args!(
-                    "Failed to read JSON data size - read returned -1; errno={}",
+                    "Failed to read JSON data size - read returned {NET_HARDERROR}; errno={}",
                     e.raw_os_error().unwrap_or(0)
                 ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
@@ -641,14 +659,23 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 {
-        // GT's hsize>0 gate (iperf_api.c:3038/:3068): a zero size warns
+        // GT's hsize>0 gate (iperf_api.c:3038/:3069): a zero size warns
         // the overflow line — live-probed wording (r1 F4).
         gt_warning(format_args!(
             "JSON data length overflow - 0 bytes JSON size is not allowed"
         ));
         return Err(crate::error::RiperfError::RecvResultsFailed);
     }
-    let mut buf = vec![0u8; len];
+    // GT calloc's the buffer and NULL-guards it (iperf_api.c:3042-3043),
+    // degrading to IERECVRESULTS with NO warning on alloc failure. `len` is
+    // an unbounded peer-controlled u32 (max_size=0 → no cap, like GT), so a
+    // fallible reserve is the faithful match: an infallible `vec![0u8; len]`
+    // would abort the process on a hostile 4 GB prefix (r2 finding 4).
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return Err(crate::error::RiperfError::RecvResultsFailed);
+    }
+    buf.resize(len, 0);
     let mut got = 0usize;
     while got < len {
         match nread_step(stream, &mut buf[got..], deadline).await {
@@ -663,8 +690,8 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
             Ok(Some(n)) => got += n,
-            // A hard read error is GT's rc<0 arm (r1 F1 — live RST probe:
-            // "JSON data read failed; errno=104").
+            // A hard read error is GT's rc<0 arm (iperf_api.c:3061; r1 F1 —
+            // live RST probe: "JSON data read failed; errno=104").
             Err(e) => {
                 gt_warning(format_args!(
                     "JSON data read failed; errno={}",
