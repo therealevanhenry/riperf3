@@ -477,8 +477,9 @@ impl Server {
                     // it (sink rule). (r1 F3: the old PeerDisconnected arm
                     // is gone — both server recv_state sites convert EOF to
                     // this class now, so it had no constructor left.
-                    // Pre-test EOFs like port scans ride the generic Io arm
-                    // below, same as GT's per-scan cookie-read error line.)
+                    // Pre-test EOFs like port scans are caught earlier by the
+                    // cookie read and take GT's IERECVCOOKIE surface via the
+                    // RecvCookieFailed arm below (#330), not this mid-test one.)
                     if !json && !crate::macros::output_quiet() {
                         eprintln!("riperf3: {CTRL_CLOSED_MSG}");
                     }

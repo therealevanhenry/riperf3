@@ -1321,3 +1321,90 @@ fn param_failure_wire_back_is_server_error_ierecvparams() {
     });
     assert!(status.success());
 }
+
+/// r1 F2 / M4: the cookie-path SERVER_ERROR wire-back i_errno (106). The two
+/// cookie tests above close before reading it; here the mock half-closes its
+/// write side (a FIN so the server's cookie read EOFs) but keeps the read side
+/// open, so it can observe the wire-back bytes.
+#[test]
+fn cookie_failure_wire_back_is_server_error_ierecvcookie() {
+    let (_sout, _serr, status) = drive_server_scenario(false, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        ctrl.write_all(b"short").unwrap(); // < 37 cookie bytes
+        ctrl.shutdown(std::net::Shutdown::Write).unwrap(); // FIN, keep read open
+        let back = read_exact(&mut ctrl, 9);
+        assert_eq!(back[0], 0xfe, "SERVER_ERROR state (-2): {back:?}");
+        assert_eq!(
+            u32::from_be_bytes(back[1..5].try_into().unwrap()),
+            106,
+            "IERECVCOOKIE i_errno"
+        );
+        assert_eq!(
+            u32::from_be_bytes(back[5..9].try_into().unwrap()),
+            0,
+            "honest errno 0"
+        );
+    });
+    assert!(status.success());
+}
+
+// ---------------------------------------------------------------------------
+// #330 (r1 F1): the serve loop's RESIDUAL generic Err arm rides the same
+// iperf_err sink. A #188-class validation rejection (valid JSON that
+// deserializes but fails config derivation — a negative block size) reaches
+// that arm; under -J it must be silent on stderr with the message in a
+// skeleton doc, not the raw stderr line GT never emits in JSON mode. The
+// wording is riperf3's own #188 deviation (not a GT class), so the pin is on
+// the SINK SHAPE.
+// ---------------------------------------------------------------------------
+
+/// Valid JSON, deserializes, but `len: -5` fails config derivation (#188).
+const GENERIC_ARM_PARAMS: &str = r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":1,"len":-5,"pacing_timer":1000,"client_version":"riperf3 0.0.0"}"#;
+
+fn drive_generic_arm_failure(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, GENERIC_ARM_PARAMS);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn generic_arm_failure_text_prints_one_error_line() {
+    let (_sout, serr, status) = drive_server_scenario(false, drive_generic_arm_failure);
+    assert!(
+        serr.starts_with("riperf3: error - ") && serr.lines().count() == 1,
+        "one iperf_err text line: {serr:?}"
+    );
+    assert!(
+        status.success(),
+        "one-off server exits 0 after a rejected test"
+    );
+}
+
+#[test]
+fn generic_arm_failure_json_is_silent_stderr_with_skeleton_doc() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_generic_arm_failure);
+    assert!(
+        serr.trim().is_empty(),
+        "-J routes the residual error to the doc, not stderr: {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("error - ")),
+        "the skeleton doc carries the error key: {doc}"
+    );
+    assert!(
+        doc["intervals"].as_array().expect("intervals").is_empty(),
+        "skeleton intervals:[]"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "skeleton bare end{{}}"
+    );
+    assert!(status.success());
+}
