@@ -160,6 +160,19 @@ fn run_scenario_full(
     mid_test: bool,
     params: &'static str,
 ) -> (String, String, std::process::ExitStatus) {
+    drive_server_scenario(json, move |port| {
+        drive_mock_round_full(port, final_action, mid_test, params)
+    })
+}
+
+/// Spawn a one-off (`-s -1`) server, run an arbitrary `mock` against it on the
+/// bound port, and capture `(stdout, stderr, exit status)`. The shared spawn
+/// body for [`run_scenario_full`] and the #330 pre-test-error scenarios (which
+/// drive a mock that never reaches a real test).
+fn drive_server_scenario(
+    json: bool,
+    mock: impl FnOnce(u16) + Send + 'static,
+) -> (String, String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -183,8 +196,7 @@ fn run_scenario_full(
         riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    let mock =
-        std::thread::spawn(move || drive_mock_round_full(port, final_action, mid_test, params));
+    let mock = std::thread::spawn(move || mock(port));
     mock.join().expect("mock");
     let status =
         riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
@@ -1164,4 +1176,371 @@ fn client_state_wait_unknown_byte_takes_gt_iemessage() {
         "GT's client IEMESSAGE line"
     );
     assert_eq!(client.status.code(), Some(1), "GT's client errexits 1");
+}
+
+// ---------------------------------------------------------------------------
+// #330: the pre-test SERVER generic-error surface (cookie + params).
+//
+// GT 3.21 live-probed: a control-connection that fails the cookie read or the
+// param read/parse errors out through iperf_err's json sink — silent stderr
+// under -J with the message in a SKELETON accumulated doc, one stderr line in
+// text — plus a best-effort SERVER_ERROR(-2) + (i_errno, errno) wire-back via
+// cleanup_server. One-off servers keep exit 0. riperf3 previously surfaced the
+// raw "early eof" / serde class on stderr with no -J doc at all.
+// ---------------------------------------------------------------------------
+
+/// IERECVCOOKIE(106) — iperf_error.c: "unable to receive cookie at server".
+const RECV_COOKIE_MSG: &str = "unable to receive cookie at server";
+/// IERECVPARAMS(114) — iperf_error.c: "unable to receive parameters from client".
+const RECV_PARAMS_MSG: &str = "unable to receive parameters from client";
+
+/// Cookie failure: connect, send a truncated cookie, then EOF. GT's
+/// iperf_accept read fails -> IERECVCOOKIE.
+fn drive_cookie_failure(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(b"short").unwrap(); // < 37 cookie bytes, then close
+    drop(ctrl);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+/// Params failure: full cookie, read ParamExchange(9), then send a
+/// length-prefixed blob that is not valid JSON. GT's get_parameters ->
+/// JSON_read cJSON_Parse fails -> IERECVPARAMS.
+fn drive_param_failure(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, "this is not json");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn cookie_failure_text_prints_the_ierecvcookie_line() {
+    let (_sout, serr, status) = drive_server_scenario(false, drive_cookie_failure);
+    // The #248 perr dangling ": " at errno 0 — GT's honest form (its own
+    // stale-errno strerror is a recorded deviation, like #336).
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_COOKIE_MSG}: \n"),
+        "{serr:?}"
+    );
+    assert!(
+        status.success(),
+        "one-off server exits 0 after a cookie failure"
+    );
+}
+
+#[test]
+fn cookie_failure_json_emits_the_skeleton_doc_silent_stderr() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_cookie_failure);
+    assert!(
+        serr.trim().is_empty(),
+        "-J silences the error line: {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {RECV_COOKIE_MSG}: ").as_str()),
+        "the -J error key carries GT's IERECVCOOKIE sentence: {doc}"
+    );
+    assert_eq!(
+        doc["start"]["connected"].as_array().map(Vec::len),
+        Some(0),
+        "skeleton start.connected is empty"
+    );
+    assert!(doc["start"]["version"].is_string());
+    assert!(doc["start"]["system_info"].is_string());
+    assert!(doc["intervals"].as_array().expect("intervals").is_empty());
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}"
+    );
+    assert!(status.success());
+}
+
+#[test]
+fn param_failure_text_prints_the_ierecvparams_line() {
+    let (_sout, serr, status) = drive_server_scenario(false, drive_param_failure);
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_PARAMS_MSG}: \n"),
+        "{serr:?}"
+    );
+    assert!(
+        status.success(),
+        "one-off server exits 0 after a param failure"
+    );
+}
+
+#[test]
+fn param_failure_json_emits_the_skeleton_doc_silent_stderr() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_param_failure);
+    assert!(
+        serr.trim().is_empty(),
+        "-J silences the error line: {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {RECV_PARAMS_MSG}: ").as_str()),
+        "the -J error key carries GT's IERECVPARAMS sentence: {doc}"
+    );
+    assert!(doc["intervals"].as_array().expect("intervals").is_empty());
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}"
+    );
+    assert!(status.success());
+}
+
+/// The wire-back: GT's cleanup_server sends SERVER_ERROR(-2), then
+/// htonl(i_errno), then htonl(errno). riperf3 mirrors it with errno pinned to
+/// 0 (honest, like #336). Observable only for the param case — a
+/// cookie-failure peer has already closed.
+#[test]
+fn param_failure_wire_back_is_server_error_ierecvparams() {
+    let (_sout, _serr, status) = drive_server_scenario(false, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, "this is not json");
+        let back = read_exact(&mut ctrl, 9);
+        assert_eq!(back[0], 0xfe, "SERVER_ERROR state (-2): {back:?}");
+        assert_eq!(
+            u32::from_be_bytes(back[1..5].try_into().unwrap()),
+            114,
+            "IERECVPARAMS i_errno"
+        );
+        assert_eq!(
+            u32::from_be_bytes(back[5..9].try_into().unwrap()),
+            0,
+            "honest errno 0"
+        );
+    });
+    assert!(status.success());
+}
+
+/// r1 F2 / M4: the cookie-path SERVER_ERROR wire-back i_errno (106). The two
+/// cookie tests above close before reading it; here the mock half-closes its
+/// write side (a FIN so the server's cookie read EOFs) but keeps the read side
+/// open, so it can observe the wire-back bytes.
+#[test]
+fn cookie_failure_wire_back_is_server_error_ierecvcookie() {
+    let (_sout, _serr, status) = drive_server_scenario(false, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        ctrl.write_all(b"short").unwrap(); // < 37 cookie bytes
+        ctrl.shutdown(std::net::Shutdown::Write).unwrap(); // FIN, keep read open
+        let back = read_exact(&mut ctrl, 9);
+        assert_eq!(back[0], 0xfe, "SERVER_ERROR state (-2): {back:?}");
+        assert_eq!(
+            u32::from_be_bytes(back[1..5].try_into().unwrap()),
+            106,
+            "IERECVCOOKIE i_errno"
+        );
+        assert_eq!(
+            u32::from_be_bytes(back[5..9].try_into().unwrap()),
+            0,
+            "honest errno 0"
+        );
+    });
+    assert!(status.success());
+}
+
+/// #339 r2b F1: GT bounds EVERY Nread (net.c:75-76) — the cookie read
+/// included; iperf_server_api.c:194-200's own comment names the timeout case
+/// ("the inability to read the correct amount of data (i.e. timed out)"),
+/// and live GT self-recovers from a connect-and-hold peer in ~20 s with the
+/// IERECVCOOKIE surface. Unbounded, riperf3's serial serve loop parked
+/// forever behind one hostile peer.
+#[test]
+fn pretest_cookie_hold_exits_bounded_with_ierecvcookie() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Detached holder: connects and sends NOTHING. The server must not wait
+    // for it (the thread outlives the assert; the process exit reaps it).
+    std::thread::spawn(move || {
+        let ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        drop(ctrl);
+    });
+
+    // The 10 s idle bound fires; the 20 s assert window leaves slack for a
+    // loaded 2-core CI runner (the exchange_half_size hold precedent).
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20))
+            .expect("server exits on GT's read bound while the peer holds");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_COOKIE_MSG}: \n"),
+        "the bounded cookie read takes the IERECVCOOKIE surface: {serr:?}"
+    );
+}
+
+/// #339 r2b F1, params half: full cookie, then 2 of the 4 length-prefix
+/// bytes and a HOLD. GT's get_parameters Nread times out and IERECVPARAMS
+/// renders; riperf3 previously parked in the unbounded json_read.
+#[test]
+fn pretest_params_hold_exits_bounded_with_ierecvparams() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        ctrl.write_all(&[0u8, 0u8]).unwrap(); // 2 of 4 size bytes, then HOLD
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        drop(ctrl);
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20))
+            .expect("server exits on GT's read bound while the peer holds");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_PARAMS_MSG}: \n"),
+        "the bounded params read takes the IERECVPARAMS surface: {serr:?}"
+    );
+}
+
+/// #339 r2b F2: iperf_err prefixes its stderr line with the --timestamps
+/// stamp (iperf_error.c:51-57, :77) — the pre-test emit site must ride the
+/// same output_timestamp_prefix() the stdout banner does. A literal strftime
+/// format keeps the pin deterministic (formats pass through verbatim, #202).
+#[test]
+fn pretest_error_line_carries_the_timestamps_prefix() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--timestamps=XTSX "])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || drive_cookie_failure(port));
+    mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
+            .expect("server exits");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    let suffix = format!("riperf3: error - {RECV_COOKIE_MSG}: \n");
+    assert!(
+        serr.ends_with(&suffix) && serr.len() > suffix.len(),
+        "a nonempty timestamp prefix precedes the iperf_err line: {serr:?}"
+    );
+    // Unix renders the literal strftime format verbatim; Windows uses the
+    // documented HH:MM:SS fallback (macros.rs render_timestamp) and ignores
+    // the format, so the byte-exact pin is unix-only.
+    #[cfg(unix)]
+    assert_eq!(
+        serr,
+        format!("XTSX {suffix}"),
+        "the literal format renders verbatim: {serr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #330 (r1 F1): the serve loop's RESIDUAL generic Err arm rides the same
+// iperf_err sink. A #188-class validation rejection (valid JSON that
+// deserializes but fails config derivation — a negative block size) reaches
+// that arm; under -J it must be silent on stderr with the message in a
+// skeleton doc, not the raw stderr line GT never emits in JSON mode. The
+// wording is riperf3's own #188 deviation (not a GT class), so the pin is on
+// the SINK SHAPE.
+// ---------------------------------------------------------------------------
+
+/// Valid JSON, deserializes, but `len: -5` fails config derivation (#188).
+const GENERIC_ARM_PARAMS: &str = r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":1,"len":-5,"pacing_timer":1000,"client_version":"riperf3 0.0.0"}"#;
+
+fn drive_generic_arm_failure(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, GENERIC_ARM_PARAMS);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+#[test]
+fn generic_arm_failure_text_prints_one_error_line() {
+    let (_sout, serr, status) = drive_server_scenario(false, drive_generic_arm_failure);
+    assert!(
+        serr.starts_with("riperf3: error - ") && serr.lines().count() == 1,
+        "one iperf_err text line: {serr:?}"
+    );
+    assert!(
+        status.success(),
+        "one-off server exits 0 after a rejected test"
+    );
+}
+
+#[test]
+fn generic_arm_failure_json_is_silent_stderr_with_skeleton_doc() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_generic_arm_failure);
+    assert!(
+        serr.trim().is_empty(),
+        "-J routes the residual error to the doc, not stderr: {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert!(
+        doc["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("error - ")),
+        "the skeleton doc carries the error key: {doc}"
+    );
+    assert!(
+        doc["intervals"].as_array().expect("intervals").is_empty(),
+        "skeleton intervals:[]"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "skeleton bare end{{}}"
+    );
+    assert!(status.success());
 }

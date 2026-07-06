@@ -477,8 +477,9 @@ impl Server {
                     // it (sink rule). (r1 F3: the old PeerDisconnected arm
                     // is gone — both server recv_state sites convert EOF to
                     // this class now, so it had no constructor left.
-                    // Pre-test EOFs like port scans ride the generic Io arm
-                    // below, same as GT's per-scan cookie-read error line.)
+                    // Pre-test EOFs like port scans are caught earlier by the
+                    // cookie read and take GT's IERECVCOOKIE surface via the
+                    // RecvCookieFailed arm below (#330), not this mid-test one.)
                     if !json && !crate::macros::output_quiet() {
                         eprintln!("riperf3: {CTRL_CLOSED_MSG}");
                     }
@@ -514,8 +515,23 @@ impl Server {
                         eprintln!("riperf3: error - {}", RiperfError::UnknownControlMessage);
                     }
                 }
+                // #330: the pre-test control failures. Unlike the classes
+                // above — which build a partial report inside handle_one_test
+                // and carried the error in it — these error BEFORE any report
+                // exists, so the serve loop emits GT's iperf_err sink shape
+                // directly: silent stderr + a SKELETON accumulated doc under
+                // -J, one text line otherwise.
+                Err(e @ RiperfError::RecvCookieFailed) | Err(e @ RiperfError::RecvParamsFailed) => {
+                    self.emit_pretest_error(&e);
+                }
                 Err(e) => {
-                    if !crate::macros::output_quiet() {
+                    // Any residual pre-report error rides the same sink: under
+                    // -J iperf_err stays silent and puts the message in a
+                    // skeleton doc, rather than the raw stderr line GT never
+                    // emits in JSON mode (#330 divergence 1).
+                    if json {
+                        self.emit_pretest_error_doc(&format!("error - {e}"));
+                    } else if !crate::macros::output_quiet() {
                         eprintln!("riperf3: error - {e}");
                     }
                 }
@@ -914,11 +930,31 @@ impl Server {
         ctrl: &mut tokio::net::TcpStream,
     ) -> Result<Option<([u8; protocol::COOKIE_SIZE], TestParams, TestConfig)>> {
         // ---- Cookie ----
-        let cookie = protocol::recv_cookie(ctrl).await?;
+        // #330: a failed cookie read is GT's IERECVCOOKIE(106) — iperf_accept
+        // errors and cleanup_server relays SERVER_ERROR(-2) + the code before
+        // the serve loop renders the exit-0 keep-serving surface (skeleton -J
+        // doc / one text line). The wire-back is best-effort: a peer that
+        // already closed (a port scan) just no-ops the send, like GT's Nwrite.
+        let cookie = match protocol::recv_cookie(ctrl).await {
+            Ok(cookie) => cookie,
+            Err(_) => {
+                let _ = protocol::send_server_error(ctrl, 106).await;
+                return Err(RiperfError::RecvCookieFailed);
+            }
+        };
 
         // ---- ParamExchange ----
         protocol::send_state(ctrl, TestState::ParamExchange).await?;
-        let mut params = protocol::recv_params(ctrl).await?;
+        // #330: GT's get_parameters sets IERECVPARAMS(114) whenever JSON_read
+        // returns NULL — a short/absent body OR a cJSON parse failure alike —
+        // and relays SERVER_ERROR(-2) + the code through cleanup_server.
+        let mut params = match protocol::recv_params(ctrl).await {
+            Ok(params) => params,
+            Err(_) => {
+                let _ = protocol::send_server_error(ctrl, 114).await;
+                return Err(RiperfError::RecvParamsFailed);
+            }
+        };
         // iperf3 sends num/blockcount = 0 for a plain `-t` run; treat 0 as
         // unlimited so the byte-limit checks below don't misread a duration test
         // as byte-limited (#119).
@@ -2841,6 +2877,45 @@ impl Server {
             eprintln!("riperf3: error - {MSG}");
         }
         Ok(())
+    }
+
+    /// #330: the JSON half of a pre-test error's iperf_err sink — the -J
+    /// skeleton document (populated `start`/`intervals:[]`/`end:{}` + `error`)
+    /// or the --json-stream error+empty-end event pair. No-op in text mode and
+    /// under the #290 console-quiet scope. Shared by [`Self::emit_pretest_error`]
+    /// and the serve loop's residual generic arm.
+    fn emit_pretest_error_doc(&self, doc_error: &str) {
+        if crate::macros::output_quiet() {
+            return;
+        }
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
+                doc_error,
+            ));
+        } else if self.json_output {
+            println!("{}", crate::json_report::error_document(doc_error));
+        }
+    }
+
+    /// #330: render a pre-test control error (IERECVCOOKIE / IERECVPARAMS) in
+    /// GT's iperf_err sink shape — silent stderr under -J with the message in
+    /// the skeleton doc, one text line otherwise. Both codes are perr=1, so the
+    /// #248 dangling ": " rides along; riperf3 pins errno 0, leaving the suffix
+    /// bare where GT would append a (often stale) strerror — the same honest
+    /// deviation as #336.
+    fn emit_pretest_error(&self, err: &RiperfError) {
+        let doc_error = format!("error - {err}: ");
+        if self.json_output || self.json_stream {
+            self.emit_pretest_error_doc(&doc_error);
+        } else if !crate::macros::output_quiet() {
+            // #339 r2b F2: iperf_err stamps its stderr line with the
+            // --timestamps prefix (iperf_error.c:51-57, :77) — same
+            // output_timestamp_prefix() the stdout banner rides.
+            eprintln!(
+                "{}riperf3: {doc_error}",
+                crate::macros::output_timestamp_prefix()
+            );
+        }
     }
 
     /// #230: refuse a test at param exchange (GT's upfront requested-duration

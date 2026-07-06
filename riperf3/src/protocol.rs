@@ -184,10 +184,16 @@ pub async fn send_cookie(stream: &mut TcpStream, cookie: &[u8; COOKIE_SIZE]) -> 
     Ok(())
 }
 
-/// Read a 37-byte cookie from a TCP stream.
+/// Read a 37-byte cookie from a TCP stream. Bounded like every GT Nread
+/// (net.c:75-76) — iperf_server_api.c:194-200's IERECVCOOKIE comment names
+/// the timed-out read explicitly, and live GT self-recovers from a
+/// connect-and-hold peer in ~20 s. Unbounded, one hostile peer parked the
+/// serial serve loop forever (#339 r2b F1). Both call sites are server-side
+/// (the control cookie and the data-stream cookie).
 pub async fn recv_cookie(stream: &mut TcpStream) -> Result<[u8; COOKIE_SIZE]> {
+    let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut cookie = [0u8; COOKIE_SIZE];
-    stream.read_exact(&mut cookie).await?;
+    nread_exact(stream, &mut cookie, deadline).await?;
     Ok(cookie)
 }
 
@@ -538,9 +544,11 @@ pub async fn send_params(stream: &mut TcpStream, params: &TestParams) -> Result<
     json_write(stream, &value).await
 }
 
-/// Receive test parameters from length-prefixed JSON.
+/// Receive test parameters from length-prefixed JSON. Bounded like every GT
+/// Nread (#339 r2b F1): a peer that holds mid-prefix or mid-body times out
+/// into the IERECVPARAMS surface instead of parking the serve loop.
 pub async fn recv_params(stream: &mut TcpStream) -> Result<TestParams> {
-    let value = json_read(stream, MAX_PARAMS_JSON_LEN).await?;
+    let value = json_read_bounded(stream, MAX_PARAMS_JSON_LEN).await?;
     let params: TestParams = serde_json::from_value(value)?;
     Ok(params)
 }
@@ -622,6 +630,48 @@ async fn nread_step(
         _ = tokio::time::sleep(NREAD_IDLE_TIMEOUT) => Ok(None),
         _ = tokio::time::sleep_until(deadline) => Ok(None),
     }
+}
+
+/// GT-bounded read_exact on top of [`nread_step`]: fills `buf` fully or
+/// fails — EOF, the idle bound, and the overall deadline all collapse to
+/// `UnexpectedEof` (GT's Nread returns the partial count and every
+/// exact-size caller treats a short read as the failure; the pre-test
+/// callers have no warning surface — that parity is a #330 residual).
+async fn nread_exact(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> std::result::Result<(), std::io::Error> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        match nread_step(stream, &mut buf[got..], deadline).await? {
+            None => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Some(n) => got += n,
+        }
+    }
+    Ok(())
+}
+
+/// GT-bounded [`json_read`] (#339 r2b F1): the server's params read gets
+/// Nread's idle/overall bounds so a holding peer can't park the serial
+/// serve loop. Client-side reads keep the plain [`json_read`] — their
+/// bound/warning parity is a separate surface (noted on #330).
+async fn json_read_bounded(stream: &mut TcpStream, max_len: usize) -> Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
+    let mut len_buf = [0u8; 4];
+    nread_exact(stream, &mut len_buf, deadline).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if max_len > 0 && len > max_len {
+        return Err(RiperfError::Protocol(format!(
+            "JSON payload too large: {len} bytes (max {max_len})"
+        )));
+    }
+
+    let mut buf = vec![0u8; len];
+    nread_exact(stream, &mut buf, deadline).await?;
+    let value: serde_json::Value = serde_json::from_slice(&buf)?;
+    Ok(value)
 }
 
 /// The SERVER's results read (#330): a malformed read gets GT's Nread_json
