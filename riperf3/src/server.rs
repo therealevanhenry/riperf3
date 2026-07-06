@@ -2908,7 +2908,13 @@ impl Server {
         if self.json_output || self.json_stream {
             self.emit_pretest_error_doc(&doc_error);
         } else if !crate::macros::output_quiet() {
-            eprintln!("riperf3: {doc_error}");
+            // #339 r2b F2: iperf_err stamps its stderr line with the
+            // --timestamps prefix (iperf_error.c:51-57, :77) — same
+            // output_timestamp_prefix() the stdout banner rides.
+            eprintln!(
+                "{}riperf3: {doc_error}",
+                crate::macros::output_timestamp_prefix()
+            );
         }
     }
 

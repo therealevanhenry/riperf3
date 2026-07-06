@@ -1349,6 +1349,133 @@ fn cookie_failure_wire_back_is_server_error_ierecvcookie() {
     assert!(status.success());
 }
 
+/// #339 r2b F1: GT bounds EVERY Nread (net.c:75-76) — the cookie read
+/// included; iperf_server_api.c:194-200's own comment names the timeout case
+/// ("the inability to read the correct amount of data (i.e. timed out)"),
+/// and live GT self-recovers from a connect-and-hold peer in ~20 s with the
+/// IERECVCOOKIE surface. Unbounded, riperf3's serial serve loop parked
+/// forever behind one hostile peer.
+#[test]
+fn pretest_cookie_hold_exits_bounded_with_ierecvcookie() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // Detached holder: connects and sends NOTHING. The server must not wait
+    // for it (the thread outlives the assert; the process exit reaps it).
+    std::thread::spawn(move || {
+        let ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        drop(ctrl);
+    });
+
+    // The 10 s idle bound fires; the 20 s assert window leaves slack for a
+    // loaded 2-core CI runner (the exchange_half_size hold precedent).
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20))
+            .expect("server exits on GT's read bound while the peer holds");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_COOKIE_MSG}: \n"),
+        "the bounded cookie read takes the IERECVCOOKIE surface: {serr:?}"
+    );
+}
+
+/// #339 r2b F1, params half: full cookie, then 2 of the 4 length-prefix
+/// bytes and a HOLD. GT's get_parameters Nread times out and IERECVPARAMS
+/// renders; riperf3 previously parked in the unbounded json_read.
+#[test]
+fn pretest_params_hold_exits_bounded_with_ierecvparams() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        ctrl.write_all(&[0u8, 0u8]).unwrap(); // 2 of 4 size bytes, then HOLD
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        drop(ctrl);
+    });
+
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20))
+            .expect("server exits on GT's read bound while the peer holds");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr,
+        format!("riperf3: error - {RECV_PARAMS_MSG}: \n"),
+        "the bounded params read takes the IERECVPARAMS surface: {serr:?}"
+    );
+}
+
+/// #339 r2b F2: iperf_err prefixes its stderr line with the --timestamps
+/// stamp (iperf_error.c:51-57, :77) — the pre-test emit site must ride the
+/// same output_timestamp_prefix() the stdout banner does. A literal strftime
+/// format keeps the pin deterministic (formats pass through verbatim, #202).
+#[test]
+fn pretest_error_line_carries_the_timestamps_prefix() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--timestamps=XTSX "])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || drive_cookie_failure(port));
+    mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
+            .expect("server exits");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert_eq!(
+        serr,
+        format!("XTSX riperf3: error - {RECV_COOKIE_MSG}: \n"),
+        "iperf_err's stderr line carries the timestamp prefix: {serr:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #330 (r1 F1): the serve loop's RESIDUAL generic Err arm rides the same
 // iperf_err sink. A #188-class validation rejection (valid JSON that
