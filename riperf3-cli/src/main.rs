@@ -212,6 +212,68 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // #334: -w/-b/--fq-rate wire through GT's unit parsers with their own
+    // error classes, all in-loop — BEFORE the post-loop role checks, so a
+    // client-only flag's bad value beats IECLIENTONLY (live-probed:
+    // `-s -b abc` is IEUNITVAL, not client-only). GT echoes the RAW argv
+    // bytes in the IEUNITVAL quotes, so those lines are written byte-for-byte.
+
+    // -w/--window (iperf_api.c:1438-1452): unit_atof (1024-based) → IEUNITVAL,
+    // then `farg > (double) MAX_TCP_BUFFER` (512*MB = 536870912) → IEBUFSIZE,
+    // else `(int) farg`.
+    const MAX_TCP_BUFFER: f64 = 536_870_912.0;
+    if let Some(spec) = cli.window.as_deref() {
+        match cli::unit_atoi_like_bytes(spec.as_encoded_bytes()) {
+            Err(()) => {
+                print_unit_val_error(spec.as_encoded_bytes());
+                return std::process::ExitCode::FAILURE;
+            }
+            Ok(farg) if farg > MAX_TCP_BUFFER => {
+                eprintln!(
+                    "riperf3: parameter error - socket buffer size too large \
+                     (maximum = 536870912 bytes)"
+                );
+                print_usage_trailer();
+                return std::process::ExitCode::FAILURE;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // -b/--bitrate (iperf_api.c:1347-1365): slash-split FIRST — if a '/' is
+    // present, burst = atoi(after) with `<= 0 || > MAX_BURST` (1000) →
+    // IEBURST; THEN rate = unit_atof_rate(before) → IEUNITVAL. The burst
+    // check precedes the rate parse (GT's code order), and the IEUNITVAL
+    // errarg is the RATE part only (the slash was NUL'd).
+    const MAX_BURST: i64 = 1000;
+    if let Some(spec) = cli.bitrate.as_deref() {
+        let (rate, burst) = cli::split_rate_interval(spec);
+        if let Some(burst) = burst {
+            let n = cli::atoi_like_bytes(burst);
+            if n <= 0 || n > MAX_BURST {
+                eprintln!("riperf3: parameter error - invalid burst count (maximum = 1000)");
+                print_usage_trailer();
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        if cli::unit_atof_rate_like_bytes(rate).is_err() {
+            print_unit_val_error(rate);
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
+    // --fq-rate (iperf_api.c:1726-1737): unit_atof_rate (1000-based) →
+    // IEUNITVAL. (GT gates the whole case on HAVE_SO_MAX_PACING_RATE, else
+    // IEUNIMP; riperf3 applies fq-pacing best-effort on every platform, so it
+    // validates the value uniformly — this is the value class the Linux
+    // reference reaches.)
+    if let Some(spec) = cli.fq_rate.as_deref() {
+        if cli::unit_atof_rate_like_bytes(spec.as_encoded_bytes()).is_err() {
+            print_unit_val_error(spec.as_encoded_bytes());
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+
     if let Some(msg) = parse_class_rejection(&cli) {
         // #270: GT routes the parse-error class through 'parameter error - '
         // with the usage trailer (live-probed for all three classes here:
@@ -358,6 +420,17 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
         // part of the live-probed line (errno 0 at parse time).
         if cli.rcv_timeout.is_some() && !cli.reverse && !cli.bidir {
             return Some("client receive timeout is valid only in receiving mode: ".to_string());
+        }
+        // #335: GT rejects `-F` under UDP with IEUDPFILETRANSFER
+        // (iperf_api.c:1919-1923) — a UDP datagram carries its own header
+        // (packet number, etc.), so a file transfer can't ride it. This sits
+        // AFTER the rvrs-rcv-timeout leg (:1880) and BEFORE the blksize block
+        // (:1926) in GT's post-loop, so it BEATS the -l/blksize rejection
+        // below (live-probed: `-u -F x -l 70000` is IEUDPFILETRANSFER, not
+        // IEUDPBLOCKSIZE). `-u` is client-only, so on a server it takes
+        // IECLIENTONLY first — this leg only matters for a client.
+        if cli.file.is_some() && cli.udp {
+            return Some("cannot transfer file using UDP".to_string());
         }
         // #328 (r1 F1): GT's -l range checks sit BETWEEN the rvrs-rcv check
         // (:1881) and the end-conditions check (:1992) in the parse
