@@ -738,14 +738,16 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
         match nread_step(stream, &mut chunk[..take], deadline).await {
             // EOF/timeout: GT's Nread returned the partial (rc >= 0) — the
             // expected/received arm (live: "expected 500 bytes but
-            // received 5; errno=0"). GT prints the uint32_t hsize through
-            // %d (iperf_api.c:3057), so the expected count two's-complement
-            // wraps past INT_MAX (#341: 0xFFFFFFF0 → "expected -16").
+            // received 5; errno=0"). GT prints BOTH counts through %d
+            // (iperf_api.c:3056: hsize, rc), so each two's-complement wraps
+            // past INT_MAX (#341: 0xFFFFFFF0 → "expected -16"; the received
+            // arm needs a >2^31-byte transfer to diverge — r1's note; the
+            // cast is well-defined since got <= len <= u32::MAX).
             Ok(None) => {
                 gt_warning(format_args!(
                     "JSON size of data read does not correspond to offered length - \
-                     expected {} bytes but received {got}; errno=0",
-                    len as u32 as i32
+                     expected {} bytes but received {}; errno=0",
+                    len as u32 as i32, got as u32 as i32
                 ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
