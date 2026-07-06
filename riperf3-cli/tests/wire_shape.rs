@@ -1133,7 +1133,7 @@ fn exchange_size_rst_takes_gt_read_failed_size_arm() {
     );
 }
 
-/// #341: GT prints the expected size through `%d` (iperf_api.c:3057 — the
+/// #341: GT prints the expected size through `%d` (iperf_api.c:3056 — the
 /// uint32_t hsize two's-complement-wraps), so a hostile 0xFFFFFFF0 prefix
 /// warns "expected -16", not the unsigned 4294967280.
 #[test]
@@ -1145,6 +1145,63 @@ fn exchange_huge_size_warning_wraps_like_gt_percent_d() {
              expected -16 bytes but received 0; errno=0"
         ),
         "GT's %d wrap on the expected count: {serr}"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+}
+
+/// #347 r2 F1: the chunk-loop bookkeeping (`take` cap + `extend ..n`) needs
+/// discriminating coverage — a paced >64 KiB blob with coalesced trailing
+/// junk. The mid-blob pause forces a partial chunk read (an `extend ..take`
+/// mutant appends stale garbage); the junk written together with the tail
+/// coalesces into the final read (a `take = chunk.len()` mutant over-reads
+/// past the promised length). Correct code reads exactly the promised
+/// length like GT (iperf_api.c:3044/:3053), completes the exchange, and the
+/// junk then lands in the END LOOP as GT's IEMESSAGE — proving it was never
+/// consumed by the blob read.
+#[test]
+fn exchange_multi_chunk_paced_blob_with_trailing_junk_completes() {
+    let (_sout, serr, status) = drive_server_scenario(false, |port| {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+
+        // A valid 100 000-byte results doc: MOCK_RESULTS plus JSON-legal
+        // trailing spaces inside the promised length (spans 2 chunks).
+        let mut blob = MOCK_RESULTS.as_bytes().to_vec();
+        blob.resize(100_000, b' ');
+        ctrl.write_all(&(blob.len() as u32).to_be_bytes()).unwrap();
+        ctrl.write_all(&blob[..30_000]).unwrap();
+        // Pause mid-blob: the server's in-flight chunk read returns partial.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Tail + junk in ONE write so they coalesce into the final read.
+        let mut tail = blob[30_000..].to_vec();
+        tail.extend_from_slice(&[b'J'; 512]);
+        ctrl.write_all(&tail).unwrap();
+
+        // The exchange completes: the server's results + DisplayResults.
+        read_json_blob(&mut ctrl);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop((ctrl, data));
+    });
+    assert!(
+        !serr.contains("warning:"),
+        "the paced multi-chunk blob parses clean — no warning arm fires: {serr}"
+    );
+    assert!(
+        serr.contains(IEMESSAGE),
+        "the junk stays queued past the blob read and lands in the end loop \
+         as GT's IEMESSAGE: {serr}"
     );
     assert!(status.success(), "one-off exits 0 like GT");
 }
