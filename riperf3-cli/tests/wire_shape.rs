@@ -945,7 +945,8 @@ fn exchange_half_size_then_hold_exits_bounded() {
 }
 
 /// #330: a short results blob then EOF — GT's expected/received warning
-/// verbatim (live: "expected 500 bytes but received 5; errno=0").
+/// verbatim (this cell sends 4 blob bytes: "expected 500 bytes but
+/// received 4; errno=0").
 #[test]
 fn exchange_short_blob_prints_gt_length_warning() {
     let (_sout, serr, status) = run_exchange_fail_scenario(false, Some((500, b"{\"cp")));
@@ -981,15 +982,23 @@ fn force_rst_on_drop(sock: &std::net::TcpStream) {
     };
     assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
 }
-#[cfg(not(unix))]
-fn force_rst_on_drop(_sock: &std::net::TcpStream) {}
+// (No non-unix stub: the only callers are the two RST pins below, both
+// #[cfg(unix)] — forcing an RST needs SO_LINGER(0), which is unix-only.)
 
 /// #336 r1 F1: a HARD read error mid-blob (an RST arriving after the SIZE
 /// was read and the server is blocked on the blob) takes GT's rc<0 arm
-/// "JSON data read failed; errno={e}" (iperf_api.c:3078) — NOT the
+/// "JSON data read failed; errno={e}" (iperf_api.c:3061) — NOT the
 /// expected/received short-read arm (that one is for a clean partial+EOF,
 /// where GT's Nread returned rc>=0). The mock promises 500 bytes, lets the
 /// server consume the size and block, then RST-closes.
+///
+/// Unix-only (r3 finding 1): the mock leaves NO unread data before it drops
+/// (the server already consumed the size), so the cross-platform
+/// unread-data→RST path doesn't apply — a real RST needs SO_LINGER(0). The
+/// warning arm itself is platform-independent Rust, exercised on every unix
+/// CI target (Linux/macOS/*BSD); Windows would send a clean FIN and hit the
+/// EOF arm instead.
+#[cfg(unix)]
 #[test]
 fn exchange_blob_rst_takes_gt_read_failed_arm() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1060,7 +1069,9 @@ fn exchange_zero_size_takes_gt_overflow_warning() {
 /// #330: a HARD read error during the SIZE read (an RST before the 4-byte
 /// length arrives) takes GT's rc<0 size arm "read returned -2; errno={e}"
 /// (GT's Nrecv returns NET_HARDERROR=-2, echoed raw; r2 finding 1) — the
-/// size-stage twin of the blob rc<0 arm above.
+/// size-stage twin of the blob rc<0 arm above. Unix-only for the same
+/// reason (r3 finding 1): the SO_LINGER(0) RST is unix-only.
+#[cfg(unix)]
 #[test]
 fn exchange_size_rst_takes_gt_read_failed_size_arm() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
