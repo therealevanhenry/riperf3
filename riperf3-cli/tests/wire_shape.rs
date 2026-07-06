@@ -889,6 +889,60 @@ fn exchange_eof_prints_warning_line_and_summary_in_text() {
     assert!(status.success(), "one-off exits 0 like GT");
 }
 
+/// #336 r1 F3: a peer that half-sends the SIZE and then HOLDS the socket
+/// — GT's Nrecv self-recovers via its 10 s idle / 30 s overall read
+/// bounds (net.c:75-76) and warns with the partial count; the exchange
+/// must not park forever.
+#[test]
+fn exchange_half_size_then_hold_exits_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        ctrl.write_all(&[0u8, 0u8]).unwrap(); // 2 of 4 size bytes, then HOLD
+        std::thread::sleep(std::time::Duration::from_secs(40));
+        drop((ctrl, data));
+    });
+
+    // The 10 s idle bound fires; well inside the 15 s assert window.
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(15))
+            .expect("server exits on GT's read bound while the peer holds");
+    assert!(status.success(), "one-off exits 0 like GT");
+    let serr = serr_reader.join().expect("stderr");
+    assert!(
+        serr.contains("warning: Failed to read JSON data size - read returned 2; errno=0"),
+        "the timed-out read warns with the partial count: {serr}"
+    );
+}
+
 /// #330: a short results blob then EOF — GT's expected/received warning
 /// verbatim (live: "expected 500 bytes but received 5; errno=0").
 #[test]

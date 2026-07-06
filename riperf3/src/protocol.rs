@@ -574,48 +574,104 @@ fn validate_results(value: serde_json::Value) -> Result<TestResultsJson> {
     Ok(results)
 }
 
+/// GT's Nread_json warning lines bypass every sink (warning() is a raw
+/// fprintf(stderr), iperf_api.c:126-129) — but the #290 quiet-guard
+/// contract wins for embedded library runs (r1 F6 decision): a quiet
+/// caller gets silence, everyone else gets GT's exact line.
+fn gt_warning(msg: std::fmt::Arguments<'_>) {
+    if !crate::macros::output_quiet() {
+        eprintln!("warning: {msg}");
+    }
+}
+
+/// GT's Nrecv read bounds (net.c:75-76): 10 s of idle silence or 30 s
+/// overall ends the read with the partial count — the warnings then carry
+/// that count like any short read (r1 F3: without these a peer that
+/// half-sends and HOLDS parked the exchange forever; GT self-recovers).
+const NREAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const NREAD_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One GT-bounded read step: Ok(Some(n)) = n bytes, Ok(None) = EOF or a
+/// timeout (GT's Nrecv returns the partial), Err = hard read error.
+async fn nread_step(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: tokio::time::Instant,
+) -> std::result::Result<Option<usize>, std::io::Error> {
+    tokio::select! {
+        r = stream.read(buf) => match r {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(e) => Err(e),
+        },
+        _ = tokio::time::sleep(NREAD_IDLE_TIMEOUT) => Ok(None),
+        _ = tokio::time::sleep_until(deadline) => Ok(None),
+    }
+}
+
 /// The SERVER's results read (#330): a malformed read gets GT's Nread_json
-/// warning surface — deterministic `warning: ...` lines on STDERR in every
-/// mode (GT's warning() bypasses all sinks; live-probed under -J) — and
-/// maps to the IERECVRESULTS class the caller renders into the doc. The
-/// client keeps the plain [`recv_results`]: its warning parity needs its
-/// own GT probes (noted on #330).
+/// warning surface (iperf_api.c:3036-3080 — all four arms, deterministic
+/// text and counts, live-probed under -J and text) and maps to the
+/// IERECVRESULTS class the caller renders into the doc. Reads are bounded
+/// like GT's Nrecv. The client keeps the plain [`recv_results`]: its
+/// warning parity needs its own GT probes (noted on #330).
 pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJson> {
+    let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut len_buf = [0u8; 4];
     let mut got = 0usize;
     while got < 4 {
-        match stream.read(&mut len_buf[got..]).await {
-            // GT's Nread returns the partial count on EOF; the warning
-            // echoes it verbatim (live: "read returned 0; errno=0").
-            Ok(0) => {
-                eprintln!("warning: Failed to read JSON data size - read returned {got}; errno=0");
+        match nread_step(stream, &mut len_buf[got..], deadline).await {
+            // GT's Nread returns the partial count on EOF/timeout; the
+            // warning echoes it verbatim (live: "read returned 0; errno=0").
+            Ok(None) => {
+                gt_warning(format_args!(
+                    "Failed to read JSON data size - read returned {got}; errno=0"
+                ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
-            Ok(n) => got += n,
+            Ok(Some(n)) => got += n,
             Err(e) => {
-                eprintln!(
-                    "warning: Failed to read JSON data size - read returned -1; errno={}",
+                gt_warning(format_args!(
+                    "Failed to read JSON data size - read returned -1; errno={}",
                     e.raw_os_error().unwrap_or(0)
-                );
+                ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
         }
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        // GT's hsize>0 gate (iperf_api.c:3038/:3068): a zero size warns
+        // the overflow line — live-probed wording (r1 F4).
+        gt_warning(format_args!(
+            "JSON data length overflow - 0 bytes JSON size is not allowed"
+        ));
+        return Err(crate::error::RiperfError::RecvResultsFailed);
+    }
     let mut buf = vec![0u8; len];
     let mut got = 0usize;
     while got < len {
-        match stream.read(&mut buf[got..]).await {
-            Ok(0) | Err(_) => {
-                // GT's short-blob warning, expected/received verbatim
-                // (live: "expected 500 bytes but received 5; errno=0").
-                eprintln!(
-                    "warning: JSON size of data read does not correspond to offered length - \
+        match nread_step(stream, &mut buf[got..], deadline).await {
+            // EOF/timeout: GT's Nread returned the partial (rc >= 0) — the
+            // expected/received arm (live: "expected 500 bytes but
+            // received 5; errno=0").
+            Ok(None) => {
+                gt_warning(format_args!(
+                    "JSON size of data read does not correspond to offered length - \
                      expected {len} bytes but received {got}; errno=0"
-                );
+                ));
                 return Err(crate::error::RiperfError::RecvResultsFailed);
             }
-            Ok(n) => got += n,
+            Ok(Some(n)) => got += n,
+            // A hard read error is GT's rc<0 arm (r1 F1 — live RST probe:
+            // "JSON data read failed; errno=104").
+            Err(e) => {
+                gt_warning(format_args!(
+                    "JSON data read failed; errno={}",
+                    e.raw_os_error().unwrap_or(0)
+                ));
+                return Err(crate::error::RiperfError::RecvResultsFailed);
+            }
         }
     }
     let value: serde_json::Value =

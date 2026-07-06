@@ -1542,13 +1542,15 @@ impl Server {
         // the next await); the UDP runners are spawn_blocking, where abort
         // is a no-op once running — their joins stay bounded anyway by the
         // 500 ms read-timeout + `done` polling in the blocking loops.
+        // (exchange_recv_failed is NOT here — this phase runs before the
+        // exchange, so the flag can't be set yet; its abort lives at the
+        // post-emit gate. r1 F5.)
         if ctx.server_error.is_some()
             || ctx.interrupted.is_some()
             || ctx.unknown_message
             || ctx.client_terminated
             || ctx.ctrl_closed
             || ctx.early_done
-            || ctx.exchange_recv_failed
         {
             // #322 r1 F1: interrupts take the same abort — a wedged peer
             // holding sockets open must not park the joins (GT closes its

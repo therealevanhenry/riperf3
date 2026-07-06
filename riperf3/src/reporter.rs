@@ -269,12 +269,17 @@ pub fn print_separator() {
 /// messages queuing behind data. With `-i 0` the threshold is zero, so the
 /// whole-run flush is unconditionally kept.
 ///
-/// RECORDED DEVIATION (#330 item 5, #333 r2 N2): on ERROR-truncated rounds
-/// (mid-test IEMESSAGE/EOF) and sub-tick complete rounds, this flush emits
-/// one partial interval GT never shows — GT's reporter is timer-driven and
-/// dead by then, so its doc carries whole ticks only (live: byte-9 cell =
-/// GT intervals [], riperf3 [1]). Kept: the flush is the #210 terminate
-/// convention and load-bearing for every interrupt dump shape.
+/// RECORDED DEVIATION (#330 item 5; scope corrected by #336 r1 F2): on
+/// ERROR-TRUNCATED rounds only (mid-test IEMESSAGE/EOF) this flush emits
+/// one partial interval GT never shows — GT's reporter genuinely never
+/// runs there (live: byte-9 cell = GT intervals [], riperf3 [1]).
+/// Sub-tick COMPLETE rounds are PARITY (live-refuted: `-n 4K` → both
+/// docs carry intervals [1]; GT's TEST_END arm runs the reporter and its
+/// keep-rule is this one). Where mock cells showed GT [] on complete
+/// rounds, the mechanism was byte accounting — GT's canceled stream
+/// threads had counted 0 bytes, so this same rule dropped its tail —
+/// not a dead reporter. Kept: the flush is the #210 terminate convention
+/// and load-bearing for every interrupt dump shape.
 fn keep_final_interval(len_secs: f64, interval_secs: f64, residual_bytes: u64) -> bool {
     len_secs >= interval_secs * 0.10 || residual_bytes > 0
 }
