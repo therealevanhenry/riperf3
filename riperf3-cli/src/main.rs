@@ -224,7 +224,11 @@ fn main() -> std::process::ExitCode {
     // not getopt/argv order. With TWO simultaneously-invalid unit flags GT
     // reports the argv-first one and we report the field-first one — same
     // class (IEUNITVAL) and exit (1), only the quoted errarg differs. A
-    // single bad flag (the realistic case) is byte-identical.
+    // single bad flag (the realistic case) is byte-identical. The same clap
+    // root also collapses REPEATED occurrences of one flag to the last
+    // value, so `-b abc -b 10M` runs where GT's in-loop per-occurrence
+    // check rejects the first `abc` (#340 audit N5) — error-vs-success, not
+    // just a different errarg; inherent to last-wins parsing (since #328).
 
     // -w/--window (iperf_api.c:1438-1452): unit_atof (1024-based) → IEUNITVAL,
     // then `farg > (double) MAX_TCP_BUFFER` (512*MB = 536870912) → IEBUFSIZE,
