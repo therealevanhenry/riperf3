@@ -1469,10 +1469,19 @@ fn pretest_error_line_carries_the_timestamps_prefix() {
             .expect("server exits");
     assert!(status.success(), "one-off exits 0 like GT");
     let serr = serr_reader.join().expect("stderr");
+    let suffix = format!("riperf3: error - {RECV_COOKIE_MSG}: \n");
+    assert!(
+        serr.ends_with(&suffix) && serr.len() > suffix.len(),
+        "a nonempty timestamp prefix precedes the iperf_err line: {serr:?}"
+    );
+    // Unix renders the literal strftime format verbatim; Windows uses the
+    // documented HH:MM:SS fallback (macros.rs render_timestamp) and ignores
+    // the format, so the byte-exact pin is unix-only.
+    #[cfg(unix)]
     assert_eq!(
         serr,
-        format!("XTSX riperf3: error - {RECV_COOKIE_MSG}: \n"),
-        "iperf_err's stderr line carries the timestamp prefix: {serr:?}"
+        format!("XTSX {suffix}"),
+        "the literal format renders verbatim: {serr:?}"
     );
 }
 
