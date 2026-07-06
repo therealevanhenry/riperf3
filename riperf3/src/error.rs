@@ -60,6 +60,24 @@ pub enum RiperfError {
     #[error("unable to receive results")]
     RecvResultsFailed,
 
+    /// iperf3's IERECVCOOKIE(106): the server's initial cookie read failed —
+    /// a truncated or absent cookie, a port scan, a peer that closed before
+    /// the 37-byte cookie arrived. GT's iperf_accept sets it, cleanup_server
+    /// relays SERVER_ERROR(-2) + the code, and the surface is exit-0
+    /// keep-serving with the message in the -J skeleton doc / one text line
+    /// (#330). GT's sentence, no "protocol violation" wrapper (#151), perr=1
+    /// so the emit sites carry the #248 dangling ": ".
+    #[error("unable to receive cookie at server")]
+    RecvCookieFailed,
+
+    /// iperf3's IERECVPARAMS(114): the server could not read or parse the
+    /// client's ParamExchange blob — malformed JSON, or a short/absent
+    /// length-prefixed body. GT's get_parameters sets it whenever JSON_read
+    /// returns NULL (a read failure OR a cJSON parse failure alike); the
+    /// surface mirrors IERECVCOOKIE (#330). GT's sentence (#151), perr=1.
+    #[error("unable to receive parameters from client")]
+    RecvParamsFailed,
+
     /// iperf3's IEMESSAGE (#325): an unhandled control byte. GT's end-loop
     /// switch has arms for only TEST_START / TEST_END / IPERF_DONE /
     /// CLIENT_TERMINATE — every other value, known state or not, hits
