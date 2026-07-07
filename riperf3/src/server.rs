@@ -893,14 +893,30 @@ impl Server {
         let (server_output_text, server_output_json, report_source) =
             self.finish_server_output(&mut ctx, &end, collected);
         let was_captured = server_output_text.is_some();
-        self.exchange_results_phase(
-            &mut ctx,
-            &end,
-            result_streams,
-            server_output_text,
-            server_output_json,
-        )
-        .await?;
+        // #353: the exchange's own Err (e.g. the ExchangeResults state
+        // write failing against an RST'd ctrl) must not skip the
+        // unconditional end-of-round abort/join below — a hostile peer
+        // provoking it while HOLDING its data sockets would leak detached
+        // parked receiver tasks + fds in a persistent server (the
+        // #331/#352/#356-F7 family, one phase later). Counts are frozen at
+        // build_result_streams, so the teardown is safe here.
+        if let Err(e) = self
+            .exchange_results_phase(
+                &mut ctx,
+                &end,
+                result_streams,
+                server_output_text,
+                server_output_json,
+            )
+            .await
+        {
+            abort_setup_streams(&mut ctx).await;
+            if let Some(h) = ctx.udp_demux_handle.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            return Err(e);
+        }
 
         // #319: an interrupt landing INSIDE the exchange phase fires after
         // EndState froze report_error — re-resolve so the sigend dump

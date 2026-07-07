@@ -3681,3 +3681,111 @@ fn running_idle_watchdog_negative_cells() {
          RECORDED DEVIATION — GT's block-quantized signal kills this cell): {serr2:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #353: an Err from the exchange phase itself (e.g. the ExchangeResults
+// state-byte write failing against an RST'd ctrl) must not skip the
+// end-of-round abort/join gate — a hostile peer provoking it while
+// HOLDING its data sockets would leak detached parked receiver tasks +
+// fds in a persistent server (the #331/#352/#356-F7 family, one phase
+// later). PERSISTENT server on purpose: one-off process exit closes the
+// sockets either way (the #356 F7 vacuous-pin lesson).
+// ---------------------------------------------------------------------------
+
+/// One #353 attempt. The ctrl-RST races the exchange's first write: RST
+/// first = the send-Err class (the `?` under test); write first = the
+/// graceful IERECVRESULTS class (which runs the gate — a retry). Returns
+/// (send_class, data_read, server_alive).
+#[cfg(unix)]
+fn drive_exchange_err_hold() -> (bool, Result<usize, std::io::ErrorKind>, bool) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        use std::io::Read;
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+                                         // RST quickly: the exchange's state write happens after the ~100 ms
+                                         // flush grace — landing the RST first yields the send-Err class.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                ctrl.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(ctrl);
+        data.set_read_timeout(Some(std::time::Duration::from_secs(4)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 16];
+        let r = data.read(&mut buf).map_err(|e| e.kind());
+        drop(data);
+        r
+    });
+
+    let data_read = mock.join().expect("mock");
+    let alive = server.0.try_wait().expect("try_wait").is_none();
+    drop(server); // ChildGuard kills; the drained stderr classifies the round
+    let serr = se.join().expect("stderr");
+    let send_class = !serr.contains("unable to receive results");
+    (send_class, data_read, alive)
+}
+
+/// #353: the exchange-phase Err runs the teardown — the held data socket
+/// sees EOF bounded while the server keeps serving. Retry-classified
+/// across the RST-vs-write race (the #345 pattern); the graceful
+/// recv-fail class already runs the gate and retries.
+#[cfg(unix)]
+#[test]
+fn exchange_phase_err_still_tears_down_streams() {
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let (send_class, data_read, alive) = drive_exchange_err_hold();
+        if send_class {
+            assert_eq!(
+                data_read,
+                Ok(0),
+                "the held data socket sees EOF bounded (the exchange Err ran the teardown)"
+            );
+            assert!(
+                alive,
+                "the persistent server kept serving after the failed round"
+            );
+            return;
+        }
+        seen.push(format!("recv-class round: {data_read:?}"));
+    }
+    panic!("the send-Err class never surfaced in 10 RST races; saw: {seen:#?}");
+}
