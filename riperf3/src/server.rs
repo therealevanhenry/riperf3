@@ -201,6 +201,10 @@ struct TestRunCtx {
     /// mapped_v4_to_regular_v4.
     accepted_host: String,
     accepted_port: u16,
+    /// Wall-clock millis at ctx creation — GT's setup-doc `timestamp` is
+    /// the on-connect stamp, not the emit time (#356 r1 F4): at the default
+    /// 120 s rcv-timeout those differ by two minutes.
+    accepted_millis: u64,
     cookie: [u8; protocol::COOKIE_SIZE],
     params: TestParams,
     cfg: TestConfig,
@@ -394,12 +398,40 @@ fn demux_local_addr_for(
     ))
 }
 
+/// GT's DEFAULT_NO_MSG_RCVD_TIMEOUT (iperf_api.h:70): the server-side
+/// no-progress bound applied when `--rcv-timeout` is unset (#338).
+const DEFAULT_RCV_TIMEOUT_MS: u64 = 120_000;
+
+/// How the #338 setup phase ended when it didn't produce data streams.
+enum SetupFlow {
+    /// All streams accepted — run the test.
+    Proceed,
+    /// The client sent IPERF_DONE mid-setup — GT's clean arm: the round
+    /// ends with no error surface, like a refusal (#356 r1 F1).
+    ClientDone,
+}
+
 /// What the #338 setup-phase ctrl watch saw.
 enum CtrlActivity {
     /// The peer closed the control connection (read-half EOF).
     Eof,
     /// A state byte is waiting; it stays OS-buffered for the mid-test loop.
     Data,
+}
+
+/// #356 r1 F7: GT's cleanup_server closes every accepted stream socket on
+/// the setup-phase error paths (iperf_server_api.c:460-473); riperf3's
+/// spawned tasks would otherwise detach into the runtime parked in read()
+/// until the peer closes — an accumulating leak under a persistent server.
+/// Abort drops each task's socket at its next await; no counts exist yet,
+/// so there is nothing to freeze (the #352 join-site concern doesn't apply).
+async fn abort_setup_streams(ctx: &mut TestRunCtx) {
+    for s in &ctx.streams {
+        s.task.abort();
+    }
+    for s in ctx.streams.drain(..) {
+        let _ = s.task.await;
+    }
 }
 
 /// #338: wait for control-socket activity without consuming it. This must
@@ -767,6 +799,10 @@ impl Server {
             ctrl,
             accepted_host,
             accepted_port,
+            accepted_millis: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             cookie,
             params,
             cfg,
@@ -801,7 +837,11 @@ impl Server {
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
         // ---- CreateStreams ----
-        self.setup_data_streams(&mut ctx, listener).await?;
+        if let SetupFlow::ClientDone = self.setup_data_streams(&mut ctx, listener).await? {
+            // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends with
+            // no error surface, keep-serving like a refusal (Ok(None)).
+            return Ok(None);
+        }
 
         // ---- TestStart / TestRunning ----
         self.start_test(&mut ctx).await?;
@@ -1191,7 +1231,7 @@ impl Server {
         &self,
         ctx: &mut TestRunCtx,
         listener: &tokio::net::TcpListener,
-    ) -> Result<()> {
+    ) -> Result<SetupFlow> {
         // Determine how many streams to accept and their roles.
         // Normal: server receives. Reverse: server sends. Bidir: both.
         let recv_count = if ctx.cfg.reverse && !ctx.cfg.bidir {
@@ -1234,36 +1274,38 @@ impl Server {
                 // #338: GT's CREATE_STREAMS wait runs inside its select()
                 // event loop, so a ctrl-EOF is noticed at once (IECTRLCLOSE,
                 // iperf_server_api.c:249-254) and a no-progress round is
-                // bounded at rcv_timeout (IENOMSG=144, :663-678; default =
-                // DEFAULT_NO_MSG_RCVD_TIMEOUT 120000 ms, iperf_api.h:70).
-                // The bare accept parked unbounded on both. The ctrl watch
-                // is readiness-only (see ctrl_activity for why it must not
-                // be TcpStream::peek) — a state byte arriving mid-setup
-                // stays OS-buffered for the mid-test loop's arms (pre-#338
-                // semantics; GT would dispatch it here — recorded residual
-                // on the issue), and once one is seen the arm disarms so
-                // the select can't spin.
-                let rcv_timeout = std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(
-                    120_000, // GT DEFAULT_NO_MSG_RCVD_TIMEOUT
-                ));
-                let mut watch_ctrl = true;
+                // bounded at rcv_timeout (IENOMSG=144, :663-678). The bare
+                // accept parked unbounded on both. The ctrl watch is
+                // readiness-only (see ctrl_activity for why it must not be
+                // TcpStream::peek); a waiting state byte is then DISPATCHED
+                // through GT's handle_message_server arms below (:236-311,
+                // #356 r1 F1) — consuming it keeps the no-progress clock
+                // honest (each byte is receive progress, GT's
+                // last_receive_time semantics) and a byte can never wedge
+                // the select in a ready-spin.
+                let rcv_timeout = std::time::Duration::from_millis(
+                    self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS),
+                );
                 for i in 0..total {
                     let (mut data_stream, _) = loop {
                         tokio::select! {
                             accepted = listener.accept() => break accepted?,
-                            activity = ctrl_activity(&ctx.ctrl), if watch_ctrl => match activity {
+                            activity = ctrl_activity(&ctx.ctrl) => match activity {
                                 // EOF: the peer closed without connecting its
                                 // data streams — GT's read-site surface. The
                                 // -J doc emits here (the serve loop's arm
                                 // prints the text sentence).
                                 Ok(CtrlActivity::Eof) => {
+                                    abort_setup_streams(ctx).await;
                                     self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
                                     return Err(RiperfError::ControlSocketClosed);
                                 }
-                                // A state byte mid-setup: left buffered;
-                                // disarm the watch.
                                 Ok(CtrlActivity::Data) => {
-                                    watch_ctrl = false;
+                                    if let SetupFlow::ClientDone =
+                                        self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                                    {
+                                        return Ok(SetupFlow::ClientDone);
+                                    }
                                 }
                                 Err(e) => return Err(e.into()),
                             },
@@ -1272,6 +1314,7 @@ impl Server {
                                 // SERVER_ERROR + IENOMSG(144) + errno 0
                                 // (live: fe 00000090 00000000), the doc with
                                 // the prefixed key, exit-0 keep-serving.
+                                abort_setup_streams(ctx).await;
                                 let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
                                 self.emit_setup_phase_error(
                                     ctx,
@@ -1284,6 +1327,7 @@ impl Server {
                     };
                     let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
                     if stream_cookie != ctx.cookie {
+                        abort_setup_streams(ctx).await;
                         return Err(RiperfError::CookieMismatch);
                     }
                     // Apply socket options (nodelay, MSS, window, congestion) to each stream
@@ -1429,7 +1473,7 @@ impl Server {
                 }
             }
         }
-        Ok(())
+        Ok(SetupFlow::Proceed)
     }
 
     /// TestStart / TestRunning: the #222 preamble prints, the start-barrier
@@ -3083,6 +3127,84 @@ impl Server {
         }
     }
 
+    /// #356 r1 F1: a state byte arrived during the CREATE_STREAMS wait —
+    /// dispatch it through GT's handle_message_server arms
+    /// (iperf_server_api.c:236-311; each cell live-probed on issue #338):
+    /// TEST_START is a no-op, CLIENT_TERMINATE relays 119 and takes the
+    /// terminate surfaces, IPERF_DONE is the clean errorless arm, and
+    /// everything else is the IEMESSAGE default with the 110 relay.
+    /// RECORDED DEVIATION: "everything else" includes TEST_END, where GT
+    /// instead runs its end processing against streams that never existed
+    /// (live: the report skeleton, an EXCHANGE_RESULTS byte, then a
+    /// stale-errno IERECVRESULTS "Bad file descriptor" tangle) —
+    /// nonconforming-only, not mirrored.
+    async fn dispatch_setup_ctrl_byte(
+        &self,
+        ctx: &mut TestRunCtx,
+        listener: &tokio::net::TcpListener,
+    ) -> Result<SetupFlow> {
+        match protocol::recv_state(&mut ctx.ctrl).await {
+            // GT's no-op arm — keep waiting (the recreated sleep IS the
+            // clock reset: a received byte is progress).
+            Ok(TestState::TestStart) => Ok(SetupFlow::Proceed),
+            Ok(TestState::ClientTerminate) => {
+                abort_setup_streams(ctx).await;
+                let _ = protocol::send_server_error(&mut ctx.ctrl, 119).await;
+                self.emit_setup_phase_terminate(ctx, listener);
+                Err(RiperfError::ClientTerminated)
+            }
+            Ok(TestState::IperfDone) => {
+                abort_setup_streams(ctx).await;
+                self.emit_setup_phase_done(ctx, listener);
+                Ok(SetupFlow::ClientDone)
+            }
+            Ok(_) | Err(RiperfError::UnknownControlMessage) => {
+                abort_setup_streams(ctx).await;
+                let _ = protocol::send_server_error(&mut ctx.ctrl, 110).await;
+                self.emit_setup_phase_error(
+                    ctx,
+                    listener,
+                    &format!("error - {}", RiperfError::UnknownControlMessage),
+                );
+                Err(RiperfError::UnknownControlMessage)
+            }
+            // The byte vanished between the readiness watch and the read —
+            // only a racing EOF does that; take the EOF surface.
+            Err(RiperfError::PeerDisconnected) => {
+                abort_setup_streams(ctx).await;
+                self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                Err(RiperfError::ControlSocketClosed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The setup-phase (CREATE_STREAMS) doc input: GT's bufsize trio comes
+    /// off the LISTENER at listen time (iperf_tcp.c:337-377) — read the
+    /// same socket (best-effort: a failed getsockopt omits the key rather
+    /// than inventing one). The timestamp is the on-connect stamp carried
+    /// on ctx, not the emit time (#356 r1 F4).
+    fn setup_phase_doc_input(
+        &self,
+        ctx: &TestRunCtx,
+        listener: &tokio::net::TcpListener,
+    ) -> crate::json_report::SetupPhaseDoc {
+        let sock = socket2::SockRef::from(listener);
+        crate::json_report::SetupPhaseDoc {
+            sock_bufsize: ctx.cfg.window.map(|w| w as u64).unwrap_or(0),
+            sndbuf_actual: sock.send_buffer_size().ok().map(|v| v as u64),
+            rcvbuf_actual: sock.recv_buffer_size().ok().map(|v| v as u64),
+            timemillisecs: ctx.accepted_millis,
+            accepted_host: ctx.accepted_host.clone(),
+            accepted_port: ctx.accepted_port,
+            // The wire cookie is 37 bytes with a trailing NUL; the -J
+            // string drops it (the :1092/:2925 convention).
+            cookie: String::from_utf8_lossy(&ctx.cookie[..protocol::COOKIE_SIZE - 1]).to_string(),
+            target_bitrate: ctx.cfg.bandwidth,
+            fq_rate: ctx.cfg.fq_rate,
+        }
+    }
+
     /// #338: render a setup-phase (CREATE_STREAMS) error in GT's sink shape.
     /// Under -J: the POPULATED setup doc (on_connect + listener metadata,
     /// live-probed — see json_report::setup_error_document); --json-stream:
@@ -3102,31 +3224,63 @@ impl Server {
                 doc_error,
             ));
         } else if self.json_output {
-            // GT's bufsize trio comes off the LISTENER at listen time
-            // (iperf_tcp.c:337-377); read the same socket. Best-effort — a
-            // failed getsockopt omits the key rather than inventing one.
-            let sock = socket2::SockRef::from(listener);
-            let timemillisecs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
             let doc = crate::json_report::setup_error_document(
-                &crate::json_report::SetupPhaseDoc {
-                    sock_bufsize: ctx.cfg.window.map(|w| w as u64).unwrap_or(0),
-                    sndbuf_actual: sock.send_buffer_size().ok().map(|v| v as u64),
-                    rcvbuf_actual: sock.recv_buffer_size().ok().map(|v| v as u64),
-                    timemillisecs,
-                    accepted_host: ctx.accepted_host.clone(),
-                    accepted_port: ctx.accepted_port,
-                    // The wire cookie is 37 bytes with a trailing NUL; the -J
-                    // string drops it (the :1092/:2925 convention).
-                    cookie: String::from_utf8_lossy(&ctx.cookie[..protocol::COOKIE_SIZE - 1])
-                        .to_string(),
-                    target_bitrate: ctx.cfg.bandwidth,
-                    fq_rate: ctx.cfg.fq_rate,
-                },
+                &self.setup_phase_doc_input(ctx, listener),
                 doc_error,
             );
+            println!("{doc}");
+        }
+    }
+
+    /// #356 r1 F1: the CLIENT_TERMINATE-at-setup surfaces. -J carries GT's
+    /// FULL-zeros end (real host cpu, remote zeros — the reporter_callback
+    /// ran); --json-stream the error + zeros-end pair; text prints the
+    /// report skeleton on stdout here (the serve loop's arm adds the
+    /// stderr sentence).
+    fn emit_setup_phase_terminate(&self, ctx: &TestRunCtx, listener: &tokio::net::TcpListener) {
+        if crate::macros::output_quiet() {
+            return;
+        }
+        let error = RiperfError::ClientTerminated.to_string();
+        let measured = crate::cpu::CpuSnapshot::now().utilization_since(&ctx.cpu_start);
+        let cpu = crate::json_report::CpuUtilization {
+            // Like build_report: only the server's own figures — GT never
+            // surfaces the remote side here (no exchange happened at all).
+            host_total: measured.host_total,
+            host_user: measured.host_user,
+            host_system: measured.host_system,
+            remote_total: 0.0,
+            remote_user: 0.0,
+            remote_system: 0.0,
+        };
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::terminate_stream_events(
+                &error, &cpu,
+            ));
+        } else if self.json_output {
+            let doc = crate::json_report::setup_terminate_document(
+                &self.setup_phase_doc_input(ctx, listener),
+                &error,
+                &cpu,
+            );
+            println!("{doc}");
+        } else {
+            crate::reporter::print_terminate_skeleton();
+        }
+    }
+
+    /// #356 r1 F1: the IPERF_DONE-at-setup surfaces — GT's clean arm: the
+    /// errorless setup doc under -J, one bare end event under
+    /// --json-stream, silence in text.
+    fn emit_setup_phase_done(&self, ctx: &TestRunCtx, listener: &tokio::net::TcpListener) {
+        if crate::macros::output_quiet() {
+            return;
+        }
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::done_stream_events());
+        } else if self.json_output {
+            let doc =
+                crate::json_report::setup_done_document(&self.setup_phase_doc_input(ctx, listener));
             println!("{doc}");
         }
     }
@@ -3596,6 +3750,14 @@ impl ServerBuilder {
 
 #[cfg(test)]
 mod tests {
+
+    /// #356 r1 F9: the unset-`--rcv-timeout` bound is GT's
+    /// DEFAULT_NO_MSG_RCVD_TIMEOUT (iperf_api.h:70). The 120 s value can't
+    /// be exercised by the suite, so the constant is the pin.
+    #[test]
+    fn default_rcv_timeout_is_gt_default() {
+        assert_eq!(super::DEFAULT_RCV_TIMEOUT_MS, 120_000);
+    }
 
     /// #316: the server adopts the client's exchanged GSO/GRO request
     /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute

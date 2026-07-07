@@ -2398,6 +2398,21 @@ mod cli_tests {
         }
 
         #[test]
+        fn server_rcv_timeout_wired() {
+            // #356 r1 F10: the SERVER glue for --rcv-timeout (#338), the
+            // builder-compare convention like the client's rcv_timeout_wired.
+            let cli = Cli::parse_from(["riperf3", "-s", "--rcv-timeout", "3000"]);
+            let s = build_server_from_cli(&cli);
+            assert_eq!(
+                s,
+                riperf3::ServerBuilder::new()
+                    .rcv_timeout(3000)
+                    .build()
+                    .unwrap()
+            );
+        }
+
+        #[test]
         fn server_idle_timeout_wired() {
             let cli = Cli::parse_from(["riperf3", "-s", "--idle-timeout", "30"]);
             let s = build_server_from_cli(&cli);
