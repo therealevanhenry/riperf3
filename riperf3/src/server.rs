@@ -1685,7 +1685,47 @@ impl Server {
         const SELF_TERM_RATE_MSG: &str = "total required bandwidth is larger than server limit";
         const SELF_TERM_DURATION_MSG: &str =
             "server test duration expired - test is terminated by the server";
+        // #351: iperf_strerror(IENOMSG) — must match RiperfError::DataIdleTimeout's
+        // Display (the #338 pre-test sibling renders through that variant).
+        const SELF_TERM_IDLE_MSG: &str = "idle timeout for receiving data";
         let mut interrupt_rx = self.interrupt.clone().map(|w| w.0);
+
+        // #351: GT's TEST_RUNNING data-idle watchdog (iperf_server_api.c:
+        // 720-739): armed only when the server RECEIVES (mode != SENDER —
+        // reverse rounds are exempt); ctrl traffic does NOT reset it. On
+        // expiry: IENOMSG(144) — the relay, then the self-terminate surface
+        // (the prefixed doc key over the accumulated intervals + bare end,
+        // the stderr line, no summary), exit-0 keep-serving like GT's
+        // restart. RECORDED DEVIATIONS (PR #369 r1+r2, live-probed):
+        // (1) progress — riperf3 resets on received BYTES advancing; GT's
+        // blocks_received advances ONLY on full-`len` block completions
+        // (the running-phase reads are Nrecv_no_select, net.c:511-553 — a
+        // timeout-free full-block accumulate; the 10s/30s statics are
+        // control-path only). The divergence is RATE-scoped, at ANY bound:
+        // GT false-kills every receiving flow slower than len*8/bound
+        // (~8.7 kbit/s at stock 128K/120s — a GT `-b 8k` TCP client dies
+        // against its own server; probed at bounds 3s/35s/120s). riperf3
+        // never kills a byte-flowing round — the liveness-preserving
+        // reading (the #356 precedent). Flip side, recorded honestly: a
+        // 1-byte-per-(bound-epsilon) trickle holds a riperf3 slot
+        // indefinitely where GT reaps at ~bound — but a full-block cadence
+        // >= bound holds GT forever too (probed), so neither watchdog is a
+        // security bound.
+        // (2) kill envelope — riperf3 fires within [bound, bound+~250ms];
+        // GT's baseline lags its main-loop wakes and expiry needs a full
+        // select timeout, so its band is [bound, ~bound+2s] (a full-block
+        // 3.6s cadence under a 3s bound survives GT, dies here). Neither
+        // tool fires before a genuine bound-length gap.
+        // (3) the killed round's doc keeps riperf3's #210/#325 partial
+        // catch-up interval row; GT's fatal wake precedes its reporter
+        // tick, so GT's doc holds one fewer whole row + no partial.
+        let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
+        let idle_bound =
+            std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
+        let mut idle_check = tokio::time::interval(std::time::Duration::from_millis(250));
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut idle_last_rx: u64 = 0;
+        let mut idle_last_at = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -1809,6 +1849,29 @@ impl Server {
                                 break;
                             }
                         }
+                    }
+                }
+                _ = idle_check.tick(), if idle_armed => {
+                    let rx: u64 = ctx
+                        .streams
+                        .iter()
+                        .map(|s| s.meta.counters.bytes_received())
+                        .sum();
+                    if rx > idle_last_rx {
+                        idle_last_rx = rx;
+                        idle_last_at = tokio::time::Instant::now();
+                    } else if idle_last_at.elapsed() >= idle_bound {
+                        // Best-effort like the #338/#349 relay sites — the
+                        // idle peer may be gone entirely.
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
+                        ctx.server_error = Some(SELF_TERM_IDLE_MSG);
+                        // GT's kill path never runs end processing — the
+                        // doc keeps the accumulated intervals over a bare
+                        // end{} (live-probed; the rate-breach sibling's
+                        // populated end is the pre-existing divergence
+                        // filed from this probe).
+                        ctx.bare_end = true;
+                        break;
                     }
                 }
                 _ = &mut watchdog_deadline, if watchdog_secs > 0 => {
