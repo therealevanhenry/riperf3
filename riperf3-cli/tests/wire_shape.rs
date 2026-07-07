@@ -2603,7 +2603,10 @@ fn setup_phase_test_start_byte_is_gt_noop() {
 
 /// r1 F7: the terminate return closes already-accepted data streams like
 /// GT's cleanup_server — the peer's data socket sees EOF bounded, not a
-/// detached task holding it until the peer gives up.
+/// detached task holding it until the peer gives up. PERSISTENT server on
+/// purpose: a one-off's process exit closes every socket and would pass
+/// with the abort removed — only a still-running server discriminates
+/// abort from detach (the mutation-vacuous first draft of this pin).
 #[test]
 fn setup_phase_terminate_closes_accepted_streams() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2613,15 +2616,15 @@ fn setup_phase_terminate_closes_accepted_streams() {
 
     let mut server = common::ChildGuard(
         std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
-            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000", "-J"])
+            .args(["-s", "-p", &port_s, "--rcv-timeout", "3000", "-J"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn server"),
     );
-    let sout_reader =
+    let _sout_reader =
         riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
-    let serr_reader =
+    let _serr_reader =
         riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
     std::thread::sleep(std::time::Duration::from_millis(400));
 
@@ -2639,7 +2642,8 @@ fn setup_phase_terminate_closes_accepted_streams() {
         ctrl.write_all(&[0x0c]).unwrap();
         let frame = read_wireback(&mut ctrl);
         // The server must close the accepted data socket (GT closes every
-        // stream socket in its terminate arm) — bounded EOF, not a park.
+        // stream socket in its terminate arm) — bounded EOF while the
+        // server keeps serving, not a detached task holding it.
         data.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .expect("set_read_timeout");
         let mut buf = [0u8; 16];
@@ -2654,12 +2658,11 @@ fn setup_phase_terminate_closes_accepted_streams() {
         Ok(0),
         "the accepted data socket sees EOF bounded (GT closes stream socks)"
     );
-    let status =
-        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
-            .expect("server exits");
-    assert!(status.success());
-    drop(sout_reader.join().expect("stdout"));
-    drop(serr_reader.join().expect("stderr"));
+    // Persistent server: still alive and serving — ChildGuard kills it.
+    assert!(
+        server.0.try_wait().expect("try_wait").is_none(),
+        "the persistent server kept serving after the terminate round"
+    );
 }
 
 /// r1 F4: the setup doc's timestamp is GT's wait-start stamp (on-connect
