@@ -533,10 +533,13 @@ impl Server {
             // (iperf_server_api.c:133-135) — no stderr line, no banner
             // re-print, no counter increment; the accept simply re-arms.
             let mut idle_restart = false;
+            let mut round_had_no_report = false;
             match self.handle_one_test(&listener).await {
                 // #137: the daemon loop discards each test's Report; library
-                // users who want it call `run_once`.
-                Ok(_) => {}
+                // users who want it call `run_once`. A None round (idle
+                // interrupt, refusal, IPERF_DONE-at-setup) emitted no doc —
+                // the #346 idle-interrupt check below needs to know.
+                Ok(r) => round_had_no_report = r.is_none(),
                 Err(RiperfError::Aborted(msg)) if msg == "idle timeout" => {
                     idle_restart = true;
                 }
@@ -623,7 +626,9 @@ impl Server {
                 // exists, so the serve loop emits GT's iperf_err sink shape
                 // directly: silent stderr + a SKELETON accumulated doc under
                 // -J, one text line otherwise.
-                Err(e @ RiperfError::RecvCookieFailed) | Err(e @ RiperfError::RecvParamsFailed) => {
+                Err(e @ RiperfError::RecvCookieFailed)
+                | Err(e @ RiperfError::RecvParamsFailed)
+                | Err(e @ RiperfError::SendControlFailed(_)) => {
                     self.emit_pretest_error(&e);
                 }
                 Err(e) => {
@@ -644,12 +649,19 @@ impl Server {
 
             // #210: an interrupted run stops serving — handle_one_test
             // already dumped its stats and told the client; the caller owns
-            // the signal-normal exit.
-            if interrupt_fired
-                .as_mut()
-                .is_some_and(|rx| rx.borrow_and_update().is_some())
-            {
-                return Ok(());
+            // the signal-normal exit. #346: EXCEPT when the interrupt landed
+            // while idle (a None round emitted no doc) — GT's signormalexit
+            // finishes the accumulated empty doc with the interrupt key
+            // (live: the skeleton -J doc / error+end event pair, silent
+            // stderr, exit 0); text keeps the caller's stderr line.
+            if let Some(rx) = interrupt_fired.as_mut() {
+                let msg = rx.borrow_and_update().clone();
+                if let Some(msg) = msg {
+                    if round_had_no_report {
+                        self.emit_pretest_error_doc(&msg);
+                    }
+                    return Ok(());
+                }
             }
             if self.one_off {
                 break;
@@ -1063,7 +1075,17 @@ impl Server {
         };
 
         // ---- ParamExchange ----
-        protocol::send_state(ctrl, TestState::ParamExchange).await?;
+        // #345: a failed post-cookie state write is GT's IESENDMESSAGE(111)
+        // — iperf_accept's iperf_set_send_state failure path; cleanup_server
+        // relays SERVER_ERROR(-2)+111 (best-effort and usually unobservable:
+        // the peer's RST is what broke the write — unpinned by design).
+        if let Err(e) = protocol::send_state(ctrl, TestState::ParamExchange).await {
+            let _ = protocol::send_server_error(ctrl, 111).await;
+            return Err(match e {
+                RiperfError::Io(io) => RiperfError::SendControlFailed(io),
+                other => other,
+            });
+        }
         // #330: GT's get_parameters sets IERECVPARAMS(114) whenever JSON_read
         // returns NULL — a short/absent body OR a cJSON parse failure alike —
         // and relays SERVER_ERROR(-2) + the code through cleanup_server.
@@ -3314,7 +3336,13 @@ impl Server {
     /// bare where GT would append a (often stale) strerror — the same honest
     /// deviation as #336.
     fn emit_pretest_error(&self, err: &RiperfError) {
-        let doc_error = format!("error - {err}: ");
+        // #345: SendControlFailed's Display already carries the live
+        // strerror (GT perr with a real errno); the errno-0 siblings keep
+        // the #248 dangling ": ".
+        let doc_error = match err {
+            RiperfError::SendControlFailed(_) => format!("error - {err}"),
+            _ => format!("error - {err}: "),
+        };
         if self.json_output || self.json_stream {
             self.emit_pretest_error_doc(&doc_error);
         } else if !crate::macros::output_quiet() {

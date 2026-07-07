@@ -81,6 +81,17 @@ pub enum RiperfError {
     #[error("unable to receive parameters from client")]
     RecvParamsFailed,
 
+    /// iperf3's IESENDMESSAGE(111): a control-channel send failed — the
+    /// post-cookie ParamExchange state write (GT's iperf_set_send_state
+    /// failure path inside iperf_accept, #345). Unlike the errno-0 dangling
+    /// `: ` siblings above, GT's suffix here is a LIVE deterministic
+    /// strerror (ENOTCONN — the peer's RST is what broke the write), so the
+    /// wrapped io::Error rides the Display; its trailing "(os error N)" is
+    /// the recorded #151-class divergence. Relay + exit-0 keep-serving like
+    /// the sibling pre-test classes (#330).
+    #[error("unable to send control message - port may not be available, the other side may have stopped running, etc.: {0}")]
+    SendControlFailed(std::io::Error),
+
     /// iperf3's IENOMSG(144): the server's no-progress watchdog fired — no
     /// messages/data received within `--rcv-timeout` (default 120000 ms, GT's
     /// DEFAULT_NO_MSG_RCVD_TIMEOUT, iperf_api.h:70). First wired at the

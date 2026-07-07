@@ -2834,3 +2834,202 @@ fn setup_phase_rcv_timeout_resets_on_stream_progress() {
     // round — only the reached-TEST_START byte is under test here.
     let _ = riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20));
 }
+
+// ---------------------------------------------------------------------------
+// #345: post-cookie send_state(ParamExchange) failure = GT's IESENDMESSAGE
+// (111) — iperf_error.c:305-308 sentence + a LIVE deterministic strerror
+// (ENOTCONN; the peer's RST broke the write). GT live-probed (N=12/mode):
+// text deterministic; -J silent stderr + skeleton doc with the prefixed key;
+// 4/12 the RST lost the race and the run took the IERECVPARAMS class
+// instead — BOTH classes stay reachable, so these pins retry-classify.
+// The SERVER_ERROR+111 relay is best-effort and unobservable (the peer
+// RST'd) — unpinned by design, like #347's try_reserve guard.
+// ---------------------------------------------------------------------------
+
+const SENDMSG_SENTENCE: &str =
+    "unable to send control message - port may not be available, the other side may have stopped running, etc.";
+
+/// One #345 attempt: cookie, then an immediate SO_LINGER(0) RST. Returns
+/// (stdout, stderr, exit).
+#[cfg(unix)]
+fn drive_cookie_then_rst(json: bool) -> (String, String, std::process::ExitStatus) {
+    drive_server_scenario(json, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        // SO_LINGER(0): the drop sends a real RST (the setup_retry.rs
+        // helper's pattern — unix-only, which is why these pins are).
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                ctrl.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        drop(ctrl); // RST races the server's ParamExchange state write
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    })
+}
+
+/// #345 text: within a bounded number of race attempts, the send-failure
+/// class must appear with GT's IESENDMESSAGE sentence (red = it never
+/// appears; pre-fix the path takes a raw Io message via the generic arm).
+#[cfg(unix)]
+#[test]
+fn pretest_send_state_failure_takes_iesendmessage_text() {
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let (_sout, serr, status) = drive_cookie_then_rst(false);
+        assert!(status.success(), "keep-serving one-off exits 0: {serr:?}");
+        let line = serr.trim().to_string();
+        if line.contains(SENDMSG_SENTENCE) {
+            assert!(
+                line.starts_with(&format!("riperf3: error - {SENDMSG_SENTENCE}: ")),
+                "GT's sentence + live strerror suffix: {line:?}"
+            );
+            return;
+        }
+        seen.push(line);
+    }
+    panic!("IESENDMESSAGE never surfaced in 12 RST races; saw: {seen:#?}");
+}
+
+/// #345 -J: same race loop; when the send class hits, the skeleton doc
+/// carries the prefixed key with the live strerror (no dangling ": ").
+#[cfg(unix)]
+#[test]
+fn pretest_send_state_failure_takes_iesendmessage_json() {
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        let (sout, serr, status) = drive_cookie_then_rst(true);
+        assert!(status.success());
+        assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+        let doc: serde_json::Value = serde_json::from_str(sout.trim())
+            .unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+        let key = doc["error"].as_str().unwrap_or_default().to_string();
+        if key.contains(SENDMSG_SENTENCE) {
+            assert!(
+                key.starts_with(&format!("error - {SENDMSG_SENTENCE}: ")),
+                "prefixed key + live strerror: {key:?}"
+            );
+            assert!(
+                !key.ends_with(": "),
+                "the live-strerror class must NOT carry the errno-0 dangling suffix: {key:?}"
+            );
+            assert!(
+                doc["end"].as_object().expect("end").is_empty(),
+                "skeleton bare end: {doc}"
+            );
+            return;
+        }
+        seen.push(key);
+    }
+    panic!("IESENDMESSAGE never surfaced in 12 RST races; saw: {seen:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// #346: SIGTERM while LISTENING (no client ever). GT live-probed: -J =
+// skeleton doc with the interrupt-class key (NO "error - " prefix), silent
+// stderr, exit 0; --json-stream = the error+bare-end event pair; text =
+// stderr `iperf3: interrupt - the server has terminated by signal
+// Terminated(15)`, exit 0. riperf3 pre-fix emitted NOTHING in the JSON
+// modes on this path.
+// ---------------------------------------------------------------------------
+
+const SIGTERM_KEY: &str = "interrupt - the server has terminated by signal Terminated(15)";
+
+#[cfg(unix)]
+fn drive_sigterm_listening(args: &[&str]) -> (String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+    let mut all = vec!["-s", "-p", &port_s];
+    all.extend_from_slice(args);
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&all)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // SIGTERM to the LISTENING server — no client ever connected.
+    unsafe { libc::kill(server.0.id() as i32, libc::SIGTERM) };
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("signal-normal exit");
+    (
+        sout.join().expect("stdout"),
+        serr.join().expect("stderr"),
+        status,
+    )
+}
+
+/// #346 -J: the skeleton doc with the interrupt key, silent stderr, exit 0.
+#[cfg(unix)]
+#[test]
+fn sigterm_while_listening_emits_skeleton_doc_in_json() {
+    let (sout, serr, status) = drive_sigterm_listening(&["-J"]);
+    assert!(status.success(), "GT signormalexit exits 0");
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout:?}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(SIGTERM_KEY),
+        "the interrupt-class key, NO error- prefix: {doc}"
+    );
+    assert_eq!(
+        doc["start"]["connected"].as_array().map(Vec::len),
+        Some(0),
+        "skeleton start: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end: {doc}"
+    );
+}
+
+/// #346 --json-stream: GT's error + bare-end event pair.
+#[cfg(unix)]
+#[test]
+fn sigterm_while_listening_stream_events() {
+    let (sout, serr, status) = drive_sigterm_listening(&["--json-stream"]);
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "silent stderr: {serr:?}");
+    let events: Vec<serde_json::Value> = sout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("event ({e}): {l}")))
+        .collect();
+    assert_eq!(events.len(), 2, "error + end pair: {sout:?}");
+    assert_eq!(events[0]["event"].as_str(), Some("error"));
+    assert_eq!(events[0]["data"].as_str(), Some(SIGTERM_KEY));
+    assert_eq!(events[1]["event"].as_str(), Some("end"));
+    assert_eq!(events[1]["data"], serde_json::json!({}));
+}
+
+/// #346 text: the stderr interrupt line + exit 0 (the pre-fix-green
+/// baseline half of the cell, pinned against regressions).
+#[cfg(unix)]
+#[test]
+fn sigterm_while_listening_text_line_and_exit_zero() {
+    let (_sout, serr, status) = drive_sigterm_listening(&[]);
+    assert!(status.success(), "GT signormalexit exits 0");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {SIGTERM_KEY}"),
+        "the CLI's interrupt line: {serr:?}"
+    );
+}
