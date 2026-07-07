@@ -688,9 +688,11 @@ impl Server {
     /// Peer-caused test endings surface as errors AFTER the report was
     /// rendered to the active sink: a CLIENT_TERMINATE returns
     /// [`RiperfError::ClientTerminated`], an unhandled control byte
-    /// returns [`RiperfError::UnknownControlMessage`] (#325), and a
+    /// returns [`RiperfError::UnknownControlMessage`] (#325), a
     /// control-connection EOF returns [`RiperfError::ControlSocketClosed`]
-    /// (#330) — all mirror GT rounds its one-off still exits 0 on.
+    /// (#330), and a setup phase that makes no progress for `--rcv-timeout`
+    /// returns [`RiperfError::DataIdleTimeout`] (#338) — all mirror GT
+    /// rounds its one-off still exits 0 on.
     pub async fn run_once(&self) -> Result<crate::json_report::Report> {
         let listener = self.listen().await?;
         self.serve_once(&listener).await
@@ -734,8 +736,10 @@ impl Server {
         let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
         match self.handle_one_test(listener).await? {
             Some(report) => Ok(report),
-            // Reachable only with an interrupt watch set (e.g. the CLI's signal
-            // handling): interrupted while idle, before any client connected.
+            // The no-report rounds: interrupted while idle (an interrupt
+            // watch), a refused test, or IPERF_DONE mid-setup (#356). The
+            // interrupt-flavored message for all three is a recorded
+            // #293/#294 candidate.
             None => Err(RiperfError::Aborted(
                 "interrupted before a test started".into(),
             )),
@@ -1294,9 +1298,13 @@ impl Server {
                                 // EOF: the peer closed without connecting its
                                 // data streams — GT's read-site surface. The
                                 // -J doc emits here (the serve loop's arm
-                                // prints the text sentence).
+                                // prints the text sentence). #342 relay like
+                                // the mid-test/end-loop EOF siblings —
+                                // observable by a half-closed peer,
+                                // best-effort no-op on a full close (r2 F1).
                                 Ok(CtrlActivity::Eof) => {
                                     abort_setup_streams(ctx).await;
+                                    let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
                                     self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
                                     return Err(RiperfError::ControlSocketClosed);
                                 }
@@ -3130,7 +3138,8 @@ impl Server {
     /// #356 r1 F1: a state byte arrived during the CREATE_STREAMS wait —
     /// dispatch it through GT's handle_message_server arms
     /// (iperf_server_api.c:236-311; each cell live-probed on issue #338):
-    /// TEST_START is a no-op, CLIENT_TERMINATE relays 119 and takes the
+    /// TEST_START keeps waiting (see the arm's deviation record — GT's
+    /// state-write quirk is not mirrored), CLIENT_TERMINATE relays 119 and takes the
     /// terminate surfaces, IPERF_DONE is the clean errorless arm, and
     /// everything else is the IEMESSAGE default with the 110 relay.
     /// RECORDED DEVIATION: "everything else" includes TEST_END, where GT
@@ -3145,7 +3154,13 @@ impl Server {
     ) -> Result<SetupFlow> {
         match protocol::recv_state(&mut ctx.ctrl).await {
             // GT's no-op arm — keep waiting (the recreated sleep IS the
-            // clock reset: a received byte is progress).
+            // clock reset: a received byte is progress). RECORDED DEVIATION
+            // (r2 F2): GT's Nread writes the byte INTO test->state
+            // (iperf_server_api.c:249), so after a 0x01 GT is no longer in
+            // CREATE_STREAMS and ACCESS_DENIED's a subsequent correct-cookie
+            // data connect (live-probed); riperf3 keeps accepting — the
+            // liveness-preserving reading of "no-op", not a mirror of the
+            // state-variable quirk. The byte-then-EOF sub-cell matches GT.
             Ok(TestState::TestStart) => Ok(SetupFlow::Proceed),
             Ok(TestState::ClientTerminate) => {
                 abort_setup_streams(ctx).await;
@@ -3169,9 +3184,11 @@ impl Server {
                 Err(RiperfError::UnknownControlMessage)
             }
             // The byte vanished between the readiness watch and the read —
-            // only a racing EOF does that; take the EOF surface.
+            // only a racing EOF does that; take the EOF surface (with the
+            // #342 relay, like the watch's own EOF arm — r2 F1).
             Err(RiperfError::PeerDisconnected) => {
                 abort_setup_streams(ctx).await;
+                let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
                 self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
                 Err(RiperfError::ControlSocketClosed)
             }
@@ -3246,6 +3263,11 @@ impl Server {
         let cpu = crate::json_report::CpuUtilization {
             // Like build_report: only the server's own figures — GT never
             // surfaces the remote side here (no exchange happened at all).
+            // RECORDED DEVIATION (r2 F4, value-level): GT's cpu_util
+            // baseline arms just before TEST_START (iperf_server_api.c:925),
+            // so in this pre-TEST_START cell GT measures against zeroed
+            // statics (an epoch window, ~1e-05 live); riperf3 reports the
+            // honest round window.
             host_total: measured.host_total,
             host_user: measured.host_user,
             host_system: measured.host_system,

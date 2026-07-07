@@ -2577,10 +2577,13 @@ fn setup_phase_iperf_done_stream_events() {
     assert_eq!(ev["data"], serde_json::json!({}), "bare data: {ev}");
 }
 
-/// TEST_START mid-setup is GT's no-op arm — the watch survives it and a
-/// later EOF still takes the IECTRLCLOSE surface.
+/// TEST_START mid-setup keeps the wait alive — the watch survives it and
+/// a later EOF still takes the IECTRLCLOSE surface (this byte-then-EOF
+/// sub-cell matches GT). RECORDED DEVIATION (r2 F2): in the accepts-after
+/// sub-cell GT's Nread has overwritten test->state, so GT ACCESS_DENIED's
+/// a subsequent correct-cookie connect; riperf3 keeps accepting.
 #[test]
-fn setup_phase_test_start_byte_is_gt_noop() {
+fn setup_phase_test_start_byte_keeps_waiting() {
     let (_sout, serr, status) =
         drive_server_scenario_with(&["--rcv-timeout", "3000"], false, |port| {
             let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
@@ -2721,4 +2724,109 @@ fn setup_phase_doc_timestamp_is_stamped_at_accept_not_emit() {
         "stamped at the wait start like GT (accept metadata), not at emit \
          ({stamped} vs CREATE_STREAMS at {t_cs} — emit would be ~+3000)"
     );
+}
+
+/// r2 F1: the setup-phase ctrl-EOF relays IECTRLCLOSE(109) like its
+/// mid-test and end-loop siblings (#342; GT cleanup_server,
+/// iperf_server_api.c:466-473) — observable by a HALF-closed peer whose
+/// read half is still open; best-effort no-op on a full close.
+#[test]
+fn setup_phase_ctrl_eof_relays_iectrlclose_on_half_close() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let _serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // HALF-close: EOF on the server's read, our read half stays open
+        // for the relay frame.
+        ctrl.shutdown(std::net::Shutdown::Write)
+            .expect("shutdown WR");
+        read_wireback(&mut ctrl)
+    });
+
+    let frame = mock.join().expect("mock");
+    assert_eq!(
+        frame,
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0), like GT's cleanup_server"
+    );
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits");
+    assert!(status.success());
+}
+
+/// r2 F3: the rcv-timeout is a NO-PROGRESS clock, not an absolute setup
+/// deadline — each accepted stream (and each dispatched ctrl byte) resets
+/// it, GT's last_receive_time semantics. A -P2 peer connecting one stream
+/// every ~2 s under --rcv-timeout 3000 must reach TEST_START, though the
+/// whole setup takes longer than 3 s.
+#[test]
+fn setup_phase_rcv_timeout_resets_on_stream_progress() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let _serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, r#"{"tcp":true,"parallel":2}"#);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // Slow-but-progressing: one stream per ~2 s. Total setup ~4 s,
+        // every gap under the 3 s bound.
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let mut d1 = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data1");
+        d1.write_all(&[b'x'; 37]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let mut d2 = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data2");
+        d2.write_all(&[b'x'; 37]).unwrap();
+        // The next ctrl byte decides: TEST_START(1) = survived (green);
+        // a SERVER_ERROR frame (0xfe = IENOMSG at ~t+3 s) = an absolute
+        // deadline killed the progressing peer (red).
+        let first = read_exact(&mut ctrl, 1)[0];
+        drop((d1, d2, ctrl));
+        first
+    });
+
+    let first = mock.join().expect("mock");
+    assert_eq!(
+        first, 1,
+        "a progressing -P2 peer reaches TEST_START; 0xfe means the bound \
+         fired mid-progress (absolute-deadline regression)"
+    );
+    // The mock vanished mid-test; the server's own machinery bounds the
+    // round — only the reached-TEST_START byte is under test here.
+    let _ = riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20));
 }
