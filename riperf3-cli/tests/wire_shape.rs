@@ -2114,3 +2114,723 @@ fn generic_arm_failure_line_carries_the_timestamps_prefix() {
         "the literal format renders verbatim: {line:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #338: the CREATE_STREAMS wait must watch the control socket and carry GT's
+// no-progress bound. Live-probed (GT 3.21, probe338.py on the issue):
+//
+// EOF variant ({"tcp":true} params, ctrl closed, no data conns): GT notices
+// the EOF at once (dt~0.00s) — text stderr = the bare IECTRLCLOSE sentence;
+// -J = a POPULATED setup-phase start (empty connected:[], listener bufsizes,
+// timestamp, accepted_connection, cookie, tcp_mss_default/target_bitrate/
+// fq_rate zeros) + intervals:[] + bare end:{} + the bare error key; exit 0.
+//
+// HOLD variant (ctrl held open, no data conns): GT bounds at rcv_timeout
+// (--rcv-timeout, default 120000 ms) — wire-back SERVER_ERROR + IENOMSG(144)
+// + errno 0 on the held ctrl, text stderr `iperf3: error - idle timeout for
+// receiving data`, -J error key `error - idle timeout for receiving data`
+// (prefixed), exit 0. Pre-fix riperf3 parked unbounded in BOTH variants.
+// ---------------------------------------------------------------------------
+
+/// Valid JSON that deserializes via serde defaults but promises data streams
+/// the peer never connects.
+const INCOMPLETE_PARAMS: &str = r#"{"tcp":true}"#;
+
+fn drive_setup_eof(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+    drop(ctrl); // EOF with no data connections
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// EOF variant, text: the server exits bounded with GT's IECTRLCLOSE line.
+#[test]
+fn setup_phase_ctrl_eof_exits_bounded_in_text() {
+    let (_sout, serr, status) = drive_server_scenario(false, drive_setup_eof);
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CTRL_CLOSED}"),
+        "GT's bare read-site sentence: {serr:?}"
+    );
+}
+
+/// EOF variant, -J: the setup-phase doc — populated start, empty shells,
+/// bare error key, silent stderr.
+#[test]
+fn setup_phase_ctrl_eof_takes_gt_doc_shape_in_json() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_setup_eof);
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(CTRL_CLOSED),
+        "bare IECTRLCLOSE key: {doc}"
+    );
+    let start = &doc["start"];
+    assert_eq!(
+        start["connected"].as_array().map(Vec::len),
+        Some(0),
+        "connected:[] present and EMPTY: {start}"
+    );
+    assert_eq!(
+        start["accepted_connection"]["host"].as_str(),
+        Some("127.0.0.1"),
+        "accepted_connection present: {start}"
+    );
+    // 36, not 37: the doc drops the wire cookie's trailing NUL slot (the
+    // shipped convention at server.rs's other cookie-render sites; a real
+    // iperf3 cookie is 36 chars + NUL, so both tools render identically for
+    // conforming clients — only this mock's 37 non-NUL bytes differ).
+    assert_eq!(
+        start["cookie"].as_str(),
+        Some("x".repeat(36).as_str()),
+        "cookie present: {start}"
+    );
+    for key in ["sndbuf_actual", "rcvbuf_actual", "timestamp"] {
+        assert!(
+            !start[key].is_null(),
+            "{key} present in the setup-phase start: {start}"
+        );
+    }
+    for key in [
+        "sock_bufsize",
+        "tcp_mss_default",
+        "target_bitrate",
+        "fq_rate",
+    ] {
+        assert_eq!(
+            start[key].as_u64(),
+            Some(0),
+            "{key} present as 0 like GT: {start}"
+        );
+    }
+    assert!(
+        doc["intervals"].as_array().expect("intervals").is_empty(),
+        "intervals:[]"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}"
+    );
+}
+
+const IDLE_TIMEOUT_MSG: &str = "idle timeout for receiving data";
+
+/// HOLD-variant driver: park in CREATE_STREAMS with the ctrl open, read the
+/// wire-back frame, return it with the captured streams.
+fn run_setup_hold_scenario(json: bool) -> (Vec<u8>, String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut args = vec!["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"];
+    if json {
+        args.push("-J");
+    }
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // HOLD: no data connections, ctrl stays open. The wire-back should
+        // arrive at the ~3 s bound; the pre-fix park never sends it.
+        let frame = read_wireback(&mut ctrl);
+        drop(ctrl);
+        frame
+    });
+
+    let frame = mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits at the rcv-timeout bound while the peer holds");
+    (
+        frame,
+        sout_reader.join().expect("stdout"),
+        serr_reader.join().expect("stderr"),
+        status,
+    )
+}
+
+/// HOLD variant, text: bounded at --rcv-timeout with GT's IENOMSG surface —
+/// the wire-back frame, the stderr line, exit 0.
+#[test]
+fn setup_phase_ctrl_hold_bounds_at_rcv_timeout_in_text() {
+    let (frame, _sout, serr, status) = run_setup_hold_scenario(false);
+    assert_eq!(
+        frame,
+        wireback_frame(144),
+        "SERVER_ERROR + htonl(IENOMSG) + htonl(0), like GT's cleanup_server"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IDLE_TIMEOUT_MSG}"),
+        "GT's IENOMSG line: {serr:?}"
+    );
+}
+
+/// HOLD variant, -J: the prefixed error key over the setup-phase doc.
+#[test]
+fn setup_phase_ctrl_hold_takes_gt_doc_shape_in_json() {
+    let (frame, sout, serr, status) = run_setup_hold_scenario(true);
+    assert_eq!(frame, wireback_frame(144));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {IDLE_TIMEOUT_MSG}").as_str()),
+        "the prefixed IENOMSG key: {doc}"
+    );
+    assert!(
+        !doc["start"]["accepted_connection"].is_null(),
+        "setup-phase start populated: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #356 r1 F1: GT dispatches setup-phase ctrl bytes through the SAME
+// handle_message_server switch as mid-test (iperf_server_api.c:236-311) —
+// the CREATE_STREAMS wait is inside its event loop. Live-probed (GT 3.21,
+// probe356b.py on issue #338):
+//
+// - 0x0c CLIENT_TERMINATE: instant; relay fe 00000077 00000000 (119, errno
+//   0 — deterministic in this cell, no post-teardown clobber); text stderr
+//   the bare "the client has terminated" + the report-skeleton pair on
+//   stdout (separator + plain header, reporter_callback at DISPLAY_RESULTS
+//   with zero streams); -J = the setup start + a FULL-zeros end (streams:[],
+//   zero sum_sent/sum_received, real host cpu_utilization_percent) + the
+//   bare error key; --json-stream = error event + zeros-end end event.
+//   GT also closes every accepted data socket at once (r1 F7).
+// - 0x10 IPERF_DONE: instant clean exit — NO relay, NO stderr; -J = the
+//   errorless setup doc (bare end{}); --json-stream = one bare end event.
+// - 0x01 TEST_START: GT's no-op arm — the wait continues (and the byte
+//   resets GT's no-progress clock: last_receive_time semantics).
+// - anything else: the IEMESSAGE default — relay fe 0000006e 00000000,
+//   prefixed doc key, bare end.
+// - 0x04 TEST_END: RECORDED DEVIATION — GT runs its ghost end processing
+//   (report headers, an EXCHANGE_RESULTS byte, then a stale-errno
+//   IERECVRESULTS tangle: "unable to receive results: Bad file
+//   descriptor"); riperf3 takes the IEMESSAGE arm above.
+// ---------------------------------------------------------------------------
+
+const CLIENT_TERMINATED_MSG: &str = "the client has terminated";
+const UNKNOWN_CTRL_MSG: &str =
+    "received an unknown control message (ensure other side is iperf3 and not iperf)";
+
+/// Dispatch-cell driver: park in CREATE_STREAMS, send one ctrl byte, read
+/// the relay until EOF (empty = no relay, the IPERF_DONE shape).
+fn run_setup_byte_scenario(
+    extra_args: &[&str],
+    byte: u8,
+) -> (Vec<u8>, String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut args = vec!["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"];
+    args.extend_from_slice(extra_args);
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        ctrl.write_all(&[byte]).unwrap();
+        let frame = read_wireback(&mut ctrl);
+        drop(ctrl);
+        frame
+    });
+
+    let frame = mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits promptly on the dispatched byte");
+    (
+        frame,
+        sout_reader.join().expect("stdout"),
+        serr_reader.join().expect("stderr"),
+        status,
+    )
+}
+
+/// CLIENT_TERMINATE mid-setup, text: the 119 relay, GT's bare sentence, the
+/// report-skeleton pair on stdout — NOT the rcv-timeout park's IENOMSG.
+#[test]
+fn setup_phase_client_terminate_dispatches_instantly_in_text() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&[], 0x0c);
+    assert_eq!(
+        frame,
+        wireback_frame(119),
+        "SERVER_ERROR + htonl(IECLIENTTERM) + htonl(0), like GT's cleanup_server"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CLIENT_TERMINATED_MSG}"),
+        "GT's bare IECLIENTTERM sentence, not the IENOMSG park: {serr:?}"
+    );
+    assert!(
+        sout.contains("- - - - - - - - - - - - - - - - - - - - - - - - -"),
+        "the terminate skeleton's separator: {sout:?}"
+    );
+    assert!(
+        sout.contains("[ ID] Interval           Transfer     Bitrate"),
+        "the terminate skeleton's header: {sout:?}"
+    );
+}
+
+/// CLIENT_TERMINATE mid-setup, -J: the setup doc with GT's FULL-zeros end.
+#[test]
+fn setup_phase_client_terminate_takes_gt_doc_shape_in_json() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&["-J"], 0x0c);
+    assert_eq!(frame, wireback_frame(119));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(CLIENT_TERMINATED_MSG),
+        "bare sentence key: {doc}"
+    );
+    let end = &doc["end"];
+    assert_eq!(
+        end["streams"].as_array().map(Vec::len),
+        Some(0),
+        "streams:[] present and empty: {end}"
+    );
+    for sum in ["sum_sent", "sum_received"] {
+        assert_eq!(
+            end[sum]["bytes"].as_u64(),
+            Some(0),
+            "{sum} zeros block present: {end}"
+        );
+        assert_eq!(end[sum]["sender"].as_bool(), Some(false), "{sum}.sender");
+    }
+    assert!(
+        end["cpu_utilization_percent"]["host_total"].is_number(),
+        "real host cpu figures like GT: {end}"
+    );
+    assert_eq!(
+        end["cpu_utilization_percent"]["remote_total"].as_f64(),
+        Some(0.0),
+        "remote zeros like GT: {end}"
+    );
+    assert!(
+        !doc["start"]["accepted_connection"].is_null(),
+        "setup-phase start populated: {doc}"
+    );
+}
+
+/// CLIENT_TERMINATE mid-setup, --json-stream: GT's error + zeros-end pair.
+#[test]
+fn setup_phase_client_terminate_stream_events() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&["--json-stream"], 0x0c);
+    assert_eq!(frame, wireback_frame(119));
+    assert!(status.success());
+    assert!(
+        serr.trim().is_empty(),
+        "--json-stream keeps stderr silent: {serr:?}"
+    );
+    let events: Vec<serde_json::Value> = sout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("event line ({e}): {l}")))
+        .collect();
+    assert_eq!(events.len(), 2, "error + end pair: {sout:?}");
+    assert_eq!(events[0]["event"].as_str(), Some("error"));
+    assert_eq!(events[0]["data"].as_str(), Some(CLIENT_TERMINATED_MSG));
+    assert_eq!(events[1]["event"].as_str(), Some("end"));
+    assert_eq!(
+        events[1]["data"]["streams"].as_array().map(Vec::len),
+        Some(0),
+        "zeros-end event data like GT: {}",
+        events[1]
+    );
+}
+
+/// A stray byte mid-setup takes GT's IEMESSAGE default, not the park.
+#[test]
+fn setup_phase_stray_byte_takes_iemessage_surface_in_text() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&[], 0x63);
+    assert_eq!(
+        frame,
+        wireback_frame(110),
+        "SERVER_ERROR + htonl(IEMESSAGE) + htonl(0)"
+    );
+    assert!(status.success());
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {UNKNOWN_CTRL_MSG}"),
+        "GT's prefixed IEMESSAGE line: {serr:?}"
+    );
+    assert!(
+        !sout.contains("- - - - -"),
+        "no report skeleton in the stray cell (GT prints none): {sout:?}"
+    );
+}
+
+/// A stray byte mid-setup, -J: the prefixed key over the bare-end setup doc.
+#[test]
+fn setup_phase_stray_byte_prefixed_key_in_json() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&["-J"], 0x63);
+    assert_eq!(frame, wireback_frame(110));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {UNKNOWN_CTRL_MSG}").as_str()),
+        "prefixed IEMESSAGE key: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}} in the stray cell: {doc}"
+    );
+}
+
+/// IPERF_DONE mid-setup is GT's clean arm: no relay, no stderr, an
+/// errorless setup doc, exit 0.
+#[test]
+fn setup_phase_iperf_done_is_clean_and_errorless_in_json() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&["-J"], 0x10);
+    assert!(
+        frame.is_empty(),
+        "GT's IPERF_DONE arm relays nothing: {frame:?}"
+    );
+    assert!(status.success());
+    assert!(
+        serr.trim().is_empty(),
+        "clean exit keeps stderr silent: {serr:?}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert!(
+        doc.get("error").is_none(),
+        "NO error key in the clean-done doc: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}: {doc}"
+    );
+    assert!(
+        !doc["start"]["accepted_connection"].is_null(),
+        "setup-phase start populated: {doc}"
+    );
+}
+
+/// IPERF_DONE mid-setup, --json-stream: GT emits a single bare end event.
+#[test]
+fn setup_phase_iperf_done_stream_events() {
+    let (frame, sout, serr, status) = run_setup_byte_scenario(&["--json-stream"], 0x10);
+    assert!(frame.is_empty());
+    assert!(status.success());
+    assert!(serr.trim().is_empty());
+    let events: Vec<&str> = sout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(events.len(), 1, "one bare end event: {sout:?}");
+    let ev: serde_json::Value = serde_json::from_str(events[0]).expect("end event");
+    assert_eq!(ev["event"].as_str(), Some("end"));
+    assert_eq!(ev["data"], serde_json::json!({}), "bare data: {ev}");
+}
+
+/// TEST_START mid-setup keeps the wait alive — the watch survives it and
+/// a later EOF still takes the IECTRLCLOSE surface (this byte-then-EOF
+/// sub-cell matches GT). RECORDED DEVIATION (r2 F2): in the accepts-after
+/// sub-cell GT's Nread has overwritten test->state, so GT ACCESS_DENIED's
+/// a subsequent correct-cookie connect; riperf3 keeps accepting.
+#[test]
+fn setup_phase_test_start_byte_keeps_waiting() {
+    let (_sout, serr, status) =
+        drive_server_scenario_with(&["--rcv-timeout", "3000"], false, |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+            ctrl.write_all(&[0x01]).unwrap(); // TEST_START: GT's no-op
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            drop(ctrl); // now EOF — the watch must still be armed
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+    assert!(status.success());
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CTRL_CLOSED}"),
+        "the no-op byte left the EOF watch armed: {serr:?}"
+    );
+}
+
+/// r1 F7: the terminate return closes already-accepted data streams like
+/// GT's cleanup_server — the peer's data socket sees EOF bounded, not a
+/// detached task holding it until the peer gives up. PERSISTENT server on
+/// purpose: a one-off's process exit closes every socket and would pass
+/// with the abort removed — only a still-running server discriminates
+/// abort from detach (the mutation-vacuous first draft of this pin).
+#[test]
+fn setup_phase_terminate_closes_accepted_streams() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &port_s, "--rcv-timeout", "3000", "-J"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let _serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, r#"{"tcp":true,"parallel":2}"#);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // Connect ONE of the two promised streams (correct cookie), then
+        // terminate on ctrl.
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&[b'x'; 37]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        ctrl.write_all(&[0x0c]).unwrap();
+        let frame = read_wireback(&mut ctrl);
+        // The server must close the accepted data socket (GT closes every
+        // stream socket in its terminate arm) — bounded EOF while the
+        // server keeps serving, not a detached task holding it.
+        data.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 16];
+        let data_read = data.read(&mut buf);
+        (frame, data_read.map_err(|e| e.kind()))
+    });
+
+    let (frame, data_read) = mock.join().expect("mock");
+    assert_eq!(frame, wireback_frame(119));
+    assert_eq!(
+        data_read,
+        Ok(0),
+        "the accepted data socket sees EOF bounded (GT closes stream socks)"
+    );
+    // Persistent server: still alive and serving — ChildGuard kills it.
+    assert!(
+        server.0.try_wait().expect("try_wait").is_none(),
+        "the persistent server kept serving after the terminate round"
+    );
+}
+
+/// r1 F4: the setup doc's timestamp is GT's wait-start stamp (on-connect
+/// metadata), not the emit time — at the default 120 s bound those differ
+/// by two minutes.
+#[test]
+fn setup_phase_doc_timestamp_is_stamped_at_accept_not_emit() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000", "-J"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        let t_cs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // HOLD to the 3 s bound.
+        let _ = read_wireback(&mut ctrl);
+        t_cs
+    });
+
+    let t_cs = mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits at the bound");
+    assert!(status.success());
+    let sout = sout_reader.join().expect("stdout");
+    drop(serr_reader.join().expect("stderr"));
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    let stamped = doc["start"]["timestamp"]["timemillisecs"]
+        .as_u64()
+        .expect("timemillisecs");
+    assert!(
+        stamped <= t_cs + 500,
+        "stamped at the wait start like GT (accept metadata), not at emit \
+         ({stamped} vs CREATE_STREAMS at {t_cs} — emit would be ~+3000)"
+    );
+}
+
+/// r2 F1: the setup-phase ctrl-EOF relays IECTRLCLOSE(109) like its
+/// mid-test and end-loop siblings (#342; GT cleanup_server,
+/// iperf_server_api.c:466-473) — observable by a HALF-closed peer whose
+/// read half is still open; best-effort no-op on a full close.
+#[test]
+fn setup_phase_ctrl_eof_relays_iectrlclose_on_half_close() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let _serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // HALF-close: EOF on the server's read, our read half stays open
+        // for the relay frame.
+        ctrl.shutdown(std::net::Shutdown::Write)
+            .expect("shutdown WR");
+        read_wireback(&mut ctrl)
+    });
+
+    let frame = mock.join().expect("mock");
+    assert_eq!(
+        frame,
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0), like GT's cleanup_server"
+    );
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("server exits");
+    assert!(status.success());
+}
+
+/// r2 F3: the rcv-timeout is a NO-PROGRESS clock, not an absolute setup
+/// deadline — each accepted stream (and each dispatched ctrl byte) resets
+/// it, GT's last_receive_time semantics. A -P2 peer connecting one stream
+/// every ~2 s under --rcv-timeout 3000 must reach TEST_START, though the
+/// whole setup takes longer than 3 s.
+#[test]
+fn setup_phase_rcv_timeout_resets_on_stream_progress() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s, "--rcv-timeout", "3000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let _serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, r#"{"tcp":true,"parallel":2}"#);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // Slow-but-progressing: one stream per ~2 s. Total setup ~4 s,
+        // every gap under the 3 s bound.
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let mut d1 = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data1");
+        d1.write_all(&[b'x'; 37]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let mut d2 = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data2");
+        d2.write_all(&[b'x'; 37]).unwrap();
+        // The next ctrl byte decides: TEST_START(1) = survived (green);
+        // a SERVER_ERROR frame (0xfe = IENOMSG at ~t+3 s) = an absolute
+        // deadline killed the progressing peer (red). Bounded read (r3
+        // nit): a regression that silences the socket entirely must fail
+        // the pin, not park the join.
+        ctrl.set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .expect("set_read_timeout");
+        let first = read_exact(&mut ctrl, 1)[0];
+        drop((d1, d2, ctrl));
+        first
+    });
+
+    let first = mock.join().expect("mock");
+    assert_eq!(
+        first, 1,
+        "a progressing -P2 peer reaches TEST_START; 0xfe means the bound \
+         fired mid-progress (absolute-deadline regression)"
+    );
+    // The mock vanished mid-test; the server's own machinery bounds the
+    // round — only the reached-TEST_START byte is under test here.
+    let _ = riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(20));
+}

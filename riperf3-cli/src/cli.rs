@@ -887,6 +887,12 @@ impl Cli {
         if let Some(secs) = self.server_max_duration {
             builder = builder.server_max_duration(u32::try_from(secs).unwrap_or(u32::MAX));
         }
+        if let Some(ms) = self.rcv_timeout {
+            // #338: the server half of --rcv-timeout (GT uses it as the
+            // no-progress bound on both roles). IERCVTIMEOUT range enforced
+            // pre-sink in main.rs (#328).
+            builder = builder.rcv_timeout(u64::try_from(ms).unwrap_or(0));
+        }
         if self.forceflush {
             builder = builder.forceflush(true);
         }
@@ -2389,6 +2395,21 @@ mod cli_tests {
             assert!(cli.daemon);
             let long = Cli::parse_from(["riperf3", "-s", "--daemon"]);
             assert!(long.daemon);
+        }
+
+        #[test]
+        fn server_rcv_timeout_wired() {
+            // #356 r1 F10: the SERVER glue for --rcv-timeout (#338), the
+            // builder-compare convention like the client's rcv_timeout_wired.
+            let cli = Cli::parse_from(["riperf3", "-s", "--rcv-timeout", "3000"]);
+            let s = build_server_from_cli(&cli);
+            assert_eq!(
+                s,
+                riperf3::ServerBuilder::new()
+                    .rcv_timeout(3000)
+                    .build()
+                    .unwrap()
+            );
         }
 
         #[test]

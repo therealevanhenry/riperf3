@@ -262,6 +262,17 @@ pub fn print_separator() {
     ));
 }
 
+/// #356 r1 F1: GT's terminate-at-setup text skeleton — its
+/// reporter_callback runs under DISPLAY_RESULTS with zero streams
+/// (iperf_server_api.c:292-297), printing just the separator and the plain
+/// TCP header (live-probed 3.21).
+pub fn print_terminate_skeleton() {
+    print_separator();
+    titled(format_args!(
+        "[ ID] Interval           Transfer     Bitrate"
+    ));
+}
+
 /// GT's final-partial-interval keep rule (iperf_print_intermediate,
 /// iperf_api.c:3853-3880, #264): a run's trailing sub-interval survives iff
 /// it spans at least 10% of the stats interval OR it actually moved bytes —

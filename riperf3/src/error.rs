@@ -81,6 +81,16 @@ pub enum RiperfError {
     #[error("unable to receive parameters from client")]
     RecvParamsFailed,
 
+    /// iperf3's IENOMSG(144): the server's no-progress watchdog fired — no
+    /// messages/data received within `--rcv-timeout` (default 120000 ms, GT's
+    /// DEFAULT_NO_MSG_RCVD_TIMEOUT, iperf_api.h:70). First wired at the
+    /// CREATE_STREAMS wait (#338; the TEST_RUNNING half is #351). GT relays
+    /// SERVER_ERROR + 144 via cleanup_server and keeps serving: text
+    /// `iperf3: error - <sentence>`, -J `error - `-prefixed doc key, exit 0.
+    /// GT's sentence (#151 convention).
+    #[error("idle timeout for receiving data")]
+    DataIdleTimeout,
+
     /// iperf3's IEMESSAGE (#325): an unhandled control byte. GT's end-loop
     /// switch has arms for only TEST_START / TEST_END / IPERF_DONE /
     /// CLIENT_TERMINATE — every other value, known state or not, hits

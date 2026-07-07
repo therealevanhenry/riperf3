@@ -200,6 +200,167 @@ pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> Stri
     .unwrap()
 }
 
+/// Inputs for the #338 setup-phase document, gathered at the CREATE_STREAMS
+/// wait (the control connection and the listener are live; no data streams).
+pub(crate) struct SetupPhaseDoc {
+    pub sock_bufsize: u64,
+    pub sndbuf_actual: Option<u64>,
+    pub rcvbuf_actual: Option<u64>,
+    pub timemillisecs: u64,
+    pub accepted_host: String,
+    pub accepted_port: u16,
+    pub cookie: String,
+    pub target_bitrate: u64,
+    pub fq_rate: u64,
+}
+
+/// #338: the setup-phase (CREATE_STREAMS) error document — by then GT's
+/// server has the on_connect metadata AND the listener's buffer fields, so
+/// the start is POPULATED (live-probed 3.21): empty `connected:[]`, the
+/// bufsize trio, timestamp, accepted_connection, cookie, `tcp_mss_default`
+/// 0 (the server never reads the ctrl MSS, the #50 convention),
+/// target_bitrate, fq_rate — over `intervals:[]`, a bare `end:{}`, and the
+/// error key. KEY ORDER is GT's SERVER insertion order: the bufsize trio
+/// lands at listen time (iperf_tcp.c:373-377), BEFORE timestamp — the
+/// shared Start serializer's client-derived order is #355.
+pub(crate) fn setup_error_document(d: &SetupPhaseDoc, error: &str) -> String {
+    setup_phase_document(d, &BareEnd {}, Some(error))
+}
+
+/// #356 r1 F1: GT's CLIENT_TERMINATE-at-setup document — its
+/// reporter_callback runs under DISPLAY_RESULTS with zero streams
+/// (iperf_server_api.c:292-297), so the end block is the FULL-zeros shape:
+/// `streams:[]`, zero sum blocks, and REAL host cpu figures with remote
+/// zeros (live-probed 3.21). The error key is the bare sentence, like the
+/// mid-test terminate arm's.
+pub(crate) fn setup_terminate_document(
+    d: &SetupPhaseDoc,
+    error: &str,
+    cpu: &CpuUtilization,
+) -> String {
+    setup_phase_document(d, &zeros_end(cpu), Some(error))
+}
+
+/// #356 r1 F1: GT's IPERF_DONE-at-setup document — the clean arm exits the
+/// run loop with no error at all, so the accumulated doc is the setup start
+/// over a bare `end:{}` and NO error key (live-probed 3.21).
+pub(crate) fn setup_done_document(d: &SetupPhaseDoc) -> String {
+    setup_phase_document(d, &BareEnd {}, None)
+}
+
+/// #356 r1 F1: the `--json-stream` terminate-at-setup pair — GT emits the
+/// bare-sentence error event, then an `end` event whose data is the same
+/// FULL-zeros end block the -J doc carries (live-probed 3.21).
+pub(crate) fn terminate_stream_events(error: &str, cpu: &CpuUtilization) -> String {
+    format!(
+        "{}\n{}",
+        json_stream_event("error", &error),
+        json_stream_event("end", &zeros_end(cpu))
+    )
+}
+
+/// #356 r1 F1: the `--json-stream` IPERF_DONE-at-setup tail — GT emits one
+/// bare `end` event and nothing else (live-probed 3.21).
+pub(crate) fn done_stream_events() -> String {
+    json_stream_event("end", &serde_json::json!({}))
+}
+
+#[derive(Serialize)]
+struct BareEnd {}
+
+/// GT's zero sum block: exactly the six keys its reporter renders for a
+/// stream-less summary (no retransmits — the sender extras never arm).
+#[derive(Serialize)]
+struct ZeroSum {
+    start: u64,
+    end: u64,
+    seconds: u64,
+    bytes: u64,
+    bits_per_second: u64,
+    sender: bool,
+}
+
+#[derive(Serialize)]
+struct ZerosEnd {
+    streams: [(); 0],
+    sum_sent: ZeroSum,
+    sum_received: ZeroSum,
+    cpu_utilization_percent: CpuUtilization,
+}
+
+fn zeros_end(cpu: &CpuUtilization) -> ZerosEnd {
+    let zero = || ZeroSum {
+        start: 0,
+        end: 0,
+        seconds: 0,
+        bytes: 0,
+        bits_per_second: 0,
+        sender: false,
+    };
+    ZerosEnd {
+        streams: [],
+        sum_sent: zero(),
+        sum_received: zero(),
+        cpu_utilization_percent: cpu.clone(),
+    }
+}
+
+fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<&str>) -> String {
+    #[derive(Serialize)]
+    struct SetupStart<'a> {
+        connected: [(); 0],
+        version: String,
+        system_info: String,
+        sock_bufsize: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sndbuf_actual: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rcvbuf_actual: Option<u64>,
+        timestamp: Timestamp,
+        accepted_connection: ConnectingTo,
+        cookie: &'a str,
+        tcp_mss_default: u32,
+        target_bitrate: u64,
+        fq_rate: u64,
+    }
+    #[derive(Serialize)]
+    struct Doc<'a, E: Serialize> {
+        start: SetupStart<'a>,
+        intervals: [(); 0],
+        end: &'a E,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
+    }
+    let secs = d.timemillisecs / 1000;
+    serde_json::to_string_pretty(&Doc {
+        start: SetupStart {
+            connected: [],
+            version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+            system_info: crate::utils::system_info(),
+            sock_bufsize: d.sock_bufsize,
+            sndbuf_actual: d.sndbuf_actual,
+            rcvbuf_actual: d.rcvbuf_actual,
+            timestamp: Timestamp {
+                time: http_date(secs),
+                timesecs: secs,
+                timemillisecs: d.timemillisecs,
+            },
+            accepted_connection: ConnectingTo {
+                host: d.accepted_host.clone(),
+                port: d.accepted_port,
+            },
+            cookie: &d.cookie,
+            tcp_mss_default: 0,
+            target_bitrate: d.target_bitrate,
+            fq_rate: d.fq_rate,
+        },
+        intervals: [],
+        end,
+        error,
+    })
+    .unwrap()
+}
+
 /// The `--json-stream` pre-test error tail (#198): an `error` event followed
 /// by an empty `end` event, iperf3's JSONStream_Output order on errexit.
 pub fn error_stream_events(error: &str) -> String {
@@ -3635,6 +3796,107 @@ mod tests {
                 "receiver_tcp_congestion"
             ],
             "end key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
+    }
+
+    /// #356 r1 F8 (+#355): the setup-phase doc's start keys are GT's SERVER
+    /// insertion order — the bufsize trio at listen time, BEFORE timestamp
+    /// (iperf_tcp.c:373-377), unlike the client-derived order the shared
+    /// Start serializer pins above. Parsed-Value asserts are order-blind;
+    /// read the raw string. The terminate variant's zeros end rides along.
+    #[test]
+    fn setup_document_key_order_is_gt_server_order() {
+        let d = SetupPhaseDoc {
+            sock_bufsize: 0,
+            sndbuf_actual: Some(16384),
+            rcvbuf_actual: Some(131072),
+            timemillisecs: 1_700_000_000_000,
+            accepted_host: "127.0.0.1".into(),
+            accepted_port: 5201,
+            cookie: "c".repeat(36),
+            target_bitrate: 0,
+            fq_rate: 0,
+        };
+        let raw = setup_terminate_document(
+            &d,
+            "the client has terminated",
+            &CpuUtilization {
+                host_total: 1.0,
+                host_user: 0.5,
+                host_system: 0.5,
+                remote_total: 0.0,
+                remote_user: 0.0,
+                remote_system: 0.0,
+            },
+        );
+
+        let keys = |obj: &str| -> Vec<String> {
+            let from = raw.find(&format!("\"{obj}\":")).unwrap() + obj.len() + 3;
+            let bytes = raw.as_bytes();
+            let mut depth = 0i32;
+            let mut i = from;
+            let mut out = Vec::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b'"' => {
+                        let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                        if depth == 1 && bytes.get(close + 1) == Some(&b':') {
+                            out.push(raw[i + 1..close].to_string());
+                        }
+                        i = close;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out
+        };
+        assert_eq!(
+            keys("start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "tcp_mss_default",
+                "target_bitrate",
+                "fq_rate"
+            ],
+            "setup start key order drifted from GT's server order: {raw}"
+        );
+        assert_eq!(
+            keys("end"),
+            [
+                "streams",
+                "sum_sent",
+                "sum_received",
+                "cpu_utilization_percent"
+            ],
+            "terminate zeros-end key order drifted: {raw}"
+        );
+        assert_eq!(
+            keys("sum_sent"),
+            [
+                "start",
+                "end",
+                "seconds",
+                "bytes",
+                "bits_per_second",
+                "sender"
+            ],
+            "zero sum block keys drifted from GT's six: {raw}"
         );
     }
 
