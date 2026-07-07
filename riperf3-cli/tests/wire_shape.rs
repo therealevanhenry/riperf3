@@ -543,6 +543,22 @@ fn mid_test_client_terminate_exits_bounded_while_peer_holds() {
     );
 }
 
+/// #331: the SUCCESS path — a COMPLETED round (IperfDone received, results
+/// exchanged, doc emitted) against a peer that then HOLDS its sockets open.
+/// GT closes every stream socket at TEST_END (iperf_server_api.c:272-275)
+/// and its one-off exits on its own clock; riperf3's success-path joins
+/// parked in the receivers' read() for the peer's whole hold (live: >6 s,
+/// 3/3 on the pre-fix tree).
+#[test]
+fn clean_finish_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario(16, false);
+    assert!(status.success(), "clean one-off exit 0");
+    assert!(
+        serr.trim().is_empty(),
+        "a completed round prints nothing to stderr: {serr:?}"
+    );
+}
+
 const CTRL_CLOSED: &str = "the client has unexpectedly closed the connection";
 
 /// #330: an abrupt EOF DURING the data phase is GT's IECTRLCLOSE read-site
