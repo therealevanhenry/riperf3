@@ -451,6 +451,21 @@ fn mid_test_unknown_byte_with_get_server_output_prints_no_summary() {
 /// which must arrive while the peer still holds. Detached mock thread;
 /// the sockets close when the test binary exits.
 fn run_holding_scenario(final_byte: u8, junk_mid_test: bool) -> (String, std::process::ExitStatus) {
+    run_holding_scenario_params(final_byte, junk_mid_test, MOCK_PARAMS, 0)
+}
+
+/// `pre_end_delay_ms`: dwell in TEST_RUNNING before sending TestEnd. The
+/// reverse (sender-park) cell needs the server's sender to FILL the
+/// unread-peer buffers and park in write_all() BEFORE `done` is set — an
+/// immediate TestEnd lets the sender exit via its done-check without ever
+/// parking, and the pin can't discriminate (buffers fill in ~ms at loopback
+/// speed; the dwell is ample).
+fn run_holding_scenario_params(
+    final_byte: u8,
+    junk_mid_test: bool,
+    params: &'static str,
+    pre_end_delay_ms: u64,
+) -> (String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -473,7 +488,7 @@ fn run_holding_scenario(final_byte: u8, junk_mid_test: bool) -> (String, std::pr
         let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
         ctrl.write_all(&cookie).unwrap();
         assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
-        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        write_json_blob(&mut ctrl, params);
         assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
         let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
         data.write_all(&cookie).unwrap();
@@ -481,6 +496,9 @@ fn run_holding_scenario(final_byte: u8, junk_mid_test: bool) -> (String, std::pr
         assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
         data.write_all(&[0u8; 4096]).unwrap();
         if !junk_mid_test {
+            if pre_end_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(pre_end_delay_ms));
+            }
             ctrl.write_all(&[4u8]).unwrap(); // TestEnd
             assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
             write_json_blob(&mut ctrl, MOCK_RESULTS);
@@ -540,6 +558,40 @@ fn mid_test_client_terminate_exits_bounded_while_peer_holds() {
         serr.trim(),
         "riperf3: the client has terminated",
         "GT's bare IECLIENTTERM line, printed while the peer still holds"
+    );
+}
+
+/// #331: the SUCCESS path — a COMPLETED round (IperfDone received, results
+/// exchanged, doc emitted) against a peer that then HOLDS its sockets open.
+/// GT closes every stream socket at TEST_END (iperf_server_api.c:272-275)
+/// and its one-off exits on its own clock; riperf3's success-path joins
+/// parked in the receivers' read() for the peer's whole hold (live: >6 s,
+/// 3/3 on the pre-fix tree).
+#[test]
+fn clean_finish_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario(16, false);
+    assert!(status.success(), "clean one-off exit 0");
+    assert!(
+        serr.trim().is_empty(),
+        "a completed round prints nothing to stderr: {serr:?}"
+    );
+}
+
+/// The reverse round's params — the server streams are SENDERS.
+const MOCK_PARAMS_REVERSE: &str = r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":1,"len":131072,"pacing_timer":1000,"reverse":true,"client_version":"riperf3 0.0.0"}"#;
+
+/// #331 (r2 F2): the SENDER arm — a REVERSE round where the peer completes
+/// the protocol but never drains the data socket parks the server's sender
+/// in write_all() against the full buffers (pre-fix: wedged the peer's whole
+/// hold, live 12 s; post-fix: ms exit). The abort is direction-blind; this
+/// pin keeps the sender arm covered explicitly.
+#[test]
+fn clean_finish_reverse_exits_bounded_while_peer_holds() {
+    let (serr, status) = run_holding_scenario_params(16, false, MOCK_PARAMS_REVERSE, 500);
+    assert!(status.success(), "clean reverse one-off exit 0");
+    assert!(
+        serr.trim().is_empty(),
+        "a completed reverse round prints nothing to stderr: {serr:?}"
     );
 }
 

@@ -850,19 +850,21 @@ impl Server {
         // its own clock). Covers the pre-existing mid-test terminate too.
         // #330: ctrl_closed joins — a peer may EOF the control socket
         // while holding the DATA sockets open; GT's cleanup closes them.
-        if ctx.interrupted.is_some()
-            || ctx.unknown_message
-            || ctx.client_terminated
-            || ctx.ctrl_closed
-            || ctx.early_done
-            || ctx.exchange_recv_failed
-        {
-            for s in &ctx.streams {
-                s.task.abort();
-            }
-            if let Some(h) = &ctx.udp_demux_handle {
-                h.abort();
-            }
+        // #331: the SUCCESS path parks the same way — a completed peer that
+        // holds its data sockets leaves receivers in read(), so the old
+        // abnormal-end gate is now unconditional. GT closes every stream
+        // socket at TEST_END (iperf_server_api.c:272-275); closing at
+        // riperf3's literal TestEnd arm would race the #55/#159 catch-up
+        // window and drift byte counts, so the safe equivalent is here:
+        // counts are frozen at build_result_streams + the exchange, and
+        // every sink has emitted. Abort drops each tokio task's socket at
+        // its next await; the spawn_blocking UDP runners are bounded by the
+        // 500 ms read-timeout + `done` polling either way.
+        for s in &ctx.streams {
+            s.task.abort();
+        }
+        if let Some(h) = &ctx.udp_demux_handle {
+            h.abort();
         }
         for s in ctx.streams {
             let _ = s.task.await;
