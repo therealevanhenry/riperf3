@@ -2814,7 +2814,11 @@ fn setup_phase_rcv_timeout_resets_on_stream_progress() {
         d2.write_all(&[b'x'; 37]).unwrap();
         // The next ctrl byte decides: TEST_START(1) = survived (green);
         // a SERVER_ERROR frame (0xfe = IENOMSG at ~t+3 s) = an absolute
-        // deadline killed the progressing peer (red).
+        // deadline killed the progressing peer (red). Bounded read (r3
+        // nit): a regression that silences the socket entirely must fail
+        // the pin, not park the join.
+        ctrl.set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .expect("set_read_timeout");
         let first = read_exact(&mut ctrl, 1)[0];
         drop((d1, d2, ctrl));
         first
