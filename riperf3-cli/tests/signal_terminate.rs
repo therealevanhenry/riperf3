@@ -963,8 +963,8 @@ fn server_sigterm_mid_test_emits_exactly_one_doc() {
     assert_eq!(scode, 0, "signal-normal exit");
     assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
     // from_str on the WHOLE stdout: a second appended doc fails the parse.
-    let doc: serde_json::Value = serde_json::from_str(sout.trim())
-        .expect("server stdout is EXACTLY ONE JSON document");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).expect("server stdout is EXACTLY ONE JSON document");
     assert!(
         doc["error"].is_string(),
         "the single doc carries the interrupt/terminate key: {doc}"
