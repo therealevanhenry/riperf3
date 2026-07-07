@@ -533,13 +533,10 @@ impl Server {
             // (iperf_server_api.c:133-135) — no stderr line, no banner
             // re-print, no counter increment; the accept simply re-arms.
             let mut idle_restart = false;
-            let mut round_had_no_report = false;
             match self.handle_one_test(&listener).await {
                 // #137: the daemon loop discards each test's Report; library
-                // users who want it call `run_once`. A None round (idle
-                // interrupt, refusal, IPERF_DONE-at-setup) emitted no doc —
-                // the #346 idle-interrupt check below needs to know.
-                Ok(r) => round_had_no_report = r.is_none(),
+                // users who want it call `run_once`.
+                Ok(_) => {}
                 Err(RiperfError::Aborted(msg)) if msg == "idle timeout" => {
                     idle_restart = true;
                 }
@@ -648,20 +645,14 @@ impl Server {
             }
 
             // #210: an interrupted run stops serving — handle_one_test
-            // already dumped its stats and told the client; the caller owns
-            // the signal-normal exit. #346: EXCEPT when the interrupt landed
-            // while idle (a None round emitted no doc) — GT's signormalexit
-            // finishes the accumulated empty doc with the interrupt key
-            // (live: the skeleton -J doc / error+end event pair, silent
-            // stderr, exit 0); text keeps the caller's stderr line.
-            if let Some(rx) = interrupt_fired.as_mut() {
-                let msg = rx.borrow_and_update().clone();
-                if let Some(msg) = msg {
-                    if round_had_no_report {
-                        self.emit_pretest_error_doc(&msg);
-                    }
-                    return Ok(());
-                }
+            // already dumped its stats and told the client (or, interrupted
+            // while idle, emitted the #346 skeleton at the accept site);
+            // the caller owns the signal-normal exit.
+            if interrupt_fired
+                .as_mut()
+                .is_some_and(|rx| rx.borrow_and_update().is_some())
+            {
+                return Ok(());
             }
             if self.one_off {
                 break;
@@ -766,7 +757,21 @@ impl Server {
         let (mut ctrl, peer_addr) = match self.accept_control(listener).await? {
             Some(accepted) => accepted,
             // Interrupted while idle (no client): no test ran, so no report.
-            None => return Ok(None),
+            // #346: THIS is the only doc-less None — refusals and
+            // IPERF_DONE-at-setup rounds return None after emitting their
+            // own docs — so the idle-interrupt skeleton emits here, not at
+            // the serve loop (where it would double-emit in a
+            // signal-during-round race). GT's signormalexit shape,
+            // live-probed: skeleton doc / error+bare-end pair with the
+            // interrupt-class key (no prefix), silent stderr, exit 0.
+            None => {
+                if let Some(w) = &self.interrupt {
+                    if let Some(msg) = w.0.borrow().clone() {
+                        self.emit_pretest_error_doc(&msg);
+                    }
+                }
+                return Ok(None);
+            }
         };
         // (#222 r1 item 6: the Time/banner/Cookie/MSS block prints AFTER the
         // param exchange — GT's iperf_on_connect fires there — so a
@@ -1083,6 +1088,8 @@ impl Server {
             let _ = protocol::send_server_error(ctrl, 111).await;
             return Err(match e {
                 RiperfError::Io(io) => RiperfError::SendControlFailed(io),
+                // send_state is one write_all, so only Io reaches here today
+                // (r1 F3) — the arm fails safe if that ever changes.
                 other => other,
             });
         }

@@ -85,10 +85,12 @@ pub enum RiperfError {
     /// post-cookie ParamExchange state write (GT's iperf_set_send_state
     /// failure path inside iperf_accept, #345). Unlike the errno-0 dangling
     /// `: ` siblings above, GT's suffix here is a LIVE deterministic
-    /// strerror (ENOTCONN — the peer's RST is what broke the write), so the
-    /// wrapped io::Error rides the Display; its trailing "(os error N)" is
-    /// the recorded #151-class divergence. Relay + exit-0 keep-serving like
-    /// the sibling pre-test classes (#330).
+    /// strerror, so the wrapped io::Error rides the Display. RECORDED
+    /// DEVIATION (r1 F2): the errno CLASS itself diverges, not just the
+    /// "(os error N)" tail — GT's select loop sees the RST before its write
+    /// (ENOTCONN); riperf3's write_all is the first post-cookie op and eats
+    /// it (ECONNRESET). Both are honest live errnos for the same peer RST.
+    /// Relay + exit-0 keep-serving like the sibling pre-test classes (#330).
     #[error("unable to send control message - port may not be available, the other side may have stopped running, etc.: {0}")]
     SendControlFailed(std::io::Error),
 
