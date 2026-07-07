@@ -3295,7 +3295,11 @@ fn params_blob_with_trailing_garbage_is_accepted() {
         ctrl.write_all(&[b'x'; 37]).unwrap();
         assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
         let mut blob = MOCK_PARAMS.as_bytes().to_vec();
-        blob.extend_from_slice(b"\x00\xffGARBAGE");
+        // NUL-FREE suffix on purpose (r1 F3): a NUL-led one also passes GT
+        // via JSON_read's strlen truncation — this pin must prove the
+        // cJSON-side leniency (require_null_terminated=0), which GT grants
+        // NUL-free garbage too (live-probed).
+        blob.extend_from_slice(b" GARBAGE-NO-NUL");
         ctrl.write_all(&(blob.len() as u32).to_be_bytes()).unwrap();
         ctrl.write_all(&blob).unwrap();
         assert_eq!(

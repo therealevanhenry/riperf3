@@ -290,11 +290,16 @@ pub async fn json_read(stream: &mut TcpStream, max_len: usize) -> Result<serde_j
 // ---------------------------------------------------------------------------
 
 /// #343: GT parses every length-prefixed blob with
-/// cJSON_Parse(require_null_terminated=0) — the FIRST JSON value wins and
+/// cJSON_Parse(require_null_terminated=0) — the first JSON value wins and
 /// trailing bytes inside the declared length are ignored. Deliberate wire
 /// leniency GT depends on (a peer that over-declares its length
 /// interoperates), mirrored per the #328 fidelity precedent; garbage from
-/// byte 0 still errors like both tools.
+/// byte 0 still errors like both tools. SCOPE (r1 F2): the mirror covers
+/// self-delimiting first values with whitespace-separated tails — the
+/// residual cJSON cells (UTF-8 BOM, bare-scalar roots, scalar-adjacent
+/// garbage, nesting past serde's 128, raw control chars in strings) stay
+/// divergent and are tracked in the follow-up issue; none are reachable
+/// from a real iperf3 encoder.
 fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
     let mut stream = serde_json::Deserializer::from_slice(buf).into_iter();
     match stream.next() {
