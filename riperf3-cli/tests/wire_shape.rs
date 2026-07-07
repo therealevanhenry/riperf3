@@ -1823,9 +1823,10 @@ fn end_loop_unknown_byte_wires_back_iemessage() {
 /// CLIENT_TERMINATE relays IECLIENTTERM(119): the terminate arm sets the
 /// i_errno global (iperf_server_api.c:290) and cleanup_server relays it at
 /// the loop's normal exit (:1001, :466) — the relay does NOT key on an error
-/// return (r1 F1; live mid-test majority fe 00000077 00000000). TWO RECORDED
-/// DEVIATIONS, both value-level: (i) GT's mid-test value RACES 119 vs 206
-/// (~2/10 live — post-teardown stream reads clobber the plain global);
+/// return (r1 F1). TWO RECORDED DEVIATIONS, both value-level: (i) GT's
+/// mid-test value is NONDETERMINISTIC — 119 vs a 206 IESTREAMREAD clobber
+/// (post-teardown stream reads overwrite the plain global; either value can
+/// dominate depending on timing — r1 and r2 observed opposite majorities);
 /// riperf3 pins the intended 119. (ii) GT's end-loop frame carries a
 /// LEFTOVER errno word (fe 00000077 00000009 live — EBADF from its own
 /// closed-socket reads); riperf3 pins errno 0, the #336 honest-errno-0
@@ -1869,6 +1870,29 @@ fn end_loop_ctrl_half_close_wires_back_iectrlclose() {
         run_wireback_scenario(None, false),
         wireback_frame(109),
         "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0) on the end-loop EOF"
+    );
+}
+
+/// The NEGATIVE half of the relay matrix (r2 F1): IPERF_DONE is GT's CLEAN
+/// arm — i_errno stays IENONE, so cleanup_server relays NOTHING (live ×5).
+/// Without this pin a spurious relay at the clean arm survives every test
+/// (the clean-cell suites never read ctrl after the final byte).
+#[test]
+fn mid_test_iperf_done_wires_back_nothing() {
+    assert_eq!(
+        run_wireback_scenario(Some(16), true),
+        Vec::<u8>::new(),
+        "clean EOF, no SERVER_ERROR frame, on the mid-test IPERF_DONE"
+    );
+}
+
+/// The end-loop clean cell — a conforming client's normal finish.
+#[test]
+fn end_loop_iperf_done_wires_back_nothing() {
+    assert_eq!(
+        run_wireback_scenario(Some(16), false),
+        Vec::<u8>::new(),
+        "clean EOF, no SERVER_ERROR frame, on the normal completion"
     );
 }
 

@@ -1519,10 +1519,12 @@ impl Server {
                             // cleanup_server relays it at the loop's normal
                             // exit (:1001, :466) — the relay does not key on
                             // an error return. RECORDED DEVIATION
-                            // (value-level): GT's live value RACES 119 vs a
-                            // 206 clobber (~2/10 — post-teardown stream
-                            // reads overwrite the plain global); riperf3
-                            // pins the intended IECLIENTTERM(119).
+                            // (value-level): GT's live value is
+                            // NONDETERMINISTIC — 119 vs a 206 IESTREAMREAD
+                            // clobber (post-teardown stream reads overwrite
+                            // the plain global; either value can dominate
+                            // depending on timing); riperf3 pins the
+                            // intended IECLIENTTERM(119).
                             let _ = protocol::send_server_error(&mut ctx.ctrl, 119).await;
                             ctx.client_terminated = true;
                             break;
