@@ -938,3 +938,35 @@ fn server_survives_a_mid_exchange_client_wedge() {
         "the sigend dump carries the interrupt error key: {doc}"
     );
 }
+
+/// #346 (M4 gate): a server SIGTERM'd MID-TEST emits EXACTLY ONE document —
+/// the round's partial report already carried the message (#210), and the
+/// serve loop's idle-interrupt skeleton (#346) must NOT append a second doc
+/// when the interrupted round produced a report. Two concatenated docs
+/// break every JSON consumer.
+#[cfg(unix)]
+#[test]
+fn server_sigterm_mid_test_emits_exactly_one_doc() {
+    let ps = free_port().to_string();
+    let server = spawn(&["-s", "-1", "-p", &ps, "-J"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let client = spawn(&["-c", "127.0.0.1", "-p", &ps, "-t", "8", "-J"]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    let spid = server.0.id() as i32;
+    unsafe {
+        libc::kill(spid, libc::SIGTERM);
+    }
+    let (sout, serr, scode) = wait_with_output_bounded(server, Duration::from_secs(8), "server");
+    let _ = wait_with_output_bounded(client, Duration::from_secs(8), "client");
+
+    assert_eq!(scode, 0, "signal-normal exit");
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    // from_str on the WHOLE stdout: a second appended doc fails the parse.
+    let doc: serde_json::Value = serde_json::from_str(sout.trim())
+        .expect("server stdout is EXACTLY ONE JSON document");
+    assert!(
+        doc["error"].is_string(),
+        "the single doc carries the interrupt/terminate key: {doc}"
+    );
+}
