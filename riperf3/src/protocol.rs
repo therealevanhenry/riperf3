@@ -281,13 +281,33 @@ pub async fn json_read(stream: &mut TcpStream, max_len: usize) -> Result<serde_j
 
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    let value: serde_json::Value = serde_json::from_slice(&buf)?;
+    let value: serde_json::Value = json_first_value(&buf)?;
     Ok(value)
 }
 
 // ---------------------------------------------------------------------------
 // Test parameters — exchanged as JSON during ParamExchange
 // ---------------------------------------------------------------------------
+
+/// #343: GT parses every length-prefixed blob with
+/// cJSON_Parse(require_null_terminated=0) — the first JSON value wins and
+/// trailing bytes inside the declared length are ignored. Deliberate wire
+/// leniency GT depends on (a peer that over-declares its length
+/// interoperates), mirrored per the #328 fidelity precedent; garbage from
+/// byte 0 still errors like both tools. SCOPE (r1 F2): the mirror covers
+/// self-delimiting first values with whitespace-separated tails — the
+/// residual cJSON cells (UTF-8 BOM, bare-scalar roots, scalar-adjacent
+/// garbage, nesting past serde's 128, raw control chars in strings) stay
+/// divergent and are tracked in the follow-up issue; none are reachable
+/// from a real iperf3 encoder.
+fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
+    let mut stream = serde_json::Deserializer::from_slice(buf).into_iter();
+    match stream.next() {
+        Some(v) => v,
+        // Empty/whitespace-only: surface the standard EOF error shape.
+        None => serde_json::from_slice(buf),
+    }
+}
 
 fn is_false_opt(v: &Option<bool>) -> bool {
     matches!(v, None | Some(false))
@@ -677,7 +697,7 @@ async fn json_read_bounded(stream: &mut TcpStream, max_len: usize) -> Result<ser
 
     let mut buf = vec![0u8; len];
     nread_exact(stream, &mut buf, deadline).await?;
-    let value: serde_json::Value = serde_json::from_slice(&buf)?;
+    let value: serde_json::Value = json_first_value(&buf)?;
     Ok(value)
 }
 
@@ -772,7 +792,7 @@ pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJs
         }
     }
     let value: serde_json::Value =
-        serde_json::from_slice(&buf).map_err(|_| crate::error::RiperfError::RecvResultsFailed)?;
+        json_first_value(&buf).map_err(|_| crate::error::RiperfError::RecvResultsFailed)?;
     validate_results(value)
 }
 

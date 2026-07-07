@@ -1792,6 +1792,16 @@ impl Server {
                         let bits_per_sec = total_bytes as f64 * 8.0 / elapsed;
                         if let Some(limit) = bitrate_limit {
                             if bits_per_sec > limit as f64 {
+                                // #350 RECORDED DEVIATION: GT relays this
+                                // frame TWICE — the explicit rate-path write
+                                // (iperf_server_api.c:626-643), then
+                                // cleanup_server re-reads the stale i_errno
+                                // global at loop exit (:466) and relays
+                                // again (live: back-to-back fe 0000001b
+                                // frames). Same stale-global class as the
+                                // #349 terminate clobber; conforming clients
+                                // stop after the first frame, so riperf3
+                                // sends exactly one (pinned).
                                 // #224: SERVER_ERROR + IETOTALRATE(27), not
                                 // SERVER_TERMINATE (iperf 3.21 GT).
                                 protocol::send_server_error(&mut ctx.ctrl, 27).await?;

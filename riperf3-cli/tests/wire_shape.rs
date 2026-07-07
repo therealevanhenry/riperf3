@@ -3273,3 +3273,183 @@ fn interrupt_stamp_renders_at_print_time_not_capture_time() {
          the banner's {banner_epoch} (a pre-run capture freezes them equal)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #343 (DECISION: MIRROR): GT parses every length-prefixed blob with
+// cJSON_Parse(require_null_terminated=0) — the FIRST JSON value wins and
+// trailing bytes inside the declared length are ignored (live-probed both
+// blob sites: garbage-suffixed params → CREATE_STREAMS follows;
+// garbage-suffixed results → clean full round, rc 0). Deliberate wire
+// leniency GT depends on, not bug noise (the #328 atoi-fidelity
+// precedent) — a peer that over-declares its length interoperates with
+// iperf3 and must interoperate with riperf3. Garbage from byte 0 still
+// rejects in both tools.
+// ---------------------------------------------------------------------------
+
+/// #343: a params blob of valid JSON + trailing garbage is ACCEPTED — the
+/// round advances to CREATE_STREAMS like GT.
+#[test]
+fn params_blob_with_trailing_garbage_is_accepted() {
+    let (_sout, _serr, status) = drive_server_scenario(false, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        let mut blob = MOCK_PARAMS.as_bytes().to_vec();
+        // NUL-FREE suffix on purpose (r1 F3): a NUL-led one also passes GT
+        // via JSON_read's strlen truncation — this pin must prove the
+        // cJSON-side leniency (require_null_terminated=0), which GT grants
+        // NUL-free garbage too (live-probed).
+        blob.extend_from_slice(b" GARBAGE-NO-NUL");
+        ctrl.write_all(&(blob.len() as u32).to_be_bytes()).unwrap();
+        ctrl.write_all(&blob).unwrap();
+        assert_eq!(
+            read_exact(&mut ctrl, 1)[0],
+            10,
+            "CreateStreams follows a garbage-suffixed params blob (GT parity)"
+        );
+        drop(ctrl);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    // The mock EOF'd at CREATE_STREAMS — the round ends via the #338
+    // IECTRLCLOSE surface; the pin is the state byte above.
+    assert!(status.success());
+}
+
+/// #343 negative cell: garbage from byte 0 still rejects (IERECVPARAMS).
+#[test]
+fn params_blob_garbage_from_byte_zero_still_rejects() {
+    let (_sout, serr, status) = drive_server_scenario(false, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, "\x00\x7fGARBAGE from byte zero");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(ctrl);
+    });
+    assert!(status.success());
+    assert!(
+        serr.contains("unable to receive parameters from client"),
+        "byte-0 garbage keeps the IERECVPARAMS surface: {serr:?}"
+    );
+}
+
+/// #343: a results blob of valid JSON + trailing garbage completes the
+/// exchange — the server sends its own results back and the round is
+/// clean, like GT.
+#[test]
+fn results_blob_with_trailing_garbage_completes_the_exchange() {
+    let (_sout, serr, status) = drive_server_scenario(false, |port| {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        let mut blob = MOCK_RESULTS.as_bytes().to_vec();
+        blob.extend_from_slice(b"\x00\xffGARBAGE");
+        ctrl.write_all(&(blob.len() as u32).to_be_bytes()).unwrap();
+        ctrl.write_all(&blob).unwrap();
+        // GT parity: the exchange COMPLETES — the server's own results
+        // come back as a length-prefixed blob.
+        let len = u32::from_be_bytes(read_exact(&mut ctrl, 4).try_into().unwrap()) as usize;
+        assert!(
+            (2..1_000_000).contains(&len),
+            "a plausible server-results blob follows: {len}"
+        );
+        let body = read_exact(&mut ctrl, len);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+            "the server's results parse"
+        );
+        drop((ctrl, data));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    assert!(status.success());
+    assert!(
+        !serr.contains("unable to receive results"),
+        "no IERECVRESULTS on the garbage-suffixed exchange: {serr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #350 (DECISION: RECORD-DEVIATION): on the runtime IETOTALRATE breach GT
+// relays the SERVER_ERROR frame TWICE (the explicit rate-path write, then
+// cleanup_server re-reading the stale i_errno global at loop exit — live:
+// two back-to-back fe 0000001b 00000000 frames). Same stale-global class
+// as the #349 terminate-arm clobber; unobservable by conforming clients
+// (they stop reading after the first frame). riperf3 pins EXACTLY ONE
+// frame then EOF.
+// ---------------------------------------------------------------------------
+
+/// #350: the runtime-breach relay is exactly one 9-byte frame, then EOF.
+#[test]
+fn runtime_rate_breach_relays_exactly_one_frame() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps, "--server-bitrate-limit", "8000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let _se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        use std::io::Read;
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        // Pump well past 8 kbit/s so the 1 Hz rate check fires, then read
+        // EVERYTHING off ctrl until EOF: exactly one fe-frame expected.
+        for _ in 0..40 {
+            if data.write_all(&[0u8; 8192]).is_err() {
+                break; // server tore the data socket down at the breach
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        ctrl.set_read_timeout(Some(std::time::Duration::from_secs(8)))
+            .expect("set_read_timeout");
+        let mut wire = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match ctrl.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => wire.extend_from_slice(&buf[..n]),
+            }
+        }
+        drop((ctrl, data));
+        wire
+    });
+
+    let wire = mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(12))
+            .expect("server exits after the breach");
+    assert!(status.success());
+    assert_eq!(
+        wire,
+        wireback_frame(27),
+        "EXACTLY one SERVER_ERROR+IETOTALRATE frame then EOF — GT's \
+         stale-global double-relay is the recorded deviation: {wire:?}"
+    );
+}
