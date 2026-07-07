@@ -493,6 +493,12 @@ impl Client {
         // end and the final report was captured at DisplayResults. UDP
         // receivers are spawn_blocking (abort is a no-op there) and exit
         // via `done` + their 500 ms read-timeout poll.
+        // RESIDUAL (the #352 join-site sibling record): GT closes its data
+        // sockets at DISPLAY_RESULTS, BEFORE sending IPERF_DONE, and
+        // sync-closes ctrl with a bounded drain-to-EOF
+        // (iperf_client_api.c:562-566, net.c:877-886); riperf3's data FINs
+        // land ~100 ms later, at this abort, and ctrl closes abruptly —
+        // observable only by a peer that holds the round open.
         for s in &ctx.streams {
             s.task.abort();
         }

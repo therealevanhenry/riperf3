@@ -3802,65 +3802,94 @@ fn exchange_phase_err_still_tears_down_streams() {
 
 // ---------------------------------------------------------------------------
 // #354: the clean-path join must not be peer-bound — GT's client cancels
-// its stream threads before joining (iperf_client_api.c:817-841), so it
-// exits on its own clock against a server that HOLDS its sockets after
-// the round. A bare join parks reverse receivers in read() (`done` cannot
-// wake a parked read) until the peer lets go.
+// its stream threads before joining (iperf_client_api.c:817-841). A bare
+// join parks on a stream task stuck in a socket wait (`done` cannot wake
+// a parked read or write) until the peer lets go.
 // ---------------------------------------------------------------------------
 
-/// #354: reverse client vs a socket-holding server — the mock speaks the
-/// full protocol through reading IperfDone, then HOLDS ctrl + data open.
-/// The bounded `run_client` wait IS the pin: a bare join is peer-bound
-/// (~25 s here); the abort-before-join exits on the client's own clock.
+/// #354 mock: full protocol, but the data phase goes SILENT/deaf after
+/// ~0.3 s — BEFORE the client's `done` lands — so the stream task
+/// genuinely PARKS: reverse = the writer stops writing (a receiver parked
+/// in `read().await`); forward = the drain stops reading (a sender parked
+/// in `write().await` on full buffers). Then it reads IperfDone(16) and
+/// HOLDS every socket for 25 s. The silence timing is load-bearing (r1
+/// F1): a writer that runs to TestEnd hands the receiver to the #23
+/// 10 s drain cap instead, and the pin's red couples to that unrelated
+/// constant rather than to the park.
+fn holding_mock_round(listener: std::net::TcpListener, reverse: bool) {
+    let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+    read_exact(&mut ctrl, 37); // cookie
+    ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+    read_json_blob(&mut ctrl); // params
+    ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
+    let (mut data, _) = listener.accept().expect("data accept");
+    read_exact(&mut data, 37); // data-stream cookie
+    ctrl.write_all(&[1u8]).unwrap(); // TestStart
+    ctrl.write_all(&[2u8]).unwrap(); // TestRunning
+                                     // ~0.3 s of live traffic, then silence. The thread holds only a
+                                     // dup'd fd — its exit does NOT close the socket while `data` lives
+                                     // on below (the hold must be real).
+    let mut data_io = data.try_clone().expect("clone data");
+    let io = std::thread::spawn(move || {
+        let mut chunk = vec![0u8; 65536];
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(300) {
+            if reverse {
+                if data_io.write_all(&chunk).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            } else if data_io.read(&mut chunk).map(|n| n == 0).unwrap_or(true) {
+                break;
+            }
+        }
+    });
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 4, "TestEnd");
+    ctrl.write_all(&[13u8]).unwrap(); // ExchangeResults
+    read_json_blob(&mut ctrl); // the client's results
+    write_json_blob(&mut ctrl, MOCK_RESULTS);
+    ctrl.write_all(&[14u8]).unwrap(); // DisplayResults
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 16, "IperfDone");
+    io.join().expect("data io");
+    // THE HOLD: ctrl + data stay open well past the exit bound — the
+    // park pin must prove the park (the #352/#356-F7 dwell lesson).
+    std::thread::sleep(Duration::from_secs(25));
+    drop(ctrl);
+    drop(data);
+}
+
+/// #354: reverse — a receiver parked in `read().await` on a holding
+/// server. The bounded `run_client` wait IS the pin: a bare join is
+/// peer-bound (the 25 s hold), the abort exits on the client's clock.
 #[test]
 fn reverse_client_exits_bounded_while_server_holds() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let port = listener.local_addr().unwrap().port().to_string();
-
-    let _mock = std::thread::spawn(move || {
-        let (mut ctrl, _) = listener.accept().expect("ctrl accept");
-        read_exact(&mut ctrl, 37); // cookie
-        ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
-        read_json_blob(&mut ctrl); // params (the client's -R lands here)
-        ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
-        let (mut data, _) = listener.accept().expect("data accept");
-        read_exact(&mut data, 37); // data-stream cookie
-        ctrl.write_all(&[1u8]).unwrap(); // TestStart
-        ctrl.write_all(&[2u8]).unwrap(); // TestRunning
-                                         // Reverse: the mock is the sender until the client's TestEnd. The
-                                         // writer holds a dup'd fd — dropping it does NOT close the socket
-                                         // while `data` lives on below (the hold must be real).
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_w = stop.clone();
-        let mut data_w = data.try_clone().expect("clone data writer");
-        let writer = std::thread::spawn(move || {
-            let chunk = vec![0u8; 65536];
-            while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-                if data_w.write_all(&chunk).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        assert_eq!(read_exact(&mut ctrl, 1)[0], 4, "TestEnd");
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.join().expect("writer");
-        ctrl.write_all(&[13u8]).unwrap(); // ExchangeResults
-        read_json_blob(&mut ctrl); // the client's results
-        write_json_blob(&mut ctrl, MOCK_RESULTS);
-        ctrl.write_all(&[14u8]).unwrap(); // DisplayResults
-        assert_eq!(read_exact(&mut ctrl, 1)[0], 16, "IperfDone");
-        // THE HOLD: ctrl + data stay open well past the exit bound — a
-        // park pin must prove the park (the #352/#356-F7 dwell lesson).
-        std::thread::sleep(Duration::from_secs(25));
-        drop(ctrl);
-        drop(data);
-    });
-
+    let _mock = std::thread::spawn(move || holding_mock_round(listener, true));
     let client = common::run_client(
         &["-c", "127.0.0.1", "-p", &port, "-R", "-t", "1"],
         Duration::from_secs(8),
         "reverse client vs holding server",
+    );
+    assert_eq!(client.status.code(), Some(0), "{}", client.stderr);
+    assert!(
+        client.stdout.contains("iperf Done."),
+        "the round completed clean before the bounded exit: {}",
+        client.stdout
+    );
+}
+
+/// #354 (r1 F4): forward — a sender parked in `write().await` on a peer
+/// that stopped reading is the same class; the abort unparks it too.
+#[test]
+fn forward_client_exits_bounded_while_server_stops_reading() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _mock = std::thread::spawn(move || holding_mock_round(listener, false));
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &port, "-t", "1"],
+        Duration::from_secs(8),
+        "forward client vs deaf server",
     );
     assert_eq!(client.status.code(), Some(0), "{}", client.stderr);
     assert!(
