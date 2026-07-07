@@ -1685,7 +1685,25 @@ impl Server {
         const SELF_TERM_RATE_MSG: &str = "total required bandwidth is larger than server limit";
         const SELF_TERM_DURATION_MSG: &str =
             "server test duration expired - test is terminated by the server";
+        // #351: iperf_strerror(IENOMSG) — must match RiperfError::DataIdleTimeout's
+        // Display (the #338 pre-test sibling renders through that variant).
+        const SELF_TERM_IDLE_MSG: &str = "idle timeout for receiving data";
         let mut interrupt_rx = self.interrupt.clone().map(|w| w.0);
+
+        // #351: GT's TEST_RUNNING data-idle watchdog (iperf_server_api.c:
+        // 720-739): armed only when the server RECEIVES (mode != SENDER —
+        // reverse rounds are exempt); progress = received bytes advancing
+        // (GT's blocks_received); ctrl traffic does NOT reset it. On expiry:
+        // IENOMSG(144) — the relay, then the self-terminate surface (the
+        // prefixed doc key over the accumulated intervals + bare end, the
+        // stderr line, no summary), exit-0 keep-serving like GT's restart.
+        let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
+        let idle_bound =
+            std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
+        let mut idle_check = tokio::time::interval(std::time::Duration::from_millis(250));
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut idle_last_rx: u64 = 0;
+        let mut idle_last_at = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -1809,6 +1827,29 @@ impl Server {
                                 break;
                             }
                         }
+                    }
+                }
+                _ = idle_check.tick(), if idle_armed => {
+                    let rx: u64 = ctx
+                        .streams
+                        .iter()
+                        .map(|s| s.meta.counters.bytes_received())
+                        .sum();
+                    if rx > idle_last_rx {
+                        idle_last_rx = rx;
+                        idle_last_at = tokio::time::Instant::now();
+                    } else if idle_last_at.elapsed() >= idle_bound {
+                        // Best-effort like the #338/#349 relay sites — the
+                        // idle peer may be gone entirely.
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
+                        ctx.server_error = Some(SELF_TERM_IDLE_MSG);
+                        // GT's kill path never runs end processing — the
+                        // doc keeps the accumulated intervals over a bare
+                        // end{} (live-probed; the rate-breach sibling's
+                        // populated end is the pre-existing divergence
+                        // filed from this probe).
+                        ctx.bare_end = true;
+                        break;
                     }
                 }
                 _ = &mut watchdog_deadline, if watchdog_secs > 0 => {

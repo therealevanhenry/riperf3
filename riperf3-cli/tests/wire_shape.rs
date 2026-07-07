@@ -3453,3 +3453,220 @@ fn runtime_rate_breach_relays_exactly_one_frame() {
          stale-global double-relay is the recorded deviation: {wire:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #351: GT's TEST_RUNNING data-idle watchdog (IENOMSG=144). GT source
+// (iperf_server_api.c:720-739): fires only when the server RECEIVES
+// (mode != SENDER — reverse tests exempt) and `blocks_received` hasn't
+// advanced for rcv_timeout; ctrl traffic does NOT reset it. Live-probed
+// (--rcv-timeout 3000, silent client holding both sockets): wire
+// fe 00000090 00000000 at dt=3.0; text stderr `iperf3: error - idle
+// timeout for receiving data`, zero-byte interval rows keep ticking, NO
+// summary, rc=0; -J = ONE doc with the accumulated intervals + bare
+// end{} + the prefixed key, silent stderr.
+// ---------------------------------------------------------------------------
+
+/// #351 driver: reach TEST_RUNNING, send one chunk, go SILENT holding both
+/// sockets; read the relay until EOF.
+fn run_running_idle_scenario(json: bool) -> (Vec<u8>, String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut args = vec!["-s", "-1", "-p", &ps, "--rcv-timeout", "3000"];
+    if json {
+        args.push("-J");
+    }
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let serr = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        // A LONG test so the duration watchdog can't be what bounds us.
+        write_json_blob(
+            &mut ctrl,
+            r#"{"tcp":true,"omit":0,"time":300,"num":0,"blockcount":0,"parallel":1,"len":131072,"pacing_timer":1000,"client_version":"x 0.0.0"}"#,
+        );
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        // SILENT from here, both sockets held open: only the idle watchdog
+        // can end this round (the test claims 300 s).
+        let frame = read_wireback(&mut ctrl);
+        drop((ctrl, data));
+        frame
+    });
+
+    let frame = mock.join().expect("mock");
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(10))
+            .expect("the idle watchdog bounds the round");
+    (
+        frame,
+        sout.join().expect("stdout"),
+        serr.join().expect("stderr"),
+        status,
+    )
+}
+
+/// #351 text: the 144 relay at the bound, GT's stderr line, ticking
+/// zero-byte rows, NO summary block, exit 0.
+#[test]
+fn running_idle_watchdog_takes_ienomsg_in_text() {
+    let (frame, sout, serr, status) = run_running_idle_scenario(false);
+    assert_eq!(
+        frame,
+        wireback_frame(144),
+        "SERVER_ERROR + htonl(IENOMSG) + htonl(0) on the running-idle bound"
+    );
+    assert!(status.success(), "keep-serving class exits 0");
+    assert!(
+        serr.contains(&format!("riperf3: error - {IDLE_TIMEOUT_MSG}")),
+        "GT's IENOMSG line: {serr:?}"
+    );
+    assert!(
+        sout.contains("0.00 Bytes"),
+        "zero-byte interval rows tick while idle: {sout:?}"
+    );
+    assert!(
+        !sout.contains("- - - - -"),
+        "NO summary block on the idle-killed round (GT): {sout:?}"
+    );
+}
+
+/// #351 -J: ONE doc — accumulated intervals present, bare end, the
+/// prefixed key, silent stderr.
+#[test]
+fn running_idle_watchdog_doc_shape_in_json() {
+    let (frame, sout, serr, status) = run_running_idle_scenario(true);
+    assert_eq!(frame, wireback_frame(144));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("ONE -J doc ({e}): {sout:?}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {IDLE_TIMEOUT_MSG}").as_str()),
+        "the prefixed IENOMSG key: {doc}"
+    );
+    assert!(
+        !doc["intervals"].as_array().expect("intervals").is_empty(),
+        "the accumulated (zero-byte) intervals are PRESENT: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}: {doc}"
+    );
+}
+
+/// #351 negative cells (GT's mode != SENDER gate + the progress reset):
+/// a reverse round longer than the bound completes (the server is the
+/// sender — exempt), and a slow-but-flowing forward round completes (each
+/// chunk resets the clock).
+#[test]
+fn running_idle_watchdog_negative_cells() {
+    // Reverse, real client: -R -t 5 under --rcv-timeout 3000.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps, "--rcv-timeout", "3000"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-p", &ps, "-R", "-t", "5", "-b", "1M"])
+        .output()
+        .expect("reverse client");
+    assert!(
+        cli.status.success(),
+        "a reverse round outliving the bound completes (mode != SENDER gate): {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(10))
+            .expect("server exits");
+    assert!(status.success());
+    let serr = se.join().expect("stderr");
+    assert!(
+        !serr.contains(IDLE_TIMEOUT_MSG),
+        "no IENOMSG on the healthy reverse round: {serr:?}"
+    );
+
+    // Slow-but-flowing forward: one chunk per second for ~5 s under the
+    // 3 s bound — progress resets the clock, the round must NOT be killed.
+    let (frame, _sout, serr2, status2) = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let ps = port.to_string();
+        let mut server = common::ChildGuard(
+            std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+                .args(["-s", "-1", "-p", &ps, "--rcv-timeout", "3000"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn server"),
+        );
+        let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+        let se2 = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let mock = std::thread::spawn(move || {
+            let cookie = [b'x'; 37];
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&cookie).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+            write_json_blob(&mut ctrl, MOCK_PARAMS);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+            let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+            data.write_all(&cookie).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+            for _ in 0..5 {
+                data.write_all(&[0u8; 1024]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+            ctrl.write_all(&[4u8]).unwrap(); // TestEnd: finish cleanly
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
+            let blob = MOCK_RESULTS.as_bytes().to_vec();
+            ctrl.write_all(&(blob.len() as u32).to_be_bytes()).unwrap();
+            ctrl.write_all(&blob).unwrap();
+            let len = u32::from_be_bytes(read_exact(&mut ctrl, 4).try_into().unwrap()) as usize;
+            let _ = read_exact(&mut ctrl, len);
+            Vec::<u8>::new()
+        });
+        let frame = mock.join().expect("mock");
+        let status =
+            riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(12))
+                .expect("server exits");
+        (frame, String::new(), se2.join().expect("stderr"), status)
+    };
+    assert!(frame.is_empty());
+    assert!(status2.success());
+    assert!(
+        !serr2.contains(IDLE_TIMEOUT_MSG),
+        "slow-but-flowing progress resets the clock: {serr2:?}"
+    );
+}
