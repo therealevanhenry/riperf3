@@ -109,9 +109,10 @@ pub(crate) fn output_timestamp_prefix() -> String {
     render_timestamp(&fmt)
 }
 
-/// Unix: localtime + strftime with the stored FORMAT, exactly iperf3's
-/// iperf_printf (default "%c " — the trailing space lives in the format;
-/// user formats are used verbatim) (#202).
+/// Unix: localtime + strftime with the GIVEN format, exactly iperf3's
+/// iperf_printf (the CLI's bare `--timestamps` default is "%c " — the
+/// trailing space lives in the format; user formats are used verbatim)
+/// (#202; public via the crate-root re-export, #348).
 #[cfg(unix)]
 pub fn render_timestamp(fmt: &str) -> String {
     let Ok(cfmt) = std::ffi::CString::new(fmt) else {
