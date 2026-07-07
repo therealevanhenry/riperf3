@@ -173,12 +173,23 @@ fn drive_server_scenario(
     json: bool,
     mock: impl FnOnce(u16) + Send + 'static,
 ) -> (String, String, std::process::ExitStatus) {
+    drive_server_scenario_with(&[], json, mock)
+}
+
+/// [`drive_server_scenario`] with extra server flags — the #344 timestamp
+/// pins arm `--timestamps` on the same mock rounds.
+fn drive_server_scenario_with(
+    extra_args: &[&str],
+    json: bool,
+    mock: impl FnOnce(u16) + Send + 'static,
+) -> (String, String, std::process::ExitStatus) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let port_s = port.to_string();
 
     let mut args = vec!["-s", "-1", "-p", &port_s];
+    args.extend_from_slice(extra_args);
     if json {
         args.push("-J");
     }
@@ -1683,4 +1694,371 @@ fn generic_arm_failure_json_is_silent_stderr_with_skeleton_doc() {
         "skeleton bare end{{}}"
     );
     assert!(status.success());
+}
+
+// ---------------------------------------------------------------------------
+// #342: GT's cleanup_server best-effort relays SERVER_ERROR(-2) + htonl(i_errno)
+// + htonl(errno) to a still-live peer before closing (iperf_server_api.c:
+// 460-473 — it keys on the i_errno GLOBAL at the run loop's exit, :1001,
+// regardless of return path). Live-probed (iperf 3.21): an unknown control
+// byte wires back fe 0000006e 00000000 (IEMESSAGE=110); a failed results read
+// fe 00000075 00000000 (IERECVRESULTS=117); a ctrl half-close
+// fe 0000006d 00000000 (IECTRLCLOSE=109, r1 F2); CLIENT_TERMINATE
+// fe 00000077 (IECLIENTTERM=119, r1 F1 — value/errno deviations on the
+// terminate pin). The mock reads the frame rather than waiting for the
+// server's close, so the pin observes the bytes regardless of close timing
+// (r1 F3: GT sends the frame and closes at once).
+// ---------------------------------------------------------------------------
+
+/// The 9-byte SERVER_ERROR relay: state(-2) + htonl(i_errno) + htonl(errno=0).
+fn wireback_frame(i_errno: u8) -> Vec<u8> {
+    vec![0xfe, 0, 0, 0, i_errno, 0, 0, 0, 0]
+}
+
+/// Bounded read of whatever the server sends after the failure: up to the
+/// 9-byte relay frame, EOF, or a 6 s timeout (a server that relays nothing
+/// yields an empty read — the red shape, and the terminate deviation's pin).
+fn read_wireback(ctrl: &mut std::net::TcpStream) -> Vec<u8> {
+    ctrl.set_read_timeout(Some(Duration::from_secs(6)))
+        .expect("set_read_timeout");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 9];
+    while got.len() < 9 {
+        match ctrl.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    got
+}
+
+/// Like [`run_holding_scenario`], but after the final action the mock READS
+/// the control socket for the #342 relay frame (then closes), returning the
+/// bytes. `final_action`: Some(byte) sends the byte; None HALF-closes the
+/// write side (`shutdown(SHUT_WR)`) and keeps the read half open — the EOF
+/// cells, where a full drop would discard the relay before the pin sees it.
+fn run_wireback_scenario(final_action: Option<u8>, junk_mid_test: bool) -> Vec<u8> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        if !junk_mid_test {
+            ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 13);
+            write_json_blob(&mut ctrl, MOCK_RESULTS);
+            read_json_blob(&mut ctrl); // server results
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
+        }
+        match final_action {
+            Some(b) => ctrl.write_all(&[b]).unwrap(),
+            None => ctrl.shutdown(std::net::Shutdown::Write).unwrap(),
+        }
+        let frame = read_wireback(&mut ctrl);
+        drop((ctrl, data));
+        frame
+    });
+
+    let frame = mock.join().expect("mock");
+    riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+        .expect("server exits");
+    frame
+}
+
+/// An unmapped byte during the data phase relays IEMESSAGE(110) — the
+/// Err(UnknownControlMessage) arm.
+#[test]
+fn mid_test_unknown_byte_wires_back_iemessage() {
+    assert_eq!(
+        run_wireback_scenario(Some(99), true),
+        wireback_frame(110),
+        "SERVER_ERROR + htonl(IEMESSAGE) + htonl(0), like GT's cleanup_server"
+    );
+}
+
+/// A KNOWN state that is a stray here (ParamExchange mid-test) takes the same
+/// relay — GT's default: arm switches on the byte value, mapped or not; the
+/// riperf3 Ok(_) arm is a separate code site from the unmapped-byte arm.
+#[test]
+fn mid_test_known_stray_wires_back_iemessage() {
+    assert_eq!(
+        run_wireback_scenario(Some(9), true),
+        wireback_frame(110),
+        "the known-stray arm relays like the unmapped-byte arm"
+    );
+}
+
+/// The end loop's IEMESSAGE (junk where IperfDone was due) relays too.
+#[test]
+fn end_loop_unknown_byte_wires_back_iemessage() {
+    assert_eq!(
+        run_wireback_scenario(Some(99), false),
+        wireback_frame(110),
+        "the end-loop arm shares GT's handle_message default relay"
+    );
+}
+
+/// CLIENT_TERMINATE relays IECLIENTTERM(119): the terminate arm sets the
+/// i_errno global (iperf_server_api.c:290) and cleanup_server relays it at
+/// the loop's normal exit (:1001, :466) — the relay does NOT key on an error
+/// return (r1 F1). TWO RECORDED DEVIATIONS, both value-level: (i) GT's
+/// mid-test value is NONDETERMINISTIC — 119 vs a 206 IESTREAMREAD clobber
+/// (post-teardown stream reads overwrite the plain global; either value can
+/// dominate depending on timing — r1 and r2 observed opposite majorities);
+/// riperf3 pins the intended 119. (ii) GT's end-loop frame carries a
+/// LEFTOVER errno word (fe 00000077 00000009 live — EBADF from its own
+/// closed-socket reads); riperf3 pins errno 0, the #336 honest-errno-0
+/// convention.
+#[test]
+fn end_loop_client_terminate_wires_back_ieclientterm() {
+    assert_eq!(
+        run_wireback_scenario(Some(12), false),
+        wireback_frame(119),
+        "SERVER_ERROR + htonl(IECLIENTTERM) + htonl(0) on the end-loop terminate"
+    );
+}
+
+/// The mid-test terminate arm relays the same frame (GT's arm is shared;
+/// riperf3's two sites are distinct).
+#[test]
+fn mid_test_client_terminate_wires_back_ieclientterm() {
+    assert_eq!(
+        run_wireback_scenario(Some(12), true),
+        wireback_frame(119),
+        "SERVER_ERROR + htonl(IECLIENTTERM) + htonl(0) on the mid-test terminate"
+    );
+}
+
+/// A ctrl HALF-close (shutdown(SHUT_WR), read half open) mid-test: GT's
+/// rval==0 arm sets IECTRLCLOSE (iperf_server_api.c:251-254) and
+/// cleanup_server relays fe 0000006d 00000000, deterministic live (r1 F2).
+#[test]
+fn mid_test_ctrl_half_close_wires_back_iectrlclose() {
+    assert_eq!(
+        run_wireback_scenario(None, true),
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0) on the mid-test EOF"
+    );
+}
+
+/// The same half-close where IperfDone was due — the end loop's EOF arm.
+#[test]
+fn end_loop_ctrl_half_close_wires_back_iectrlclose() {
+    assert_eq!(
+        run_wireback_scenario(None, false),
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0) on the end-loop EOF"
+    );
+}
+
+/// The NEGATIVE half of the relay matrix (r2 F1): IPERF_DONE is GT's CLEAN
+/// arm — i_errno stays IENONE, so cleanup_server relays NOTHING (live ×5).
+/// Without this pin a spurious relay at the clean arm survives every test
+/// (the clean-cell suites never read ctrl after the final byte).
+#[test]
+fn mid_test_iperf_done_wires_back_nothing() {
+    assert_eq!(
+        run_wireback_scenario(Some(16), true),
+        Vec::<u8>::new(),
+        "clean EOF, no SERVER_ERROR frame, on the mid-test IPERF_DONE"
+    );
+}
+
+/// The end-loop clean cell — a conforming client's normal finish.
+#[test]
+fn end_loop_iperf_done_wires_back_nothing() {
+    assert_eq!(
+        run_wireback_scenario(Some(16), false),
+        Vec::<u8>::new(),
+        "clean EOF, no SERVER_ERROR frame, on the normal completion"
+    );
+}
+
+/// A zero-size results prefix from a peer that HOLDS its socket: GT wires
+/// back fe 00000075 00000000 (IERECVRESULTS=117, live-probed) — riperf3's
+/// exchange_recv_failed arm must relay before the finalize phases.
+#[test]
+fn exchange_failure_wires_back_recv_results() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &port_s])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        ctrl.write_all(&0u32.to_be_bytes()).unwrap(); // zero-size prefix, HOLD
+        let frame = read_wireback(&mut ctrl);
+        drop((ctrl, data));
+        frame
+    });
+
+    let frame = mock.join().expect("mock");
+    riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+        .expect("server exits");
+    assert_eq!(
+        frame,
+        wireback_frame(117),
+        "SERVER_ERROR + htonl(IERECVRESULTS) + htonl(0), like GT's cleanup_server"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #344: iperf_err stamps EVERY stderr error line with the --timestamps prefix
+// (iperf_error.c:51-57, :77) — the serve-loop arms must ride the same
+// output_timestamp_prefix() the pre-test emit gained in #339. GT's warning()
+// lines stay BARE (live-probed) — the exchange pin discriminates the two.
+// A literal strftime format keeps the pins deterministic on unix; Windows
+// uses the documented HH:MM:SS fallback and ignores the format, so the
+// byte-exact half of each pin is unix-only (the #339 lesson).
+// ---------------------------------------------------------------------------
+
+const TS_ARGS: &[&str] = &["--timestamps=XTSX "];
+
+/// Portable half: a nonempty prefix precedes the expected line. Unix half:
+/// the literal format renders verbatim.
+fn assert_stamped(line: &str, bare: &str) {
+    assert!(
+        line.ends_with(bare) && line.len() > bare.len(),
+        "a nonempty timestamp prefix precedes the line: {line:?}"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        line,
+        &format!("XTSX {bare}"),
+        "the literal format renders verbatim: {line:?}"
+    );
+}
+
+/// The mid-test ctrl-EOF arm (IECTRLCLOSE sentence).
+#[test]
+fn mid_test_eof_line_carries_the_timestamps_prefix() {
+    let (_sout, serr, status) = drive_server_scenario_with(TS_ARGS, false, |port| {
+        drive_mock_round_full(port, None, true, MOCK_PARAMS)
+    });
+    assert!(status.success());
+    assert_stamped(
+        serr.trim_end_matches('\n'),
+        &format!("riperf3: {CTRL_CLOSED}"),
+    );
+}
+
+/// The client-terminated arm (bare IECLIENTTERM sentence, no "error - ").
+#[test]
+fn end_loop_client_terminate_line_carries_the_timestamps_prefix() {
+    let (_sout, serr, status) = drive_server_scenario_with(TS_ARGS, false, |port| {
+        drive_mock_round_full(port, Some(12), false, MOCK_PARAMS)
+    });
+    assert!(status.success());
+    assert_stamped(
+        serr.trim_end_matches('\n'),
+        "riperf3: the client has terminated",
+    );
+}
+
+/// The recv-results arm: the ERROR line is stamped, the read-site warning()
+/// line above it stays BARE like GT's (iperf_error.c has no stamp in
+/// warning-class output; live-probed).
+#[test]
+fn exchange_eof_error_line_stamped_warning_stays_bare() {
+    let (_sout, serr, status) = drive_server_scenario_with(TS_ARGS, false, |port| {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2);
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        drop((ctrl, data)); // EOF where the results were due
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    assert!(status.success());
+    let lines: Vec<&str> = serr.lines().collect();
+    assert_eq!(lines.len(), 2, "warning then the error line: {serr:?}");
+    assert_eq!(
+        lines[0], "warning: Failed to read JSON data size - read returned 0; errno=0",
+        "the warning-class line stays BARE like GT's"
+    );
+    assert_stamped(lines[1], &format!("riperf3: {RECV_RESULTS_ERR}"));
+}
+
+/// The unknown-message arm (end loop; the mid-test arm shares the print site).
+#[test]
+fn end_loop_unknown_byte_line_carries_the_timestamps_prefix() {
+    let (_sout, serr, status) = drive_server_scenario_with(TS_ARGS, false, |port| {
+        drive_mock_round_full(port, Some(99), false, MOCK_PARAMS)
+    });
+    assert!(status.success());
+    assert_stamped(
+        serr.trim_end_matches('\n'),
+        &format!("riperf3: error - {IEMESSAGE}"),
+    );
+}
+
+/// The serve loop's residual generic arm (#188-class rejection wording is
+/// riperf3's own, so the pin is on the PREFIX, not the sentence).
+#[test]
+fn generic_arm_failure_line_carries_the_timestamps_prefix() {
+    let (_sout, serr, status) =
+        drive_server_scenario_with(TS_ARGS, false, drive_generic_arm_failure);
+    assert!(status.success());
+    let line = serr.trim_end_matches('\n');
+    assert!(
+        line.contains("riperf3: error - ") && !line.starts_with("riperf3:"),
+        "a nonempty timestamp prefix precedes the residual-arm line: {line:?}"
+    );
+    #[cfg(unix)]
+    assert!(
+        line.starts_with("XTSX riperf3: error - "),
+        "the literal format renders verbatim: {line:?}"
+    );
 }
