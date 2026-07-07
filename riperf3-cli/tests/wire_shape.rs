@@ -3458,7 +3458,9 @@ fn runtime_rate_breach_relays_exactly_one_frame() {
 // #351: GT's TEST_RUNNING data-idle watchdog (IENOMSG=144). GT source
 // (iperf_server_api.c:720-739): fires only when the server RECEIVES
 // (mode != SENDER — reverse tests exempt) and `blocks_received` hasn't
-// advanced for rcv_timeout; ctrl traffic does NOT reset it. Live-probed
+// advanced for rcv_timeout; ctrl traffic does NOT reset it. riperf3's
+// progress signal is received BYTES — a recorded deviation below the
+// Nread quanta (see the negative-cells test + the arm comment). Live-probed
 // (--rcv-timeout 3000, silent client holding both sockets): wire
 // fe 00000090 00000000 at dt=3.0; text stderr `iperf3: error - idle
 // timeout for receiving data`, zero-byte interval rows keep ticking, NO
@@ -3574,10 +3576,16 @@ fn running_idle_watchdog_doc_shape_in_json() {
     );
 }
 
-/// #351 negative cells (GT's mode != SENDER gate + the progress reset):
-/// a reverse round longer than the bound completes (the server is the
-/// sender — exempt), and a slow-but-flowing forward round completes (each
-/// chunk resets the clock).
+/// #351 negative cells: a reverse round longer than the bound completes
+/// (GT's mode != SENDER gate — the server is the sender, exempt), and a
+/// slow-but-flowing forward round completes. The second half is a
+/// RECORDED DEVIATION, not GT parity (PR #369 r1, live-probed): GT's
+/// blocks_received is quantized to COMPLETED `len` blocks by Nread, so GT
+/// kills this exact sub-block trickle at the bound ("idle timeout" while
+/// data flows); riperf3's byte-based progress deliberately survives it —
+/// the liveness-preserving reading of "idle" (emergent Nread noise, the
+/// #356 TEST_START precedent). The two signals converge at the 120 s
+/// default, where the 10 s/30 s Nread partial quanta are absorbed.
 #[test]
 fn running_idle_watchdog_negative_cells() {
     // Reverse, real client: -R -t 5 under --rcv-timeout 3000.
@@ -3667,6 +3675,7 @@ fn running_idle_watchdog_negative_cells() {
     assert!(status2.success());
     assert!(
         !serr2.contains(IDLE_TIMEOUT_MSG),
-        "slow-but-flowing progress resets the clock: {serr2:?}"
+        "byte-based progress keeps a flowing sub-block trickle alive (the \
+         RECORDED DEVIATION — GT's block-quantized signal kills this cell): {serr2:?}"
     );
 }

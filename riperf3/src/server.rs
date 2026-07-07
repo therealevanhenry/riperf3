@@ -1692,11 +1692,28 @@ impl Server {
 
         // #351: GT's TEST_RUNNING data-idle watchdog (iperf_server_api.c:
         // 720-739): armed only when the server RECEIVES (mode != SENDER —
-        // reverse rounds are exempt); progress = received bytes advancing
-        // (GT's blocks_received); ctrl traffic does NOT reset it. On expiry:
-        // IENOMSG(144) — the relay, then the self-terminate surface (the
-        // prefixed doc key over the accumulated intervals + bare end, the
-        // stderr line, no summary), exit-0 keep-serving like GT's restart.
+        // reverse rounds are exempt); ctrl traffic does NOT reset it. On
+        // expiry: IENOMSG(144) — the relay, then the self-terminate surface
+        // (the prefixed doc key over the accumulated intervals + bare end,
+        // the stderr line, no summary), exit-0 keep-serving like GT's
+        // restart. RECORDED DEVIATIONS (PR #369 r1, live-probed):
+        // (1) progress — riperf3 resets on received BYTES advancing; GT's
+        // blocks_received advances only when a full `len` block completes
+        // (or Nread's static 10s/30s partials land, net.c:75-76), so under
+        // a bound below those quanta GT kills a genuinely FLOWING sub-block
+        // trickle (1 KiB/s vs len 128K, bound 3s: GT fires "idle timeout"
+        // at 3.02s while data arrives). Emergent Nread noise, not designed
+        // semantics — bytes are the liveness-preserving reading (the #356
+        // TEST_START precedent). At the 120s default the quanta are
+        // absorbed and the signals converge (probed).
+        // (2) kill envelope — riperf3 fires within [bound, bound+250ms];
+        // GT's baseline lags its main-loop wakes and expiry needs a full
+        // select timeout, so its band is [bound, ~bound+2s] (a full-block
+        // 3.6s cadence under a 3s bound survives GT, dies here). Neither
+        // tool fires before a genuine bound-length gap.
+        // (3) the killed round's doc keeps riperf3's #210/#325 partial
+        // catch-up interval row; GT's fatal wake precedes its reporter
+        // tick, so GT's doc holds one fewer whole row + no partial.
         let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
         let idle_bound =
             std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
