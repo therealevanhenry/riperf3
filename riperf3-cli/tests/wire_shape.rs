@@ -2850,8 +2850,12 @@ const SENDMSG_SENTENCE: &str =
     "unable to send control message - port may not be available, the other side may have stopped running, etc.";
 
 /// One #345 attempt: cookie, then an immediate SO_LINGER(0) RST. Returns
-/// (stdout, stderr, exit).
-#[cfg(unix)]
+/// (stdout, stderr, exit). LINUX-ONLY (the #339 SO_LINGER lesson, refined):
+/// on macOS/FreeBSD the RST surfaces through an EARLIER syscall (CI: a
+/// kind-only InvalidInput via the generic pre-test arm, deterministic on
+/// FreeBSD) and the send-write race is essentially never won — the mapping
+/// under test is platform-independent; only Linux timing exercises it.
+#[cfg(target_os = "linux")]
 fn drive_cookie_then_rst(json: bool) -> (String, String, std::process::ExitStatus) {
     drive_server_scenario(json, |port| {
         let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
@@ -2881,7 +2885,7 @@ fn drive_cookie_then_rst(json: bool) -> (String, String, std::process::ExitStatu
 /// #345 text: within a bounded number of race attempts, the send-failure
 /// class must appear with GT's IESENDMESSAGE sentence (red = it never
 /// appears; pre-fix the path takes a raw Io message via the generic arm).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn pretest_send_state_failure_takes_iesendmessage_text() {
     let mut seen = Vec::new();
@@ -2903,7 +2907,7 @@ fn pretest_send_state_failure_takes_iesendmessage_text() {
 
 /// #345 -J: same race loop; when the send class hits, the skeleton doc
 /// carries the prefixed key with the live strerror (no dangling ": ").
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn pretest_send_state_failure_takes_iesendmessage_json() {
     let mut seen = Vec::new();
