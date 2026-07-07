@@ -3759,7 +3759,13 @@ fn drive_exchange_err_hold() -> (bool, Result<usize, std::io::ErrorKind>, bool) 
     let alive = server.0.try_wait().expect("try_wait").is_none();
     drop(server); // ChildGuard kills; the drained stderr classifies the round
     let serr = se.join().expect("stderr");
-    let send_class = !serr.contains("unable to receive results");
+    // Positive classification (#370 r2): the kill races the serve-loop's
+    // stderr line, so "no recv-results line" alone could misclassify a
+    // recv-class round as send-class — benign on the fix, but a false
+    // green for a teardown-less mutant (recv-class rounds tear down via
+    // the pre-existing gate). Require an error line to have landed; a
+    // line-less round just retries.
+    let send_class = serr.contains("error - ") && !serr.contains("unable to receive results");
     (send_class, data_read, alive)
 }
 
@@ -3774,10 +3780,14 @@ fn exchange_phase_err_still_tears_down_streams() {
     for _ in 0..10 {
         let (send_class, data_read, alive) = drive_exchange_err_hold();
         if send_class {
-            assert_eq!(
-                data_read,
-                Ok(0),
-                "the held data socket sees EOF bounded (the exchange Err ran the teardown)"
+            // EOF is the common close; RST lands when the abort drops the
+            // receiver with the mock's bytes unread (#370 r2 — GT's own
+            // close on this class RSTs too). Main's failure mode is
+            // TimedOut/WouldBlock, so the discrimination survives.
+            assert!(
+                matches!(data_read, Ok(0) | Err(std::io::ErrorKind::ConnectionReset)),
+                "the held data socket sees a bounded close (the exchange \
+                 Err ran the teardown): {data_read:?}"
             );
             assert!(
                 alive,
