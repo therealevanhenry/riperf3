@@ -480,8 +480,15 @@ impl Server {
                     // Pre-test EOFs like port scans are caught earlier by the
                     // cookie read and take GT's IERECVCOOKIE surface via the
                     // RecvCookieFailed arm below (#330), not this mid-test one.)
+                    // #344: iperf_err stamps its stderr lines with the
+                    // --timestamps prefix (iperf_error.c:51-57, :77) — every
+                    // arm below rides output_timestamp_prefix() like the
+                    // pre-test emit (#339) and the stdout banner.
                     if !json && !crate::macros::output_quiet() {
-                        eprintln!("riperf3: {CTRL_CLOSED_MSG}");
+                        eprintln!(
+                            "{}riperf3: {CTRL_CLOSED_MSG}",
+                            crate::macros::output_timestamp_prefix()
+                        );
                     }
                 }
                 Err(RiperfError::ClientTerminated) => {
@@ -491,7 +498,11 @@ impl Server {
                     // modes the doc/event carried it — stderr stays silent
                     // like iperf_err (review r1 f1/f3).
                     if !json && !crate::macros::output_quiet() {
-                        eprintln!("riperf3: {}", RiperfError::ClientTerminated);
+                        eprintln!(
+                            "{}riperf3: {}",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::ClientTerminated
+                        );
                     }
                 }
                 Err(RiperfError::RecvResultsFailed) => {
@@ -501,7 +512,11 @@ impl Server {
                     // under -J the doc carried it and stderr keeps only
                     // the read-site warning.
                     if !json && !crate::macros::output_quiet() {
-                        eprintln!("riperf3: error - {}: ", RiperfError::RecvResultsFailed);
+                        eprintln!(
+                            "{}riperf3: error - {}: ",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::RecvResultsFailed
+                        );
                     }
                 }
                 Err(RiperfError::UnknownControlMessage) => {
@@ -512,7 +527,11 @@ impl Server {
                     // Under -J iperf_err's sink carried it in the doc —
                     // stderr stays silent, like the terminate arm above.
                     if !json && !crate::macros::output_quiet() {
-                        eprintln!("riperf3: error - {}", RiperfError::UnknownControlMessage);
+                        eprintln!(
+                            "{}riperf3: error - {}",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::UnknownControlMessage
+                        );
                     }
                 }
                 // #330: the pre-test control failures. Unlike the classes
@@ -532,7 +551,10 @@ impl Server {
                     if json {
                         self.emit_pretest_error_doc(&format!("error - {e}"));
                     } else if !crate::macros::output_quiet() {
-                        eprintln!("riperf3: error - {e}");
+                        eprintln!(
+                            "{}riperf3: error - {e}",
+                            crate::macros::output_timestamp_prefix()
+                        );
                     }
                 }
             }
@@ -1492,6 +1514,12 @@ impl Server {
                             // partial results in the finalize phases (the old
                             // early return leaked the reporter — the #147
                             // class — and skipped the dump iperf3 performs).
+                            // #342 RECORDED DEVIATION: NO SERVER_ERROR relay
+                            // here. GT's terminate arm returns 0 (no error),
+                            // yet a live GT wires back fe 000000ce
+                            // (IESTREAMREAD=206): its post-teardown stream
+                            // reads clobber i_errno before cleanup_server
+                            // reads it — bug noise, not behavior.
                             ctx.client_terminated = true;
                             break;
                         }
@@ -1512,7 +1540,12 @@ impl Server {
                         // prefixed doc key, exit 0; the full stray set is
                         // 2/9/10/11/13/14/15/-1/-2). The #145 tolerance is
                         // gone on this loop like the end loop's (#329).
+                        // #342: cleanup_server's best-effort relay —
+                        // SERVER_ERROR + htonl(IEMESSAGE=110) + htonl(errno)
+                        // to a still-live peer (iperf_server_api.c:460-473;
+                        // live: fe 0000006e 00000000).
                         Ok(_) => {
+                            let _ = protocol::send_server_error(&mut ctx.ctrl, 110).await;
                             ctx.unknown_message = true;
                             ctx.bare_end = true;
                             break;
@@ -1527,6 +1560,10 @@ impl Server {
                         // convention); GT's reporter dies with only whole
                         // ticks in the doc.
                         Err(RiperfError::UnknownControlMessage) => {
+                            // #342: the unmapped-byte arm relays like the
+                            // known-stray arm above — GT's default: switches
+                            // on the byte value, mapped or not.
+                            let _ = protocol::send_server_error(&mut ctx.ctrl, 110).await;
                             ctx.unknown_message = true;
                             ctx.bare_end = true;
                             break;
@@ -1655,7 +1692,12 @@ impl Server {
         // returning an error from this path (#224).
         if let Some(msg) = ctx.server_error {
             if !self.json_output && !self.json_stream && !crate::macros::output_quiet() {
-                eprintln!("riperf3: error - {msg}");
+                // #344: iperf_err's --timestamps stamp (server_timer_proc
+                // prints through iperf_err directly).
+                eprintln!(
+                    "{}riperf3: error - {msg}",
+                    crate::macros::output_timestamp_prefix()
+                );
             }
         }
 
@@ -1934,7 +1976,12 @@ impl Server {
                     // the doc. (The rendered error KEY is IERECVRESULTS on
                     // every close-type here — a deliberate deviation from
                     // GT's RST→IESENDMESSAGE flip; see the field's docs.)
+                    // #342: cleanup_server's relay — SERVER_ERROR +
+                    // htonl(IERECVRESULTS=117) + htonl(errno) to a peer that
+                    // still holds the socket (live: fe 00000075 00000000);
+                    // best-effort, a vanished peer just fails the write.
                     Err(_) => {
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 117).await;
                         ctx.exchange_recv_failed = true;
                         return Ok(());
                     }
@@ -1976,6 +2023,9 @@ impl Server {
                     // full blocks). riperf3 prints one dump; -J is identical
                     // on both (single doc, error key).
                     Ok(TestState::ClientTerminate) => {
+                        // #342: no relay — the mid-test terminate arm's
+                        // recorded deviation (GT's fe 000000ce is i_errno
+                        // clobber noise).
                         ctx.client_terminated = true;
                         return Ok(());
                     }
@@ -1993,6 +2043,10 @@ impl Server {
                     // would wedge both sides; it takes the IEMESSAGE class
                     // instead.
                     Ok(_) | Err(RiperfError::UnknownControlMessage) => {
+                        // #342: the same cleanup_server relay as the
+                        // mid-test arms — GT routes both loops through one
+                        // handle_message_server switch.
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 110).await;
                         ctx.unknown_message = true;
                         return Ok(());
                     }
@@ -2848,7 +2902,12 @@ impl Server {
         }
         match serde_json::to_string_pretty(report) {
             Ok(s) => println!("{s}"),
-            Err(e) => eprintln!("riperf3: error - failed to serialize JSON: {e}"),
+            // #344: stamped for sink consistency (riperf3-internal class —
+            // GT has no serialize-fail arm to match).
+            Err(e) => eprintln!(
+                "{}riperf3: error - failed to serialize JSON: {e}",
+                crate::macros::output_timestamp_prefix()
+            ),
         }
     }
 
@@ -2874,7 +2933,12 @@ impl Server {
                 );
             }
         } else if !crate::macros::output_quiet() {
-            eprintln!("riperf3: error - {MSG}");
+            // #344: iperf_err's --timestamps stamp (the refusal reaches
+            // main.c:174's iperf_err via the -1 return).
+            eprintln!(
+                "{}riperf3: error - {MSG}",
+                crate::macros::output_timestamp_prefix()
+            );
         }
         Ok(())
     }
@@ -2950,7 +3014,11 @@ impl Server {
                 );
             }
         } else if !crate::macros::output_quiet() {
-            eprintln!("riperf3: error - {MSG}");
+            // #344: iperf_err's --timestamps stamp, like the total-rate twin.
+            eprintln!(
+                "{}riperf3: error - {MSG}",
+                crate::macros::output_timestamp_prefix()
+            );
         }
         Ok(())
     }

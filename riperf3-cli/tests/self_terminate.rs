@@ -702,3 +702,82 @@ fn refusal_skeleton_carries_the_client_target_bitrate() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #344: iperf_err stamps its stderr lines with the --timestamps prefix
+// (iperf_error.c:51-57, :77) — GT's self-terminate line rides iperf_err
+// directly (server_timer_proc, iperf_server_api.c:328) and both refusal
+// kinds reach main.c:174's iperf_err via the -1 return. A literal strftime
+// format keeps the pins deterministic on unix; Windows uses the documented
+// HH:MM:SS fallback and ignores the format, so the byte-exact half is
+// unix-only (the #339 lesson).
+// ---------------------------------------------------------------------------
+
+/// Portable half: a nonempty prefix precedes the expected line somewhere in
+/// stderr. Unix half: the literal format renders verbatim.
+fn assert_stamped_line(serr: &str, bare: &str) {
+    let line = serr
+        .lines()
+        .find(|l| l.ends_with(bare))
+        .unwrap_or_else(|| panic!("no line ending with {bare:?} in {serr:?}"));
+    assert!(
+        line.len() > bare.len(),
+        "a nonempty timestamp prefix precedes the line: {line:?}"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        line,
+        &format!("XTSX {bare}"),
+        "the literal format renders verbatim: {line:?}"
+    );
+}
+
+/// The runtime breach line (the handle_one_test server_error emit site).
+#[test]
+fn bitrate_limit_line_carries_the_timestamps_prefix() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-bitrate-limit", "1K", "--timestamps=XTSX "], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "5"],
+        Duration::from_secs(40),
+        "client",
+    );
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(scode, 0);
+    assert_stamped_line(&serr, &format!("riperf3: error - {BITRATE_MSG}"));
+}
+
+/// The upfront total-rate refusal line (refuse_total_rate's text emit — the
+/// message matches the runtime breach, so the scenario picks the site: a
+/// refused param exchange never starts the test).
+#[test]
+fn upfront_total_rate_line_carries_the_timestamps_prefix() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-bitrate-limit", "1M", "--timestamps=XTSX "], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-b", "2M", "-t", "2"],
+        Duration::from_secs(20),
+        "refused client",
+    );
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(scode, 0);
+    assert_stamped_line(&serr, &format!("riperf3: error - {BITRATE_MSG}"));
+}
+
+/// The upfront max-duration refusal line (refuse_max_duration's text emit).
+#[test]
+fn upfront_max_duration_line_carries_the_timestamps_prefix() {
+    let ps = common::free_port().to_string();
+    let server = spawn_server(&["--server-max-duration", "2", "--timestamps=XTSX "], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = common::run_client(
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "6"],
+        Duration::from_secs(20),
+        "refused client",
+    );
+    let (_sout, serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(scode, 0);
+    assert_stamped_line(&serr, &format!("riperf3: error - {MAXDUR_MSG}"));
+}
