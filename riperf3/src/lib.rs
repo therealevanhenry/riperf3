@@ -50,6 +50,12 @@ pub use json_report::Report;
 
 pub use net::set_cpu_affinity;
 
+/// Render a `--timestamps` strftime FORMAT into the line prefix
+/// (#202/#348) — the same renderer the lib's own iperf_err-class sites
+/// use, for CLI-layer stderr lines that print outside a run's scope
+/// (GT's stamp is process-global; the lib's is run-scoped).
+pub use macros::render_timestamp as render_timestamp_prefix;
+
 // --- Internal modules: implementation detail, NOT part of the public API. ---
 // Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
 // few genuinely-public types are re-exported at the crate root above (#67).

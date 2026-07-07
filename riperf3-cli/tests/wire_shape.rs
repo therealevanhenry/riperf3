@@ -2851,10 +2851,12 @@ const SENDMSG_SENTENCE: &str =
 
 /// One #345 attempt: cookie, then an immediate SO_LINGER(0) RST. Returns
 /// (stdout, stderr, exit). LINUX-ONLY (the #339 SO_LINGER lesson, refined):
-/// on macOS/FreeBSD the RST surfaces through an EARLIER syscall (CI: a
-/// kind-only InvalidInput via the generic pre-test arm, deterministic on
-/// FreeBSD) and the send-write race is essentially never won — the mapping
-/// under test is platform-independent; only Linux timing exercises it.
+/// on macOS/FreeBSD the RST surfaces through an EARLIER syscall (CI:
+/// macOS = a kind-only InvalidInput via the generic pre-test arm;
+/// FreeBSD = ECONNABORTED at the accept/configure site, deterministic)
+/// and the send-write race is essentially never won — the mapping under
+/// test is platform-independent; only Linux timing exercises it (#362
+/// tracks the non-Linux surfaces).
 #[cfg(target_os = "linux")]
 fn drive_cookie_then_rst(json: bool) -> (String, String, std::process::ExitStatus) {
     drive_server_scenario(json, |port| {
@@ -3036,4 +3038,179 @@ fn sigterm_while_listening_text_line_and_exit_zero() {
         format!("riperf3: {SIGTERM_KEY}"),
         "the CLI's interrupt line: {serr:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #348: GT stamps CLIENT-side stderr error lines too — iperf_errexit routes
+// through the same strftime stamp as iperf_err (iperf_error.c:100-127).
+// Live-probed (GT 3.21, --timestamps="XTSX "): connect-refused = `XTSX
+// iperf3: error - ...`; the SERVER-ERROR relay = BOTH lines stamped (`XTSX
+// iperf3: SERVER ERROR - ...` then `XTSX iperf3: error - ...`); the
+// interrupt line = stamped on BOTH roles. GT prints NO second-signal line
+// at all (one interrupt line even on a double SIGINT), so riperf3's
+// second-signal emergency lines stay bare by design (#158's raw-handler
+// write can't render a stamp async-signal-safely).
+// ---------------------------------------------------------------------------
+
+/// #348: the client's connect-refused line carries the stamp.
+#[test]
+fn client_error_line_carries_the_timestamps_prefix() {
+    let free = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = free.local_addr().unwrap().port();
+    drop(free); // nothing listens: connect refused
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args([
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "--timestamps=XTSX ",
+        ])
+        .output()
+        .expect("run client");
+    assert_eq!(out.status.code(), Some(1), "iperf_errexit exits 1");
+    let serr = String::from_utf8_lossy(&out.stderr);
+    let line = serr.trim();
+    assert!(
+        line.contains("riperf3: error - ") && !line.starts_with("riperf3:"),
+        "a nonempty stamp precedes the client error line: {line:?}"
+    );
+    #[cfg(unix)]
+    assert!(
+        line.starts_with("XTSX riperf3: error - "),
+        "the literal format renders verbatim: {line:?}"
+    );
+}
+
+/// #348: the client's SERVER-ERROR relay surface — BOTH stderr lines carry
+/// the stamp, like GT's iperf_err + iperf_errexit pair.
+#[test]
+fn client_relay_lines_carry_the_timestamps_prefix() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps, "--server-bitrate-limit", "1000"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args([
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-b",
+            "1M",
+            "-t",
+            "2",
+            "--timestamps=XTSX ",
+        ])
+        .output()
+        .expect("run client");
+    let _ = riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8));
+    assert_eq!(out.status.code(), Some(1), "refused-run errexit");
+    let serr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = serr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let relay = lines
+        .iter()
+        .find(|l| l.contains("SERVER ERROR - "))
+        .unwrap_or_else(|| panic!("the relay line is present: {serr:?}"));
+    let exitl = lines
+        .iter()
+        .find(|l| l.contains("riperf3: error - "))
+        .unwrap_or_else(|| panic!("the errexit line is present: {serr:?}"));
+    for (name, l) in [("relay", relay), ("errexit", exitl)] {
+        assert!(
+            !l.starts_with("riperf3:"),
+            "{name} line carries a stamp: {l:?}"
+        );
+        #[cfg(unix)]
+        assert!(l.starts_with("XTSX riperf3: "), "{name} literal: {l:?}");
+    }
+}
+
+/// #348: the interrupt line is stamped on BOTH roles (the main.rs:660
+/// shared site — GT live: `XTSX iperf3: interrupt - ...` each role).
+#[cfg(unix)]
+#[test]
+fn interrupt_lines_carry_the_timestamps_prefix_both_roles() {
+    // Server role: SIGTERM while listening, text mode.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps, "--timestamps=XTSX "])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    unsafe { libc::kill(server.0.id() as i32, libc::SIGTERM) };
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("signal-normal exit");
+    assert!(status.success());
+    let serr = se.join().expect("stderr");
+    assert!(
+        serr.trim()
+            .starts_with("XTSX riperf3: interrupt - the server has terminated by signal"),
+        "server interrupt line stamped: {serr:?}"
+    );
+
+    // Client role: SIGINT mid-test.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port2 = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps2 = port2.to_string();
+    let mut srv2 = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps2])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server2"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let mut client = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args([
+                "-c",
+                "127.0.0.1",
+                "-p",
+                &ps2,
+                "-t",
+                "10",
+                "--timestamps=XTSX ",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn client"),
+    );
+    let _co = riperf3_test_support::drain_reader(client.0.stdout.take().unwrap());
+    let ce = riperf3_test_support::drain_reader(client.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    unsafe { libc::kill(client.0.id() as i32, libc::SIGINT) };
+    let cstatus =
+        riperf3_test_support::wait_bounded(&mut client.0, std::time::Duration::from_secs(8))
+            .expect("client signal exit");
+    assert!(cstatus.success(), "signal-normal exit");
+    let cerr = ce.join().expect("client stderr");
+    assert!(
+        cerr.trim()
+            .starts_with("XTSX riperf3: interrupt - the client has terminated by signal"),
+        "client interrupt line stamped: {cerr:?}"
+    );
+    let _ = riperf3_test_support::wait_bounded(&mut srv2.0, std::time::Duration::from_secs(8));
 }

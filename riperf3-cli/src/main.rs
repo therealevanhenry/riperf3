@@ -326,6 +326,13 @@ fn main() -> std::process::ExitCode {
     let json = cli.json;
     let json_stream = cli.json_stream;
     let logfile = cli.logfile.clone();
+    // #348: the sink stamps like GT's iperf_errexit; the lib's prefix is
+    // run-scoped and already gone here, so render from the CLI's format.
+    let ts_prefix = cli
+        .timestamps
+        .clone()
+        .map(|f| riperf3::render_timestamp_prefix(&f))
+        .unwrap_or_default();
     match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -361,7 +368,9 @@ fn main() -> std::process::ExitCode {
                     println!("{}", riperf3::json_report::error_document(&e.to_string()));
                 }
             } else {
-                let line = format!("riperf3: error - {e}");
+                // #348: GT's iperf_errexit stamps this line like iperf_err
+                // (iperf_error.c:100-127).
+                let line = format!("{ts_prefix}riperf3: error - {e}");
                 let logged = logfile.as_deref().and_then(|path| {
                     use std::io::Write;
                     std::fs::OpenOptions::new()
@@ -574,6 +583,13 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let pidfile = cli.pidfile.clone();
     let is_server = cli.server;
     let (json, json_stream) = (cli.json, cli.json_stream);
+    // #348: the interrupt notice prints after the run — render the stamp
+    // from the CLI's own format (the lib's prefix is run-scoped).
+    let ts_prefix = cli
+        .timestamps
+        .clone()
+        .map(|f| riperf3::render_timestamp_prefix(&f))
+        .unwrap_or_default();
     // #210: the first signal no longer cancels the run outright — it fires
     // this watch with iperf3's formatted message, and the lib dumps the
     // accumulated stats + tells the peer (CLIENT_TERMINATE /
@@ -657,7 +673,10 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
             // there (#210 review r1 f3).
             if !json && !json_stream {
                 let role = if is_server { "server" } else { "client" };
-                eprintln!("riperf3: interrupt - the {role} has terminated by signal {sig}");
+                // #348: stamped on both roles (GT live).
+                eprintln!(
+                    "{ts_prefix}riperf3: interrupt - the {role} has terminated by signal {sig}"
+                );
             }
             Ok(())
         }

@@ -113,7 +113,7 @@ pub(crate) fn output_timestamp_prefix() -> String {
 /// iperf_printf (default "%c " — the trailing space lives in the format;
 /// user formats are used verbatim) (#202).
 #[cfg(unix)]
-fn render_timestamp(fmt: &str) -> String {
+pub fn render_timestamp(fmt: &str) -> String {
     let Ok(cfmt) = std::ffi::CString::new(fmt) else {
         return String::new();
     };
@@ -136,7 +136,7 @@ fn render_timestamp(fmt: &str) -> String {
 /// native Windows has no iperf3 ground truth to match — keep the simple
 /// HH:MM:SS UTC shape (#202).
 #[cfg(not(unix))]
-fn render_timestamp(_fmt: &str) -> String {
+pub fn render_timestamp(_fmt: &str) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

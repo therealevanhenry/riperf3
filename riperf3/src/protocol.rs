@@ -211,7 +211,9 @@ pub async fn send_state(stream: &mut TcpStream, state: TestState) -> Result<()> 
 /// Send SERVER_ERROR with iperf3's (i_errno, errno) u32-pair payload (#224):
 /// the state byte, then both words big-endian — iperf_server_api.c's Nwrite
 /// pair (the bitrate, duration-timer, and cleanup_server relay sites). The os
-/// errno is always 0 from riperf3: our self-terminate causes carry none.
+/// errno word is always 0 from riperf3 — most relayed causes carry none, and
+/// where one exists (#345's send failure) the peer's RST makes the relay
+/// unobservable anyway; GT itself often leaks a stale word here (#336).
 pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<()> {
     send_state(stream, TestState::ServerError).await?;
     stream.write_all(&i_errno.to_be_bytes()).await?;
