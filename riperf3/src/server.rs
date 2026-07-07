@@ -1696,17 +1696,22 @@ impl Server {
         // expiry: IENOMSG(144) — the relay, then the self-terminate surface
         // (the prefixed doc key over the accumulated intervals + bare end,
         // the stderr line, no summary), exit-0 keep-serving like GT's
-        // restart. RECORDED DEVIATIONS (PR #369 r1, live-probed):
+        // restart. RECORDED DEVIATIONS (PR #369 r1+r2, live-probed):
         // (1) progress — riperf3 resets on received BYTES advancing; GT's
-        // blocks_received advances only when a full `len` block completes
-        // (or Nread's static 10s/30s partials land, net.c:75-76), so under
-        // a bound below those quanta GT kills a genuinely FLOWING sub-block
-        // trickle (1 KiB/s vs len 128K, bound 3s: GT fires "idle timeout"
-        // at 3.02s while data arrives). Emergent Nread noise, not designed
-        // semantics — bytes are the liveness-preserving reading (the #356
-        // TEST_START precedent). At the 120s default the quanta are
-        // absorbed and the signals converge (probed).
-        // (2) kill envelope — riperf3 fires within [bound, bound+250ms];
+        // blocks_received advances ONLY on full-`len` block completions
+        // (the running-phase reads are Nrecv_no_select, net.c:511-553 — a
+        // timeout-free full-block accumulate; the 10s/30s statics are
+        // control-path only). The divergence is RATE-scoped, at ANY bound:
+        // GT false-kills every receiving flow slower than len*8/bound
+        // (~8.7 kbit/s at stock 128K/120s — a GT `-b 8k` TCP client dies
+        // against its own server; probed at bounds 3s/35s/120s). riperf3
+        // never kills a byte-flowing round — the liveness-preserving
+        // reading (the #356 precedent). Flip side, recorded honestly: a
+        // 1-byte-per-(bound-epsilon) trickle holds a riperf3 slot
+        // indefinitely where GT reaps at ~bound — but a full-block cadence
+        // >= bound holds GT forever too (probed), so neither watchdog is a
+        // security bound.
+        // (2) kill envelope — riperf3 fires within [bound, bound+~250ms];
         // GT's baseline lags its main-loop wakes and expiry needs a full
         // select timeout, so its band is [bound, ~bound+2s] (a full-block
         // 3.6s cadence under a 3s bound survives GT, dies here). Neither

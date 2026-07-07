@@ -3459,8 +3459,9 @@ fn runtime_rate_breach_relays_exactly_one_frame() {
 // (iperf_server_api.c:720-739): fires only when the server RECEIVES
 // (mode != SENDER — reverse tests exempt) and `blocks_received` hasn't
 // advanced for rcv_timeout; ctrl traffic does NOT reset it. riperf3's
-// progress signal is received BYTES — a recorded deviation below the
-// Nread quanta (see the negative-cells test + the arm comment). Live-probed
+// progress signal is received BYTES — a recorded RATE-scoped deviation
+// (GT's blocks_received is full-block-quantized at ANY bound; see the
+// negative-cells test + the arm comment). Live-probed
 // (--rcv-timeout 3000, silent client holding both sockets): wire
 // fe 00000090 00000000 at dt=3.0; text stderr `iperf3: error - idle
 // timeout for receiving data`, zero-byte interval rows keep ticking, NO
@@ -3579,13 +3580,14 @@ fn running_idle_watchdog_doc_shape_in_json() {
 /// #351 negative cells: a reverse round longer than the bound completes
 /// (GT's mode != SENDER gate — the server is the sender, exempt), and a
 /// slow-but-flowing forward round completes. The second half is a
-/// RECORDED DEVIATION, not GT parity (PR #369 r1, live-probed): GT's
-/// blocks_received is quantized to COMPLETED `len` blocks by Nread, so GT
+/// RECORDED DEVIATION, not GT parity (PR #369 r1+r2, live-probed): GT's
+/// blocks_received is quantized to COMPLETED `len` blocks (running-phase
+/// reads are Nrecv_no_select — timeout-free full-block accumulate), so GT
 /// kills this exact sub-block trickle at the bound ("idle timeout" while
-/// data flows); riperf3's byte-based progress deliberately survives it —
-/// the liveness-preserving reading of "idle" (emergent Nread noise, the
-/// #356 TEST_START precedent). The two signals converge at the 120 s
-/// default, where the 10 s/30 s Nread partial quanta are absorbed.
+/// data flows) — at ANY bound, for any flow slower than len*8/bound
+/// (~8.7 kbit/s at stock defaults). riperf3's byte-based progress
+/// deliberately survives it — the liveness-preserving reading of "idle"
+/// (the #356 TEST_START precedent).
 #[test]
 fn running_idle_watchdog_negative_cells() {
     // Reverse, real client: -R -t 5 under --rcv-timeout 3000.
