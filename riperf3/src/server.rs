@@ -335,6 +335,10 @@ pub struct Server {
     pub(crate) one_off: bool,
     pub(crate) verbose: bool,
     pub(crate) idle_timeout: Option<u32>,
+    /// `--rcv-timeout` (ms): the no-progress bound on waits that GT caps at
+    /// rcv_timeout (#338 CREATE_STREAMS; default 120000 = GT's
+    /// DEFAULT_NO_MSG_RCVD_TIMEOUT, iperf_api.h:70).
+    pub(crate) rcv_timeout: Option<u64>,
     pub(crate) server_bitrate_limit: Option<u64>,
     pub(crate) server_max_duration: Option<u32>,
     pub(crate) forceflush: bool,
@@ -531,6 +535,19 @@ impl Server {
                             "{}riperf3: error - {}",
                             crate::macros::output_timestamp_prefix(),
                             RiperfError::UnknownControlMessage
+                        );
+                    }
+                }
+                Err(RiperfError::DataIdleTimeout) => {
+                    // #338: GT's rcv_timeout no-progress bound at the
+                    // CREATE_STREAMS wait — IENOMSG(144). The doc emitted at
+                    // the setup site; text prints iperf_err's stamped line.
+                    // Keep-serving, exit 0 (GT's rc -1 class, like IEMESSAGE).
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {}",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::DataIdleTimeout
                         );
                     }
                 }
@@ -1180,8 +1197,56 @@ impl Server {
             TransportProtocol::Tcp => {
                 protocol::send_state(&mut ctx.ctrl, TestState::CreateStreams).await?;
 
+                // #338: GT's CREATE_STREAMS wait runs inside its select()
+                // event loop, so a ctrl-EOF is noticed at once (IECTRLCLOSE,
+                // iperf_server_api.c:249-254) and a no-progress round is
+                // bounded at rcv_timeout (IENOMSG=144, :663-678; default =
+                // DEFAULT_NO_MSG_RCVD_TIMEOUT 120000 ms, iperf_api.h:70).
+                // The bare accept parked unbounded on both. The ctrl watch
+                // PEEKs — a state byte arriving mid-setup stays buffered for
+                // the mid-test loop's arms (pre-#338 semantics; GT would
+                // dispatch it here — recorded residual on the issue), and
+                // once one is seen the arm disarms so the select can't spin.
+                let rcv_timeout = std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(
+                    120_000, // GT DEFAULT_NO_MSG_RCVD_TIMEOUT
+                ));
+                let mut watch_ctrl = true;
                 for i in 0..total {
-                    let (mut data_stream, _) = listener.accept().await?;
+                    let mut peek_buf = [0u8; 1];
+                    let (mut data_stream, _) = loop {
+                        tokio::select! {
+                            accepted = listener.accept() => break accepted?,
+                            peeked = ctx.ctrl.peek(&mut peek_buf), if watch_ctrl => match peeked {
+                                // EOF: the peer closed without connecting its
+                                // data streams — GT's read-site surface. The
+                                // -J doc emits here (the serve loop's arm
+                                // prints the text sentence).
+                                Ok(0) => {
+                                    self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                                    return Err(RiperfError::ControlSocketClosed);
+                                }
+                                // A state byte mid-setup: leave it buffered
+                                // (peek) and disarm the watch.
+                                Ok(_) => {
+                                    watch_ctrl = false;
+                                }
+                                Err(e) => return Err(e.into()),
+                            },
+                            _ = tokio::time::sleep(rcv_timeout) => {
+                                // GT's no-progress bound: wire-back
+                                // SERVER_ERROR + IENOMSG(144) + errno 0
+                                // (live: fe 00000090 00000000), the doc with
+                                // the prefixed key, exit-0 keep-serving.
+                                let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
+                                self.emit_setup_phase_error(
+                                    ctx,
+                                    listener,
+                                    &format!("error - {}", RiperfError::DataIdleTimeout),
+                                );
+                                return Err(RiperfError::DataIdleTimeout);
+                            }
+                        }
+                    };
                     let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
                     if stream_cookie != ctx.cookie {
                         return Err(RiperfError::CookieMismatch);
@@ -2983,6 +3048,54 @@ impl Server {
         }
     }
 
+    /// #338: render a setup-phase (CREATE_STREAMS) error in GT's sink shape.
+    /// Under -J: the POPULATED setup doc (on_connect + listener metadata,
+    /// live-probed — see json_report::setup_error_document); --json-stream:
+    /// the same error+end event pair GT emits here (live-probed, no start
+    /// event); text: nothing — the serve loop's arms print the stderr line.
+    fn emit_setup_phase_error(
+        &self,
+        ctx: &TestRunCtx,
+        listener: &tokio::net::TcpListener,
+        doc_error: &str,
+    ) {
+        if crate::macros::output_quiet() {
+            return;
+        }
+        if self.json_stream {
+            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
+                doc_error,
+            ));
+        } else if self.json_output {
+            // GT's bufsize trio comes off the LISTENER at listen time
+            // (iperf_tcp.c:337-377); read the same socket. Best-effort — a
+            // failed getsockopt omits the key rather than inventing one.
+            let sock = socket2::SockRef::from(listener);
+            let timemillisecs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let doc = crate::json_report::setup_error_document(
+                &crate::json_report::SetupPhaseDoc {
+                    sock_bufsize: ctx.cfg.window.map(|w| w as u64).unwrap_or(0),
+                    sndbuf_actual: sock.send_buffer_size().ok().map(|v| v as u64),
+                    rcvbuf_actual: sock.recv_buffer_size().ok().map(|v| v as u64),
+                    timemillisecs,
+                    accepted_host: ctx.accepted_host.clone(),
+                    accepted_port: ctx.accepted_port,
+                    // The wire cookie is 37 bytes with a trailing NUL; the -J
+                    // string drops it (the :1092/:2925 convention).
+                    cookie: String::from_utf8_lossy(&ctx.cookie[..protocol::COOKIE_SIZE - 1])
+                        .to_string(),
+                    target_bitrate: ctx.cfg.bandwidth,
+                    fq_rate: ctx.cfg.fq_rate,
+                },
+                doc_error,
+            );
+            println!("{doc}");
+        }
+    }
+
     /// #330: render a pre-test control error (IERECVCOOKIE / IERECVPARAMS) in
     /// GT's iperf_err sink shape — silent stderr under -J with the message in
     /// the skeleton doc, one text line otherwise. Both codes are perr=1, so the
@@ -3139,6 +3252,7 @@ pub struct ServerBuilder {
     one_off: bool,
     verbose: bool,
     idle_timeout: Option<u32>,
+    rcv_timeout: Option<u64>,
     server_bitrate_limit: Option<u64>,
     server_max_duration: Option<u32>,
     forceflush: bool,
@@ -3166,6 +3280,7 @@ impl Default for ServerBuilder {
             one_off: false,
             verbose: false,
             idle_timeout: None,
+            rcv_timeout: None,
             server_bitrate_limit: None,
             server_max_duration: None,
             forceflush: false,
@@ -3259,6 +3374,13 @@ impl ServerBuilder {
     /// `secs` seconds (with `-1/--one-off`, exit instead).
     pub fn idle_timeout(mut self, secs: u32) -> Self {
         self.idle_timeout = Some(secs);
+        self
+    }
+
+    /// `--rcv-timeout` (ms): the server's no-progress bound (#338). Unset:
+    /// GT's DEFAULT_NO_MSG_RCVD_TIMEOUT (120000 ms).
+    pub fn rcv_timeout(mut self, ms: u64) -> Self {
+        self.rcv_timeout = Some(ms);
         self
     }
 
@@ -3410,6 +3532,7 @@ impl ServerBuilder {
             one_off: self.one_off,
             verbose: self.verbose,
             idle_timeout: self.idle_timeout,
+            rcv_timeout: self.rcv_timeout,
             server_bitrate_limit: self.server_bitrate_limit,
             server_max_duration: self.server_max_duration,
             forceflush: self.forceflush,

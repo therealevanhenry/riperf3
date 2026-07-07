@@ -200,6 +200,84 @@ pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> Stri
     .unwrap()
 }
 
+/// Inputs for the #338 setup-phase document, gathered at the CREATE_STREAMS
+/// wait (the control connection and the listener are live; no data streams).
+pub(crate) struct SetupPhaseDoc {
+    pub sock_bufsize: u64,
+    pub sndbuf_actual: Option<u64>,
+    pub rcvbuf_actual: Option<u64>,
+    pub timemillisecs: u64,
+    pub accepted_host: String,
+    pub accepted_port: u16,
+    pub cookie: String,
+    pub target_bitrate: u64,
+    pub fq_rate: u64,
+}
+
+/// #338: the setup-phase (CREATE_STREAMS) error document — by then GT's
+/// server has the on_connect metadata AND the listener's buffer fields, so
+/// the start is POPULATED (live-probed 3.21): empty `connected:[]`, the
+/// bufsize trio, timestamp, accepted_connection, cookie, `tcp_mss_default`
+/// 0 (the server never reads the ctrl MSS, the #50 convention),
+/// target_bitrate, fq_rate — over `intervals:[]`, a bare `end:{}`, and the
+/// error key. KEY ORDER is GT's SERVER insertion order: the bufsize trio
+/// lands at listen time (iperf_tcp.c:373-377), BEFORE timestamp — the
+/// shared Start serializer's client-derived order is #355.
+pub(crate) fn setup_error_document(d: &SetupPhaseDoc, error: &str) -> String {
+    #[derive(Serialize)]
+    struct SetupStart<'a> {
+        connected: [(); 0],
+        version: String,
+        system_info: String,
+        sock_bufsize: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sndbuf_actual: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rcvbuf_actual: Option<u64>,
+        timestamp: Timestamp,
+        accepted_connection: ConnectingTo,
+        cookie: &'a str,
+        tcp_mss_default: u32,
+        target_bitrate: u64,
+        fq_rate: u64,
+    }
+    #[derive(Serialize)]
+    struct Doc<'a> {
+        start: SetupStart<'a>,
+        intervals: [(); 0],
+        end: serde_json::Map<String, serde_json::Value>,
+        error: &'a str,
+    }
+    let secs = d.timemillisecs / 1000;
+    serde_json::to_string_pretty(&Doc {
+        start: SetupStart {
+            connected: [],
+            version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
+            system_info: crate::utils::system_info(),
+            sock_bufsize: d.sock_bufsize,
+            sndbuf_actual: d.sndbuf_actual,
+            rcvbuf_actual: d.rcvbuf_actual,
+            timestamp: Timestamp {
+                time: http_date(secs),
+                timesecs: secs,
+                timemillisecs: d.timemillisecs,
+            },
+            accepted_connection: ConnectingTo {
+                host: d.accepted_host.clone(),
+                port: d.accepted_port,
+            },
+            cookie: &d.cookie,
+            tcp_mss_default: 0,
+            target_bitrate: d.target_bitrate,
+            fq_rate: d.fq_rate,
+        },
+        intervals: [],
+        end: serde_json::Map::new(),
+        error,
+    })
+    .unwrap()
+}
+
 /// The `--json-stream` pre-test error tail (#198): an `error` event followed
 /// by an empty `end` event, iperf3's JSONStream_Output order on errexit.
 pub fn error_stream_events(error: &str) -> String {

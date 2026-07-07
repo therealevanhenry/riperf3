@@ -887,6 +887,12 @@ impl Cli {
         if let Some(secs) = self.server_max_duration {
             builder = builder.server_max_duration(u32::try_from(secs).unwrap_or(u32::MAX));
         }
+        if let Some(ms) = self.rcv_timeout {
+            // #338: the server half of --rcv-timeout (GT uses it as the
+            // no-progress bound on both roles). IERCVTIMEOUT range enforced
+            // pre-sink in main.rs (#328).
+            builder = builder.rcv_timeout(u64::try_from(ms).unwrap_or(0));
+        }
         if self.forceflush {
             builder = builder.forceflush(true);
         }
