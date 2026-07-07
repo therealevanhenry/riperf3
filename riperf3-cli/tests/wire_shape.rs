@@ -1699,11 +1699,15 @@ fn generic_arm_failure_json_is_silent_stderr_with_skeleton_doc() {
 // ---------------------------------------------------------------------------
 // #342: GT's cleanup_server best-effort relays SERVER_ERROR(-2) + htonl(i_errno)
 // + htonl(errno) to a still-live peer before closing (iperf_server_api.c:
-// 460-473). Live-probed (iperf 3.21): an unknown control byte wires back
-// fe 0000006e 00000000 (IEMESSAGE=110); a failed results read wires back
-// fe 00000075 00000000 (IERECVRESULTS=117). The mock reads the frame and then
-// closes — GT itself parks >10 s post-error while the peer holds, so the pin
-// must not wait for the server's close to observe the bytes.
+// 460-473 — it keys on the i_errno GLOBAL at the run loop's exit, :1001,
+// regardless of return path). Live-probed (iperf 3.21): an unknown control
+// byte wires back fe 0000006e 00000000 (IEMESSAGE=110); a failed results read
+// fe 00000075 00000000 (IERECVRESULTS=117); a ctrl half-close
+// fe 0000006d 00000000 (IECTRLCLOSE=109, r1 F2); CLIENT_TERMINATE
+// fe 00000077 (IECLIENTTERM=119, r1 F1 — value/errno deviations on the
+// terminate pin). The mock reads the frame rather than waiting for the
+// server's close, so the pin observes the bytes regardless of close timing
+// (r1 F3: GT sends the frame and closes at once).
 // ---------------------------------------------------------------------------
 
 /// The 9-byte SERVER_ERROR relay: state(-2) + htonl(i_errno) + htonl(errno=0).
@@ -1728,9 +1732,12 @@ fn read_wireback(ctrl: &mut std::net::TcpStream) -> Vec<u8> {
     got
 }
 
-/// Like [`run_holding_scenario`], but after the final byte the mock READS the
-/// control socket for the #342 relay frame (then closes), returning the bytes.
-fn run_wireback_scenario(final_byte: u8, junk_mid_test: bool) -> Vec<u8> {
+/// Like [`run_holding_scenario`], but after the final action the mock READS
+/// the control socket for the #342 relay frame (then closes), returning the
+/// bytes. `final_action`: Some(byte) sends the byte; None HALF-closes the
+/// write side (`shutdown(SHUT_WR)`) and keeps the read half open — the EOF
+/// cells, where a full drop would discard the relay before the pin sees it.
+fn run_wireback_scenario(final_action: Option<u8>, junk_mid_test: bool) -> Vec<u8> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -1765,7 +1772,10 @@ fn run_wireback_scenario(final_byte: u8, junk_mid_test: bool) -> Vec<u8> {
             read_json_blob(&mut ctrl); // server results
             assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
         }
-        ctrl.write_all(&[final_byte]).unwrap();
+        match final_action {
+            Some(b) => ctrl.write_all(&[b]).unwrap(),
+            None => ctrl.shutdown(std::net::Shutdown::Write).unwrap(),
+        }
         let frame = read_wireback(&mut ctrl);
         drop((ctrl, data));
         frame
@@ -1782,7 +1792,7 @@ fn run_wireback_scenario(final_byte: u8, junk_mid_test: bool) -> Vec<u8> {
 #[test]
 fn mid_test_unknown_byte_wires_back_iemessage() {
     assert_eq!(
-        run_wireback_scenario(99, true),
+        run_wireback_scenario(Some(99), true),
         wireback_frame(110),
         "SERVER_ERROR + htonl(IEMESSAGE) + htonl(0), like GT's cleanup_server"
     );
@@ -1794,7 +1804,7 @@ fn mid_test_unknown_byte_wires_back_iemessage() {
 #[test]
 fn mid_test_known_stray_wires_back_iemessage() {
     assert_eq!(
-        run_wireback_scenario(9, true),
+        run_wireback_scenario(Some(9), true),
         wireback_frame(110),
         "the known-stray arm relays like the unmapped-byte arm"
     );
@@ -1804,25 +1814,61 @@ fn mid_test_known_stray_wires_back_iemessage() {
 #[test]
 fn end_loop_unknown_byte_wires_back_iemessage() {
     assert_eq!(
-        run_wireback_scenario(99, false),
+        run_wireback_scenario(Some(99), false),
         wireback_frame(110),
         "the end-loop arm shares GT's handle_message default relay"
     );
 }
 
-/// RECORDED DEVIATION: no relay on CLIENT_TERMINATE. GT's terminate arm
-/// (iperf_server_api.c:289-307) sets IECLIENTTERM, prints, closes the stream
-/// sockets, and returns 0 — no error return — yet a live GT wires back
-/// fe 000000ce (IESTREAMREAD=206): its post-teardown stream reads CLOBBER
-/// i_errno before cleanup_server reads it. That relay is bug noise, not
-/// behavior (the ethos ruling: implement cleanly, document, don't mirror) —
-/// riperf3 sends nothing and closes.
+/// CLIENT_TERMINATE relays IECLIENTTERM(119): the terminate arm sets the
+/// i_errno global (iperf_server_api.c:290) and cleanup_server relays it at
+/// the loop's normal exit (:1001, :466) — the relay does NOT key on an error
+/// return (r1 F1; live mid-test majority fe 00000077 00000000). TWO RECORDED
+/// DEVIATIONS, both value-level: (i) GT's mid-test value RACES 119 vs 206
+/// (~2/10 live — post-teardown stream reads clobber the plain global);
+/// riperf3 pins the intended 119. (ii) GT's end-loop frame carries a
+/// LEFTOVER errno word (fe 00000077 00000009 live — EBADF from its own
+/// closed-socket reads); riperf3 pins errno 0, the #336 honest-errno-0
+/// convention.
 #[test]
-fn end_loop_client_terminate_wires_back_nothing() {
+fn end_loop_client_terminate_wires_back_ieclientterm() {
     assert_eq!(
-        run_wireback_scenario(12, false),
-        Vec::<u8>::new(),
-        "clean EOF, no SERVER_ERROR frame, on the terminate path"
+        run_wireback_scenario(Some(12), false),
+        wireback_frame(119),
+        "SERVER_ERROR + htonl(IECLIENTTERM) + htonl(0) on the end-loop terminate"
+    );
+}
+
+/// The mid-test terminate arm relays the same frame (GT's arm is shared;
+/// riperf3's two sites are distinct).
+#[test]
+fn mid_test_client_terminate_wires_back_ieclientterm() {
+    assert_eq!(
+        run_wireback_scenario(Some(12), true),
+        wireback_frame(119),
+        "SERVER_ERROR + htonl(IECLIENTTERM) + htonl(0) on the mid-test terminate"
+    );
+}
+
+/// A ctrl HALF-close (shutdown(SHUT_WR), read half open) mid-test: GT's
+/// rval==0 arm sets IECTRLCLOSE (iperf_server_api.c:251-254) and
+/// cleanup_server relays fe 0000006d 00000000, deterministic live (r1 F2).
+#[test]
+fn mid_test_ctrl_half_close_wires_back_iectrlclose() {
+    assert_eq!(
+        run_wireback_scenario(None, true),
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0) on the mid-test EOF"
+    );
+}
+
+/// The same half-close where IperfDone was due — the end loop's EOF arm.
+#[test]
+fn end_loop_ctrl_half_close_wires_back_iectrlclose() {
+    assert_eq!(
+        run_wireback_scenario(None, false),
+        wireback_frame(109),
+        "SERVER_ERROR + htonl(IECTRLCLOSE) + htonl(0) on the end-loop EOF"
     );
 }
 

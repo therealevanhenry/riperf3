@@ -1514,12 +1514,16 @@ impl Server {
                             // partial results in the finalize phases (the old
                             // early return leaked the reporter — the #147
                             // class — and skipped the dump iperf3 performs).
-                            // #342 RECORDED DEVIATION: NO SERVER_ERROR relay
-                            // here. GT's terminate arm returns 0 (no error),
-                            // yet a live GT wires back fe 000000ce
-                            // (IESTREAMREAD=206): its post-teardown stream
-                            // reads clobber i_errno before cleanup_server
-                            // reads it — bug noise, not behavior.
+                            // #342 (r1 F1): the terminate arm sets the
+                            // i_errno GLOBAL (iperf_server_api.c:290) and
+                            // cleanup_server relays it at the loop's normal
+                            // exit (:1001, :466) — the relay does not key on
+                            // an error return. RECORDED DEVIATION
+                            // (value-level): GT's live value RACES 119 vs a
+                            // 206 clobber (~2/10 — post-teardown stream
+                            // reads overwrite the plain global); riperf3
+                            // pins the intended IECLIENTTERM(119).
+                            let _ = protocol::send_server_error(&mut ctx.ctrl, 119).await;
                             ctx.client_terminated = true;
                             break;
                         }
@@ -1571,7 +1575,14 @@ impl Server {
                         // #330: control EOF mid-test — GT's IECTRLCLOSE
                         // read-site surface, a CLEAN round (IPERF_DONE):
                         // bare sentence in the doc, no summary, exit 0.
+                        // #342 (r1 F2): the rval==0 arm sets IECTRLCLOSE
+                        // (iperf_server_api.c:251-254) and cleanup_server
+                        // relays it — observable by a half-closed peer whose
+                        // read half is still open (deterministic live:
+                        // fe 0000006d 00000000); best-effort no-op on a
+                        // full close.
                         Err(RiperfError::PeerDisconnected) => {
+                            let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
                             ctx.ctrl_closed = true;
                             ctx.bare_end = true;
                             break;
@@ -2023,9 +2034,13 @@ impl Server {
                     // full blocks). riperf3 prints one dump; -J is identical
                     // on both (single doc, error key).
                     Ok(TestState::ClientTerminate) => {
-                        // #342: no relay — the mid-test terminate arm's
-                        // recorded deviation (GT's fe 000000ce is i_errno
-                        // clobber noise).
+                        // #342 (r1 F1): IECLIENTTERM(119) relay like the
+                        // mid-test terminate arm. RECORDED DEVIATION
+                        // (value-level): GT's end-loop frame carries a
+                        // LEFTOVER errno word (fe 00000077 00000009 live —
+                        // EBADF from its own closed-socket reads); riperf3
+                        // pins errno 0, the #336 honest-errno-0 convention.
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 119).await;
                         ctx.client_terminated = true;
                         return Ok(());
                     }
@@ -2054,7 +2069,10 @@ impl Server {
                     // cell. GT prints its read-site sentence and the doc
                     // keeps the error key over the POPULATED end (the
                     // exchange completed; live-probed).
+                    // #342 (r1 F2): IECTRLCLOSE(109) relay like the
+                    // mid-test EOF arm — observable on a half-close only.
                     Err(RiperfError::PeerDisconnected) => {
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
                         ctx.ctrl_closed = true;
                         break;
                     }
