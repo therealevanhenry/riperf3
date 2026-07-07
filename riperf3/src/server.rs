@@ -394,6 +394,40 @@ fn demux_local_addr_for(
     ))
 }
 
+/// What the #338 setup-phase ctrl watch saw.
+enum CtrlActivity {
+    /// The peer closed the control connection (read-half EOF).
+    Eof,
+    /// A state byte is waiting; it stays OS-buffered for the mid-test loop.
+    Data,
+}
+
+/// #338: wait for control-socket activity without consuming it. This must
+/// NOT be `TcpStream::peek` — tokio's poll_peek path leaves winsock
+/// readiness corrupted so LATER reads on the same socket never wake (the
+/// mid-test loop missed TEST_END forever; deterministic on Windows even
+/// with the peek arm never resolving — reproduced natively on Windows 11,
+/// see PR #356).
+/// `ready()` performs no syscall on the socket, so in the common case
+/// (setup completes with no ctrl activity) the socket is untouched; the
+/// classifying peek goes straight to the OS via `SockRef`, with `try_io`
+/// keeping tokio's WouldBlock/clear-readiness discipline. Cancel-safe: the
+/// only await is `ready()`, which holds no I/O state.
+async fn ctrl_activity(ctrl: &tokio::net::TcpStream) -> std::io::Result<CtrlActivity> {
+    loop {
+        ctrl.ready(tokio::io::Interest::READABLE).await?;
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit()];
+        match ctrl.try_io(tokio::io::Interest::READABLE, || {
+            socket2::SockRef::from(ctrl).peek(&mut buf)
+        }) {
+            Ok(0) => return Ok(CtrlActivity::Eof),
+            Ok(_) => return Ok(CtrlActivity::Data),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Server {
     /// Chainable form of [`ServerBuilder::interrupt`] for an already-built
     /// server (#210).
@@ -1203,31 +1237,32 @@ impl Server {
                 // bounded at rcv_timeout (IENOMSG=144, :663-678; default =
                 // DEFAULT_NO_MSG_RCVD_TIMEOUT 120000 ms, iperf_api.h:70).
                 // The bare accept parked unbounded on both. The ctrl watch
-                // PEEKs — a state byte arriving mid-setup stays buffered for
-                // the mid-test loop's arms (pre-#338 semantics; GT would
-                // dispatch it here — recorded residual on the issue), and
-                // once one is seen the arm disarms so the select can't spin.
+                // is readiness-only (see ctrl_activity for why it must not
+                // be TcpStream::peek) — a state byte arriving mid-setup
+                // stays OS-buffered for the mid-test loop's arms (pre-#338
+                // semantics; GT would dispatch it here — recorded residual
+                // on the issue), and once one is seen the arm disarms so
+                // the select can't spin.
                 let rcv_timeout = std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(
                     120_000, // GT DEFAULT_NO_MSG_RCVD_TIMEOUT
                 ));
                 let mut watch_ctrl = true;
                 for i in 0..total {
-                    let mut peek_buf = [0u8; 1];
                     let (mut data_stream, _) = loop {
                         tokio::select! {
                             accepted = listener.accept() => break accepted?,
-                            peeked = ctx.ctrl.peek(&mut peek_buf), if watch_ctrl => match peeked {
+                            activity = ctrl_activity(&ctx.ctrl), if watch_ctrl => match activity {
                                 // EOF: the peer closed without connecting its
                                 // data streams — GT's read-site surface. The
                                 // -J doc emits here (the serve loop's arm
                                 // prints the text sentence).
-                                Ok(0) => {
+                                Ok(CtrlActivity::Eof) => {
                                     self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
                                     return Err(RiperfError::ControlSocketClosed);
                                 }
-                                // A state byte mid-setup: leave it buffered
-                                // (peek) and disarm the watch.
-                                Ok(_) => {
+                                // A state byte mid-setup: left buffered;
+                                // disarm the watch.
+                                Ok(CtrlActivity::Data) => {
                                     watch_ctrl = false;
                                 }
                                 Err(e) => return Err(e.into()),
