@@ -485,6 +485,17 @@ impl Client {
         // ---- Clean up ----
         ctx.done.store(true, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(100)).await;
+        // #354: abort before join, like the #352 server gate — GT's client
+        // cancels its stream threads before joining
+        // (iperf_client_api.c:817-841). A receiver parked in read() on a
+        // socket-holding server cannot see `done`, so a bare join is
+        // peer-bound. Counts are frozen: senders stopped at the data-phase
+        // end and the final report was captured at DisplayResults. UDP
+        // receivers are spawn_blocking (abort is a no-op there) and exit
+        // via `done` + their 500 ms read-timeout poll.
+        for s in &ctx.streams {
+            s.task.abort();
+        }
         for s in ctx.streams {
             let _ = s.task.await;
         }
