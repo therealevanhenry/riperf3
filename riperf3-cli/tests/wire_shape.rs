@@ -3214,3 +3214,62 @@ fn interrupt_lines_carry_the_timestamps_prefix_both_roles() {
     );
     let _ = riperf3_test_support::wait_bounded(&mut srv2.0, std::time::Duration::from_secs(8));
 }
+
+/// #348 (r1 F1): the stamp renders AT PRINT TIME, per line, like GT's
+/// strftime — a prefix captured before the run would stamp the interrupt
+/// line with the START time. The literal-format pins can't see this;
+/// `%s` (epoch seconds) can: the interrupt line's epoch must be later
+/// than the banner's (SIGINT lands ≥2 s in; slow runners only widen it).
+#[cfg(unix)]
+#[test]
+fn interrupt_stamp_renders_at_print_time_not_capture_time() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut srv = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let mut client = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-c", "127.0.0.1", "-p", &ps, "-t", "10", "--timestamps=%s "])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn client"),
+    );
+    let co = riperf3_test_support::drain_reader(client.0.stdout.take().unwrap());
+    let ce = riperf3_test_support::drain_reader(client.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    unsafe { libc::kill(client.0.id() as i32, libc::SIGINT) };
+    let status =
+        riperf3_test_support::wait_bounded(&mut client.0, std::time::Duration::from_secs(8))
+            .expect("client signal exit");
+    assert!(status.success());
+    let cout = co.join().expect("stdout");
+    let cerr = ce.join().expect("stderr");
+    let _ = riperf3_test_support::wait_bounded(&mut srv.0, std::time::Duration::from_secs(8));
+
+    let epoch_of = |line: &str| -> Option<u64> { line.split(' ').next()?.parse().ok() };
+    let banner_epoch = cout
+        .lines()
+        .find_map(epoch_of)
+        .expect("a %s-stamped stdout line exists");
+    let interrupt_line = cerr
+        .lines()
+        .find(|l| l.contains("interrupt - the client has terminated"))
+        .unwrap_or_else(|| panic!("the interrupt line is present: {cerr:?}"));
+    let interrupt_epoch = epoch_of(interrupt_line)
+        .unwrap_or_else(|| panic!("the interrupt line is %s-stamped: {interrupt_line:?}"));
+    assert!(
+        interrupt_epoch > banner_epoch,
+        "print-time rendering: interrupt epoch {interrupt_epoch} must postdate \
+         the banner's {banner_epoch} (a pre-run capture freezes them equal)"
+    );
+}
