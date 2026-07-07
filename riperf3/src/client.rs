@@ -916,7 +916,11 @@ impl Client {
             // stderr. Revisit with the sink plumbing.
             // #290: quiet runs surface the error via Err alone.
             if !crate::macros::output_quiet() {
-                eprintln!("riperf3: SERVER ERROR - {msg}");
+                // #348: GT stamps this line too (iperf_err route).
+                eprintln!(
+                    "{}riperf3: SERVER ERROR - {msg}",
+                    crate::macros::output_timestamp_prefix()
+                );
             }
         }
         RiperfError::ServerErrorRelayed(msg)
