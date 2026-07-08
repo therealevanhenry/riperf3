@@ -3068,6 +3068,11 @@ fn sigterm_on_wedged_precookie_client_emits_skeleton_in_json() {
         Some(SIGTERM_KEY),
         "the interrupt-class key: {doc}"
     );
+    assert_eq!(
+        doc["start"]["connected"].as_array().map(Vec::len),
+        Some(0),
+        "skeleton start even with the client attached, like GT (#385 r2 F2): {doc}"
+    );
     assert!(
         doc["end"].as_object().expect("end").is_empty(),
         "bare end: {doc}"
@@ -3095,6 +3100,12 @@ fn sigterm_on_wedged_precookie_client_stream_events() {
     assert_eq!(events[0]["event"].as_str(), Some("error"));
     assert_eq!(events[0]["data"].as_str(), Some(SIGTERM_KEY));
     assert_eq!(events[1]["event"].as_str(), Some("end"));
+    assert_eq!(
+        events[1]["data"],
+        serde_json::json!({}),
+        "bare end event data like GT (#385 r2 F1): {}",
+        events[1]
+    );
 }
 
 /// #361 text: GT's stderr line + exit 0, immediately.
