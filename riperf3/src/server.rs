@@ -3655,14 +3655,37 @@ impl Server {
         // #383 r1 F1a: the four TCP-flavored keys are absent for UDP —
         // see the SetupPhaseDoc doc for the GT gates.
         let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
+        // #357: with -w exchanged, GT re-listens with the window applied
+        // and reads the actuals off THAT socket (probed 131072/131072 for
+        // window 65536); riperf3 has no re-listen step (deliberate), so a
+        // scratch socket with the same window applied yields the identical
+        // kernel read-back. Without -w the un-windowed listener matches
+        // GT's re-listened defaults.
+        let (sndbuf_actual, rcvbuf_actual) = match (udp, ctx.cfg.window) {
+            (false, Some(w)) => {
+                let scratch =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok();
+                match scratch {
+                    Some(sc) => {
+                        net::apply_socket_window(&socket2::SockRef::from(&sc), Some(w));
+                        (
+                            sc.send_buffer_size().ok().map(|v| v as u64),
+                            sc.recv_buffer_size().ok().map(|v| v as u64),
+                        )
+                    }
+                    None => (None, None),
+                }
+            }
+            (false, None) => (
+                sock.send_buffer_size().ok().map(|v| v as u64),
+                sock.recv_buffer_size().ok().map(|v| v as u64),
+            ),
+            (true, _) => (None, None),
+        };
         crate::json_report::SetupPhaseDoc {
             sock_bufsize: (!udp).then(|| ctx.cfg.window.map(|w| w as u64).unwrap_or(0)),
-            sndbuf_actual: (!udp)
-                .then(|| sock.send_buffer_size().ok().map(|v| v as u64))
-                .flatten(),
-            rcvbuf_actual: (!udp)
-                .then(|| sock.recv_buffer_size().ok().map(|v| v as u64))
-                .flatten(),
+            sndbuf_actual,
+            rcvbuf_actual,
             // The server never reads the ctrl MSS — 0, the #50 convention.
             tcp_mss_default: (!udp).then_some(0),
             udp,
