@@ -409,6 +409,9 @@ fn main() -> std::process::ExitCode {
             } else {
                 // #348: GT's iperf_errexit stamps this line like iperf_err
                 // (iperf_error.c:100-127).
+                // iperf3's iperf_errexit shape ("iperf3: error - <text>",
+                // exit 1) instead of Rust's Debug rendering; the Display
+                // strings mirror iperf3's IE* wording (#151).
                 let line = format!(
                     "{}riperf3: error - {e}{perr_tail}",
                     ts_format
@@ -416,26 +419,30 @@ fn main() -> std::process::ExitCode {
                         .map(riperf3::render_timestamp_prefix)
                         .unwrap_or_default()
                 );
-                let logged = logfile.as_deref().and_then(|path| {
-                    use std::io::Write;
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .and_then(|mut f| writeln!(f, "{line}"))
-                        .ok()
-                });
-                if logged.is_none() {
-                    // iperf3's iperf_errexit shape ("iperf3: error - <text>",
-                    // exit 1) instead of Rust's Debug rendering; the Display
-                    // strings mirror iperf3's IE* wording (#151). Also the
-                    // fallback when the logfile cannot be opened.
-                    eprintln!("{line}");
-                }
+                err_line_to_logfile_or_stderr(logfile.as_deref(), &line);
             }
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// The text-mode error-line sink (#198/#364): append to the logfile when
+/// one is set — GT's iperf_err and iperf_exit both write to test->outfile
+/// when a logfile is open (iperf_error.c:67-79, :107-115) — else stderr,
+/// which is also the fallback when the file cannot be opened.
+fn err_line_to_logfile_or_stderr(logfile: Option<&str>, line: &str) {
+    if let Some(path) = logfile {
+        use std::io::Write;
+        let logged = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{line}"));
+        if logged.is_ok() {
+            return;
+        }
+    }
+    eprintln!("{line}");
 }
 
 /// #365: the --timestamps format straight off raw argv — for the clap-arm
@@ -610,6 +617,12 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // #364: the LIB's iperf_err-shaped lines (the SERVER-ERROR relay
+    // receipt) follow the same file — GT's iperf_err honors the logfile.
+    // Armed unconditionally like the errexit sink in main() (#198), which
+    // appends on every platform regardless of the unix-only stdout redirect.
+    let _err_sink_guard = cli.logfile.as_deref().map(riperf3::ErrorSinkGuard::set);
+
     // Set CPU affinity BEFORE building the tokio runtime so worker threads
     // inherit the affinity mask from the main thread.
     if let Some(ref spec) = cli.affinity {
@@ -652,8 +665,10 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let is_server = cli.server;
     let (json, json_stream) = (cli.json, cli.json_stream);
     // #348: the interrupt notice prints after the run — keep the CLI's
-    // format and render at print time (GT strftimes per line).
+    // format and render at print time (GT strftimes per line). #364: it
+    // also follows iperf_exit's logfile-or-stderr chooser.
     let ts_format = cli.timestamps.clone();
+    let logfile = cli.logfile.clone();
     // #210: the first signal no longer cancels the run outright — it fires
     // this watch with iperf3's formatted message, and the lib dumps the
     // accumulated stats + tells the peer (CLIENT_TERMINATE /
@@ -738,12 +753,16 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
             if !json && !json_stream {
                 let role = if is_server { "server" } else { "client" };
                 // #348: stamped on both roles (GT live), rendered now.
-                eprintln!(
-                    "{}riperf3: interrupt - the {role} has terminated by signal {sig}",
-                    ts_format
-                        .as_deref()
-                        .map(riperf3::render_timestamp_prefix)
-                        .unwrap_or_default()
+                // #364: to the logfile when set, like iperf_signormalexit.
+                err_line_to_logfile_or_stderr(
+                    logfile.as_deref(),
+                    &format!(
+                        "{}riperf3: interrupt - the {role} has terminated by signal {sig}",
+                        ts_format
+                            .as_deref()
+                            .map(riperf3::render_timestamp_prefix)
+                            .unwrap_or_default()
+                    ),
                 );
             }
             Ok(())

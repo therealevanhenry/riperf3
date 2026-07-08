@@ -199,8 +199,9 @@ fn logfile_receives_the_relay_line() {
     );
     let logged = std::fs::read_to_string(&log).expect("logfile written");
     assert!(
-        logged
-            .contains("riperf3: SERVER ERROR - total required bandwidth is larger than server limit"),
+        logged.contains(
+            "riperf3: SERVER ERROR - total required bandwidth is larger than server limit"
+        ),
         "the relay line lands in the logfile: {logged:?}"
     );
     assert!(

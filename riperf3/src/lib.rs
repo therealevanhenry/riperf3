@@ -56,6 +56,11 @@ pub use net::set_cpu_affinity;
 /// (GT's stamp is process-global; the lib's is run-scoped).
 pub use macros::render_timestamp as render_timestamp_prefix;
 
+/// `--logfile` routing for the lib's error lines (#364) — armed by the
+/// binary next to its stdout redirect, so the SERVER-ERROR relay receipt
+/// follows iperf_err's logfile-or-stderr chooser.
+pub use macros::ErrorSinkGuard;
+
 // --- Internal modules: implementation detail, NOT part of the public API. ---
 // Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
 // few genuinely-public types are re-exported at the crate root above (#67).
