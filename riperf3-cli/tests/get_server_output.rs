@@ -178,6 +178,13 @@ fn json_client_gets_server_output_json() {
         own_n > 0,
         "the -J server's own doc lost its intervals (double-build class): {server_own}"
     );
+    // #368 inverse guard: a NORMAL (non-self-terminated) server run keeps the
+    // POPULATED finalize end — the bare-end flag must not fire on the happy
+    // path (only the rate/duration/idle kill arms set it).
+    assert!(
+        sv["end"].as_object().is_some_and(|m| !m.is_empty()),
+        "a normal server run's end must stay populated: {server_own}"
+    );
     assert_eq!(
         Some(own_n),
         sj["intervals"].as_array().map(Vec::len),

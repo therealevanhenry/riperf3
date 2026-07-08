@@ -2075,6 +2075,14 @@ impl Server {
                                 // SERVER_TERMINATE (iperf 3.21 GT).
                                 protocol::send_server_error(&mut ctx.ctrl, 27).await?;
                                 ctx.server_error = Some(SELF_TERM_RATE_MSG);
+                                // #368: GT's rate-breach kill path
+                                // (cleanup_server + return -1,
+                                // iperf_server_api.c:624-646) never runs end
+                                // processing — the -J doc keeps the
+                                // accumulated intervals over a BARE end{}
+                                // (live-probed: GT end keys []). Same shape
+                                // as the idle-arm sibling below.
+                                ctx.bare_end = true;
                                 break;
                             }
                         }
@@ -2108,6 +2116,17 @@ impl Server {
                     // IESERVERTESTDURATIONEXPIRED(160) on the wire.
                     protocol::send_server_error(&mut ctx.ctrl, 160).await?;
                     ctx.server_error = Some(SELF_TERM_DURATION_MSG);
+                    // #368: the duration-watchdog kill path is the rate
+                    // breach's sibling — server_timer_proc frees the streams
+                    // and the run loop exits without end processing, so GT's
+                    // -J doc is BARE end{} here too. Probe-confirmed: a
+                    // wedged client past the (duration+omit+40 s) watchdog
+                    // yields GT end keys [] (the error key then clobbers to a
+                    // stale select-fail global — the recorded #349/#350
+                    // nondeterminism class — but the end SHAPE is bare). Not
+                    // CI-pinnable: the 40 s grace can't be shortened, same as
+                    // the #230 watchdog-timing behavior.
+                    ctx.bare_end = true;
                     break;
                 }
             }
