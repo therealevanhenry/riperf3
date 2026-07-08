@@ -3074,6 +3074,29 @@ fn sigterm_on_wedged_precookie_client_emits_skeleton_in_json() {
     );
 }
 
+/// #361 --json-stream (#385 r1 F3): GT's error + bare-end event pair,
+/// immediately — symmetric with the #346 idle-cell pin.
+#[cfg(unix)]
+#[test]
+fn sigterm_on_wedged_precookie_client_stream_events() {
+    let (sout, serr, status, elapsed) = drive_sigterm_wedged(&["--json-stream"]);
+    assert!(status.success());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "GT exits immediately: {elapsed:?}"
+    );
+    assert!(serr.trim().is_empty(), "silent stderr: {serr:?}");
+    let events: Vec<serde_json::Value> = sout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("event ({e}): {l}")))
+        .collect();
+    assert_eq!(events.len(), 2, "error + end pair: {sout:?}");
+    assert_eq!(events[0]["event"].as_str(), Some("error"));
+    assert_eq!(events[0]["data"].as_str(), Some(SIGTERM_KEY));
+    assert_eq!(events[1]["event"].as_str(), Some("end"));
+}
+
 /// #361 text: GT's stderr line + exit 0, immediately.
 #[cfg(unix)]
 #[test]

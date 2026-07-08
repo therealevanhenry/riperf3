@@ -983,15 +983,7 @@ fn server_sigterm_mid_test_emits_exactly_one_doc() {
 fn sigterm_during_params_read_emits_exactly_one_doc() {
     use std::io::{Read, Write};
     let ps = free_port();
-    let server = spawn(&[
-        "-s",
-        "-1",
-        "-p",
-        &ps.to_string(),
-        "-J",
-        "--server-max-duration",
-        "5",
-    ]);
+    let server = spawn(&["-s", "-1", "-p", &ps.to_string(), "-J"]);
     std::thread::sleep(Duration::from_millis(400));
 
     let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", ps)).expect("ctrl");

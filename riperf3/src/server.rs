@@ -1094,9 +1094,10 @@ impl Server {
     /// full 5 s dump window (the post-merge macOS CI red: systemd-style
     /// SIGTERM-while-listening took ~5 s). There is nothing to dump while
     /// idle; returning `None` lets the run loop's interrupt check exit the
-    /// serve loop. The post-accept phases (cookie/param reads) stay
-    /// interrupt-blind by design — the #158 second-signal wedge test depends
-    /// on that window.
+    /// serve loop. The cookie/param reads race the interrupt watch too
+    /// (#361 — GT's sigend exits immediately from any phase); the remaining
+    /// interrupt-blind window is the CREATE_STREAMS setup wait, where the
+    /// #158 second-signal wedge test now parks (recorded on #361).
     async fn accept_control(
         &self,
         listener: &tokio::net::TcpListener,
