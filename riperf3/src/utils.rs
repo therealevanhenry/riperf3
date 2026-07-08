@@ -573,6 +573,44 @@ mod error_tests {
             format!("{}", RiperfError::CookieMismatch),
             "cookie mismatch"
         );
+        // #362: the GT accept/configure classes — the strerror rides via
+        // io::Error's "(os error N)" form, the recorded #151 convention
+        // (GT's perr prints strerror alone; the suffix is the house
+        // deviation every raw-os class already carries). The strerror
+        // TEXT is platform-specific (the macOS CI red on the first pin
+        // form), so the pins hold the GT sentence + the suffix only.
+        for (rendered, sentence) in [
+            (
+                format!(
+                    "{}",
+                    RiperfError::AcceptFailed(std::io::Error::from_raw_os_error(24))
+                ),
+                "unable to accept connection from client: ",
+            ),
+            (
+                format!(
+                    "{}",
+                    RiperfError::StreamConnectFailed(std::io::Error::from_raw_os_error(24))
+                ),
+                "unable to connect stream: ",
+            ),
+            (
+                format!(
+                    "{}",
+                    RiperfError::SetNoDelayFailed(std::io::Error::from_raw_os_error(24))
+                ),
+                "unable to set TCP/SCTP NODELAY: ",
+            ),
+        ] {
+            assert!(
+                rendered.starts_with(sentence),
+                "GT sentence prefix: {rendered}"
+            );
+            assert!(
+                rendered.ends_with("(os error 24)"),
+                "the #151 os-error suffix: {rendered}"
+            );
+        }
         assert_eq!(
             format!("{}", RiperfError::AccessDenied),
             "access denied by server"

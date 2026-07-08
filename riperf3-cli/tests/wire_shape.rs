@@ -4751,6 +4751,145 @@ fn tcp_reverse_setup_hold_is_idle_exempt() {
     reverse_hold_case(r#"{"tcp":true,"reverse":true}"#, false);
 }
 
+// ---------------------------------------------------------------------------
+// #362 (#387 r1 F3): the accept-failure classes, E2E via prlimit-after-
+// startup — clamp RLIMIT_NOFILE to the process's first free slot, then
+// connect; the accept fails EMFILE deterministically. GT byte-parity is
+// NOT pinnable (GT's own class drifts 203→200 with one fd of budget and
+// its printed errno is post-cleanup clobbered — r1's probes); these pin
+// riperf3's OWN surfaces, whose shapes r1 verified against GT source.
+// Linux-only (prlimit + errno 24 = EMFILE).
+// ---------------------------------------------------------------------------
+
+/// The EMFILE cells serialize on this lock: two concurrent clamped
+/// servers on 2 pinned cores interfered (~50% ConnectionRefused on the
+/// second cell's data connect — the paired hot-spin starves the other
+/// server's accept path); each cell is deterministic alone.
+#[cfg(target_os = "linux")]
+static EMFILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clamp the target's RLIMIT_NOFILE to its current FIRST-FREE slot — a
+/// new fd always takes the lowest free index, so the limit must sit AT
+/// that hole, not at max+1 (the CI runner's spawned processes carry
+/// holes below max; the dense-table assumption let the accept dodge the
+/// clamp — the 28c1184 Linux CI red).
+#[cfg(target_os = "linux")]
+fn clamp_fd_table(pid: u32) {
+    let open: std::collections::BTreeSet<u32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read fd table")
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    assert!(!open.is_empty(), "nonempty fd table");
+    let mut first_free = 0u32;
+    while open.contains(&first_free) {
+        first_free += 1;
+    }
+    let limit = first_free.to_string();
+    let st = std::process::Command::new("prlimit")
+        .args([
+            &format!("--pid={pid}"),
+            &format!("--nofile={limit}:{limit}"),
+        ])
+        .status()
+        .expect("prlimit runs");
+    assert!(st.success(), "prlimit failed");
+}
+
+/// #362: the control accept() under EMFILE — GT's IEACCEPT class line
+/// (strerror'd, no dangling suffix) and keep-serving. The persistent
+/// server currently line-spins on the sticky error (the filed hot-spin
+/// issue records the GT listener-recycle delta) — the pin asserts the
+/// class, at least once, and the process staying alive.
+#[cfg(target_os = "linux")]
+#[test]
+fn accept_emfile_takes_gt_ieaccept_class() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    clamp_fd_table(server.0.id());
+    let _client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let alive = server.0.try_wait().expect("try_wait").is_none();
+    drop(server);
+    let serr = se.join().expect("stderr");
+    assert!(alive, "keep-serving like GT's rc -1 class");
+    assert!(
+        serr.contains("error - unable to accept connection from client: ")
+            && serr.contains("(os error 24)"),
+        "GT's IEACCEPT sentence with the live strerror, no dangling: {}",
+        &serr[..serr.len().min(400)]
+    );
+    assert!(
+        !serr.contains("client: Too many open files (os error 24): "),
+        "no dangling suffix after the strerror (r1 F1): {}",
+        &serr[..serr.len().min(400)]
+    );
+}
+
+/// #362: the setup data-accept under EMFILE — the fe+203+LIVE-errno
+/// wire-back (r1 F2/r2 F2: the wire word carries the strerror content of
+/// the GT client's SERVER ERROR line — live-proven interop on the
+/// PERSISTENT pairing; the one-off pairing's close-ordering divergence is
+/// the filed follow-up), the strerror'd line, exit 0.
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_data_accept_emfile_wires_iestreamconnect_with_live_errno() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = server.0.id();
+
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+    // The server is parked in the setup select — clamp NOW, then connect
+    // the data socket; its accept fails EMFILE.
+    clamp_fd_table(pid);
+    let _data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data connect");
+    let frame = read_wireback(&mut ctrl);
+    assert_eq!(
+        frame,
+        vec![0xfe, 0, 0, 0, 203, 0, 0, 0, 24],
+        "fe + htonl(IESTREAMCONNECT=203) + htonl(EMFILE=24), GT's live-errno wire"
+    );
+    drop(ctrl);
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
+            .expect("one-off exits");
+    let serr = se.join().expect("stderr");
+    assert!(status.success(), "exit 0 keep-serving class");
+    assert!(
+        serr.contains("error - unable to connect stream: ") && serr.contains("(os error 24)"),
+        "the strerror'd IESTREAMCONNECT line: {serr:?}"
+    );
+}
+
 /// #383 r2 F1: the demux design's idle exemption — the both-designs
 /// convention every other #358 cell follows.
 #[test]

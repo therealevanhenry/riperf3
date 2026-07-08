@@ -103,6 +103,34 @@ pub enum RiperfError {
     #[error("unable to send control message - port may not be available, the other side may have stopped running, etc.: {0}")]
     SendControlFailed(std::io::Error),
 
+    /// iperf3's IEACCEPT(104): the control accept() failed
+    /// (iperf_server_api.c:163; herr+perr). The site-captured errno rides
+    /// — and MATCHES GT's text surface in this pre-test cell (#387 r2 F1
+    /// live probes, all four sinks: GT prints the LIVE strerror here;
+    /// nothing gets closed before the print, so no clobber — the clobber
+    /// is real only in the mid-setup double-close cells, see
+    /// [`Self::StreamConnectFailed`]). BSD-class reachable (ECONNABORTED);
+    /// Linux EMFILE (#362 — previously the raw io line on the generic
+    /// arm).
+    #[error("unable to accept connection from client: {0}")]
+    AcceptFailed(std::io::Error),
+
+    /// iperf3's IESTREAMCONNECT(203): the SETUP data-stream accept()
+    /// failed (iperf_tcp.c:134-135) — GT's cleanup_server round-kill with
+    /// the fe+203+LIVE-errno wire-back and the populated setup doc (#362,
+    /// the PR #384 r2 F4 cell). The site-captured errno rides text and
+    /// wire (GT's TEXT surface prints the clobbered post-cleanup errno
+    /// but WIRES the live one — #387 r1 F2/F6).
+    #[error("unable to connect stream: {0}")]
+    StreamConnectFailed(std::io::Error),
+
+    /// iperf3's IESETNODELAY(122, iperf_api.h:471): TCP_NODELAY on the
+    /// just-accepted control socket failed (iperf_server_api.c:170-173;
+    /// perr) — the #362 macOS kind-only-InvalidInput cell's likeliest
+    /// site. The fe+122+errno relay is best-effort on the failing ctrl.
+    #[error("unable to set TCP/SCTP NODELAY: {0}")]
+    SetNoDelayFailed(std::io::Error),
+
     /// iperf3's IENOMSG(144): the server's no-progress watchdog fired — no
     /// messages/data received within `--rcv-timeout` (default 120000 ms, GT's
     /// DEFAULT_NO_MSG_RCVD_TIMEOUT, iperf_api.h:70). First wired at the

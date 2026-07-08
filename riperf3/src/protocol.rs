@@ -209,13 +209,30 @@ pub async fn send_state(stream: &mut TcpStream, state: TestState) -> Result<()> 
 /// Send SERVER_ERROR with iperf3's (i_errno, errno) u32-pair payload (#224):
 /// the state byte, then both words big-endian — iperf_server_api.c's Nwrite
 /// pair (the bitrate, duration-timer, and cleanup_server relay sites). The os
-/// errno word is always 0 from riperf3 — most relayed causes carry none, and
+/// errno word is 0 from this form — most relayed causes carry none, and
 /// where one exists (#345's send failure) the peer's RST makes the relay
 /// unobservable anyway; GT itself often leaks a stale word here (#336).
+/// A cause with a REAL live errno uses [`send_server_error_errno`].
 pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<()> {
+    send_server_error_errno(stream, i_errno, 0).await
+}
+
+/// [`send_server_error`] with a live os errno word (#387 r1 F2, wording
+/// corrected r2 F2): GT's cleanup_server wires htonl(errno) captured
+/// live (iperf_server_api.c:470-471). A GT client prints its immediate
+/// `SERVER ERROR - …` line in BOTH branches — the wire word gates only
+/// the `, errno: <strerror>` suffix and the strerror content
+/// (iperf_client_api.c:403-407; live: fe+203+0 still prints the dangling
+/// line) — so the accept-failure relays carry the real errno for the
+/// CONTENT parity, not the line's existence.
+pub async fn send_server_error_errno(
+    stream: &mut TcpStream,
+    i_errno: u32,
+    os_errno: u32,
+) -> Result<()> {
     send_state(stream, TestState::ServerError).await?;
     stream.write_all(&i_errno.to_be_bytes()).await?;
-    stream.write_all(&0u32.to_be_bytes()).await?;
+    stream.write_all(&os_errno.to_be_bytes()).await?;
     Ok(())
 }
 
