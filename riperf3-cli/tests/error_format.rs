@@ -1223,3 +1223,58 @@ fn udp_file_transfer_rejects_before_blocksize() {
         );
     }
 }
+
+/// #365: POST-LOOP parameter errors are stamped unconditionally in GT
+/// (the --timestamps format is always parsed by the post-loop checks,
+/// iperf_api.c ~:1825+; live: stamped with --timestamps LAST). The stamp
+/// rides the error line only — the usage trailer stays bare (GT probed
+/// with cat -A). Mid-loop-equivalent errors (the range checks) keep the
+/// #301-F4 recorded ordering deviation and stay bare.
+#[test]
+fn post_loop_parameter_errors_are_stamped() {
+    // The parse-class rejection (client-only flag on a server) — stamped.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-s", "--bidir", "--timestamps=XTSX "])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("XTSX riperf3: parameter error - "),
+        "the post-loop class is stamped with --timestamps LAST: {stderr}"
+    );
+    assert!(
+        stderr.contains("\nUsage:"),
+        "the trailer stays bare (its line has no stamp): {stderr}"
+    );
+    assert!(
+        !stderr.contains("XTSX Usage:"),
+        "GT stamps the error line only: {stderr}"
+    );
+
+    // IENOROLE (no -s/-c at all) — post-loop in GT, stamped; clap dies
+    // pre-parse here so the format rides raw argv.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["--timestamps=XTSX "])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("XTSX riperf3: parameter error - must either be a client"),
+        "IENOROLE is stamped off raw argv: {stderr}"
+    );
+
+    // The boundary guard: a range check (GT mid-loop) stays BARE — the
+    // #301-F4 ordering class is a recorded deviation, not stamped.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["-c", "127.0.0.1", "-t", "90000", "--timestamps=XTSX "])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("riperf3: parameter error - ") && !stderr.starts_with("XTSX"),
+        "mid-loop-equivalent range errors stay bare: {stderr}"
+    );
+}
