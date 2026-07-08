@@ -623,6 +623,21 @@ impl Server {
                         );
                     }
                 }
+                Err(RiperfError::RecvDataCookieFailed) => {
+                    // #359 r1 F2: GT's hard-read-error kill at the DATA
+                    // cookie gate (IERECVCOOKIE via cleanup_server). The
+                    // populated setup doc emitted at the site; text prints
+                    // the prefixed dangling perr line (#248 errno-0 form —
+                    // GT appends the live/stale strerror, live "Bad file
+                    // descriptor"). Keep-serving, exit 0.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {}: ",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::RecvDataCookieFailed
+                        );
+                    }
+                }
                 // #330: the pre-test control failures. Unlike the classes
                 // above — which build a partial report inside handle_one_test
                 // and carried the error in it — these error BEFORE any report
@@ -1365,9 +1380,111 @@ impl Server {
                 // patiently (GT live: >9 s at --rcv-timeout 3000).
                 let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
                 for i in 0..total {
-                    let (mut data_stream, _) = loop {
+                    let data_stream = loop {
                         tokio::select! {
-                            accepted = listener.accept() => break accepted?,
+                            accepted = listener.accept() => {
+                                let (mut candidate, _) = accepted?;
+                                // #359: GT's deny-and-continue cookie gate —
+                                // a wrong-cookie or silent/FIN'd connect
+                                // gets ACCESS_DENIED on ITS socket
+                                // (iperf_tcp.c:161-166; the closed-socket
+                                // guard iperf_server_api.c:786) and the wait
+                                // continues; only the no-progress clock ends
+                                // a round with no real streams. The old gate
+                                // killed the round (CookieMismatch /
+                                // unexpected-EOF).
+                                // PARITY NOTE (#384 r1 F1): this inline
+                                // cookie read blinding the ctrl/timeout arms
+                                // is GT-FAITHFUL — GT's data-cookie read is
+                                // an inline blocking Nread inside
+                                // iperf_tcp_accept (iperf_tcp.c:155-160),
+                                // probed identical (silent conn + ctrl-EOF
+                                // at t=2 → both tools notice at ~10 s); the
+                                // bounds are Nread's (10 s idle / 30 s
+                                // overall on a dripper), same as GT's
+                                // net.c:75-76 modulo the recorded nread_step
+                                // per-step-idle nuance.
+                                match protocol::recv_cookie(&mut candidate).await {
+                                    Ok(c) if c == ctx.cookie => break candidate,
+                                    // Wrong cookie, the silent Nread bound,
+                                    // or a clean FIN (nread collapses both
+                                    // to UnexpectedEof): best-effort deny
+                                    // like GT's Nwrite-then-close (the peer
+                                    // may already be gone; GT prints a
+                                    // "failed to send access denied" line
+                                    // when ITS deny write fails — riperf3
+                                    // stays silent, recorded, racy cell).
+                                    // RECORDED DEVIATION (#384 r2 F1, GT
+                                    // bug not mirrored): a FIN/hold at
+                                    // EXACTLY 36 cookie bytes is ACCEPTED
+                                    // by GT as the real stream — its Nread
+                                    // returns the partial 36 and
+                                    // strncmp(cookie, buf, 37) passes via
+                                    // the zero-filled buffer byte matching
+                                    // the trailing NUL (iperf_util.c:
+                                    // 121-124); it then runs a zero-byte
+                                    // test on the dead socket. riperf3's
+                                    // exact-37 read denies the truncated
+                                    // cookie instead. Cookie-knowledge-
+                                    // gated cell (only the real client or
+                                    // an on-path observer holds the
+                                    // prefix); the #271 do-not-mirror
+                                    // ethos.
+                                    // RECORDED DEVIATION (#384 r1 F3, GT
+                                    // bug not mirrored): with negotiated
+                                    // TOS != 0, GT runs sockopts on the
+                                    // just-denied CLOSED fd before its
+                                    // is_closed guard
+                                    // (iperf_server_api.c:780 vs :786) and
+                                    // IESETTOS-kills the round; riperf3
+                                    // continues (the #271 ethos).
+                                    Ok(_) => {
+                                        let _ = protocol::send_state(
+                                            &mut candidate,
+                                            TestState::AccessDenied,
+                                        )
+                                        .await;
+                                        // Dropped here; the slot stays
+                                        // unclaimed and the select re-arms.
+                                    }
+                                    Err(RiperfError::Io(ref io))
+                                        if io.kind()
+                                            == std::io::ErrorKind::UnexpectedEof =>
+                                    {
+                                        let _ = protocol::send_state(
+                                            &mut candidate,
+                                            TestState::AccessDenied,
+                                        )
+                                        .await;
+                                    }
+                                    // #384 r1 F2: a HARD read error (e.g.
+                                    // ECONNRESET) is NOT a deny — GT's
+                                    // Nread < 0 arm takes IERECVCOOKIE
+                                    // through cleanup_server
+                                    // (iperf_tcp.c:155-159): the fe+106
+                                    // wire-back, the populated setup doc,
+                                    // round dead, keep-serving.
+                                    Err(_) => {
+                                        abort_setup_streams(ctx).await;
+                                        let _ = protocol::send_server_error(
+                                            &mut ctx.ctrl,
+                                            106,
+                                        )
+                                        .await;
+                                        self.emit_setup_phase_error(
+                                            ctx,
+                                            listener,
+                                            &format!(
+                                                "error - {}: ",
+                                                RiperfError::RecvDataCookieFailed
+                                            ),
+                                        );
+                                        return Err(
+                                            RiperfError::RecvDataCookieFailed,
+                                        );
+                                    }
+                                }
+                            }
                             activity = ctrl_activity(&ctx.ctrl) => match activity {
                                 // EOF: the peer closed without connecting its
                                 // data streams — GT's read-site surface. The
@@ -1407,11 +1524,6 @@ impl Server {
                             }
                         }
                     };
-                    let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
-                    if stream_cookie != ctx.cookie {
-                        abort_setup_streams(ctx).await;
-                        return Err(RiperfError::CookieMismatch);
-                    }
                     // Apply socket options (nodelay, MSS, window, congestion) to each stream
                     net::configure_tcp_stream_full(
                         &data_stream,

@@ -72,6 +72,15 @@ pub enum RiperfError {
     #[error("unable to receive cookie at server")]
     RecvCookieFailed,
 
+    /// iperf3's IERECVCOOKIE(106) from the SETUP phase's data-stream cookie
+    /// gate (#359): a HARD read error mid-cookie (e.g. ECONNRESET) takes
+    /// GT's cleanup_server round-kill (iperf_tcp.c:155-159) — unlike the
+    /// pre-test ctrl-cookie class above (skeleton doc), this one carries
+    /// the POPULATED setup doc, so the serve loop must tell them apart.
+    /// Same wire sentence and perr dangling as [`Self::RecvCookieFailed`].
+    #[error("unable to receive cookie at server")]
+    RecvDataCookieFailed,
+
     /// iperf3's IERECVPARAMS(114): the server could not read or parse the
     /// client's ParamExchange blob — malformed JSON, a short/absent
     /// length-prefixed body, or a timed-out read (bounded like every GT

@@ -4640,6 +4640,221 @@ fn udp_reverse_setup_hold_is_idle_exempt_demux() {
     reverse_hold_case(r#"{"udp":true,"reverse":true}"#, true);
 }
 
+// ---------------------------------------------------------------------------
+// #359: GT's deny-and-continue at the TCP setup cookie gate — a
+// wrong-cookie, silent, or died data connect gets ACCESS_DENIED (0xff) on
+// ITS socket (iperf_tcp.c:161-166; the closed-socket guard
+// iperf_server_api.c:786) and the CREATE_STREAMS wait continues; only the
+// #356 no-progress clock ends a round with no real streams (IENOMSG,
+// GT-probed at ~13 s = the 10 s cookie-read bound + rcv-timeout 3 s).
+// riperf3 killed the round in both cells (`error - cookie mismatch` /
+// `error - unexpected end of file`).
+// ---------------------------------------------------------------------------
+
+/// #359 cell 1: a wrong-cookie connect is denied on its own socket and
+/// the round then serves the REAL stream (TestStart/TestRunning arrive).
+#[test]
+fn setup_wrong_cookie_conn_is_denied_and_the_round_continues() {
+    let (_sout, serr, status) = drive_server_scenario(false, |port| {
+        use std::io::Read;
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // The imposter: right port, wrong cookie.
+        let mut imposter = std::net::TcpStream::connect(("127.0.0.1", port)).expect("imposter");
+        imposter.write_all(&[b'z'; 37]).unwrap();
+        imposter
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .expect("set_read_timeout");
+        let mut b = [0u8; 4];
+        let n = imposter.read(&mut b).expect("the deny byte");
+        assert_eq!(&b[..n], &[0xff], "ACCESS_DENIED on the offending socket");
+        assert_eq!(
+            imposter.read(&mut b).expect("the deny close"),
+            0,
+            "GT closes the denied socket"
+        );
+        // The REAL stream: the round must still be alive to accept it.
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(
+            read_exact(&mut ctrl, 1)[0],
+            1,
+            "TestStart after the deny — the round continued"
+        );
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2, "TestRunning");
+        drop((ctrl, data));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    assert!(status.success(), "one-off exits 0: {serr}");
+}
+
+/// #359 (#384 r1 F2): a HARD read error mid-cookie (RST) is NOT a deny —
+/// GT kills the round via IERECVCOOKIE (iperf_tcp.c:155-159 ->
+/// cleanup_server): the fe+106 wire-back on ctrl, the prefixed dangling
+/// doc/text key (GT live appends the stale strerror "Bad file
+/// descriptor" — the #336-class recorded deviation, errno-0 form here),
+/// exit 0, NO deny byte on the imposter.
+#[cfg(unix)]
+#[test]
+fn setup_rst_mid_cookie_kills_the_round_ierecvcookie() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (_sout, serr, status) = drive_server_scenario(false, move |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // The imposter RSTs mid-cookie (SO_LINGER 0, nothing written).
+        let imposter = std::net::TcpStream::connect(("127.0.0.1", port)).expect("imposter");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                imposter.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(imposter);
+        // GT's kill: the SERVER_ERROR relay lands on ctrl.
+        *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+        drop(ctrl);
+    });
+    assert_eq!(
+        *frame.lock().unwrap(),
+        wireback_frame(106),
+        "fe + htonl(IERECVCOOKIE=106), GT's cleanup_server wire-back"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    // No whole-string trim: the dangling `: ` IS the pin (#248 form).
+    let lines: Vec<&str> = serr.lines().collect();
+    assert_eq!(
+        lines,
+        vec![&format!("riperf3: error - {RECV_COOKIE_MSG}: ") as &str],
+        "the prefixed dangling IERECVCOOKIE line, once: {serr:?}"
+    );
+}
+
+/// #384 r2 F2: the RST-kill's -J twin — the POPULATED setup doc (the
+/// RecvDataCookieFailed-vs-pretest-skeleton distinction is exactly this
+/// property), the prefixed dangling error key, bare end, silent stderr
+/// (GT live byte-parallel modulo the recorded strerror suffix).
+#[cfg(unix)]
+#[test]
+fn setup_rst_mid_cookie_takes_gt_doc_shape_in_json() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (sout, serr, status) = drive_server_scenario(true, move |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        let imposter = std::net::TcpStream::connect(("127.0.0.1", port)).expect("imposter");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                imposter.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(imposter);
+        *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+        drop(ctrl);
+    });
+    assert_eq!(*frame.lock().unwrap(), wireback_frame(106));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {RECV_COOKIE_MSG}: ").as_str()),
+        "the prefixed dangling IERECVCOOKIE key: {doc}"
+    );
+    assert_eq!(
+        doc["start"]["accepted_connection"]["host"].as_str(),
+        Some("127.0.0.1"),
+        "the POPULATED setup doc, not the pretest skeleton: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}: {doc}"
+    );
+}
+
+/// #359 cell 2: a silent connect is denied at the 10 s cookie-read bound
+/// and the round then IENOMSGs at the re-armed rcv-timeout (~13 s), GT's
+/// exact cadence (probed). The pre-fix path killed the round at 10 s with
+/// `error - unexpected end of file` and no deny byte.
+#[test]
+fn setup_silent_conn_is_denied_then_the_round_ienomsgs() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (_sout, serr, status) =
+        drive_server_scenario_with(&["--rcv-timeout", "3000"], false, move |port| {
+            use std::io::Read;
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+            // The silent connect: no cookie, ever.
+            let mut silent = std::net::TcpStream::connect(("127.0.0.1", port)).expect("silent");
+            silent
+                .set_read_timeout(Some(Duration::from_secs(14)))
+                .expect("set_read_timeout");
+            let t0 = std::time::Instant::now();
+            let mut b = [0u8; 4];
+            let n = silent
+                .read(&mut b)
+                .expect("the deny byte at the read bound");
+            let dt = t0.elapsed();
+            assert_eq!(&b[..n], &[0xff], "ACCESS_DENIED at the cookie-read bound");
+            assert!(
+                dt >= Duration::from_secs(8) && dt <= Duration::from_secs(13),
+                "the deny lands at GT's ~10 s cookie-read bound: {dt:?}"
+            );
+            assert_eq!(silent.read(&mut b).expect("deny close"), 0);
+            // The round then IENOMSGs at the re-armed rcv-timeout.
+            *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+            drop(ctrl);
+        });
+    // Errno word 0: the recorded #336-class deviation — GT live leaks a
+    // stale EBADF (9) in this exact cell (#384 r1 F5).
+    assert_eq!(
+        *frame.lock().unwrap(),
+        wireback_frame(144),
+        "the round IENOMSGs after the deny, GT's ~13 s cadence"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IDLE_TIMEOUT_MSG}"),
+        "GT's IENOMSG line, not the old kill surface: {serr:?}"
+    );
+}
+
 /// #383 r2 F3: reverse+bidir stays ARMED — GT's iperf_set_test_bidirectional
 /// forces mode BIDIRECTIONAL (iperf_api.c:827-834), which is != SENDER, so
 /// the bound fires (GT live: 3.01 s). A conforming client cannot send the
