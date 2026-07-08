@@ -3668,10 +3668,12 @@ impl Server {
         // sockets, which never arrive in wedge cells — the doc carries the
         // clamped actuals instead (probed w=16M: GT errors, riperf3 emits
         // 8388608/8388608).
-        // #391 r1 F1: GT's re-listen guard is C truthiness (iperf_tcp.c:
-        // 257) — an exchanged window:0 is NOT applied; it reads the
+        // #391 r1 F1: GT's buffer-APPLY guard is C truthiness (the
+        // re-listen decision is iperf_tcp.c:195, the apply gate :257 — r2
+        // F2 cite) — an exchanged window:0 is NOT applied; it reads the
         // listener like the no-window state (probed: GT 16384/131072 for
-        // window:0). Negative windows ARE applied (truthiness; both tools
+        // window:0, and the nodelay-forced re-listen without buffer-apply
+        // reads the same defaults). Negative windows ARE applied (truthiness; both tools
         // clamp identically — probed w=-1).
         let (sndbuf_actual, rcvbuf_actual) = match (udp, ctx.cfg.window) {
             (false, Some(w)) if w != 0 => {
