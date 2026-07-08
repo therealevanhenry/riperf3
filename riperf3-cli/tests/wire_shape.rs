@@ -3915,3 +3915,154 @@ fn forward_client_exits_bounded_while_server_stops_reading() {
         client.stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// #372: a start_test / await_test_end Err must not skip the end-of-round
+// abort/join gate — the RUNNING-phase siblings of #353 (the same
+// detached-parked-task fd leak, one and two phases earlier). PERSISTENT
+// server on purpose: one-off process exit closes the sockets either way
+// (the #356 F7 vacuous-pin lesson).
+// ---------------------------------------------------------------------------
+
+/// Params for the #372 drives: parallel 2, so a PARTIAL teardown (abort
+/// stream 0 only) still reds (the #354 r2 F1 lesson).
+#[cfg(unix)]
+const MOCK_PARAMS_P2: &str = r#"{"tcp":true,"omit":0,"time":1,"num":0,"blockcount":0,"parallel":2,"len":131072,"pacing_timer":1000,"client_version":"riperf3 0.0.0"}"#;
+
+/// One #372 attempt. The mock completes setup — proven complete by
+/// TestStart(1) arriving on ctrl, so the RST below cannot land in a
+/// setup-phase arm (those run their own teardown and would false-green) —
+/// optionally rides TEST_RUNNING for ~0.3 s of traffic, then
+/// SO_LINGER(0)-RSTs the ctrl while HOLDING both data sockets. The RST
+/// surfaces as a send-Err inside start_test or a non-EOF recv Err inside
+/// await_test_end; both `?` past the gate on an unguarded build.
+/// Classification (the #370 r2 positive-classification lesson): a valid
+/// round printed an `error - ` line — the clean-EOF class (which runs the
+/// whole normal flow, gate included) prints its line WITHOUT the prefix,
+/// and a line-less round (the kill racing stderr) just retries. The
+/// exchange class ("unable to receive results") also runs the gate (#353)
+/// and is excluded. Returns (valid_class, data_reads, server_alive).
+#[cfg(unix)]
+fn drive_running_err_hold(
+    mid_running: bool,
+) -> (bool, Vec<Result<usize, std::io::ErrorKind>>, bool) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-p", &ps])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let _so = riperf3_test_support::drain_reader(server.0.stdout.take().unwrap());
+    let se = riperf3_test_support::drain_reader(server.0.stderr.take().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || {
+        use std::io::Read;
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9);
+        write_json_blob(&mut ctrl, MOCK_PARAMS_P2);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10);
+        let mut datas = Vec::new();
+        for _ in 0..2 {
+            let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+            data.write_all(&cookie).unwrap();
+            datas.push(data);
+        }
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1, "TestStart");
+        if mid_running {
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 2, "TestRunning");
+            for data in &mut datas {
+                data.write_all(&[0u8; 65536]).unwrap();
+            }
+            // Let the receivers drain the burst and PARK in read().await —
+            // the hold below must hold parked tasks, not live ones.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                ctrl.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(ctrl);
+        let mut reads = Vec::new();
+        for data in &mut datas {
+            data.set_read_timeout(Some(std::time::Duration::from_secs(4)))
+                .expect("set_read_timeout");
+            let mut buf = [0u8; 16];
+            reads.push(data.read(&mut buf).map_err(|e| e.kind()));
+        }
+        drop(datas);
+        reads
+    });
+
+    let reads = mock.join().expect("mock");
+    let alive = server.0.try_wait().expect("try_wait").is_none();
+    drop(server); // ChildGuard kills; the drained stderr classifies the round
+    let serr = se.join().expect("stderr");
+    let valid = serr.contains("error - ") && !serr.contains("unable to receive results");
+    (valid, reads, alive)
+}
+
+/// The shared #372 assert: on a valid ECONNRESET-class round, both held
+/// data sockets see a bounded close (EOF, or RST when the abort drops a
+/// receiver with bytes unread — the #370 r2 record) while the persistent
+/// server keeps serving. An unguarded build leaks the parked receivers,
+/// so the reads time out instead.
+#[cfg(unix)]
+fn running_phase_err_case(mid_running: bool) {
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let (valid, reads, alive) = drive_running_err_hold(mid_running);
+        if valid {
+            for (i, r) in reads.iter().enumerate() {
+                assert!(
+                    matches!(r, Ok(0) | Err(std::io::ErrorKind::ConnectionReset)),
+                    "held data socket {i} sees a bounded close (the \
+                     running-phase Err ran the gate): {r:?}"
+                );
+            }
+            assert!(
+                alive,
+                "the persistent server kept serving after the failed round"
+            );
+            return;
+        }
+        seen.push(format!("off-class round: {reads:?}"));
+    }
+    panic!("no error-line round in 10 RST attempts; saw: {seen:#?}");
+}
+
+/// #372, window 1: the RST lands right after TestStart — the TestRunning
+/// send (start_test) or the first end-loop recv (await_test_end) errors.
+#[cfg(unix)]
+#[test]
+fn running_phase_err_at_test_start_still_tears_down_streams() {
+    running_phase_err_case(false);
+}
+
+/// #372, window 2: ~0.3 s of live TEST_RUNNING traffic first — the RST
+/// lands in await_test_end's non-EOF recv arm (ECONNRESET, not the mapped
+/// PeerDisconnected EOF class).
+#[cfg(unix)]
+#[test]
+fn running_phase_err_mid_running_still_tears_down_streams() {
+    running_phase_err_case(true);
+}

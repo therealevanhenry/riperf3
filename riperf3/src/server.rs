@@ -864,108 +864,110 @@ impl Server {
             return Ok(None);
         }
 
-        // ---- TestStart / TestRunning ----
-        self.start_test(&mut ctx).await?;
+        // #372: every phase from TestStart to the final output runs inside
+        // this block, so every `?` — start_test's sends, await_test_end's
+        // non-EOF recv errors, the exchange phase (#353) — falls through to
+        // the ONE unconditional abort/join gate below instead of skipping
+        // it. Per-arm teardown wrappers were whack-a-mole: this is the 4th
+        // site in the family (#331 gate, #353 exchange, #372 running
+        // phase). A `return` inside the block exits the BLOCK, not
+        // handle_one_test.
+        let outcome: Result<crate::json_report::Report> = async {
+            // ---- TestStart / TestRunning ----
+            self.start_test(&mut ctx).await?;
 
-        // ---- Wait for TEST_END (watchdog + bitrate limit + interrupt) ----
-        self.await_test_end(&mut ctx).await?;
+            // ---- Wait for TEST_END (watchdog + bitrate limit + interrupt) ----
+            self.await_test_end(&mut ctx).await?;
 
-        // ---- Shut down streams + flush the reporter ----
-        let mut end = self.shutdown_and_flush(&mut ctx).await;
+            // ---- Shut down streams + flush the reporter ----
+            let mut end = self.shutdown_and_flush(&mut ctx).await;
 
-        // ORDER CONSTRAINT (#296): built BEFORE the --get-server-output
-        // finish. Both read live stream counters; the exchange figures must
-        // be captured before the capture-finish renders text summaries, or
-        // a still-draining receiver could send the peer fresher numbers
-        // than its own rendered rows. Post-flush the counters are usually
-        // settled, so no deterministic pin can catch an inversion — this
-        // comment (and TestRunCtx's docs) are the guard.
-        let result_streams = self.build_result_streams(&ctx, &end);
+            // ORDER CONSTRAINT (#296): built BEFORE the --get-server-output
+            // finish. Both read live stream counters; the exchange figures must
+            // be captured before the capture-finish renders text summaries, or
+            // a still-draining receiver could send the peer fresher numbers
+            // than its own rendered rows. Post-flush the counters are usually
+            // settled, so no deterministic pin can catch an inversion — this
+            // comment (and TestRunCtx's docs) are the guard.
+            let result_streams = self.build_result_streams(&ctx, &end);
 
-        // The ONE drain of the reporter's collections (#287): the reporter was
-        // joined in shutdown_and_flush, so the take is final. From here the
-        // collections move by value — into the pre-exchange build (JSON-mode
-        // --get-server-output) or through `ReportSource::Pending` to the
-        // single post-exchange build below.
-        let collected = crate::reporter::CollectedIntervals::drain(&ctx.interval_data);
+            // The ONE drain of the reporter's collections (#287): the reporter was
+            // joined in shutdown_and_flush, so the take is final. From here the
+            // collections move by value — into the pre-exchange build (JSON-mode
+            // --get-server-output) or through `ReportSource::Pending` to the
+            // single post-exchange build below.
+            let collected = crate::reporter::CollectedIntervals::drain(&ctx.interval_data);
 
-        // ---- --get-server-output finish + ExchangeResults / IperfDone ----
-        let (server_output_text, server_output_json, report_source) =
-            self.finish_server_output(&mut ctx, &end, collected);
-        let was_captured = server_output_text.is_some();
-        // #353: the exchange's own Err (e.g. the ExchangeResults state
-        // write failing against an RST'd ctrl) must not skip the
-        // unconditional end-of-round abort/join below — a hostile peer
-        // provoking it while HOLDING its data sockets would leak detached
-        // parked receiver tasks + fds in a persistent server (the
-        // #331/#352/#356-F7 family, one phase later). Counts are frozen at
-        // build_result_streams, so the teardown is safe here.
-        if let Err(e) = self
-            .exchange_results_phase(
+            // ---- --get-server-output finish + ExchangeResults / IperfDone ----
+            let (server_output_text, server_output_json, report_source) =
+                self.finish_server_output(&mut ctx, &end, collected);
+            let was_captured = server_output_text.is_some();
+            // #353: the exchange's own Err (e.g. the ExchangeResults state
+            // write failing against an RST'd ctrl) reaches the gate through
+            // this `?` — counts are frozen at build_result_streams, so the
+            // teardown is safe on this path.
+            self.exchange_results_phase(
                 &mut ctx,
                 &end,
                 result_streams,
                 server_output_text,
                 server_output_json,
             )
-            .await
-        {
-            abort_setup_streams(&mut ctx).await;
-            if let Some(h) = ctx.udp_demux_handle.take() {
-                h.abort();
-                let _ = h.await;
-            }
-            return Err(e);
-        }
+            .await?;
 
-        // #319: an interrupt landing INSIDE the exchange phase fires after
-        // EndState froze report_error — re-resolve so the sigend dump
-        // carries the interrupt key like the mid-test arms. (A pre-exchange
-        // --get-server-output capture keeps its frozen shape: it was built
-        // before the signal by definition.)
-        if end.report_error.is_none() {
-            if let Some(msg) = &ctx.interrupted {
-                end.report_error = Some(msg.clone());
-            } else if ctx.client_terminated {
-                // #325: an end-loop CLIENT_TERMINATE postdates EndState's
-                // resolution exactly like the #322 mid-exchange interrupt.
-                end.report_error = Some("the client has terminated".to_string());
-            } else if ctx.unknown_message {
-                // #325: GT's IEMESSAGE reaches the doc through main.c:174's
-                // `iperf_err(test, "error - %s", ...)` json sink — the
-                // in-doc value carries the prefix (live-captured), unlike
-                // IECLIENTTERM's bare sentence above.
-                end.report_error = Some(format!("error - {}", RiperfError::UnknownControlMessage));
-            } else if ctx.ctrl_closed {
-                // #330: IECTRLCLOSE's read-site line is a DIRECT iperf_err
-                // — bare, no prefix (live-probed both windows).
-                end.report_error = Some(CTRL_CLOSED_MSG.to_string());
-            } else if ctx.exchange_recv_failed {
-                // #330: the perr dangling `: ` at errno 0 (#248 form; see
-                // the field's deviation record).
-                end.report_error = Some(format!("error - {}: ", RiperfError::RecvResultsFailed));
-            }
-        }
-
-        // #137/#287: the report is built exactly ONCE per test, by
-        // construction — the collections moved either into the pre-exchange
-        // --get-server-output build (#33) or arrive here for the single
-        // post-exchange build. handle_one_test returns it (run discards it;
-        // run_once hands it back to the library caller).
-        let report = match report_source {
-            ReportSource::Built(mut report) => {
-                // #322 r1 F4: a mid-exchange interrupt postdates the
-                // pre-exchange --get-server-output build — carry the key
-                // like GT's exit-time json_finish.
-                if report.error.is_none() {
-                    report.error = end.report_error.clone();
+            // #319: an interrupt landing INSIDE the exchange phase fires after
+            // EndState froze report_error — re-resolve so the sigend dump
+            // carries the interrupt key like the mid-test arms. (A pre-exchange
+            // --get-server-output capture keeps its frozen shape: it was built
+            // before the signal by definition.)
+            if end.report_error.is_none() {
+                if let Some(msg) = &ctx.interrupted {
+                    end.report_error = Some(msg.clone());
+                } else if ctx.client_terminated {
+                    // #325: an end-loop CLIENT_TERMINATE postdates EndState's
+                    // resolution exactly like the #322 mid-exchange interrupt.
+                    end.report_error = Some("the client has terminated".to_string());
+                } else if ctx.unknown_message {
+                    // #325: GT's IEMESSAGE reaches the doc through main.c:174's
+                    // `iperf_err(test, "error - %s", ...)` json sink — the
+                    // in-doc value carries the prefix (live-captured), unlike
+                    // IECLIENTTERM's bare sentence above.
+                    end.report_error =
+                        Some(format!("error - {}", RiperfError::UnknownControlMessage));
+                } else if ctx.ctrl_closed {
+                    // #330: IECTRLCLOSE's read-site line is a DIRECT iperf_err
+                    // — bare, no prefix (live-probed both windows).
+                    end.report_error = Some(CTRL_CLOSED_MSG.to_string());
+                } else if ctx.exchange_recv_failed {
+                    // #330: the perr dangling `: ` at errno 0 (#248 form; see
+                    // the field's deviation record).
+                    end.report_error =
+                        Some(format!("error - {}: ", RiperfError::RecvResultsFailed));
                 }
-                *report
             }
-            ReportSource::Pending(collected) => self.build_ctx_report(&ctx, &end, collected),
-        };
 
-        self.emit_final_output(&ctx, &end, &report, was_captured);
+            // #137/#287: the report is built exactly ONCE per test, by
+            // construction — the collections moved either into the pre-exchange
+            // --get-server-output build (#33) or arrive here for the single
+            // post-exchange build. handle_one_test returns it (run discards it;
+            // run_once hands it back to the library caller).
+            let report = match report_source {
+                ReportSource::Built(mut report) => {
+                    // #322 r1 F4: a mid-exchange interrupt postdates the
+                    // pre-exchange --get-server-output build — carry the key
+                    // like GT's exit-time json_finish.
+                    if report.error.is_none() {
+                        report.error = end.report_error.clone();
+                    }
+                    *report
+                }
+                ReportSource::Pending(collected) => self.build_ctx_report(&ctx, &end, collected),
+            };
+
+            self.emit_final_output(&ctx, &end, &report, was_captured);
+            Ok(report)
+        }
+        .await;
 
         // Join stream tasks (best-effort, they should be done).
         // #322 r1 F1: a mid-EXCHANGE interrupt postdates shutdown_and_flush's
@@ -988,20 +990,35 @@ impl Server {
         // every sink has emitted. Abort drops each tokio task's socket at
         // its next await; the spawn_blocking UDP runners are bounded by the
         // 500 ms read-timeout + `done` polling either way.
+        // #372: `done` must be set HERE, not only by the drop guard — on
+        // the block's Err paths shutdown_and_flush never ran, and a
+        // spawn_blocking UDP runner ignores abort() and exits via `done` +
+        // its 500 ms read-timeout poll; joining it with `done` unset would
+        // hang. Idempotent on the clean path (shutdown_and_flush set it).
+        // The interval reporter (ctx.interval_handle) is deliberately NOT
+        // reaped here (#379 r1 F2 record): on the Err paths it
+        // self-terminates detached via `done` (bounded: its ~1 s tick +
+        // 2 s wait), prints nothing post-done, and holds no peer-visible
+        // fd — while an abort could kill a text-mode emit mid-line. The
+        // done-store-BEFORE-abort order also keeps a post-close reporter
+        // tick from sampling a recycled raw_fd.
+        ctx.done.store(true, Ordering::Relaxed);
         for s in &ctx.streams {
             s.task.abort();
         }
         if let Some(h) = &ctx.udp_demux_handle {
             h.abort();
         }
-        for s in ctx.streams {
+        for s in ctx.streams.drain(..) {
             let _ = s.task.await;
         }
         // The single-socket UDP demux receiver (#80) serves all receiving streams
         // and lives outside `streams`; join it too. `None` on the recycling path.
-        if let Some(h) = ctx.udp_demux_handle {
+        if let Some(h) = ctx.udp_demux_handle.take() {
             let _ = h.await;
         }
+
+        let report = outcome?;
 
         if ctx.client_terminated {
             // The dump above already rendered; the caller prints iperf3's
