@@ -116,11 +116,16 @@ pub enum RiperfError {
     ExchangeSendMessageFailed(std::io::Error),
 
     /// iperf3's IESENDRESULTS(116, iperf_api.h:465): the `send_results` write
-    /// in the post-TEST_END exchange failed (#371). GT's sentence, perr; the
-    /// populated-doc surface of [`Self::ExchangeSendMessageFailed`]. (In
-    /// practice the buffered results write often succeeds and the failure
-    /// lands on the following state send → IESENDMESSAGE; this class is the
-    /// faithful mapping for the write that does fail.)
+    /// in the post-TEST_END exchange failed (#371, iperf_api.c:2789). GT's
+    /// sentence, perr; the populated-doc surface of
+    /// [`Self::ExchangeSendMessageFailed`]. The mapping is GT-RULE-faithful
+    /// (send_results fail → IESENDRESULTS on both tools). RECORDED DEVIATION
+    /// (r1, probe-confirmed both tools): in the peer-RSTs-after-its-results
+    /// cell riperf3's `send_results` write FAILS deterministically (ECONNRESET)
+    /// → this class, whereas GT's write BUFFERS and succeeds and the failure
+    /// lands on the following `send_state(DISPLAY_RESULTS)` → IESENDMESSAGE.
+    /// So the class riperf3 surfaces here diverges from GT's for the same
+    /// scenario — an honest socket-buffering difference, not a mis-mapping.
     #[error("unable to send results: {0}")]
     ExchangeSendResultsFailed(std::io::Error),
 

@@ -3018,14 +3018,18 @@ fn pretest_send_state_failure_takes_iesendmessage_json() {
 
 // ---------------------------------------------------------------------------
 // #371: the POST-TEST_END exchange-phase send failure. A peer that RSTs the
-// ctrl after TEST_END fails the server's send_state(EXCHANGE_RESULTS) — GT's
-// IESENDMESSAGE(111). Unlike the pre-test #345 sibling, the reporter already
-// ran at TEST_END, so GT emits the POPULATED doc (start/intervals/end) + the
-// prefixed key, not the skeleton (PR #370 r2 addendum, live-probed; probe371
-// re-confirmed all three sub-classes → populated + IESENDMESSAGE). riperf3's
-// 100 ms flush sleep in shutdown_and_flush runs BEFORE this send, so the RST
-// has arrived and the send deterministically fails (no #345 race). LINUX-ONLY
-// like #345 (SO_LINGER(0) RST; the mapping is platform-independent).
+// ctrl right after TEST_END fails the server's FIRST exchange send —
+// send_state(EXCHANGE_RESULTS) — GT's IESENDMESSAGE(111). Unlike the pre-test
+// #345 sibling, the reporter already ran at TEST_END, so GT emits the
+// POPULATED doc (start/intervals/end) + the prefixed key, not the skeleton
+// (PR #370 r2 addendum, live-probed). riperf3's 100 ms flush sleep in
+// shutdown_and_flush runs BEFORE this send, so the RST has arrived and the
+// send deterministically fails (no #345 race). This pin covers the WHICH-
+// SENDS-FIRST cell (EXCHANGE_RESULTS); the later sends buffer on loopback and
+// diverge by class/phase (recorded: send_results → IESENDRESULTS deviation on
+// ExchangeSendResultsFailed; the DISPLAY_RESULTS-buffers-then-IperfDone-read
+// skeleton is filed as #406). LINUX-ONLY like #345 (SO_LINGER(0) RST; the
+// mapping is platform-independent).
 // ---------------------------------------------------------------------------
 
 /// Drive a FULL round through TEST_END, then SO_LINGER(0) RST the ctrl so the

@@ -57,7 +57,11 @@ fn exchange_send_message_error(e: RiperfError) -> RiperfError {
     }
 }
 
-/// #371: the `send_results` sibling → IESENDRESULTS.
+/// #371: the `send_results` sibling → IESENDRESULTS. `send_results`
+/// serializes before the socket write, so a (theoretical) serialize error
+/// would be non-Io; the fallthrough leaves it unchanged rather than
+/// mislabel it. In practice `TestResultsJson` never fails to serialize
+/// (non-finite f64 → JSON null, not Err), so the input is always Io.
 fn exchange_send_results_error(e: RiperfError) -> RiperfError {
     match e {
         RiperfError::Io(io) => RiperfError::ExchangeSendResultsFailed(io),
