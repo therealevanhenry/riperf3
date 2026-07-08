@@ -2769,8 +2769,10 @@ impl Server {
         // #358: the wait runs the #356 select machinery like the TCP arm —
         // ctrl-EOF is IECTRLCLOSE at once, a no-progress round bounds at
         // rcv_timeout (IENOMSG; the per-iteration sleep re-arm makes any
-        // datagram or ctrl byte progress, GT's last_receive_time
-        // semantics), and a waiting ctrl byte dispatches. The old fixed
+        // datagram or ctrl byte progress — mirroring GT's select window
+        // restarting per fd wake; its last_receive_time anchor never
+        // resets pre-streams, observably equivalent in every reachable
+        // cell — #383 r2 F5), and a waiting ctrl byte dispatches. The old fixed
         // per-stream UDP_CONNECT_TOTAL_TIMEOUT budget was riperf3-only
         // (the client keeps its own 30 s handshake budget).
         let rcv_timeout =

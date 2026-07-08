@@ -4345,6 +4345,16 @@ fn run_udp_setup_hold_scenario(
     demux: bool,
     json: bool,
 ) -> (Vec<u8>, String, String, std::process::ExitStatus) {
+    run_udp_setup_hold_scenario_params(demux, json, UDP_INCOMPLETE_PARAMS)
+}
+
+/// The hold runner with explicit params — the #383 r2 F3 reverse+bidir
+/// hostile-peer cell needs a non-default param set.
+fn run_udp_setup_hold_scenario_params(
+    demux: bool,
+    json: bool,
+    params: &'static str,
+) -> (Vec<u8>, String, String, std::process::ExitStatus) {
     let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let frame_in = frame.clone();
     let (sout, serr, status) = drive_udp_server_scenario(
@@ -4355,7 +4365,7 @@ fn run_udp_setup_hold_scenario(
             let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
             ctrl.write_all(&[b'x'; 37]).unwrap();
             assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
-            write_json_blob(&mut ctrl, UDP_INCOMPLETE_PARAMS);
+            write_json_blob(&mut ctrl, params);
             assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
             // HOLD: the connect magic never comes, ctrl stays open. The
             // wire-back should arrive at the ~3 s bound; the pre-fix path
@@ -4621,6 +4631,88 @@ fn udp_reverse_setup_hold_is_idle_exempt() {
 #[test]
 fn tcp_reverse_setup_hold_is_idle_exempt() {
     reverse_hold_case(r#"{"tcp":true,"reverse":true}"#, false);
+}
+
+/// #383 r2 F1: the demux design's idle exemption — the both-designs
+/// convention every other #358 cell follows.
+#[test]
+fn udp_reverse_setup_hold_is_idle_exempt_demux() {
+    reverse_hold_case(r#"{"udp":true,"reverse":true}"#, true);
+}
+
+/// #383 r2 F3: reverse+bidir stays ARMED — GT's iperf_set_test_bidirectional
+/// forces mode BIDIRECTIONAL (iperf_api.c:827-834), which is != SENDER, so
+/// the bound fires (GT live: 3.01 s). A conforming client cannot send the
+/// combination (GT rejects -R --bidir locally); a hand-rolled peer can.
+#[test]
+fn udp_reverse_bidir_setup_hold_stays_armed() {
+    let (frame, _sout, serr, status) = run_udp_setup_hold_scenario_params(
+        false,
+        false,
+        r#"{"udp":true,"reverse":true,"bidirectional":true}"#,
+    );
+    assert_eq!(
+        frame,
+        wireback_frame(144),
+        "bidir arms the bound like GT (mode BIDIRECTIONAL != SENDER)"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IDLE_TIMEOUT_MSG}"),
+        "GT's IENOMSG line: {serr:?}"
+    );
+}
+
+/// #383 r2 F4: the --json-stream UDP terminate pair — the TCP flavor has
+/// its own pin (setup_phase_client_terminate_stream_events); the UDP end
+/// event carries the UDP-flavored zeros (end.sum + the datagram counters).
+#[test]
+fn udp_setup_terminate_takes_udp_zeros_in_json_stream() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (sout, serr, status) = drive_udp_server_scenario(
+        false,
+        &["--json-stream"],
+        false,
+        move |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, UDP_INCOMPLETE_PARAMS);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+            ctrl.write_all(&[12u8]).unwrap(); // CLIENT_TERMINATE
+            *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+            drop(ctrl);
+        },
+        Duration::from_secs(5),
+    );
+    assert_eq!(*frame.lock().unwrap(), wireback_frame(119));
+    assert!(status.success());
+    assert!(
+        serr.trim().is_empty(),
+        "--json-stream keeps stderr silent: {serr:?}"
+    );
+    let events: Vec<serde_json::Value> = sout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("event line ({e}): {l}")))
+        .collect();
+    assert_eq!(events.len(), 2, "error + end pair: {sout:?}");
+    assert_eq!(events[0]["event"].as_str(), Some("error"));
+    assert_eq!(events[0]["data"].as_str(), Some(CLIENT_TERMINATED_MSG));
+    assert_eq!(events[1]["event"].as_str(), Some("end"));
+    let end = &events[1]["data"];
+    assert!(
+        end["sum"].is_object(),
+        "the UDP zeros end carries end.sum: {end}"
+    );
+    assert_eq!(
+        end["sum"]["jitter_ms"].as_u64(),
+        Some(0),
+        "the UDP datagram counters ride the stream event too: {end}"
+    );
+    assert_eq!(end["sum_sent"]["sender"].as_bool(), Some(true), "{end}");
 }
 
 /// #358 HOLD, recycling, text: bounded at --rcv-timeout with GT's IENOMSG

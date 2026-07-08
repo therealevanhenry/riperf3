@@ -4013,6 +4013,98 @@ mod tests {
         );
     }
 
+    /// #383 r2 F2: the UDP flavor's raw byte order — the four TCP keys
+    /// absent from start, `sum` FIRST in the zeros end, and the datagram
+    /// counters between bits_per_second and sender in every sum
+    /// (live-probed GT 3.21; the -J pin's parsed asserts are order-blind,
+    /// so this raw walk is the order guard).
+    #[test]
+    fn udp_setup_document_key_order_is_gt_server_order() {
+        let d = SetupPhaseDoc {
+            sock_bufsize: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            tcp_mss_default: None,
+            udp: true,
+            timemillisecs: 1_700_000_000_000,
+            accepted_host: "127.0.0.1".into(),
+            accepted_port: 5201,
+            cookie: "c".repeat(36),
+            target_bitrate: 0,
+            fq_rate: 0,
+        };
+        let raw = setup_terminate_document(
+            &d,
+            "the client has terminated",
+            &CpuUtilization {
+                host_total: 1.0,
+                host_user: 0.5,
+                host_system: 0.5,
+                remote_total: 0.0,
+                remote_user: 0.0,
+                remote_system: 0.0,
+            },
+        );
+        let keys = |obj: &str| raw_keys(&raw, obj);
+        assert_eq!(
+            keys("start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "target_bitrate",
+                "fq_rate"
+            ],
+            "UDP setup start must drop the four TCP keys: {raw}"
+        );
+        assert_eq!(
+            keys("end"),
+            [
+                "streams",
+                "sum",
+                "sum_sent",
+                "sum_received",
+                "cpu_utilization_percent"
+            ],
+            "UDP zeros-end carries sum first: {raw}"
+        );
+        assert_eq!(
+            keys("sum"),
+            [
+                "start",
+                "end",
+                "seconds",
+                "bytes",
+                "bits_per_second",
+                "jitter_ms",
+                "lost_packets",
+                "packets",
+                "lost_percent",
+                "sender"
+            ],
+            "UDP zero-sum key order drifted from GT: {raw}"
+        );
+        assert_eq!(
+            keys("sum_sent"),
+            [
+                "start",
+                "end",
+                "seconds",
+                "bytes",
+                "bits_per_second",
+                "jitter_ms",
+                "lost_packets",
+                "packets",
+                "lost_percent",
+                "sender"
+            ],
+            "UDP sum_sent key order drifted from GT: {raw}"
+        );
+    }
+
     /// #281: the pre-ParamExchange shape (GT stage 0, second capture on the
     /// issue) — `start` carries ONLY connected/version/system_info; even the
     /// timestamp and cookie are absent, because GT stamps them at on_connect.
