@@ -228,9 +228,14 @@ pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<(
 /// in-crate). Bounded like every GT Nread (#382 r1 F1 — GT bounds these
 /// two reads, iperf_client_api.c:393-401, exiting a hold at ~30 s with a
 /// garbage-errno line from the UNINITIALIZED short-read buffer; the
-/// deterministic None-fallback is the recorded deviation, and the house
-/// 10 s idle bound fires first on a fully-silent hold). This read races
-/// NO interrupt arm, so an unbounded read was signal-immune.
+/// deterministic None-fallback is the recorded deviation — GT's rc<0
+/// arm maps to IECTRLREAD (iperf_client_api.c:394-400) and folds into
+/// the same fallback here, pre-existing — and the house 10 s idle bound
+/// fires first on a fully-silent hold). This read races NO interrupt
+/// arm, so an unbounded read was signal-immune; post-fix a signal in
+/// this window is honored when the bound fires (≤10 s silent, ≤30 s
+/// dripping — GT's select EINTRs immediately; adversarial-only, the
+/// recv_cookie/json_read_bounded house pattern) (#382 r2 F2/F3).
 pub async fn read_server_error_payload(stream: &mut TcpStream) -> Option<(u32, u32)> {
     let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut buf = [0u8; 8];
