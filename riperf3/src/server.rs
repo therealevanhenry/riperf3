@@ -1414,6 +1414,22 @@ impl Server {
                                     // "failed to send access denied" line
                                     // when ITS deny write fails — riperf3
                                     // stays silent, recorded, racy cell).
+                                    // RECORDED DEVIATION (#384 r2 F1, GT
+                                    // bug not mirrored): a FIN/hold at
+                                    // EXACTLY 36 cookie bytes is ACCEPTED
+                                    // by GT as the real stream — its Nread
+                                    // returns the partial 36 and
+                                    // strncmp(cookie, buf, 37) passes via
+                                    // the zero-filled buffer byte matching
+                                    // the trailing NUL (iperf_util.c:
+                                    // 121-124); it then runs a zero-byte
+                                    // test on the dead socket. riperf3's
+                                    // exact-37 read denies the truncated
+                                    // cookie instead. Cookie-knowledge-
+                                    // gated cell (only the real client or
+                                    // an on-path observer holds the
+                                    // prefix); the #271 do-not-mirror
+                                    // ethos.
                                     // RECORDED DEVIATION (#384 r1 F3, GT
                                     // bug not mirrored): with negotiated
                                     // TOS != 0, GT runs sockopts on the

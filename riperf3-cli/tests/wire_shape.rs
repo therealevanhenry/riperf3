@@ -4746,6 +4746,63 @@ fn setup_rst_mid_cookie_kills_the_round_ierecvcookie() {
     );
 }
 
+/// #384 r2 F2: the RST-kill's -J twin — the POPULATED setup doc (the
+/// RecvDataCookieFailed-vs-pretest-skeleton distinction is exactly this
+/// property), the prefixed dangling error key, bare end, silent stderr
+/// (GT live byte-parallel modulo the recorded strerror suffix).
+#[cfg(unix)]
+#[test]
+fn setup_rst_mid_cookie_takes_gt_doc_shape_in_json() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (sout, serr, status) = drive_server_scenario(true, move |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        let imposter = std::net::TcpStream::connect(("127.0.0.1", port)).expect("imposter");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                imposter.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(imposter);
+        *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+        drop(ctrl);
+    });
+    assert_eq!(*frame.lock().unwrap(), wireback_frame(106));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {RECV_COOKIE_MSG}: ").as_str()),
+        "the prefixed dangling IERECVCOOKIE key: {doc}"
+    );
+    assert_eq!(
+        doc["start"]["accepted_connection"]["host"].as_str(),
+        Some("127.0.0.1"),
+        "the POPULATED setup doc, not the pretest skeleton: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}: {doc}"
+    );
+}
+
 /// #359 cell 2: a silent connect is denied at the 10 s cookie-read bound
 /// and the round then IENOMSGs at the re-armed rcv-timeout (~13 s), GT's
 /// exact cadence (probed). The pre-fix path killed the round at 10 s with
