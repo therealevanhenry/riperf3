@@ -3007,6 +3007,90 @@ fn sigterm_while_listening_emits_skeleton_doc_in_json() {
     );
 }
 
+/// #361: SIGTERM while a client sits WEDGED pre-cookie (connected,
+/// silent, never closing) — GT exits IMMEDIATELY with the same #346
+/// skeleton (live: exit 0, dt 0.00). riperf3 pre-fix rode the CLI's 5 s
+/// dump wall and exited with EMPTY -J stdout (the #158 interrupt-blind
+/// window; that test's wedge moved one phase later).
+#[cfg(unix)]
+fn drive_sigterm_wedged(args: &[&str]) -> (String, String, std::process::ExitStatus, Duration) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+    let mut all = vec!["-s", "-p", &port_s];
+    all.extend_from_slice(args);
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&all)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout = riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr = riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // The wedge: connected, silent, never closing — the server parks in
+    // the cookie read.
+    let _wedge = std::net::TcpStream::connect(("127.0.0.1", port)).expect("wedge");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let t0 = std::time::Instant::now();
+    unsafe { libc::kill(server.0.id() as i32, libc::SIGTERM) };
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(8))
+            .expect("signal-normal exit");
+    let elapsed = t0.elapsed();
+    (
+        sout.join().expect("stdout"),
+        serr.join().expect("stderr"),
+        status,
+        elapsed,
+    )
+}
+
+/// #361 -J: the interrupt skeleton emits IMMEDIATELY (GT dt 0.00; the
+/// pre-fix red = empty stdout after the 5 s dump wall).
+#[cfg(unix)]
+#[test]
+fn sigterm_on_wedged_precookie_client_emits_skeleton_in_json() {
+    let (sout, serr, status, elapsed) = drive_sigterm_wedged(&["-J"]);
+    assert!(status.success(), "GT signormalexit exits 0");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "GT exits immediately, not at the 5 s dump wall: {elapsed:?}"
+    );
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout:?}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(SIGTERM_KEY),
+        "the interrupt-class key: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end: {doc}"
+    );
+}
+
+/// #361 text: GT's stderr line + exit 0, immediately.
+#[cfg(unix)]
+#[test]
+fn sigterm_on_wedged_precookie_client_prints_line_in_text() {
+    let (_sout, serr, status, elapsed) = drive_sigterm_wedged(&[]);
+    assert!(status.success(), "exit 0: {serr:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "GT exits immediately: {elapsed:?}"
+    );
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {SIGTERM_KEY}"),
+        "GT's stderr interrupt line: {serr:?}"
+    );
+}
+
 /// #346 --json-stream: GT's error + bare-end event pair.
 #[cfg(unix)]
 #[test]
