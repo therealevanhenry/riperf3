@@ -104,12 +104,14 @@ pub enum RiperfError {
     SendControlFailed(std::io::Error),
 
     /// iperf3's IEACCEPT(104): the control accept() failed
-    /// (iperf_server_api.c:163; herr+perr). RECORDED DEVIATION (#387 r1
-    /// F6): riperf3 carries the SITE-CAPTURED errno; GT's surface prints
-    /// the post-cleanup CLOBBERED errno (live: "Bad file descriptor"
-    /// where the accept errno was EMFILE) — the honest-errno call, the
-    /// #345 convention. BSD-class reachable (ECONNABORTED); Linux EMFILE
-    /// (#362 — previously the raw io line on the generic arm).
+    /// (iperf_server_api.c:163; herr+perr). The site-captured errno rides
+    /// — and MATCHES GT's text surface in this pre-test cell (#387 r2 F1
+    /// live probes, all four sinks: GT prints the LIVE strerror here;
+    /// nothing gets closed before the print, so no clobber — the clobber
+    /// is real only in the mid-setup double-close cells, see
+    /// [`Self::StreamConnectFailed`]). BSD-class reachable (ECONNABORTED);
+    /// Linux EMFILE (#362 — previously the raw io line on the generic
+    /// arm).
     #[error("unable to accept connection from client: {0}")]
     AcceptFailed(std::io::Error),
 

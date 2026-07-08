@@ -1446,9 +1446,11 @@ impl Server {
                                         // r1 F2: GT wires the LIVE accept
                                         // errno (cleanup_server sends
                                         // htonl(errno), iperf_server_api.c:
-                                        // 469-470) — a GT client prints its
-                                        // SERVER ERROR line only when the
-                                        // wire errno > 0.
+                                        // 470-471) — the wire word carries
+                                        // the strerror content of the GT
+                                        // client's SERVER ERROR line (r2
+                                        // F2: the line prints either way;
+                                        // the word gates its errno tail).
                                         let errno =
                                             e.raw_os_error().unwrap_or(0) as u32;
                                         let _ = protocol::send_server_error_errno(

@@ -4761,15 +4761,30 @@ fn tcp_reverse_setup_hold_is_idle_exempt() {
 // Linux-only (prlimit + errno 24 = EMFILE).
 // ---------------------------------------------------------------------------
 
-/// Clamp the target's RLIMIT_NOFILE to its current first-free slot.
+/// The EMFILE cells serialize on this lock: two concurrent clamped
+/// servers on 2 pinned cores interfered (~50% ConnectionRefused on the
+/// second cell's data connect — the paired hot-spin starves the other
+/// server's accept path); each cell is deterministic alone.
+#[cfg(target_os = "linux")]
+static EMFILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clamp the target's RLIMIT_NOFILE to its current FIRST-FREE slot — a
+/// new fd always takes the lowest free index, so the limit must sit AT
+/// that hole, not at max+1 (the CI runner's spawned processes carry
+/// holes below max; the dense-table assumption let the accept dodge the
+/// clamp — the 28c1184 Linux CI red).
 #[cfg(target_os = "linux")]
 fn clamp_fd_table(pid: u32) {
-    let max_fd = std::fs::read_dir(format!("/proc/{pid}/fd"))
+    let open: std::collections::BTreeSet<u32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .expect("read fd table")
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .max()
-        .expect("nonempty fd table");
-    let limit = (max_fd + 1).to_string();
+        .collect();
+    assert!(!open.is_empty(), "nonempty fd table");
+    let mut first_free = 0u32;
+    while open.contains(&first_free) {
+        first_free += 1;
+    }
+    let limit = first_free.to_string();
     let st = std::process::Command::new("prlimit")
         .args([
             &format!("--pid={pid}"),
@@ -4788,6 +4803,7 @@ fn clamp_fd_table(pid: u32) {
 #[cfg(target_os = "linux")]
 #[test]
 fn accept_emfile_takes_gt_ieaccept_class() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -4823,11 +4839,14 @@ fn accept_emfile_takes_gt_ieaccept_class() {
 }
 
 /// #362: the setup data-accept under EMFILE — the fe+203+LIVE-errno
-/// wire-back (r1 F2: a GT client prints its SERVER ERROR line only when
-/// the wire word is > 0), the strerror'd line, exit 0.
+/// wire-back (r1 F2/r2 F2: the wire word carries the strerror content of
+/// the GT client's SERVER ERROR line — live-proven interop on the
+/// PERSISTENT pairing; the one-off pairing's close-ordering divergence is
+/// the filed follow-up), the strerror'd line, exit 0.
 #[cfg(target_os = "linux")]
 #[test]
 fn setup_data_accept_emfile_wires_iestreamconnect_with_live_errno() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     drop(listener);

@@ -217,11 +217,14 @@ pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<(
     send_server_error_errno(stream, i_errno, 0).await
 }
 
-/// [`send_server_error`] with a live os errno word (#387 r1 F2): GT's
-/// cleanup_server wires htonl(errno) captured live
-/// (iperf_server_api.c:469-470), and a GT client prints its immediate
-/// `SERVER ERROR - …, errno: …` line only when the wire word is > 0 —
-/// so the accept-failure relays must carry the real errno.
+/// [`send_server_error`] with a live os errno word (#387 r1 F2, wording
+/// corrected r2 F2): GT's cleanup_server wires htonl(errno) captured
+/// live (iperf_server_api.c:470-471). A GT client prints its immediate
+/// `SERVER ERROR - …` line in BOTH branches — the wire word gates only
+/// the `, errno: <strerror>` suffix and the strerror content
+/// (iperf_client_api.c:403-407; live: fe+203+0 still prints the dangling
+/// line) — so the accept-failure relays carry the real errno for the
+/// CONTENT parity, not the line's existence.
 pub async fn send_server_error_errno(
     stream: &mut TcpStream,
     i_errno: u32,
