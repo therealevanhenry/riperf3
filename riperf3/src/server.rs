@@ -3655,14 +3655,51 @@ impl Server {
         // #383 r1 F1a: the four TCP-flavored keys are absent for UDP —
         // see the SetupPhaseDoc doc for the GT gates.
         let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
+        // #357: with -w exchanged, GT re-listens with the window applied
+        // and reads the actuals off THAT socket (probed 131072/131072 for
+        // window 65536); riperf3 has no re-listen step (deliberate), so a
+        // scratch socket with the same window applied yields the identical
+        // kernel read-back. Without -w the un-windowed listener matches
+        // GT's re-listened defaults.
+        // RECORDED DEVIATION (#391 r1 F3, pre-existing design consequence):
+        // at a window past 2x wmem_max GT fires IESETBUF2 at its re-listen
+        // (error doc, no trio, fe frame instead of CreateStreams); riperf3
+        // has no re-listen (deliberate) and its #97 check lives on data
+        // sockets, which never arrive in wedge cells — the doc carries the
+        // clamped actuals instead (probed w=16M: GT errors, riperf3 emits
+        // 8388608/8388608).
+        // #391 r1 F1: GT's buffer-APPLY guard is C truthiness (the
+        // re-listen decision is iperf_tcp.c:195, the apply gate :257 — r2
+        // F2 cite) — an exchanged window:0 is NOT applied; it reads the
+        // listener like the no-window state (probed: GT 16384/131072 for
+        // window:0, and the nodelay-forced re-listen without buffer-apply
+        // reads the same defaults). Negative windows ARE applied (truthiness; both tools
+        // clamp identically — probed w=-1).
+        let (sndbuf_actual, rcvbuf_actual) = match (udp, ctx.cfg.window) {
+            (false, Some(w)) if w != 0 => {
+                let scratch =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok();
+                match scratch {
+                    Some(sc) => {
+                        net::apply_socket_window(&socket2::SockRef::from(&sc), Some(w));
+                        (
+                            sc.send_buffer_size().ok().map(|v| v as u64),
+                            sc.recv_buffer_size().ok().map(|v| v as u64),
+                        )
+                    }
+                    None => (None, None),
+                }
+            }
+            (false, _) => (
+                sock.send_buffer_size().ok().map(|v| v as u64),
+                sock.recv_buffer_size().ok().map(|v| v as u64),
+            ),
+            (true, _) => (None, None),
+        };
         crate::json_report::SetupPhaseDoc {
             sock_bufsize: (!udp).then(|| ctx.cfg.window.map(|w| w as u64).unwrap_or(0)),
-            sndbuf_actual: (!udp)
-                .then(|| sock.send_buffer_size().ok().map(|v| v as u64))
-                .flatten(),
-            rcvbuf_actual: (!udp)
-                .then(|| sock.recv_buffer_size().ok().map(|v| v as u64))
-                .flatten(),
+            sndbuf_actual,
+            rcvbuf_actual,
             // The server never reads the ctrl MSS — 0, the #50 convention.
             tcp_mss_default: (!udp).then_some(0),
             udp,
