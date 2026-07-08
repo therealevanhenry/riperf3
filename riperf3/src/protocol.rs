@@ -597,12 +597,14 @@ pub async fn recv_params(stream: &mut TcpStream) -> Result<TestParams> {
 /// Deserialize a params blob's root JSON value into `TestParams`.
 ///
 /// #367 cell 2: a NON-OBJECT root yields all-defaults. GT's `get_parameters`
-/// (iperf_api.c:2533+) is a sequence of typed `cJSON_GetObjectItem` lookups;
-/// on a non-object root every lookup misses, so no field is set and GT
-/// proceeds to CREATE_STREAMS with defaults. serde's `from_value` instead
-/// hard-errors on a non-map, so map the non-object case to defaults to match.
-/// (A malformed object — e.g. a field of the wrong JSON type — is a separate,
-/// broader cJSON-vs-serde gap, not this cell.)
+/// (iperf_api.c:2533+) is a sequence of `iperf_cJSON_GetObjectItemType`
+/// lookups (iperf_util.c:444); on a non-object root every lookup misses, so
+/// no field is set and GT proceeds to CREATE_STREAMS with defaults. serde's
+/// `from_value` instead hard-errors on a non-map, so map the non-object case
+/// to defaults to match. (A malformed object — e.g. a field of the wrong
+/// JSON type, where GT's wrapper warns and defaults the field but serde
+/// hard-errors — is a separate, broader cJSON-vs-serde gap, tracked in a
+/// follow-up, not this cell.)
 fn params_from_value(value: serde_json::Value) -> serde_json::Result<TestParams> {
     if value.is_object() {
         serde_json::from_value(value)
