@@ -919,14 +919,45 @@ impl Client {
         let results = self.build_results(&ctx.streams, ctx.cpu_start.as_ref(), ctx.measured_secs);
         protocol::send_results(&mut ctx.ctrl, &results).await?;
         tokio::select! {
-            r = protocol::recv_results(&mut ctx.ctrl) => {
-                ctx.server_results = Some(r?);
-                Ok(None)
-            }
+            r = protocol::recv_results(&mut ctx.ctrl) => match r {
+                Ok(results) => {
+                    ctx.server_results = Some(results);
+                    Ok(None)
+                }
+                // #374: GT's IERECVRESULTS surface. The bounded read (GT's
+                // Nread 10 s idle / 30 s overall — a wedging server can't
+                // park the client) already printed the sink-bypassing
+                // Nread_json warning at the read site; here the JSON sinks
+                // get the doc and the class errexits (the CLI renders the
+                // text line).
+                Err(_) => Err(self.on_recv_results_failed(ctx)),
+            },
             msg = wait_interrupt(ctx.interrupt.as_mut()) => {
                 Ok(Some(self.on_interrupted_wait(ctx, &msg).await))
             }
         }
+    }
+
+    /// The client's failed results read (#374), the on_ctrl_lost shape:
+    /// JSON sinks get the populated doc with GT's bare `end: {}` and the
+    /// error value in the #248 dangling errno-0 perr form ("unable to
+    /// receive results: " — GT appends a STALE errno's strerror, live
+    /// "Transport endpoint is not connected"; recorded deviation, the
+    /// #330 server precedent). Text gets NO dump (GT prints no summary on
+    /// this class — probed; the errexit line is the CLI's). The collected
+    /// closing interval may appear where GT's is still pending display —
+    /// the #55 flush-order drift, recorded on #374.
+    fn on_recv_results_failed(&self, ctx: &RunCtx) -> RiperfError {
+        if self.json_output || self.json_stream {
+            self.emit_results(
+                ctx,
+                None,
+                true,
+                ctx.measured_secs,
+                Some(&format!("{}: ", RiperfError::RecvResultsFailed)),
+            );
+        }
+        RiperfError::RecvResultsFailed
     }
 
     async fn on_display_results(&self, ctx: &mut RunCtx) -> Result<StepFlow> {
