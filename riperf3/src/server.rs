@@ -623,6 +623,17 @@ impl Server {
                         );
                     }
                 }
+                Err(e @ RiperfError::StreamConnectFailed(_)) => {
+                    // #362: the data-accept kill — the populated setup doc
+                    // emitted at the site; text prints the strerror'd line
+                    // (live errno, no dangling). Keep-serving, exit 0.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {e}",
+                            crate::macros::output_timestamp_prefix()
+                        );
+                    }
+                }
                 Err(RiperfError::RecvDataCookieFailed) => {
                     // #359 r1 F2: GT's hard-read-error kill at the DATA
                     // cookie gate (IERECVCOOKIE via cleanup_server). The
@@ -646,7 +657,12 @@ impl Server {
                 // -J, one text line otherwise.
                 Err(e @ RiperfError::RecvCookieFailed)
                 | Err(e @ RiperfError::RecvParamsFailed)
-                | Err(e @ RiperfError::SendControlFailed(_)) => {
+                | Err(e @ RiperfError::SendControlFailed(_))
+                // #362: IEACCEPT / IESETNODELAY ride the same pre-test
+                // sink (their Displays carry the live strerror, so no
+                // dangling suffix — the SendControlFailed convention).
+                | Err(e @ RiperfError::AcceptFailed(_))
+                | Err(e @ RiperfError::SetNoDelayFailed(_)) => {
                     self.emit_pretest_error(&e);
                 }
                 Err(e) => {
@@ -797,7 +813,13 @@ impl Server {
         // (#222 r1 item 6: the Time/banner/Cookie/MSS block prints AFTER the
         // param exchange — GT's iperf_on_connect fires there — so a
         // --get-server-output capture relays it; see print_connect_block.)
-        net::configure_tcp_stream(&ctrl, true)?;
+        // #362: GT classes a failed TCP_NODELAY on the just-accepted ctrl
+        // as IESETNODELAY (iperf_server_api.c:170-173) — the macOS
+        // kind-only-InvalidInput cell's likeliest site.
+        net::configure_tcp_stream(&ctrl, true).map_err(|e| match e {
+            RiperfError::Io(io) => RiperfError::SetNoDelayFailed(io),
+            other => other,
+        })?;
 
         // The control-socket peer address feeds the server's `start.accepted_connection`
         // (iperf_api.c uses getpeername(ctrl_sck) — distinct from the data-stream
@@ -1105,6 +1127,9 @@ impl Server {
         let mut accept_interrupt = self.interrupt.clone().map(|w| w.0);
         let accepted = tokio::select! {
             r = async {
+                // #362: an accept() failure is GT's IEACCEPT
+                // (iperf_server_api.c:163) — previously the raw io line
+                // on the generic arm (BSD ECONNABORTED / Linux EMFILE).
                 if let Some(secs) = self.idle_timeout {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(secs as u64),
@@ -1112,11 +1137,11 @@ impl Server {
                     )
                     .await
                     {
-                        Ok(result) => result.map_err(RiperfError::from),
+                        Ok(result) => result.map_err(RiperfError::AcceptFailed),
                         Err(_) => Err(RiperfError::Aborted("idle timeout".into())),
                     }
                 } else {
-                    listener.accept().await.map_err(RiperfError::from)
+                    listener.accept().await.map_err(RiperfError::AcceptFailed)
                 }
             } => Some(r),
             _ = crate::client::wait_interrupt(accept_interrupt.as_mut()) => None,
@@ -1398,7 +1423,32 @@ impl Server {
                     let data_stream = loop {
                         tokio::select! {
                             accepted = listener.accept() => {
-                                let (mut candidate, _) = accepted?;
+                                // #362 (the PR #384 r2 F4 cell): a failed
+                                // data accept is GT's IESTREAMCONNECT
+                                // through cleanup_server (iperf_tcp.c:
+                                // 134-135) — the fe+203 wire-back, the
+                                // populated setup doc, round dead,
+                                // keep-serving. The raw io line rode the
+                                // generic arm before (BSD ECONNABORTED).
+                                let (mut candidate, _) = match accepted {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        abort_setup_streams(ctx).await;
+                                        let _ = protocol::send_server_error(
+                                            &mut ctx.ctrl,
+                                            203,
+                                        )
+                                        .await;
+                                        let err =
+                                            RiperfError::StreamConnectFailed(e);
+                                        self.emit_setup_phase_error(
+                                            ctx,
+                                            listener,
+                                            &format!("error - {err}"),
+                                        );
+                                        return Err(err);
+                                    }
+                                };
                                 // #359: GT's deny-and-continue cookie gate —
                                 // a wrong-cookie or silent/FIN'd connect
                                 // gets ACCESS_DENIED on ITS socket

@@ -573,6 +573,31 @@ mod error_tests {
             format!("{}", RiperfError::CookieMismatch),
             "cookie mismatch"
         );
+        // #362: the GT accept/configure classes — the strerror rides via
+        // io::Error's "(os error N)" form, the recorded #151 convention
+        // (GT's perr prints strerror alone; the suffix is the house
+        // deviation every raw-os class already carries).
+        assert_eq!(
+            format!(
+                "{}",
+                RiperfError::AcceptFailed(std::io::Error::from_raw_os_error(24))
+            ),
+            "unable to accept connection from client: Too many open files (os error 24)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RiperfError::StreamConnectFailed(std::io::Error::from_raw_os_error(103))
+            ),
+            "unable to connect stream: Software caused connection abort (os error 103)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RiperfError::SetNoDelayFailed(std::io::Error::from_raw_os_error(22))
+            ),
+            "unable to set TCP/SCTP NODELAY: Invalid argument (os error 22)"
+        );
         assert_eq!(
             format!("{}", RiperfError::AccessDenied),
             "access denied by server"
