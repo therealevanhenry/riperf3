@@ -264,13 +264,20 @@ pub fn print_separator() {
 
 /// #356 r1 F1: GT's terminate-at-setup text skeleton — its
 /// reporter_callback runs under DISPLAY_RESULTS with zero streams
-/// (iperf_server_api.c:292-297), printing just the separator and the plain
-/// TCP header (live-probed 3.21).
-pub fn print_terminate_skeleton() {
+/// (iperf_server_api.c:292-297), printing just the separator and the
+/// plain protocol header (live-probed 3.21; #383 r1 F1c: the UDP header
+/// carries GT's Jitter / Lost/Total Datagrams columns).
+pub fn print_terminate_skeleton(udp: bool) {
     print_separator();
-    titled(format_args!(
-        "[ ID] Interval           Transfer     Bitrate"
-    ));
+    if udp {
+        titled(format_args!(
+            "[ ID] Interval           Transfer     Bitrate         Jitter    Lost/Total Datagrams"
+        ));
+    } else {
+        titled(format_args!(
+            "[ ID] Interval           Transfer     Bitrate"
+        ));
+    }
 }
 
 /// GT's final-partial-interval keep rule (iperf_print_intermediate,
