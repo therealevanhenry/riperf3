@@ -426,6 +426,12 @@ enum CtrlActivity {
 /// Abort drops each task's socket at its next await; no counts exist yet,
 /// so there is nothing to freeze (the #352 join-site concern doesn't apply).
 async fn abort_setup_streams(ctx: &mut TestRunCtx) {
+    // #358: `done` first — the UDP paths hold spawn_blocking threads parked
+    // on the start barrier / 500 ms-poll reads, where abort() is a no-op
+    // and an unset `done` would hang the joins (the #372-gate lesson).
+    // Every caller ends the round, so the store is round-terminal by
+    // construction; the TCP tasks never needed it (abort suffices).
+    ctx.done.store(true, Ordering::Relaxed);
     for s in &ctx.streams {
         s.task.abort();
     }
@@ -1515,31 +1521,18 @@ impl Server {
                     Err(_) => cfg!(windows),
                 };
 
-                if udp_use_demux {
-                    self.setup_udp_demux_streams(
-                        &mut ctx.ctrl,
-                        &ctx.cfg,
-                        recv_count,
-                        total,
-                        max_duration,
-                        &ctx.done,
-                        &ctx.start,
-                        &mut ctx.streams,
-                        &mut ctx.udp_demux_handle,
-                    )
-                    .await?;
+                // #358: both UDP designs run the same #356 select machinery
+                // as the TCP arm, so they can dispatch ctrl bytes — a
+                // ClientDone (IPERF_DONE) surfaces here like TCP's.
+                let flow = if udp_use_demux {
+                    self.setup_udp_demux_streams(ctx, listener, recv_count, total, max_duration)
+                        .await?
                 } else {
-                    self.setup_udp_recycling_streams(
-                        &mut ctx.ctrl,
-                        &ctx.cfg,
-                        recv_count,
-                        total,
-                        max_duration,
-                        &ctx.done,
-                        &ctx.start,
-                        &mut ctx.streams,
-                    )
-                    .await?;
+                    self.setup_udp_recycling_streams(ctx, listener, recv_count, total, max_duration)
+                        .await?
+                };
+                if let SetupFlow::ClientDone = flow {
+                    return Ok(SetupFlow::ClientDone);
                 }
             }
         }
@@ -2466,15 +2459,24 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     async fn setup_udp_recycling_streams(
         &self,
-        ctrl: &mut tokio::net::TcpStream,
-        cfg: &TestConfig,
+        ctx: &mut TestRunCtx,
+        listener: &tokio::net::TcpListener,
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
-        done: &Arc<AtomicBool>,
-        start: &Arc<AtomicBool>,
-        streams: &mut Vec<DataStream>,
-    ) -> Result<()> {
+    ) -> Result<SetupFlow> {
+        // The scalar knobs, copied out so the select arms below can borrow
+        // ctx whole (dispatch_setup_ctrl_byte / emit_setup_phase_error).
+        let blksize = ctx.cfg.blksize;
+        let tos = ctx.cfg.tos;
+        let window = ctx.cfg.window;
+        let bandwidth = ctx.cfg.bandwidth;
+        let pacing_timer = ctx.cfg.pacing_timer;
+        let burst = ctx.cfg.burst;
+        let udp_counters_64bit = ctx.cfg.udp_counters_64bit;
+        let fq_rate = ctx.cfg.fq_rate;
+        let gso_dg_size = ctx.cfg.gso_dg_size;
+
         let mut udp_listener = net::udp_bind_reusable(
             self.bind_address.as_deref(),
             self.port,
@@ -2482,26 +2484,91 @@ impl Server {
             self.bind_dev.as_deref(),
         )
         .await?;
-        protocol::send_state(ctrl, TestState::CreateStreams).await?;
+        protocol::send_state(&mut ctx.ctrl, TestState::CreateStreams).await?;
+
+        // #358: GT's UDP CREATE_STREAMS wait runs inside its select loop
+        // like the TCP arm's — a ctrl-EOF is IECTRLCLOSE at once, a
+        // no-progress round bounds at rcv_timeout (IENOMSG), and a waiting
+        // ctrl byte dispatches. The old fixed per-stream
+        // UDP_CONNECT_TOTAL_TIMEOUT budget was riperf3-only: GT has no
+        // per-stream connect budget (the client keeps its own 30 s
+        // handshake budget in udp_connect_client).
+        let rcv_timeout =
+            std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
 
         // #316: the client's GSO/GRO request, probed per accepted socket
         // below. Once a probe fails, GT zeroes the setting and later
         // sockets don't retry (iperf_udp.c:459-515).
-        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
+        let (mut gso_on, mut gro_on) = (ctx.cfg.gso, ctx.cfg.gro);
 
         // #178: each stream's spawn_blocking data thread is spawned through
         // the gate; the barrier below holds TestStart until the data plane
         // actually exists.
         let mut thread_gate = stream::StreamThreadGate::new();
         for i in 0..total {
-            // Accept: recv magic, connect() to client, send reply.
-            // Bounded so a client that never connects fails the test
-            // instead of hanging setup forever (#11); uses the same
-            // budget as the client's handshake so neither side aborts
-            // while the other is still retrying.
-            let _client_addr =
-                protocol::udp_connect_server(&udp_listener, protocol::UDP_CONNECT_TOTAL_TIMEOUT)
-                    .await?;
+            // Accept: recv magic (via the select), then connect() to the
+            // client and send the reply AFTER the arm wins — a ctrl byte
+            // cannot cancel a half-done handshake into a lost reply (the
+            // select-cancellation window the retired udp_connect_server
+            // call would have had).
+            let mut magic_buf = [0u8; 65536];
+            loop {
+                tokio::select! {
+                    r = udp_listener.recv_from(&mut magic_buf) => {
+                        let (n, addr) = r?;
+                        // Validation identical to the retired
+                        // udp_connect_server: short/foreign datagrams stay
+                        // fatal on this connected-per-stream design.
+                        if n < 4 {
+                            return Err(RiperfError::Protocol(
+                                "UDP connect message too short".into(),
+                            ));
+                        }
+                        let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
+                        if msg != protocol::UDP_CONNECT_MSG {
+                            return Err(RiperfError::Protocol(format!(
+                                "unexpected UDP connect message: {msg:#x}"
+                            )));
+                        }
+                        udp_listener.connect(addr).await?;
+                        udp_listener
+                            .send(&protocol::UDP_CONNECT_REPLY.to_ne_bytes())
+                            .await?;
+                        break;
+                    }
+                    activity = ctrl_activity(&ctx.ctrl) => match activity {
+                        // EOF: GT's read-site surface, noticed at once —
+                        // the TCP arm's exact shape (#338/#342).
+                        Ok(CtrlActivity::Eof) => {
+                            abort_setup_streams(ctx).await;
+                            let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
+                            self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                            return Err(RiperfError::ControlSocketClosed);
+                        }
+                        Ok(CtrlActivity::Data) => {
+                            if let SetupFlow::ClientDone =
+                                self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                            {
+                                return Ok(SetupFlow::ClientDone);
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    },
+                    _ = tokio::time::sleep(rcv_timeout) => {
+                        // GT's no-progress bound: wire-back SERVER_ERROR +
+                        // IENOMSG(144) + errno 0, the doc with the prefixed
+                        // key, exit-0 keep-serving — the TCP arm's shape.
+                        abort_setup_streams(ctx).await;
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
+                        self.emit_setup_phase_error(
+                            ctx,
+                            listener,
+                            &format!("error - {}", RiperfError::DataIdleTimeout),
+                        );
+                        return Err(RiperfError::DataIdleTimeout);
+                    }
+                }
+            }
             // The listener is now locked to this client — use it as the data socket
             let data_sock = udp_listener;
             // #316: per-accept like GT's iperf_udp_accept (iperf_udp.c:
@@ -2514,7 +2581,7 @@ impl Server {
             // reply, riperf3 after — no observable delta, the reply is
             // never segmented; r2 F4.)
             if gso_on {
-                gso_on = net::set_udp_gso(&data_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
+                gso_on = net::set_udp_gso(&data_sock, saturate_i32(gso_dg_size)).is_ok();
             }
             if gro_on {
                 gro_on = net::set_udp_gro(&data_sock).is_ok();
@@ -2522,7 +2589,7 @@ impl Server {
             // #302 r2: pace EVERY accepted stream — GT's block lives in
             // iperf_udp_accept (iperf_udp.c:581-595), once per stream; the
             // pre-loop listener call covered stream 0 only.
-            net::apply_fq_rate(&data_sock, cfg.fq_rate);
+            net::apply_fq_rate(&data_sock, fq_rate);
 
             // Create a fresh listener for the next stream (if any)
             if i + 1 < total {
@@ -2548,37 +2615,36 @@ impl Server {
             // site (#45). The TCP accept loop has had this since #45; the
             // UDP paths never did (#154). IP_TOS is independent of SO_SND/RCVBUF,
             // so setting it before the window-apply/capture below is equivalent.
-            if cfg.tos != 0 {
-                net::set_tos(&data_sock, cfg.tos as u32)?;
+            if tos != 0 {
+                net::set_tos(&data_sock, tos as u32)?;
             }
             // Socket addresses + buffer sizes + the #97 window-clamp check for
             // the `-J` blob (#50), captured before the socket is converted to
             // std + moved. apply_window=true: honor -w/--window on the server's
             // UDP data socket too (#59) so reverse/bidir UDP matches iperf3,
             // before the read-back (#144).
-            let sock =
-                net::capture_stream_meta(socket2::SockRef::from(&data_sock), cfg.window, true)?;
+            let sock = net::capture_stream_meta(socket2::SockRef::from(&data_sock), window, true)?;
 
             let std_sock = data_sock.into_std().map_err(RiperfError::Io)?;
 
             if is_sender {
                 let c = counters.clone();
-                let d = done.clone();
-                let bs = cfg.blksize;
+                let d = ctx.done.clone();
+                let bs = blksize;
                 // Already resolved in TestConfig (#17); 0 = unlimited.
-                let rate = cfg.bandwidth;
-                let pt = cfg.pacing_timer; // #185: pace the UDP batch too
-                let u64bit = cfg.udp_counters_64bit;
-                let bu = cfg.burst;
-                let uw = cfg.window.is_some();
-                let st = start.clone();
+                let rate = bandwidth;
+                let pt = pacing_timer; // #185: pace the UDP batch too
+                let u64bit = udp_counters_64bit;
+                let bu = burst;
+                let uw = window.is_some();
+                let st = ctx.start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(
                         std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
-                streams.push(DataStream {
+                ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
                         is_sender,
@@ -2593,15 +2659,15 @@ impl Server {
                 });
             } else {
                 let c = counters.clone();
-                let d = done.clone();
-                let bs = cfg.blksize;
+                let d = ctx.done.clone();
+                let bs = blksize;
                 let stats = Arc::new(Mutex::new(UdpRecvStats::new()));
                 let stats_clone = stats.clone();
-                let u64bit = cfg.udp_counters_64bit;
+                let u64bit = udp_counters_64bit;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
-                streams.push(DataStream {
+                ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
                         is_sender,
@@ -2621,7 +2687,7 @@ impl Server {
         // OS-thread creation, which stalls for seconds on loaded hosts. On
         // timeout proceed anyway (degraded = pre-fix behavior).
         thread_gate.wait(stream::STREAM_THREAD_START_TIMEOUT).await;
-        Ok(())
+        Ok(SetupFlow::Proceed)
     }
 
     /// Single-socket UDP server demux (#80; default on Windows). Bind ONE
@@ -2637,21 +2703,28 @@ impl Server {
     /// positional client/server stream pairing (the client creates streams
     /// sequentially by index). One demux thread serves every receiving stream;
     /// each sending stream `send_to`s its own client over the shared socket.
-    #[allow(clippy::too_many_arguments)]
     async fn setup_udp_demux_streams(
         &self,
-        ctrl: &mut tokio::net::TcpStream,
-        cfg: &TestConfig,
+        ctx: &mut TestRunCtx,
+        listener: &tokio::net::TcpListener,
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
-        done: &Arc<AtomicBool>,
-        start: &Arc<AtomicBool>,
-        streams: &mut Vec<DataStream>,
-        demux_handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
-    ) -> Result<()> {
+    ) -> Result<SetupFlow> {
         use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
+
+        // The scalar knobs, copied out so the select arms below can borrow
+        // ctx whole (dispatch_setup_ctrl_byte / emit_setup_phase_error).
+        let blksize = ctx.cfg.blksize;
+        let tos = ctx.cfg.tos;
+        let window = ctx.cfg.window;
+        let bandwidth = ctx.cfg.bandwidth;
+        let pacing_timer = ctx.cfg.pacing_timer;
+        let burst = ctx.cfg.burst;
+        let udp_counters_64bit = ctx.cfg.udp_counters_64bit;
+        let fq_rate = ctx.cfg.fq_rate;
+        let gso_dg_size = ctx.cfg.gso_dg_size;
 
         // One unconnected dual-stack socket for the whole test. Never connect()'d
         // and never sharing its port with a second socket, so there is no
@@ -2668,73 +2741,96 @@ impl Server {
         // (per-stream sockets pace N×R); inherent to the demux design,
         // which is Windows-default (where the sockopt no-ops) and Linux
         // opt-in via RIPERF3_UDP_SERVER_DEMUX.
-        net::apply_fq_rate(&udp_sock, cfg.fq_rate);
+        net::apply_fq_rate(&udp_sock, fq_rate);
         // #316: the demux shared socket IS the data socket — same GSO/GRO
         // honor, best-effort, probed once for every stream's meta.
-        let (mut gso_on, mut gro_on) = (cfg.gso, cfg.gro);
+        let (mut gso_on, mut gro_on) = (ctx.cfg.gso, ctx.cfg.gro);
         if gso_on {
-            gso_on = net::set_udp_gso(&udp_sock, saturate_i32(cfg.gso_dg_size)).is_ok();
+            gso_on = net::set_udp_gso(&udp_sock, saturate_i32(gso_dg_size)).is_ok();
         }
         if gro_on {
             gro_on = net::set_udp_gro(&udp_sock).is_ok();
         }
 
-        protocol::send_state(ctrl, TestState::CreateStreams).await?;
+        protocol::send_state(&mut ctx.ctrl, TestState::CreateStreams).await?;
 
         // Accept the connect handshake from every client stream on the one
         // socket. Record the source address of each NEW client in arrival order
         // (slot i == stream i). Reply to every valid magic — including a
         // retransmit from an already-seen client whose reply was lost — but only
-        // a new source claims a slot. Bounded by the same budget as the client
-        // handshake so a client that never connects fails setup instead of
-        // hanging (#11).
+        // a new source claims a slot.
+        // #358: the wait runs the #356 select machinery like the TCP arm —
+        // ctrl-EOF is IECTRLCLOSE at once, a no-progress round bounds at
+        // rcv_timeout (IENOMSG; the per-iteration sleep re-arm makes any
+        // datagram or ctrl byte progress, GT's last_receive_time
+        // semantics), and a waiting ctrl byte dispatches. The old fixed
+        // per-stream UDP_CONNECT_TOTAL_TIMEOUT budget was riperf3-only
+        // (the client keeps its own 30 s handshake budget).
+        let rcv_timeout =
+            std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
         let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(total as usize);
         let mut seen: HashSet<SocketAddr> = HashSet::new();
         let mut magic_buf = [0u8; 65536];
-        // Each *new* stream gets a fresh budget — matching the recycling path,
-        // which calls udp_connect_server(UDP_CONNECT_TOTAL_TIMEOUT) once per
-        // stream, and the client, which retries each stream's connect for that
-        // long independently. A single aggregate deadline would abort setup while
-        // the client is still legitimately handshaking a later stream.
-        let mut deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
         while client_addrs.len() < total as usize {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(RiperfError::Aborted(
-                    "timed out waiting for UDP stream connect".into(),
-                ));
-            }
-            let (n, src) =
-                match tokio::time::timeout(remaining, udp_sock.recv_from(&mut magic_buf)).await {
-                    Ok(Ok(r)) => r,
-                    // Reset-class noise: our own UDP_CONNECT_REPLY to a client
-                    // port that just closed (e.g. a retry on a fresh socket)
-                    // queues WSAECONNRESET on Windows — it must not abort setup
-                    // for EVERY stream; skip like the data-phase receivers (#180).
-                    Ok(Err(e)) if crate::stream::is_reset_class(&e) => continue,
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_) => {
-                        return Err(RiperfError::Aborted(
-                            "timed out waiting for UDP stream connect".into(),
-                        ))
+            tokio::select! {
+                r = udp_sock.recv_from(&mut magic_buf) => {
+                    let (n, src) = match r {
+                        Ok(v) => v,
+                        // Reset-class noise: our own UDP_CONNECT_REPLY to a
+                        // client port that just closed (e.g. a retry on a
+                        // fresh socket) queues WSAECONNRESET on Windows — it
+                        // must not abort setup for EVERY stream; skip like
+                        // the data-phase receivers (#180).
+                        Err(e) if crate::stream::is_reset_class(&e) => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                    // Drop anything that isn't the connect magic (too short,
+                    // or a stray datagram) and keep waiting.
+                    if n < 4 {
+                        continue;
                     }
-                };
-            // Drop anything that isn't the connect magic (too short, or a stray
-            // datagram) and keep waiting — matches udp_connect_server's check.
-            if n < 4 {
-                continue;
-            }
-            let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
-            if msg != protocol::UDP_CONNECT_MSG {
-                continue;
-            }
-            udp_sock
-                .send_to(&protocol::UDP_CONNECT_REPLY.to_ne_bytes(), src)
-                .await?;
-            if seen.insert(src) {
-                client_addrs.push(src);
-                // Fresh per-stream budget for the next stream's handshake.
-                deadline = tokio::time::Instant::now() + protocol::UDP_CONNECT_TOTAL_TIMEOUT;
+                    let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
+                    if msg != protocol::UDP_CONNECT_MSG {
+                        continue;
+                    }
+                    udp_sock
+                        .send_to(&protocol::UDP_CONNECT_REPLY.to_ne_bytes(), src)
+                        .await?;
+                    if seen.insert(src) {
+                        client_addrs.push(src);
+                    }
+                }
+                activity = ctrl_activity(&ctx.ctrl) => match activity {
+                    // EOF: GT's read-site surface, noticed at once — the
+                    // TCP arm's exact shape (#338/#342).
+                    Ok(CtrlActivity::Eof) => {
+                        abort_setup_streams(ctx).await;
+                        let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
+                        self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                        return Err(RiperfError::ControlSocketClosed);
+                    }
+                    Ok(CtrlActivity::Data) => {
+                        if let SetupFlow::ClientDone =
+                            self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                        {
+                            return Ok(SetupFlow::ClientDone);
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+                _ = tokio::time::sleep(rcv_timeout) => {
+                    // GT's no-progress bound: wire-back SERVER_ERROR +
+                    // IENOMSG(144) + errno 0, the doc with the prefixed
+                    // key, exit-0 keep-serving — the TCP arm's shape.
+                    abort_setup_streams(ctx).await;
+                    let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
+                    self.emit_setup_phase_error(
+                        ctx,
+                        listener,
+                        &format!("error - {}", RiperfError::DataIdleTimeout),
+                    );
+                    return Err(RiperfError::DataIdleTimeout);
+                }
             }
         }
 
@@ -2750,7 +2846,7 @@ impl Server {
         // buffer sizes are read once; honor -w/--window on it once too.
         let (sndbuf_actual, rcvbuf_actual) = {
             let sock = socket2::SockRef::from(&udp_std);
-            net::apply_socket_window(&sock, cfg.window);
+            net::apply_socket_window(&sock, window);
             // The recycling path gives each receiving stream its OWN socket (and
             // its own SO_RCVBUF), drained by its own thread. This path funnels
             // every receiving stream through ONE socket drained by a single
@@ -2772,12 +2868,12 @@ impl Server {
         // #97: abort if -w was clamped below the request (iperf3 IESETBUF2). On the
         // single-socket demux path the recv buffer is sized to the aggregate, but a
         // genuine wmem/rmem_max clamp still drives the readback below the request.
-        net::check_socket_window(cfg.window, sndbuf_actual, rcvbuf_actual)?;
+        net::check_socket_window(window, sndbuf_actual, rcvbuf_actual)?;
         // iperf3 applies IP_TOS/IPV6_TCLASS per UDP stream socket on both
         // roles; every stream here shares this one socket and one cfg.tos,
         // so once-per-socket is semantically identical (#154). Fatal per #45.
-        if cfg.tos != 0 {
-            net::set_tos(&udp_std, cfg.tos as u32)?;
+        if tos != 0 {
+            net::set_tos(&udp_std, tos as u32)?;
         }
         // The connected recycling path reports each stream's local_host as the
         // kernel-selected source IP for that client. The demux socket is never
@@ -2793,10 +2889,10 @@ impl Server {
         // Build the per-stream entries: senders get their own send_to task;
         // receivers register a route and share the single demux thread.
         let mut routes: HashMap<SocketAddr, stream::UdpDemuxRoute> = HashMap::new();
-        let bs = cfg.blksize;
-        let rate = cfg.bandwidth;
-        let pt = cfg.pacing_timer; // #185: pace the UDP batch too
-        let u64bit = cfg.udp_counters_64bit;
+        let bs = blksize;
+        let rate = bandwidth;
+        let pt = pacing_timer; // #185: pace the UDP batch too
+        let u64bit = udp_counters_64bit;
         // #178: every spawn_blocking data thread (each sender + the one demux
         // receiver) is spawned through the gate; the barrier below holds
         // TestStart until the data plane actually exists.
@@ -2815,10 +2911,10 @@ impl Server {
             if is_sender {
                 let s = shared.clone();
                 let c = counters.clone();
-                let d = done.clone();
-                let bu = cfg.burst;
-                let uw = cfg.window.is_some();
-                let st = start.clone();
+                let d = ctx.done.clone();
+                let bu = burst;
+                let uw = window.is_some();
+                let st = ctx.start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_server_demux_sender(
@@ -2836,7 +2932,7 @@ impl Server {
                         md,
                     )
                 });
-                streams.push(DataStream {
+                ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
                         is_sender,
@@ -2867,7 +2963,7 @@ impl Server {
                 // below; give each a resolved placeholder task so the per-stream
                 // join at teardown stays uniform. The real handle is `demux_handle`.
                 let task = tokio::spawn(async { Ok::<(), RiperfError>(()) });
-                streams.push(DataStream {
+                ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
                         is_sender,
@@ -2892,9 +2988,9 @@ impl Server {
         // is anything to receive — a pure-reverse test has senders only).
         if !routes.is_empty() {
             let s = shared.clone();
-            let d = done.clone();
-            let bs = cfg.blksize;
-            *demux_handle =
+            let d = ctx.done.clone();
+            let bs = blksize;
+            ctx.udp_demux_handle =
                 Some(thread_gate.spawn(move || {
                     stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
                 }));
@@ -2904,7 +3000,7 @@ impl Server {
         // OS-thread creation, which stalls for seconds on loaded hosts. On
         // timeout proceed anyway (degraded = pre-fix behavior).
         thread_gate.wait(stream::STREAM_THREAD_START_TIMEOUT).await;
-        Ok(())
+        Ok(SetupFlow::Proceed)
     }
 
     /// Per-stream final summaries for the text report (shared by the normal
@@ -4052,6 +4148,47 @@ mod tests {
         })
     }
 
+    /// A minimal TestRunCtx for driving the setup fns directly (#358: they
+    /// take the ctx whole so the select arms can dispatch ctrl bytes).
+    #[cfg(target_os = "linux")]
+    fn test_run_ctx(
+        ctrl: tokio::net::TcpStream,
+        params: TestParams,
+        cfg: TestConfig,
+    ) -> TestRunCtx {
+        TestRunCtx {
+            ctrl,
+            accepted_host: "127.0.0.1".into(),
+            accepted_port: 0,
+            accepted_millis: 0,
+            cookie: [b'x'; 37],
+            params,
+            cfg,
+            want_server_output: false,
+            capture: None,
+            done: Arc::new(AtomicBool::new(false)),
+            start: Arc::new(AtomicBool::new(false)),
+            streams: Vec::new(),
+            byte_budget: None,
+            budget_target: None,
+            udp_demux_handle: None,
+            interval_data: Arc::new(Mutex::new(crate::reporter::CollectedIntervals::default())),
+            cpu_start: CpuSnapshot::now(),
+            test_start_millis: 0,
+            report_start: std::time::Instant::now(),
+            reporter_end: Arc::new(crate::reporter::ReporterEnd::new()),
+            interval_handle: None,
+            server_error: None,
+            client_terminated: false,
+            unknown_message: false,
+            ctrl_closed: false,
+            early_done: false,
+            exchange_recv_failed: false,
+            bare_end: false,
+            interrupted: None,
+        }
+    }
+
     /// #154: the server's UDP data sockets must carry IP_TOS — iperf3 runs
     /// iperf_common_sockopts on UDP stream sockets on both roles (matters
     /// for reverse/bidir egress marking). Reverse, one stream: the server is
@@ -4065,7 +4202,7 @@ mod tests {
         let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
             .await
             .unwrap();
-        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+        let (ctrl_srv, _) = l.accept().await.unwrap();
 
         let srv = ServerBuilder::new()
             .port(Some(port))
@@ -4080,29 +4217,18 @@ mod tests {
             ..Default::default()
         };
         let cfg = TestConfig::from_params(&params).unwrap();
-        let done = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(AtomicBool::new(false));
-        let mut streams = Vec::new();
+        let mut ctx = test_run_ctx(ctrl_srv, params, cfg);
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_recycling_streams(
-            &mut ctrl_srv,
-            &cfg,
-            0,
-            1,
-            None,
-            &done,
-            &start,
-            &mut streams,
-        )
-        .await
-        .unwrap();
-        start.store(true, Ordering::Relaxed);
+        srv.setup_udp_recycling_streams(&mut ctx, &l, 0, 1, None)
+            .await
+            .unwrap();
+        ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();
-        done.store(true, Ordering::Relaxed);
-        for s in streams {
+        ctx.done.store(true, Ordering::Relaxed);
+        for s in ctx.streams.drain(..) {
             let _ = s.task.await;
         }
         assert_eq!(tos, Some(0x48), "server UDP egress must carry cfg.tos");
@@ -4120,7 +4246,7 @@ mod tests {
         let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
             .await
             .unwrap();
-        let (mut ctrl_srv, _) = l.accept().await.unwrap();
+        let (ctrl_srv, _) = l.accept().await.unwrap();
 
         let srv = ServerBuilder::new()
             .port(Some(port))
@@ -4135,34 +4261,21 @@ mod tests {
             ..Default::default()
         };
         let cfg = TestConfig::from_params(&params).unwrap();
-        let done = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(AtomicBool::new(false));
-        let mut streams = Vec::new();
-        let mut demux_handle = None;
+        let mut ctx = test_run_ctx(ctrl_srv, params, cfg);
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_demux_streams(
-            &mut ctrl_srv,
-            &cfg,
-            0,
-            1,
-            None,
-            &done,
-            &start,
-            &mut streams,
-            &mut demux_handle,
-        )
-        .await
-        .unwrap();
-        start.store(true, Ordering::Relaxed);
+        srv.setup_udp_demux_streams(&mut ctx, &l, 0, 1, None)
+            .await
+            .unwrap();
+        ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();
-        done.store(true, Ordering::Relaxed);
-        for s in streams {
+        ctx.done.store(true, Ordering::Relaxed);
+        for s in ctx.streams.drain(..) {
             let _ = s.task.await;
         }
-        if let Some(h) = demux_handle {
+        if let Some(h) = ctx.udp_demux_handle.take() {
             h.abort();
         }
         assert_eq!(tos, Some(0x48), "demux UDP egress must carry cfg.tos");

@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -927,16 +925,19 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
     ))
 }
 
-/// Server-side UDP connect handshake.
-/// Waits (up to `timeout`) for the client's magic word, "connects" the socket
-/// to the client, sends the reply, and returns the client address. The bounded
-/// wait means a client that never connects — or whose magic is lost on a real
-/// network — fails the test instead of hanging setup forever (issue #11).
+/// Server-side UDP connect handshake — retained as the REFERENCE
+/// implementation for the handshake round-trip tests below. #358 retired
+/// its production call: the recycling setup now receives the magic inside
+/// the #356 select machinery (server.rs) so ctrl-EOF/rcv-timeout are
+/// honored, and runs the connect+reply after the arm wins (this fn's
+/// select-cancellation would risk a lost reply). Validation semantics are
+/// duplicated verbatim at that site.
 /// Note: iperf3 uses native byte order (not network byte order) for the magic values.
+#[cfg(test)]
 pub async fn udp_connect_server(
     socket: &UdpSocket,
     timeout: std::time::Duration,
-) -> Result<SocketAddr> {
+) -> Result<std::net::SocketAddr> {
     let mut buf = [0u8; 65536];
     let (n, addr) = match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
         Ok(r) => r?,

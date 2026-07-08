@@ -4264,6 +4264,224 @@ fn client_server_error_payload_wedge_self_bounds() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #358: the UDP setup phase gets the #356 select machinery — the TCP-only
+// fix left three GT-fidelity gaps (all live-probed on GT 3.21 in #356's
+// r1, {"udp":true} params): ctrl-EOF sat out the riperf3-only 30 s UDP
+// connect budget where GT IECTRLCLOSEs at once; --rcv-timeout was ignored
+// (GT bounds the wait at rcv_timeout, probed dt 3.01 at 3000 ms); and the
+// timeout surface was riperf3-only ("test aborted: timed out waiting for
+// UDP stream connect", no IENOMSG wire-back, no setup doc — GT sends
+// fe 00000090 00000000 and emits the #356 setup-phase document). Both
+// server designs (recycling + demux) are pinned via
+// RIPERF3_UDP_SERVER_DEMUX.
+// ---------------------------------------------------------------------------
+
+/// Valid UDP params via serde defaults; the peer never sends the connect
+/// magic (the #356 INCOMPLETE_PARAMS shape, UDP protocol).
+const UDP_INCOMPLETE_PARAMS: &str = r#"{"udp":true}"#;
+
+/// [`drive_server_scenario_with`] + the UDP-design env knob and a caller
+/// exit bound (the EOF reds sit out the old 30 s budget — the bound IS
+/// the pin).
+fn drive_udp_server_scenario(
+    demux: bool,
+    extra_args: &[&str],
+    json: bool,
+    mock: impl FnOnce(u16) + Send + 'static,
+    exit_bound: Duration,
+) -> (String, String, std::process::ExitStatus) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let port_s = port.to_string();
+
+    let mut args = vec!["-s", "-1", "-p", &port_s];
+    args.extend_from_slice(extra_args);
+    if json {
+        args.push("-J");
+    }
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(&args)
+            .env("RIPERF3_UDP_SERVER_DEMUX", if demux { "1" } else { "0" })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    let serr_reader =
+        riperf3_test_support::drain_reader(server.0.stderr.take().expect("piped stderr"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mock = std::thread::spawn(move || mock(port));
+    mock.join().expect("mock");
+    let status = riperf3_test_support::wait_bounded(&mut server.0, exit_bound)
+        .expect("server exits bounded");
+    (
+        sout_reader.join().expect("stdout"),
+        serr_reader.join().expect("stderr"),
+        status,
+    )
+}
+
+/// The #358 EOF driver: full setup to CreateStreams under UDP params,
+/// then ctrl-EOF with the connect magic never sent.
+fn drive_udp_setup_eof(port: u16) {
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, UDP_INCOMPLETE_PARAMS);
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+    drop(ctrl); // EOF with the UDP connect never attempted
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// The #358 HOLD runner: park in the UDP CREATE_STREAMS wait with the
+/// ctrl open, read the wire-back frame at the --rcv-timeout 3000 bound.
+fn run_udp_setup_hold_scenario(
+    demux: bool,
+    json: bool,
+) -> (Vec<u8>, String, String, std::process::ExitStatus) {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (sout, serr, status) = drive_udp_server_scenario(
+        demux,
+        &["--rcv-timeout", "3000"],
+        json,
+        move |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, UDP_INCOMPLETE_PARAMS);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+            // HOLD: the connect magic never comes, ctrl stays open. The
+            // wire-back should arrive at the ~3 s bound; the pre-fix path
+            // errors at its own 30 s budget with no wire-back at all.
+            *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+            drop(ctrl);
+        },
+        Duration::from_secs(8),
+    );
+    let frame = frame.lock().unwrap().clone();
+    (frame, sout, serr, status)
+}
+
+/// #358 EOF, recycling design, text: GT's instant IECTRLCLOSE — the
+/// pre-fix server sat out the full 30 s UDP connect budget (the 5 s exit
+/// bound is the red).
+#[test]
+fn udp_setup_ctrl_eof_exits_bounded_in_text() {
+    let (_sout, serr, status) = drive_udp_server_scenario(
+        false,
+        &[],
+        false,
+        drive_udp_setup_eof,
+        Duration::from_secs(5),
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CTRL_CLOSED}"),
+        "GT's bare read-site sentence: {serr:?}"
+    );
+}
+
+/// #358 EOF, demux design, text: the same instant IECTRLCLOSE.
+#[test]
+fn udp_setup_ctrl_eof_exits_bounded_in_text_demux() {
+    let (_sout, serr, status) = drive_udp_server_scenario(
+        true,
+        &[],
+        false,
+        drive_udp_setup_eof,
+        Duration::from_secs(5),
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: {CTRL_CLOSED}"),
+        "GT's bare read-site sentence: {serr:?}"
+    );
+}
+
+/// #358 EOF, -J (recycling): the #356 setup-phase doc with the bare
+/// IECTRLCLOSE key and silent stderr — the field walk is the TCP pins'
+/// (setup_phase_ctrl_eof_takes_gt_doc_shape_in_json); this asserts the
+/// UDP arm routes through the same emit.
+#[test]
+fn udp_setup_ctrl_eof_takes_gt_doc_shape_in_json() {
+    let (sout, serr, status) = drive_udp_server_scenario(
+        false,
+        &[],
+        true,
+        drive_udp_setup_eof,
+        Duration::from_secs(5),
+    );
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(CTRL_CLOSED),
+        "bare IECTRLCLOSE key: {doc}"
+    );
+    assert!(
+        doc["end"].as_object().expect("end").is_empty(),
+        "bare end{{}}: {doc}"
+    );
+}
+
+/// #358 HOLD, recycling, text: bounded at --rcv-timeout with GT's IENOMSG
+/// surface — the fe 00000090 00000000 wire-back, the stderr line, exit 0.
+#[test]
+fn udp_setup_ctrl_hold_bounds_at_rcv_timeout_in_text() {
+    let (frame, _sout, serr, status) = run_udp_setup_hold_scenario(false, false);
+    assert_eq!(
+        frame,
+        wireback_frame(144),
+        "SERVER_ERROR + htonl(IENOMSG) + htonl(0), like GT's cleanup_server"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IDLE_TIMEOUT_MSG}"),
+        "GT's IENOMSG line: {serr:?}"
+    );
+}
+
+/// #358 HOLD, demux, text: the same rcv_timeout bound and surface.
+#[test]
+fn udp_setup_ctrl_hold_bounds_at_rcv_timeout_in_text_demux() {
+    let (frame, _sout, serr, status) = run_udp_setup_hold_scenario(true, false);
+    assert_eq!(frame, wireback_frame(144));
+    assert!(status.success(), "one-off exits 0 like GT");
+    assert_eq!(
+        serr.trim(),
+        format!("riperf3: error - {IDLE_TIMEOUT_MSG}"),
+        "GT's IENOMSG line: {serr:?}"
+    );
+}
+
+/// #358 HOLD, -J (recycling): the prefixed IENOMSG key over the setup doc.
+#[test]
+fn udp_setup_ctrl_hold_takes_gt_doc_shape_in_json() {
+    let (frame, sout, serr, status) = run_udp_setup_hold_scenario(false, true);
+    assert_eq!(frame, wireback_frame(144));
+    assert!(status.success());
+    assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some(format!("error - {IDLE_TIMEOUT_MSG}").as_str()),
+        "the prefixed IENOMSG key: {doc}"
+    );
+}
+
 /// #374: EOF where the results were due, -J — the doc carries the
 /// dangling error value and GT's bare `end: {}` (live-probed 3.21; GT's
 /// in-doc value appends a STALE errno's strerror — recorded deviation,
