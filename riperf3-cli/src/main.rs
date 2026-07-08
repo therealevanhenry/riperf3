@@ -32,8 +32,17 @@ fn main() -> std::process::ExitCode {
                     // "block size too large", riperf3 this sentence). clap's
                     // required mode group fires first by construction (#198);
                     // same reject class + exit either way.
+                    // #365: GT's IENOROLE is post-loop — stamped
+                    // unconditionally (the format parsed by then). clap died
+                    // before the parse here, so the format comes off raw
+                    // argv (=-attached or the bare-flag default, matching
+                    // the arg's clap definition).
                     eprintln!(
-                        "riperf3: parameter error - must either be a client (-c) or server (-s)"
+                        "{}riperf3: parameter error - must either be a client (-c) or server (-s)",
+                        timestamps_from_argv()
+                            .as_deref()
+                            .map(riperf3::render_timestamp_prefix)
+                            .unwrap_or_default()
                     );
                     print_usage_trailer();
                     return std::process::ExitCode::FAILURE;
@@ -42,6 +51,9 @@ fn main() -> std::process::ExitCode {
                     if e.to_string().contains("--server") && e.to_string().contains("--client") =>
                 {
                     // iperf3's IESERVCLIENT (live: exit 1 + usage trailer).
+                    // Deliberately UNSTAMPED (#365 r1 F5): GT raises this
+                    // MID-loop (iperf_api.c:1293/:1300 — probed bare with
+                    // --timestamps last), the #301-F4 ordering class.
                     eprintln!("riperf3: parameter error - cannot be both server and client");
                     print_usage_trailer();
                     return std::process::ExitCode::FAILURE;
@@ -291,7 +303,19 @@ fn main() -> std::process::ExitCode {
         // with the usage trailer (live-probed for all three classes here:
         // end-conditions, client-only, server-only). #328: the -l range
         // checks live INSIDE parse_class_rejection at GT's post-loop slot.
-        eprintln!("riperf3: parameter error - {msg}");
+        // #365: post-loop parameter errors are stamped UNCONDITIONALLY in
+        // GT (the format is always parsed by the post-loop checks,
+        // iperf_api.c ~:1825+; live: stamped with --timestamps LAST) — the
+        // #348 mid-loop ordering note applies only to in-loop errors (the
+        // range checks above, which stay bare — the #301-F4 recorded
+        // deviation). GT stamps the error line only; the trailer is bare.
+        eprintln!(
+            "{}riperf3: parameter error - {msg}",
+            cli.timestamps
+                .as_deref()
+                .map(riperf3::render_timestamp_prefix)
+                .unwrap_or_default()
+        );
         print_usage_trailer();
         return std::process::ExitCode::FAILURE;
     }
@@ -412,6 +436,29 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// #365: the --timestamps format straight off raw argv — for the clap-arm
+/// post-loop errors (IENOROLE), where clap errored before a parse existed.
+/// Mirrors GT's getopt optional_argument (r1 F2 — NOT clap's parse, which
+/// also accepts a space-separated value; that clap-vs-getopt divergence is
+/// the filed require_equals follow-up): `=`-attached value or the
+/// bare-flag "%c " default, last occurrence wins. args_os: a non-UTF8
+/// argv elsewhere must not panic the error path (r1 F1 — std::env::args
+/// panics mid-iteration; GT prints its parameter error regardless).
+/// KNOWN LIMIT (r1 F3): a `--timestamps=X` token consumed as ANOTHER
+/// option's value still stamps here (position-blind scan); GT's getopt is
+/// bare in that cell — contrived argv, not worth position tracking.
+fn timestamps_from_argv() -> Option<String> {
+    let mut fmt = None;
+    for a in std::env::args_os() {
+        if a == std::ffi::OsStr::new("--timestamps") {
+            fmt = Some("%c ".to_string());
+        } else if let Some(v) = a.as_encoded_bytes().strip_prefix(b"--timestamps=") {
+            fmt = Some(String::from_utf8_lossy(v).into_owned());
+        }
+    }
+    fmt
 }
 
 /// iperf3's parameter-error usage trailer (usage_shortstr + the --help hint).
