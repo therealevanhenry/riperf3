@@ -3024,12 +3024,16 @@ fn pretest_send_state_failure_takes_iesendmessage_json() {
 // POPULATED doc (start/intervals/end) + the prefixed key, not the skeleton
 // (PR #370 r2 addendum, live-probed). riperf3's 100 ms flush sleep in
 // shutdown_and_flush runs BEFORE this send, so the RST has arrived and the
-// send deterministically fails (no #345 race). This pin covers the WHICH-
-// SENDS-FIRST cell (EXCHANGE_RESULTS); the later sends buffer on loopback and
-// diverge by class/phase (recorded: send_results → IESENDRESULTS deviation on
-// ExchangeSendResultsFailed; the DISPLAY_RESULTS-buffers-then-IperfDone-read
-// skeleton is filed as #406). LINUX-ONLY like #345 (SO_LINGER(0) RST; the
-// mapping is platform-independent).
+// send deterministically fails (no #345 race). The three exchange sends
+// diverge cell-by-cell: (A) send_state(EXCHANGE_RESULTS) fails → IESENDMESSAGE
+// (this cell); (B) send_results ALSO fails deterministically on riperf3
+// (ECONNRESET) → IESENDRESULTS, where GT's buffers-and-succeeds so its failure
+// shifts to the next send → IESENDMESSAGE (recorded deviation on
+// ExchangeSendResultsFailed; pinned by the sub-class-B test below); (C)
+// send_state(DISPLAY_RESULTS) buffers on riperf3 and the RST is caught on the
+// following IperfDone read → skeleton (the pre-#371 recv-path shape, filed as
+// #406). LINUX-ONLY like #345 (SO_LINGER(0) RST; the mapping is
+// platform-independent).
 // ---------------------------------------------------------------------------
 
 /// Drive a FULL round through TEST_END, then SO_LINGER(0) RST the ctrl so the
@@ -3074,6 +3078,87 @@ fn drive_full_round_then_rst(json: bool) -> (String, String, std::process::ExitS
         drop((ctrl, data));
         std::thread::sleep(std::time::Duration::from_millis(500));
     })
+}
+
+/// Drive through the client's results send, THEN SO_LINGER(0) RST — so the
+/// server's `send_results` write is the one that fails. On riperf3 this write
+/// fails deterministically (ECONNRESET) → IESENDRESULTS; GT's buffers and the
+/// failure shifts to the next state send → IESENDMESSAGE (recorded deviation).
+#[cfg(target_os = "linux")]
+fn drive_round_rst_after_client_results(json: bool) -> (String, String, std::process::ExitStatus) {
+    drive_server_scenario(json, |port| {
+        let set_rst = |s: &std::net::TcpStream| {
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            let rc = unsafe {
+                use std::os::fd::AsRawFd;
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    std::ptr::from_ref(&linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        };
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        set_rst(&ctrl);
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9); // ParamExchange
+        write_json_blob(&mut ctrl, MOCK_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10); // CreateStreams
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        set_rst(&data);
+        data.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 1); // TestStart
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 2); // TestRunning
+        data.write_all(&[0u8; 4096]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 13); // ExchangeResults
+        write_json_blob(&mut ctrl, MOCK_RESULTS); // the client's results
+                                                  // RST NOW — the server's send_results write is next and fails.
+        drop((ctrl, data));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    })
+}
+
+/// #371 sub-class B (-J): the `send_results` write fails → GT's
+/// IESENDRESULTS(116) over the POPULATED doc. Deterministic on riperf3
+/// (the write fails, ECONNRESET); GT diverges to IESENDMESSAGE (recorded
+/// on `ExchangeSendResultsFailed`). Red pre-fix (raw-io skeleton).
+#[cfg(target_os = "linux")]
+#[test]
+fn exchange_send_results_failure_takes_iesendresults_json_over_populated_doc() {
+    const SENDRESULTS_SENTENCE: &str = "unable to send results";
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let (sout, serr, status) = drive_round_rst_after_client_results(true);
+        assert!(status.success());
+        assert!(serr.trim().is_empty(), "-J keeps stderr silent: {serr:?}");
+        let doc: serde_json::Value = serde_json::from_str(sout.trim())
+            .unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+        let key = doc["error"].as_str().unwrap_or_default().to_string();
+        if key.contains(SENDRESULTS_SENTENCE) {
+            assert!(
+                key.starts_with(&format!("error - {SENDRESULTS_SENTENCE}: "))
+                    && !key.ends_with(": "),
+                "prefixed IESENDRESULTS key + live strerror: {key:?}"
+            );
+            assert!(
+                doc["end"].as_object().is_some_and(|m| !m.is_empty())
+                    && doc["intervals"].as_array().is_some_and(|a| !a.is_empty()),
+                "populated end + intervals: {doc}"
+            );
+            return;
+        }
+        seen.push(key);
+    }
+    panic!("exchange IESENDRESULTS never surfaced in 8 RST rounds; saw: {seen:#?}");
 }
 
 /// #371 text: the exchange-send failure prints GT's IESENDMESSAGE line, and
