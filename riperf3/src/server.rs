@@ -809,7 +809,21 @@ impl Server {
             (peer_addr.ip().to_canonical().to_string(), peer_addr.port());
 
         // ---- Cookie + ParamExchange (+ the #230 upfront max-duration refusal) ----
-        let (cookie, params, cfg) = match self.negotiate_test(&mut ctrl).await? {
+        // #361: the cookie/params reads race the interrupt watch — GT's
+        // sigend exits IMMEDIATELY from this window with the #346 skeleton
+        // (live: exit 0, dt 0.00); the old interrupt-blind window rode the
+        // CLI's 5 s dump wall with EMPTY -J stdout against a wedged
+        // client. (The #158 second-signal test's deterministic wedge moved
+        // one phase later, to the interrupt-blind setup wait.)
+        let mut neg_interrupt = self.interrupt.clone().map(|w| w.0);
+        let negotiated = tokio::select! {
+            r = self.negotiate_test(&mut ctrl) => r?,
+            msg = crate::client::wait_interrupt(neg_interrupt.as_mut()) => {
+                self.emit_pretest_error_doc(&msg);
+                return Ok(None);
+            }
+        };
+        let (cookie, params, cfg) = match negotiated {
             Some(negotiated) => negotiated,
             // Refused before any test ran → no report.
             None => return Ok(None),
@@ -1080,9 +1094,10 @@ impl Server {
     /// full 5 s dump window (the post-merge macOS CI red: systemd-style
     /// SIGTERM-while-listening took ~5 s). There is nothing to dump while
     /// idle; returning `None` lets the run loop's interrupt check exit the
-    /// serve loop. The post-accept phases (cookie/param reads) stay
-    /// interrupt-blind by design — the #158 second-signal wedge test depends
-    /// on that window.
+    /// serve loop. The cookie/param reads race the interrupt watch too
+    /// (#361 — GT's sigend exits immediately from any phase); the remaining
+    /// interrupt-blind window is the CREATE_STREAMS setup wait, where the
+    /// #158 second-signal wedge test now parks (recorded on #361).
     async fn accept_control(
         &self,
         listener: &tokio::net::TcpListener,

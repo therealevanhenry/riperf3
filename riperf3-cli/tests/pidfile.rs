@@ -139,10 +139,13 @@ fn pidfile_unlinked_after_one_off_run() {
 /// #158/#210: a SECOND signal exits immediately, dying BY the signal. The
 /// first signal now takes the graceful sigend path (#210: dump + terminate
 /// the peer), so the old blasting-UDP wedge converges too fast to race.
-/// Instead a half-open control connection wedges the server in the param
-/// exchange — a phase with no interrupt-aware await — so the first signal's
-/// bounded dump window (5 s) holds deterministically while the second signal
-/// hits the pre-armed raw handler.
+/// The deterministic wedge is a phase with no interrupt-aware await: the
+/// cookie/param reads served until #361 made them interrupt-aware (GT
+/// exits immediately there), so the wedge now parks in the CREATE_STREAMS
+/// setup wait — params sent, no data connections; its select watches the
+/// ctrl and the rcv_timeout (120 s default) but NOT the interrupt — so the
+/// first signal's bounded dump window (5 s) holds deterministically while
+/// the second signal hits the pre-armed raw handler.
 #[cfg(unix)]
 #[test]
 fn second_signal_during_teardown_exits_immediately() {
@@ -168,10 +171,25 @@ fn second_signal_during_teardown_exits_immediately() {
         "server pidfile written",
     );
 
-    // The wedge: connect to the control port and send nothing — the server
-    // sits in the cookie/param read, which no interrupt arm covers.
-    let _wedge = std::net::TcpStream::connect(("127.0.0.1", port)).expect("wedge connect");
-    std::thread::sleep(Duration::from_millis(300)); // let the accept land
+    // The wedge (#361 moved it one phase later): complete the cookie/param
+    // exchange, then connect NO data streams — the server parks in the
+    // CREATE_STREAMS setup wait, which no interrupt arm covers.
+    let _wedge = {
+        use std::io::{Read as _, Write as _};
+        let mut w = std::net::TcpStream::connect(("127.0.0.1", port)).expect("wedge connect");
+        w.write_all(&[b'x'; 37]).expect("cookie");
+        let mut b = [0u8; 1];
+        w.read_exact(&mut b).expect("ParamExchange state");
+        assert_eq!(b[0], 9);
+        let params = br#"{"tcp":true}"#;
+        w.write_all(&(params.len() as u32).to_be_bytes())
+            .expect("len");
+        w.write_all(params).expect("params");
+        w.read_exact(&mut b).expect("CreateStreams state");
+        assert_eq!(b[0], 10);
+        w
+    };
+    std::thread::sleep(Duration::from_millis(300)); // let the setup wait park
 
     let pid = server.0.id() as i32;
     // SAFETY: plain kill(2) on our own child.
