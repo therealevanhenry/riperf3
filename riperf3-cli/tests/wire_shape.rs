@@ -2261,6 +2261,41 @@ fn setup_doc_window_actuals_reflect_the_exchanged_window() {
     );
 }
 
+/// #391 r1 F1: an exchanged window:0 is NOT applied — GT's re-listen
+/// guard is C truthiness (iperf_tcp.c:257), so the doc reads the
+/// listener like the no-window state. Platform-independent: the w=0
+/// cell's actuals must EQUAL the no-window cell's (the pre-fix scratch
+/// arm applied 0 and emitted the kernel minimums instead).
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_doc_window_zero_reads_the_listener_like_no_window() {
+    let drive = |params: &'static str| {
+        let (sout, _serr, status) = drive_server_scenario(true, move |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, params);
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+            drop(ctrl);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        assert!(status.success());
+        let doc: serde_json::Value = serde_json::from_str(sout.trim())
+            .unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+        (
+            doc["start"]["sndbuf_actual"].as_u64(),
+            doc["start"]["rcvbuf_actual"].as_u64(),
+        )
+    };
+    let zero = drive(r#"{"tcp":true,"window":0}"#);
+    let none = drive(r#"{"tcp":true}"#);
+    assert_eq!(
+        zero, none,
+        "window:0 reads the listener like the no-window state (GT truthiness)"
+    );
+    assert!(zero.0.is_some() && zero.1.is_some(), "the trio is present");
+}
+
 const IDLE_TIMEOUT_MSG: &str = "idle timeout for receiving data";
 
 /// HOLD-variant driver: park in CREATE_STREAMS with the ctrl open, read the

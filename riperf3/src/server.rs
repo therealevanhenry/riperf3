@@ -3661,8 +3661,20 @@ impl Server {
         // scratch socket with the same window applied yields the identical
         // kernel read-back. Without -w the un-windowed listener matches
         // GT's re-listened defaults.
+        // RECORDED DEVIATION (#391 r1 F3, pre-existing design consequence):
+        // at a window past 2x wmem_max GT fires IESETBUF2 at its re-listen
+        // (error doc, no trio, fe frame instead of CreateStreams); riperf3
+        // has no re-listen (deliberate) and its #97 check lives on data
+        // sockets, which never arrive in wedge cells — the doc carries the
+        // clamped actuals instead (probed w=16M: GT errors, riperf3 emits
+        // 8388608/8388608).
+        // #391 r1 F1: GT's re-listen guard is C truthiness (iperf_tcp.c:
+        // 257) — an exchanged window:0 is NOT applied; it reads the
+        // listener like the no-window state (probed: GT 16384/131072 for
+        // window:0). Negative windows ARE applied (truthiness; both tools
+        // clamp identically — probed w=-1).
         let (sndbuf_actual, rcvbuf_actual) = match (udp, ctx.cfg.window) {
-            (false, Some(w)) => {
+            (false, Some(w)) if w != 0 => {
                 let scratch =
                     socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok();
                 match scratch {
@@ -3676,7 +3688,7 @@ impl Server {
                     None => (None, None),
                 }
             }
-            (false, None) => (
+            (false, _) => (
                 sock.send_buffer_size().ok().map(|v| v as u64),
                 sock.recv_buffer_size().ok().map(|v| v as u64),
             ),
