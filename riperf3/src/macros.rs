@@ -195,16 +195,20 @@ impl Drop for OutputQuietGuard {
 /// Process-global like OUTPUT_TITLE (one run at a time).
 static ERR_SINK: RwLock<Option<String>> = RwLock::new(None);
 
-/// RAII guard routing this crate's error lines — diagnostics that otherwise
-/// print to stderr, like the client's `SERVER ERROR - …` relay receipt — to
-/// a logfile instead, matching iperf3's `--logfile` behavior (its iperf_err
-/// writes to the logfile whenever one is open). Lines are appended; stderr
-/// remains the fallback when the file cannot be opened. Construct ONLY when
-/// a logfile is active (callers gate then `.map(ErrorSinkGuard::set)`);
-/// Drop restores stderr routing. Process-global: one run at a time.
+/// RAII guard routing this crate's error lines to a logfile instead of
+/// stderr, matching iperf3's `--logfile` behavior (its iperf_err writes to
+/// the logfile whenever one is open). Currently routed: the client's
+/// `SERVER ERROR - …` relay receipt; the crate's remaining stderr
+/// diagnostics are tracked in #398 and still print to stderr. A quiet run
+/// (#290) suppresses these lines entirely — quiet wins over the sink.
+/// Lines are appended; stderr remains the fallback when the file cannot be
+/// opened. Construct ONLY when a logfile is active (callers gate then
+/// `.map(ErrorSinkGuard::set)`); Drop restores stderr routing.
+/// Process-global: one run at a time.
 // The private unit field makes `set()` the only constructor, like
 // OutputQuietGuard — a literal construction elsewhere would pair a no-op
 // arm with a sink-clearing Drop.
+#[must_use = "the sink disarms when the guard drops — bind it for the run's duration"]
 pub struct ErrorSinkGuard(());
 
 impl ErrorSinkGuard {
