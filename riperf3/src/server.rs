@@ -814,12 +814,21 @@ impl Server {
         // param exchange — GT's iperf_on_connect fires there — so a
         // --get-server-output capture relays it; see print_connect_block.)
         // #362: GT classes a failed TCP_NODELAY on the just-accepted ctrl
-        // as IESETNODELAY (iperf_server_api.c:170-173) — the macOS
-        // kind-only-InvalidInput cell's likeliest site.
-        net::configure_tcp_stream(&ctrl, true).map_err(|e| match e {
-            RiperfError::Io(io) => RiperfError::SetNoDelayFailed(io),
-            other => other,
-        })?;
+        // as IESETNODELAY(122) (iperf_server_api.c:170-173) — the macOS
+        // kind-only-InvalidInput cell's likeliest site. GT's cleanup_server
+        // relays fe+122+errno on the live ctrl (ctrl_sck is set BEFORE the
+        // sockopt, :169) — best-effort here like the sibling relays (r1 F5).
+        if let Err(e) = net::configure_tcp_stream(&ctrl, true) {
+            let err = match e {
+                RiperfError::Io(io) => {
+                    let errno = io.raw_os_error().unwrap_or(0) as u32;
+                    let _ = protocol::send_server_error_errno(&mut ctrl, 122, errno).await;
+                    RiperfError::SetNoDelayFailed(io)
+                }
+                other => other,
+            };
+            return Err(err);
+        }
 
         // The control-socket peer address feeds the server's `start.accepted_connection`
         // (iperf_api.c uses getpeername(ctrl_sck) — distinct from the data-stream
@@ -1434,9 +1443,18 @@ impl Server {
                                     Ok(v) => v,
                                     Err(e) => {
                                         abort_setup_streams(ctx).await;
-                                        let _ = protocol::send_server_error(
+                                        // r1 F2: GT wires the LIVE accept
+                                        // errno (cleanup_server sends
+                                        // htonl(errno), iperf_server_api.c:
+                                        // 469-470) — a GT client prints its
+                                        // SERVER ERROR line only when the
+                                        // wire errno > 0.
+                                        let errno =
+                                            e.raw_os_error().unwrap_or(0) as u32;
+                                        let _ = protocol::send_server_error_errno(
                                             &mut ctx.ctrl,
                                             203,
+                                            errno,
                                         )
                                         .await;
                                         let err =
@@ -3754,7 +3772,11 @@ impl Server {
         // strerror (GT perr with a real errno); the errno-0 siblings keep
         // the #248 dangling ": ".
         let doc_error = match err {
-            RiperfError::SendControlFailed(_) => format!("error - {err}"),
+            // #362 r1 F1: the strerror-carrying classes take no dangling
+            // suffix — their Displays already end with the errno text.
+            RiperfError::SendControlFailed(_)
+            | RiperfError::AcceptFailed(_)
+            | RiperfError::SetNoDelayFailed(_) => format!("error - {err}"),
             _ => format!("error - {err}: "),
         };
         if self.json_output || self.json_stream {

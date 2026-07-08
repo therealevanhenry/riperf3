@@ -104,23 +104,28 @@ pub enum RiperfError {
     SendControlFailed(std::io::Error),
 
     /// iperf3's IEACCEPT(104): the control accept() failed
-    /// (iperf_server_api.c:163; herr+perr — the live strerror rides, the
-    /// #345 SendControlFailed convention). BSD-class reachable
-    /// (ECONNABORTED surfaces from accept there); Linux EMFILE (#362 —
-    /// previously the raw io line on the generic arm).
+    /// (iperf_server_api.c:163; herr+perr). RECORDED DEVIATION (#387 r1
+    /// F6): riperf3 carries the SITE-CAPTURED errno; GT's surface prints
+    /// the post-cleanup CLOBBERED errno (live: "Bad file descriptor"
+    /// where the accept errno was EMFILE) — the honest-errno call, the
+    /// #345 convention. BSD-class reachable (ECONNABORTED); Linux EMFILE
+    /// (#362 — previously the raw io line on the generic arm).
     #[error("unable to accept connection from client: {0}")]
     AcceptFailed(std::io::Error),
 
     /// iperf3's IESTREAMCONNECT(203): the SETUP data-stream accept()
     /// failed (iperf_tcp.c:134-135) — GT's cleanup_server round-kill with
-    /// the fe+203 wire-back and the populated setup doc (#362, the
-    /// PR #384 r2 F4 cell). Live strerror rides (herr+perr).
+    /// the fe+203+LIVE-errno wire-back and the populated setup doc (#362,
+    /// the PR #384 r2 F4 cell). The site-captured errno rides text and
+    /// wire (GT's TEXT surface prints the clobbered post-cleanup errno
+    /// but WIRES the live one — #387 r1 F2/F6).
     #[error("unable to connect stream: {0}")]
     StreamConnectFailed(std::io::Error),
 
-    /// iperf3's IESETNODELAY(112-class): TCP_NODELAY on the just-accepted
-    /// control socket failed (iperf_server_api.c:170-173; perr) — the
-    /// #362 macOS kind-only-InvalidInput cell's likeliest site.
+    /// iperf3's IESETNODELAY(122, iperf_api.h:471): TCP_NODELAY on the
+    /// just-accepted control socket failed (iperf_server_api.c:170-173;
+    /// perr) — the #362 macOS kind-only-InvalidInput cell's likeliest
+    /// site. The fe+122+errno relay is best-effort on the failing ctrl.
     #[error("unable to set TCP/SCTP NODELAY: {0}")]
     SetNoDelayFailed(std::io::Error),
 
