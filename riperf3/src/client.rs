@@ -386,7 +386,16 @@ impl Client {
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
         // ---- State machine: react to server-driven transitions ----
-        loop {
+        // #375: the whole dispatch loop runs inside this block so EVERY
+        // exit — the `?` propagations and the early returns alike — falls
+        // through to the ONE unconditional teardown below (the server's
+        // #372 shape; per-arm wrappers were whack-a-mole across the
+        // #331/#353/#354 family). `Ok(Some(report))` = an early-exit round
+        // that already rendered its output (the interrupt dumps); the
+        // clean IperfDone break is `Ok(None)`. A `return` inside the block
+        // exits the BLOCK, not run().
+        let outcome: Result<Option<crate::json_report::Report>> = async {
+            loop {
             // #231: iperf_catch_sigend is armed for the WHOLE run, so the
             // central state wait polls the interrupt watch like the
             // TEST_RUNNING selects — covering the setup phases AND the
@@ -412,7 +421,7 @@ impl Client {
                     Err(e) => return Err(e),
                 },
                 msg = wait_interrupt(ctx.interrupt.as_mut()) => {
-                    return Ok(self.on_interrupted_wait(&mut ctx, &msg).await);
+                    return Ok(Some(self.on_interrupted_wait(&mut ctx, &msg).await));
                 }
             };
 
@@ -436,7 +445,7 @@ impl Client {
 
                 TestState::ExchangeResults => match self.on_exchange_results(&mut ctx).await? {
                     // #268: a signal landed inside the bulk results read.
-                    Some(report) => return Ok(report),
+                    Some(report) => return Ok(Some(report)),
                     None => StepFlow::Continue,
                 },
 
@@ -474,36 +483,54 @@ impl Client {
             match flow {
                 StepFlow::Continue => {}
                 StepFlow::Break => break,
-                StepFlow::Return(report) => return Ok(*report),
+                StepFlow::Return(report) => return Ok(Some(*report)),
             }
             // #145: AUDITABILITY ONLY — advance the table cursor to the state
             // just handled, before the next recv. Reached only by the arms that
             // fall through (the break/return arms end the run anyway).
             ctx.prev_state = state;
         }
+        Ok(None)
+        }
+        .await;
 
-        // ---- Clean up ----
-        ctx.done.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // ---- Unconditional stream teardown (#354/#375) ----
+        // Every exit reaps the spawned stream tasks: a detached task parked
+        // in read()/write().await against a holding peer survives `done`
+        // (the flag cannot wake a parked await) and leaks with its fd into
+        // a library consumer's runtime — a CLI process exit masked the
+        // class. GT joins its stream threads on the error exits too
+        // (iperf_client_api.c's cleanup paths run iperf_client_end).
         // #354: abort before join, like the #352 server gate — GT's client
         // cancels its stream threads before joining
-        // (iperf_client_api.c:817-841). A receiver parked in read() on a
-        // socket-holding server cannot see `done`, so a bare join is
-        // peer-bound. Counts are frozen: senders stopped at the data-phase
-        // end and the final report was captured at DisplayResults. UDP
-        // receivers are spawn_blocking (abort is a no-op there) and exit
-        // via `done` + their 500 ms read-timeout poll.
+        // (iperf_client_api.c:817-841). Counts are frozen: senders stopped
+        // at the data-phase end and the final report was captured at
+        // DisplayResults. UDP receivers are spawn_blocking (abort is a
+        // no-op there) and exit via `done` + their 500 ms read-timeout
+        // poll. The 100 ms catch-up grace is skipped when no streams were
+        // ever spawned (the pre-CreateStreams error paths have nothing to
+        // let land).
         // RESIDUAL (the #352 join-site sibling record): GT closes its data
         // sockets at DISPLAY_RESULTS, BEFORE sending IPERF_DONE, and
         // sync-closes ctrl with a bounded drain-to-EOF
         // (iperf_client_api.c:562-566, net.c:877-886); riperf3's data FINs
         // land ~100 ms later, at this abort, and ctrl closes abruptly —
         // observable only by a peer that holds the round open.
+        ctx.done.store(true, Ordering::Relaxed);
+        if !ctx.streams.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         for s in &ctx.streams {
             s.task.abort();
         }
-        for s in ctx.streams {
+        for s in ctx.streams.drain(..) {
             let _ = s.task.await;
+        }
+
+        // The early-exit rounds (the interrupt dumps, #210/#268) already
+        // rendered their output — only the teardown above was owed.
+        if let Some(report) = outcome? {
+            return Ok(report);
         }
 
         // #222: every clean text-mode client run closes with a blank line +
