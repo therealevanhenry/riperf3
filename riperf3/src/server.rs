@@ -2270,7 +2270,7 @@ impl Server {
             // iperf3's server reports only its own measured bytes and a 0 remote
             // CPU (#50).
             let _client_results = tokio::select! {
-                r = protocol::recv_results_server(&mut ctx.ctrl) => match r {
+                r = protocol::recv_results(&mut ctx.ctrl) => match r {
                     Ok(v) => v,
                     // #330: a malformed results read routes to the
                     // exchange_recv_failed surface — the Nread_json warning

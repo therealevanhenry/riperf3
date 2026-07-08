@@ -267,24 +267,6 @@ pub async fn json_write(stream: &mut TcpStream, value: &serde_json::Value) -> Re
     Ok(())
 }
 
-/// Read a length-prefixed JSON value. If `max_len` is 0, no size limit is enforced.
-pub async fn json_read(stream: &mut TcpStream, max_len: usize) -> Result<serde_json::Value> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if max_len > 0 && len > max_len {
-        return Err(RiperfError::Protocol(format!(
-            "JSON payload too large: {len} bytes (max {max_len})"
-        )));
-    }
-
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    let value: serde_json::Value = json_first_value(&buf)?;
-    Ok(value)
-}
-
 // ---------------------------------------------------------------------------
 // Test parameters — exchanged as JSON during ParamExchange
 // ---------------------------------------------------------------------------
@@ -581,12 +563,6 @@ pub async fn send_results(stream: &mut TcpStream, results: &TestResultsJson) -> 
     json_write(stream, &value).await
 }
 
-/// Receive test results from length-prefixed JSON (no size limit).
-pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
-    let value = json_read(stream, 0).await?;
-    validate_results(value)
-}
-
 /// The #271 shape validation shared by both results readers.
 fn validate_results(value: serde_json::Value) -> Result<TestResultsJson> {
     let results: TestResultsJson = serde_json::from_value(value)?;
@@ -701,13 +677,16 @@ async fn json_read_bounded(stream: &mut TcpStream, max_len: usize) -> Result<ser
     Ok(value)
 }
 
-/// The SERVER's results read (#330): a malformed read gets GT's Nread_json
-/// warning surface (iperf_api.c:3036-3080 — all five arms, deterministic
-/// text and counts, live-probed under -J and text) and maps to the
-/// IERECVRESULTS class the caller renders into the doc. Reads are bounded
-/// like GT's Nrecv. The client keeps the plain [`recv_results`]: its
-/// warning parity needs its own GT probes (noted on #330).
-pub async fn recv_results_server(stream: &mut TcpStream) -> Result<TestResultsJson> {
+/// The results read, BOTH roles (#330 server, #374 client — GT's
+/// get_results is role-agnostic, iperf_api.c:3033): a malformed read gets
+/// GT's Nread_json warning surface (iperf_api.c:3036-3080 — all five
+/// arms, deterministic text and counts, live-probed under -J and text)
+/// and maps to the IERECVRESULTS class each role renders at its own site.
+/// Reads are bounded like GT's Nrecv (#374 live probes: the client's
+/// state-byte WAITS are unbounded in GT — silent post-accept,
+/// post-TestEnd, and pre-DisplayResults wedges all exceeded 45 s — so
+/// recv_state stays unbounded by design; only in-message reads bound).
+pub async fn recv_results(stream: &mut TcpStream) -> Result<TestResultsJson> {
     let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut len_buf = [0u8; 4];
     let mut got = 0usize;
@@ -1270,7 +1249,9 @@ mod tests {
         });
 
         let (mut stream, _) = listener.accept().await.unwrap();
-        let value = json_read(&mut stream, MAX_PARAMS_JSON_LEN).await.unwrap();
+        let value = json_read_bounded(&mut stream, MAX_PARAMS_JSON_LEN)
+            .await
+            .unwrap();
         writer.await.unwrap();
 
         assert_eq!(value["tcp"], true);
@@ -1646,7 +1627,7 @@ mod protocol_tests {
         });
 
         let (mut stream, _) = listener.accept().await.unwrap();
-        let result = protocol::json_read(&mut stream, protocol::MAX_PARAMS_JSON_LEN).await;
+        let result = protocol::json_read_bounded(&mut stream, protocol::MAX_PARAMS_JSON_LEN).await;
         writer.await.unwrap();
 
         assert!(result.is_err());

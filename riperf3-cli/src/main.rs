@@ -349,8 +349,25 @@ fn main() -> std::process::ExitCode {
                         // #267: the lib emits the populated ctrl-closed doc
                         // (bare end{}) before returning this class.
                         | riperf3::RiperfError::ControlSocketClosed
+                        // #374: the client's failed results read — the lib
+                        // emitted the doc with the dangling IERECVRESULTS
+                        // value before returning.
+                        | riperf3::RiperfError::RecvResultsFailed
                 )
             });
+            // #374: GT marks IERECVRESULTS perr, so its errexit line carries
+            // the strerror tail — at the wedge/EOF windows that is the #248
+            // dangling `: ` (GT appends a STALE errno's strerror, live
+            // "Transport endpoint is not connected"; recorded deviation —
+            // the errno-0 form, the #330 server-line precedent).
+            let perr_tail = if e
+                .downcast_ref::<riperf3::RiperfError>()
+                .is_some_and(|le| matches!(le, riperf3::RiperfError::RecvResultsFailed))
+            {
+                ": "
+            } else {
+                ""
+            };
             // --json-stream wins over -J when combined: iperf3's
             // --json-stream gates iperf_json_finish into stream events
             // (review r1 f2, live-verified).
@@ -369,7 +386,7 @@ fn main() -> std::process::ExitCode {
                 // #348: GT's iperf_errexit stamps this line like iperf_err
                 // (iperf_error.c:100-127).
                 let line = format!(
-                    "{}riperf3: error - {e}",
+                    "{}riperf3: error - {e}{perr_tail}",
                     ts_format
                         .as_deref()
                         .map(riperf3::render_timestamp_prefix)

@@ -4066,3 +4066,196 @@ fn running_phase_err_at_test_start_still_tears_down_streams() {
 fn running_phase_err_mid_running_still_tears_down_streams() {
     running_phase_err_case(true);
 }
+
+// ---------------------------------------------------------------------------
+// #374: the CLIENT's results read gets GT's Nread bounds + the shared
+// Nread_json warning surface (get_results is role-agnostic in GT,
+// iperf_api.c:3036-3080) and the IERECVRESULTS errexit. GT live-probes
+// (3.21, all windows): the state-byte WAITS are UNBOUNDED in GT (silent
+// post-accept, post-TestEnd, and pre-DisplayResults wedges all exceed
+// 45 s) — so riperf3's unbounded recv_state waits are already faithful
+// and stay; only the in-message exchange reads bound. Wedge-hold → exit 1
+// at ~11 s (1 s test + the 10 s idle bound; GT adds its ~10 s close-drain,
+// the #354-recorded residual riperf3 deliberately lacks), the size-read
+// warning, and `error - unable to receive results: ` — the #248 dangling
+// errno-0 form (GT appends a STALE errno's strerror on the EOF path,
+// "Transport endpoint is not connected" live — the #330-recorded
+// deviation, not mirrored). Text prints NO summary. -J: the doc carries
+// the dangling error value and GT's bare `end: {}`.
+// ---------------------------------------------------------------------------
+
+/// How the mock server wedges the results slot after reading the
+/// client's blob.
+#[derive(Clone, Copy)]
+enum ExchangeWedge {
+    /// Send nothing and HOLD the sockets — the size read must self-bound.
+    Hold,
+    /// Send a 500-byte promise + 5 bytes, then HOLD — the blob read must
+    /// self-bound and warn with both counts.
+    PartialBlob,
+    /// Close where the results were due — the fast EOF form.
+    Eof,
+}
+
+/// Mock SERVER for the #374 client pins: full protocol through the
+/// client's TestEnd, sends ExchangeResults, reads the client's results
+/// blob, then wedges per the variant.
+fn exchange_wedge_mock(listener: std::net::TcpListener, wedge: ExchangeWedge) {
+    use std::io::Read;
+    let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+    read_exact(&mut ctrl, 37); // cookie
+    ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+    read_json_blob(&mut ctrl); // the client's params
+    ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
+    let (mut data, _) = listener.accept().expect("data accept");
+    read_exact(&mut data, 37); // data-stream cookie
+    ctrl.write_all(&[1u8]).unwrap(); // TestStart
+    ctrl.write_all(&[2u8]).unwrap(); // TestRunning
+                                     // Drain the forward data until TestEnd lands on ctrl.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain = {
+        let stop = stop.clone();
+        let mut d = data.try_clone().expect("clone data");
+        d.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("drain timeout");
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match d.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 4, "TestEnd");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drain.join().expect("drain");
+    ctrl.write_all(&[13u8]).unwrap(); // ExchangeResults
+    read_json_blob(&mut ctrl); // the client's results
+    match wedge {
+        ExchangeWedge::Hold => std::thread::sleep(Duration::from_secs(30)),
+        ExchangeWedge::PartialBlob => {
+            ctrl.write_all(&500u32.to_be_bytes()).unwrap();
+            ctrl.write_all(b"12345").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        ExchangeWedge::Eof => {}
+    }
+    drop((ctrl, data));
+}
+
+const CLIENT_RECV_RESULTS_LINE: &str = "riperf3: error - unable to receive results: ";
+
+/// One #374 client run against the wedging mock; returns the finished
+/// client output (the bounded wait inside run_client IS the self-bound
+/// pin — an unbounded read parks past it).
+fn run_exchange_wedge_client(wedge: ExchangeWedge, json: bool) -> common::ClientRun {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _mock = std::thread::spawn(move || exchange_wedge_mock(listener, wedge));
+    let mut args = vec!["-c", "127.0.0.1", "-p", port.as_str(), "-t", "1"];
+    if json {
+        args.push("-J");
+    }
+    common::run_client(
+        &args,
+        Duration::from_secs(25),
+        "client vs results-wedging server",
+    )
+}
+
+/// #374: the wedge-hold — the size read self-bounds at GT's 10 s idle
+/// Nread bound with the read-returned-0 warning, the dangling errexit
+/// line, exit 1, and NO summary (GT prints none on IERECVRESULTS).
+#[test]
+fn client_exchange_wedge_self_bounds_with_gt_warning() {
+    let client = run_exchange_wedge_client(ExchangeWedge::Hold, false);
+    assert_eq!(
+        client.status.code(),
+        Some(1),
+        "GT errexits 1: {}",
+        client.stderr
+    );
+    assert!(
+        client
+            .stderr
+            .contains("warning: Failed to read JSON data size - read returned 0; errno=0"),
+        "the sink-bypassing size-read warning: {}",
+        client.stderr
+    );
+    assert!(
+        client
+            .stderr
+            .contains(&format!("{CLIENT_RECV_RESULTS_LINE}\n")),
+        "the dangling errno-0 errexit line: {:?}",
+        client.stderr
+    );
+    assert_eq!(
+        client.stdout.matches(SUMMARY_SEPARATOR).count(),
+        0,
+        "no summary on the failed exchange: {}",
+        client.stdout
+    );
+}
+
+/// #374: the mid-blob wedge — the blob read self-bounds and warns with
+/// GT's expected/received counts.
+#[test]
+fn client_exchange_mid_blob_wedge_warns_partial_count() {
+    let client = run_exchange_wedge_client(ExchangeWedge::PartialBlob, false);
+    assert_eq!(client.status.code(), Some(1), "{}", client.stderr);
+    assert!(
+        client.stderr.contains(
+            "warning: JSON size of data read does not correspond to offered length - \
+             expected 500 bytes but received 5; errno=0"
+        ),
+        "the expected/received warning arm: {}",
+        client.stderr
+    );
+    assert!(
+        client
+            .stderr
+            .contains(&format!("{CLIENT_RECV_RESULTS_LINE}\n")),
+        "the dangling errexit line: {:?}",
+        client.stderr
+    );
+}
+
+/// #374: EOF where the results were due, -J — the doc carries the
+/// dangling error value and GT's bare `end: {}` (live-probed 3.21; GT's
+/// in-doc value appends a STALE errno's strerror — recorded deviation,
+/// the errno-0 form is emitted instead, the #330 server precedent).
+/// riperf3's collected closing interval may appear where GT's is still
+/// pending display — the intervals count is deliberately un-pinned (the
+/// #55 flush-order drift, recorded in the PR).
+#[test]
+fn client_exchange_eof_takes_gt_recv_results_shape_in_json() {
+    let client = run_exchange_wedge_client(ExchangeWedge::Eof, true);
+    assert_eq!(client.status.code(), Some(1), "{}", client.stderr);
+    let doc: serde_json::Value = serde_json::from_str(client.stdout.trim())
+        .unwrap_or_else(|e| panic!("one -J doc ({e}): {}", client.stdout));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("unable to receive results: "),
+        "the IERECVRESULTS key in the errno-0 form: {doc}"
+    );
+    assert_eq!(
+        doc["end"],
+        serde_json::json!({}),
+        "GT's bare end on the failed exchange: {doc}"
+    );
+    assert_eq!(
+        client.stderr.trim(),
+        "warning: Failed to read JSON data size - read returned 0; errno=0",
+        "the warning bypasses the -J sink, and nothing else: {}",
+        client.stderr
+    );
+}
