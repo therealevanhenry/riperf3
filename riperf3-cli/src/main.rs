@@ -51,6 +51,9 @@ fn main() -> std::process::ExitCode {
                     if e.to_string().contains("--server") && e.to_string().contains("--client") =>
                 {
                     // iperf3's IESERVCLIENT (live: exit 1 + usage trailer).
+                    // Deliberately UNSTAMPED (#365 r1 F5): GT raises this
+                    // MID-loop (iperf_api.c:1293/:1300 — probed bare with
+                    // --timestamps last), the #301-F4 ordering class.
                     eprintln!("riperf3: parameter error - cannot be both server and client");
                     print_usage_trailer();
                     return std::process::ExitCode::FAILURE;
@@ -437,15 +440,22 @@ fn main() -> std::process::ExitCode {
 
 /// #365: the --timestamps format straight off raw argv — for the clap-arm
 /// post-loop errors (IENOROLE), where clap errored before a parse existed.
-/// Mirrors the arg's clap definition: `=`-attached value or the bare-flag
-/// "%c " default.
+/// Mirrors GT's getopt optional_argument (r1 F2 — NOT clap's parse, which
+/// also accepts a space-separated value; that clap-vs-getopt divergence is
+/// the filed require_equals follow-up): `=`-attached value or the
+/// bare-flag "%c " default, last occurrence wins. args_os: a non-UTF8
+/// argv elsewhere must not panic the error path (r1 F1 — std::env::args
+/// panics mid-iteration; GT prints its parameter error regardless).
+/// KNOWN LIMIT (r1 F3): a `--timestamps=X` token consumed as ANOTHER
+/// option's value still stamps here (position-blind scan); GT's getopt is
+/// bare in that cell — contrived argv, not worth position tracking.
 fn timestamps_from_argv() -> Option<String> {
     let mut fmt = None;
-    for a in std::env::args() {
-        if a == "--timestamps" {
+    for a in std::env::args_os() {
+        if a == std::ffi::OsStr::new("--timestamps") {
             fmt = Some("%c ".to_string());
-        } else if let Some(v) = a.strip_prefix("--timestamps=") {
-            fmt = Some(v.to_string());
+        } else if let Some(v) = a.as_encoded_bytes().strip_prefix(b"--timestamps=") {
+            fmt = Some(String::from_utf8_lossy(v).into_owned());
         }
     }
     fmt

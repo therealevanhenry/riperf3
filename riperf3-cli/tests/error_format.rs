@@ -1280,6 +1280,32 @@ fn post_loop_parameter_errors_are_stamped() {
         "a stamp rides IENOROLE on every platform: {stderr}"
     );
 
+    // r1 F4: the bare-flag branch — GT's optional_argument renders the
+    // "%c " default; the stamp must be PRESENT (its rendered text is
+    // locale/platform-dependent, so presence-only). Last occurrence wins.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["--timestamps"])
+        .output()
+        .expect("spawn riperf3");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.starts_with("riperf3:")
+            && stderr.contains("riperf3: parameter error - must either be a client"),
+        "the bare --timestamps stamps IENOROLE with the %c default: {stderr}"
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(["--timestamps=XTSX ", "--timestamps=YTSY "])
+        .output()
+        .expect("spawn riperf3");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    #[cfg(unix)]
+    assert!(
+        stderr.starts_with("YTSY riperf3: parameter error - "),
+        "the LAST occurrence wins, like getopt: {stderr}"
+    );
+    let _ = &stderr;
+
     // The boundary guard: a range check (GT mid-loop) stays BARE — the
     // #301-F4 ordering class is a recorded deviation, not stamped.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
