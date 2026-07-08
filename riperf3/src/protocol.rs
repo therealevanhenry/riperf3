@@ -222,13 +222,20 @@ pub async fn send_server_error(stream: &mut TcpStream, i_errno: u32) -> Result<(
 }
 
 /// Read SERVER_ERROR's (i_errno, errno) payload. `None` when it never
-/// arrives (a peer that died mid-relay, or a bare -2 sender): the caller
-/// degrades to its generic message — a payloadless SERVER_ERROR must error
-/// cleanly, never hang or panic (tested in-crate).
+/// arrives (a peer that died mid-relay, held the socket, or sent a bare
+/// -2): the caller degrades to its generic message — a payloadless
+/// SERVER_ERROR must error cleanly, never hang or panic (tested
+/// in-crate). Bounded like every GT Nread (#382 r1 F1 — GT bounds these
+/// two reads, iperf_client_api.c:393-401, exiting a hold at ~30 s with a
+/// garbage-errno line from the UNINITIALIZED short-read buffer; the
+/// deterministic None-fallback is the recorded deviation, and the house
+/// 10 s idle bound fires first on a fully-silent hold). This read races
+/// NO interrupt arm, so an unbounded read was signal-immune.
 pub async fn read_server_error_payload(stream: &mut TcpStream) -> Option<(u32, u32)> {
+    let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut buf = [0u8; 8];
-    match stream.read_exact(&mut buf).await {
-        Ok(_) => Some((
+    match nread_exact(stream, &mut buf, deadline).await {
+        Ok(()) => Some((
             u32::from_be_bytes(buf[0..4].try_into().unwrap()),
             u32::from_be_bytes(buf[4..8].try_into().unwrap()),
         )),
@@ -655,10 +662,11 @@ async fn nread_exact(
     Ok(())
 }
 
-/// GT-bounded [`json_read`] (#339 r2b F1): the server's params read gets
-/// Nread's idle/overall bounds so a holding peer can't park the serial
-/// serve loop. Client-side reads keep the plain [`json_read`] — their
-/// bound/warning parity is a separate surface (noted on #330).
+/// The bounded length-prefixed JSON read (#339 r2b F1): Nread's
+/// idle/overall bounds so a holding peer can't park the reader. The
+/// params slot's reader; the results slot has its own warning-parity
+/// reader below (#330/#374 — which retired the plain unbounded reader
+/// this fn was once the bounded variant of).
 async fn json_read_bounded(stream: &mut TcpStream, max_len: usize) -> Result<serde_json::Value> {
     let deadline = tokio::time::Instant::now() + NREAD_OVERALL_TIMEOUT;
     let mut len_buf = [0u8; 4];
@@ -678,9 +686,10 @@ async fn json_read_bounded(stream: &mut TcpStream, max_len: usize) -> Result<ser
 }
 
 /// The results read, BOTH roles (#330 server, #374 client — GT's
-/// get_results is role-agnostic, iperf_api.c:3033): a malformed read gets
-/// GT's Nread_json warning surface (iperf_api.c:3036-3080 — all five
-/// arms, deterministic text and counts, live-probed under -J and text)
+/// get_results, iperf_api.c:2801, is called by both roles at
+/// iperf_api.c:2400/2404): a malformed read gets GT's Nread_json warning
+/// surface (JSON_read, iperf_api.c:3036-3080 — all five arms,
+/// deterministic text and counts, live-probed under -J and text)
 /// and maps to the IERECVRESULTS class each role renders at its own site.
 /// Reads are bounded like GT's Nrecv (#374 live probes: the client's
 /// state-byte WAITS are unbounded in GT — silent post-accept,

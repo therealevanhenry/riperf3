@@ -4229,6 +4229,41 @@ fn client_exchange_mid_blob_wedge_warns_partial_count() {
     );
 }
 
+/// #374 (r1 F1): the SERVER_ERROR relay payload read is bounded too — GT
+/// bounds these Nreads (iperf_client_api.c:393-401; live: a
+/// state-byte-then-hold wedge exits 1 at ~30.0 s with a garbage-errno
+/// SERVER ERROR line — GT prints UNINITIALIZED bytes on the short read).
+/// riperf3 self-bounds on the house Nread budgets and degrades to the
+/// deterministic payloadless fallback instead of mirroring the
+/// uninitialized-memory line (recorded deviation). Unlike the results
+/// read, this window races NO interrupt arm, so an unbounded read was
+/// SIGNAL-IMMUNE (r1's live probe: SIGTERM did not free it).
+#[test]
+fn client_server_error_payload_wedge_self_bounds() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let _mock = std::thread::spawn(move || {
+        let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+        read_exact(&mut ctrl, 37); // cookie
+        ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+        read_json_blob(&mut ctrl); // the client's params
+        ctrl.write_all(&[0xfeu8]).unwrap(); // SERVER_ERROR (-2), then HOLD
+        std::thread::sleep(Duration::from_secs(30));
+        drop(ctrl);
+    });
+    let client = common::run_client(
+        &["-c", "127.0.0.1", "-p", &port, "-t", "1"],
+        Duration::from_secs(25),
+        "client vs payloadless SERVER_ERROR wedge",
+    );
+    assert_eq!(client.status.code(), Some(1), "{}", client.stderr);
+    assert!(
+        client.stderr.contains("SERVER ERROR - server error"),
+        "the payloadless fallback line: {}",
+        client.stderr
+    );
+}
+
 /// #374: EOF where the results were due, -J — the doc carries the
 /// dangling error value and GT's bare `end: {}` (live-probed 3.21; GT's
 /// in-doc value appends a STALE errno's strerror — recorded deviation,
