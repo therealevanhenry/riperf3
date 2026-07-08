@@ -447,6 +447,23 @@ impl Serialize for Start {
         m.serialize_entry("connected", &self.connected)?;
         m.serialize_entry("version", &self.version)?;
         m.serialize_entry("system_info", &self.system_info)?;
+        // #355: the SERVER inserts the bufsize trio at listen time
+        // (iperf_tcp.c:373-377) — positions 4-6, BEFORE timestamp; the
+        // client takes them at TestStart, after fq_rate (both live-probed
+        // 3.21). Same #261 stage gate either way; byte order is the only
+        // role difference.
+        let server_role = self.accepted_connection.is_some();
+        if server_role && self.stage == StartStage::Started {
+            if let Some(v) = &self.sock_bufsize {
+                m.serialize_entry("sock_bufsize", v)?;
+            }
+            if let Some(v) = &self.sndbuf_actual {
+                m.serialize_entry("sndbuf_actual", v)?;
+            }
+            if let Some(v) = &self.rcvbuf_actual {
+                m.serialize_entry("rcvbuf_actual", v)?;
+            }
+        }
         if self.stage != StartStage::Connecting {
             // GT stage 1 — stamped at on_connect (end of PARAM_EXCHANGE).
             m.serialize_entry("timestamp", &self.timestamp)?;
@@ -468,14 +485,18 @@ impl Serialize for Start {
         }
         if self.stage == StartStage::Started {
             // GT stage 2 — the #261 late fields, stamped at TestStart.
-            if let Some(v) = &self.sock_bufsize {
-                m.serialize_entry("sock_bufsize", v)?;
-            }
-            if let Some(v) = &self.sndbuf_actual {
-                m.serialize_entry("sndbuf_actual", v)?;
-            }
-            if let Some(v) = &self.rcvbuf_actual {
-                m.serialize_entry("rcvbuf_actual", v)?;
+            // The bufsize trio already went out at positions 4-6 on the
+            // server role (#355).
+            if !server_role {
+                if let Some(v) = &self.sock_bufsize {
+                    m.serialize_entry("sock_bufsize", v)?;
+                }
+                if let Some(v) = &self.sndbuf_actual {
+                    m.serialize_entry("sndbuf_actual", v)?;
+                }
+                if let Some(v) = &self.rcvbuf_actual {
+                    m.serialize_entry("rcvbuf_actual", v)?;
+                }
             }
             if let Some(v) = &self.test_start {
                 m.serialize_entry("test_start", v)?;
@@ -3796,6 +3817,72 @@ mod tests {
                 "receiver_tcp_congestion"
             ],
             "end key order drifted from the frozen 0.8.0 wire shape: {raw}"
+        );
+    }
+
+    /// #355: the SERVER role's start keys are GT's server insertion order —
+    /// the bufsize trio lands at listen time (iperf_tcp.c:373-377), at
+    /// positions 4-6, BEFORE timestamp; the client takes them at TestStart,
+    /// after fq_rate (both live-probed 3.21, byte order only — the value
+    /// set is identical). Parsed-Value asserts are order-blind; read the
+    /// raw string.
+    #[test]
+    fn server_role_start_key_order_is_gt_server_order() {
+        let mut input = base_input();
+        input.is_server = true;
+        input.connecting_host = String::new();
+        input.connecting_port = 0;
+        input.accepted_host = "127.0.0.1".into();
+        input.accepted_port = 5201;
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+
+        let keys = |obj: &str| -> Vec<String> {
+            let from = raw.find(&format!("\"{obj}\":")).unwrap() + obj.len() + 3;
+            let bytes = raw.as_bytes();
+            let mut depth = 0i32;
+            let mut i = from;
+            let mut out = Vec::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b'"' => {
+                        let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                        if depth == 1 && bytes.get(close + 1) == Some(&b':') {
+                            out.push(raw[i + 1..close].to_string());
+                        }
+                        i = close;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out
+        };
+        assert_eq!(
+            keys("start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "tcp_mss_default",
+                "target_bitrate",
+                "fq_rate",
+                "test_start"
+            ],
+            "server start key order drifted from GT's server order (#355): {raw}"
         );
     }
 
