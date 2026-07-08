@@ -3065,8 +3065,8 @@ fn drive_full_round_then_rst(json: bool) -> (String, String, std::process::ExitS
         data.write_all(&[0u8; 4096]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
         ctrl.write_all(&[4u8]).unwrap(); // TestEnd
-        // RST both sockets NOW — the server's 100 ms flush sleep guarantees
-        // the RST lands before its send_state(ExchangeResults) write.
+                                         // RST both sockets NOW — the server's 100 ms flush sleep guarantees
+                                         // the RST lands before its send_state(ExchangeResults) write.
         drop((ctrl, data));
         std::thread::sleep(std::time::Duration::from_millis(500));
     })
