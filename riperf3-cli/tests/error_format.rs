@@ -1239,9 +1239,18 @@ fn post_loop_parameter_errors_are_stamped() {
         .expect("spawn riperf3");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Unix renders the literal format verbatim; Windows uses the #202
+    // HH:MM:SS fallback and ignores the format, so the byte-exact half is
+    // unix-only (the house stamp-pin convention) — the stamp's PRESENCE
+    // asserts everywhere.
+    #[cfg(unix)]
     assert!(
         stderr.starts_with("XTSX riperf3: parameter error - "),
         "the post-loop class is stamped with --timestamps LAST: {stderr}"
+    );
+    assert!(
+        !stderr.starts_with("riperf3:") && stderr.contains("riperf3: parameter error - "),
+        "a stamp rides the post-loop line on every platform: {stderr}"
     );
     assert!(
         stderr.contains("\nUsage:"),
@@ -1260,9 +1269,15 @@ fn post_loop_parameter_errors_are_stamped() {
         .expect("spawn riperf3");
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
+    #[cfg(unix)]
     assert!(
         stderr.starts_with("XTSX riperf3: parameter error - must either be a client"),
         "IENOROLE is stamped off raw argv: {stderr}"
+    );
+    assert!(
+        !stderr.starts_with("riperf3:")
+            && stderr.contains("riperf3: parameter error - must either be a client"),
+        "a stamp rides IENOROLE on every platform: {stderr}"
     );
 
     // The boundary guard: a range check (GT mid-loop) stays BARE — the
