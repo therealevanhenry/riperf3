@@ -4783,6 +4783,8 @@ fn setup_silent_conn_is_denied_then_the_round_ienomsgs() {
             *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
             drop(ctrl);
         });
+    // Errno word 0: the recorded #336-class deviation — GT live leaks a
+    // stale EBADF (9) in this exact cell (#384 r1 F5).
     assert_eq!(
         *frame.lock().unwrap(),
         wireback_frame(144),
