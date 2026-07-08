@@ -1365,9 +1365,42 @@ impl Server {
                 // patiently (GT live: >9 s at --rcv-timeout 3000).
                 let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
                 for i in 0..total {
-                    let (mut data_stream, _) = loop {
+                    let data_stream = loop {
                         tokio::select! {
-                            accepted = listener.accept() => break accepted?,
+                            accepted = listener.accept() => {
+                                let (mut candidate, _) = accepted?;
+                                // #359: GT's deny-and-continue cookie gate —
+                                // a wrong-cookie, silent, or died connect
+                                // gets ACCESS_DENIED on ITS socket
+                                // (iperf_tcp.c:161-166; the closed-socket
+                                // guard iperf_server_api.c:786) and the wait
+                                // continues; only the no-progress clock ends
+                                // a round with no real streams. The old gate
+                                // killed the round (CookieMismatch /
+                                // unexpected-EOF).
+                                // RECORDED DEVIATION: this inline cookie
+                                // read blinds the ctrl-EOF / rcv_timeout
+                                // arms for its ≤10 s Nread bound — GT's
+                                // cookie read joins its select instead.
+                                // Adversarial-only: a real client writes
+                                // the cookie immediately on connect.
+                                match protocol::recv_cookie(&mut candidate).await {
+                                    Ok(c) if c == ctx.cookie => break candidate,
+                                    // Wrong cookie, the 10 s silent bound,
+                                    // or died mid-cookie: best-effort deny
+                                    // like GT's Nwrite-then-close (the peer
+                                    // may already be gone).
+                                    _ => {
+                                        let _ = protocol::send_state(
+                                            &mut candidate,
+                                            TestState::AccessDenied,
+                                        )
+                                        .await;
+                                        // Dropped here; the slot stays
+                                        // unclaimed and the select re-arms.
+                                    }
+                                }
+                            }
                             activity = ctrl_activity(&ctx.ctrl) => match activity {
                                 // EOF: the peer closed without connecting its
                                 // data streams — GT's read-site surface. The
@@ -1407,11 +1440,6 @@ impl Server {
                             }
                         }
                     };
-                    let stream_cookie = protocol::recv_cookie(&mut data_stream).await?;
-                    if stream_cookie != ctx.cookie {
-                        abort_setup_streams(ctx).await;
-                        return Err(RiperfError::CookieMismatch);
-                    }
                     // Apply socket options (nodelay, MSS, window, congestion) to each stream
                     net::configure_tcp_stream_full(
                         &data_stream,
