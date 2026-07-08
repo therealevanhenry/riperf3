@@ -1358,6 +1358,12 @@ impl Server {
                 let rcv_timeout = std::time::Duration::from_millis(
                     self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS),
                 );
+                // #383 r1 F2: GT arms the CREATE_STREAMS no-progress bound
+                // only when the server RECEIVES (test->mode != SENDER,
+                // iperf_server_api.c:662-678, 720-733; the #351 idle_armed
+                // precedent one phase later) — a pure-reverse round waits
+                // patiently (GT live: >9 s at --rcv-timeout 3000).
+                let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
                 for i in 0..total {
                     let (mut data_stream, _) = loop {
                         tokio::select! {
@@ -1385,7 +1391,7 @@ impl Server {
                                 }
                                 Err(e) => return Err(e.into()),
                             },
-                            _ = tokio::time::sleep(rcv_timeout) => {
+                            _ = tokio::time::sleep(rcv_timeout), if idle_armed => {
                                 // GT's no-progress bound: wire-back
                                 // SERVER_ERROR + IENOMSG(144) + errno 0
                                 // (live: fe 00000090 00000000), the doc with
@@ -2456,7 +2462,6 @@ impl Server {
     /// stream. This is faithful to iperf3 and gives kernel-parallel receive, but
     /// relies on kernel demux that native winsock doesn't provide (see
     /// [`Self::setup_udp_demux_streams`] / #80).
-    #[allow(clippy::too_many_arguments)]
     async fn setup_udp_recycling_streams(
         &self,
         ctx: &mut TestRunCtx,
@@ -2495,6 +2500,8 @@ impl Server {
         // handshake budget in udp_connect_client).
         let rcv_timeout =
             std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
+        // #383 r1 F2: the sender-mode exemption — see the TCP arm's note.
+        let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
 
         // #316: the client's GSO/GRO request, probed per accepted socket
         // below. Once a probe fails, GT zeroes the setting and later
@@ -2554,7 +2561,7 @@ impl Server {
                         }
                         Err(e) => return Err(e.into()),
                     },
-                    _ = tokio::time::sleep(rcv_timeout) => {
+                    _ = tokio::time::sleep(rcv_timeout), if idle_armed => {
                         // GT's no-progress bound: wire-back SERVER_ERROR +
                         // IENOMSG(144) + errno 0, the doc with the prefixed
                         // key, exit-0 keep-serving — the TCP arm's shape.
@@ -2768,6 +2775,8 @@ impl Server {
         // (the client keeps its own 30 s handshake budget).
         let rcv_timeout =
             std::time::Duration::from_millis(self.rcv_timeout.unwrap_or(DEFAULT_RCV_TIMEOUT_MS));
+        // #383 r1 F2: the sender-mode exemption — see the TCP arm's note.
+        let idle_armed = !ctx.cfg.reverse || ctx.cfg.bidir;
         let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(total as usize);
         let mut seen: HashSet<SocketAddr> = HashSet::new();
         let mut magic_buf = [0u8; 65536];
@@ -2780,7 +2789,13 @@ impl Server {
                         // client port that just closed (e.g. a retry on a
                         // fresh socket) queues WSAECONNRESET on Windows — it
                         // must not abort setup for EVERY stream; skip like
-                        // the data-phase receivers (#180).
+                        // the data-phase receivers (#180). The continue
+                        // re-arms the no-progress clock (#383 r1 F5):
+                        // sustained ICMP feedback keeps the wait alive past
+                        // any bound, but GT can't reach the cell at all
+                        // (recvfrom error -> IESTREAMACCEPT fatal) and the
+                        // client's own 30 s handshake budget ends the round
+                        // via ctrl-EOF in practice.
                         Err(e) if crate::stream::is_reset_class(&e) => continue,
                         Err(e) => return Err(e.into()),
                     };
@@ -2818,7 +2833,7 @@ impl Server {
                     }
                     Err(e) => return Err(e.into()),
                 },
-                _ = tokio::time::sleep(rcv_timeout) => {
+                _ = tokio::time::sleep(rcv_timeout), if idle_armed => {
                     // GT's no-progress bound: wire-back SERVER_ERROR +
                     // IENOMSG(144) + errno 0, the doc with the prefixed
                     // key, exit-0 keep-serving — the TCP arm's shape.
@@ -3438,10 +3453,20 @@ impl Server {
         listener: &tokio::net::TcpListener,
     ) -> crate::json_report::SetupPhaseDoc {
         let sock = socket2::SockRef::from(listener);
+        // #383 r1 F1a: the four TCP-flavored keys are absent for UDP —
+        // see the SetupPhaseDoc doc for the GT gates.
+        let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
         crate::json_report::SetupPhaseDoc {
-            sock_bufsize: ctx.cfg.window.map(|w| w as u64).unwrap_or(0),
-            sndbuf_actual: sock.send_buffer_size().ok().map(|v| v as u64),
-            rcvbuf_actual: sock.recv_buffer_size().ok().map(|v| v as u64),
+            sock_bufsize: (!udp).then(|| ctx.cfg.window.map(|w| w as u64).unwrap_or(0)),
+            sndbuf_actual: (!udp)
+                .then(|| sock.send_buffer_size().ok().map(|v| v as u64))
+                .flatten(),
+            rcvbuf_actual: (!udp)
+                .then(|| sock.recv_buffer_size().ok().map(|v| v as u64))
+                .flatten(),
+            // The server never reads the ctrl MSS — 0, the #50 convention.
+            tcp_mss_default: (!udp).then_some(0),
+            udp,
             timemillisecs: ctx.accepted_millis,
             accepted_host: ctx.accepted_host.clone(),
             accepted_port: ctx.accepted_port,
@@ -3506,9 +3531,10 @@ impl Server {
             remote_user: 0.0,
             remote_system: 0.0,
         };
+        let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
         if self.json_stream {
             crate::reporter::emit_json_stream_line(&crate::json_report::terminate_stream_events(
-                &error, &cpu,
+                udp, &error, &cpu,
             ));
         } else if self.json_output {
             let doc = crate::json_report::setup_terminate_document(
@@ -3518,7 +3544,7 @@ impl Server {
             );
             println!("{doc}");
         } else {
-            crate::reporter::print_terminate_skeleton();
+            crate::reporter::print_terminate_skeleton(udp);
         }
     }
 

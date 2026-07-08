@@ -202,10 +202,17 @@ pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> Stri
 
 /// Inputs for the #338 setup-phase document, gathered at the CREATE_STREAMS
 /// wait (the control connection and the listener are live; no data streams).
+/// #383 r1 F1a: for a UDP round the four TCP-flavored keys are ABSENT —
+/// GT's tcp_mss_default is SOCK_STREAM-gated (iperf_api.c:1021-1027) and
+/// its UDP bufsize trio only lands via iperf_udp_buffercheck at stream
+/// accept (iperf_udp.c:439-452), which never runs in a setup-phase wedge
+/// (live key-diff probed) — so the builder passes None for all four.
 pub(crate) struct SetupPhaseDoc {
-    pub sock_bufsize: u64,
+    pub sock_bufsize: Option<u64>,
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
+    pub tcp_mss_default: Option<u32>,
+    pub udp: bool,
     pub timemillisecs: u64,
     pub accepted_host: String,
     pub accepted_port: u16,
@@ -238,7 +245,7 @@ pub(crate) fn setup_terminate_document(
     error: &str,
     cpu: &CpuUtilization,
 ) -> String {
-    setup_phase_document(d, &zeros_end(cpu), Some(error))
+    setup_phase_document(d, &zeros_end(d.udp, cpu), Some(error))
 }
 
 /// #356 r1 F1: GT's IPERF_DONE-at-setup document — the clean arm exits the
@@ -251,11 +258,11 @@ pub(crate) fn setup_done_document(d: &SetupPhaseDoc) -> String {
 /// #356 r1 F1: the `--json-stream` terminate-at-setup pair — GT emits the
 /// bare-sentence error event, then an `end` event whose data is the same
 /// FULL-zeros end block the -J doc carries (live-probed 3.21).
-pub(crate) fn terminate_stream_events(error: &str, cpu: &CpuUtilization) -> String {
+pub(crate) fn terminate_stream_events(udp: bool, error: &str, cpu: &CpuUtilization) -> String {
     format!(
         "{}\n{}",
         json_stream_event("error", &error),
-        json_stream_event("end", &zeros_end(cpu))
+        json_stream_event("end", &zeros_end(udp, cpu))
     )
 }
 
@@ -269,7 +276,10 @@ pub(crate) fn done_stream_events() -> String {
 struct BareEnd {}
 
 /// GT's zero sum block: exactly the six keys its reporter renders for a
-/// stream-less summary (no retransmits — the sender extras never arm).
+/// stream-less TCP summary (no retransmits — the sender extras never
+/// arm). #383 r1 F1b: the UDP flavor inserts jitter_ms / lost_packets /
+/// packets / lost_percent between bits_per_second and sender, GT's UDP
+/// sum order (live-probed 3.21).
 #[derive(Serialize)]
 struct ZeroSum {
     start: u64,
@@ -277,30 +287,48 @@ struct ZeroSum {
     seconds: u64,
     bytes: u64,
     bits_per_second: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jitter_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lost_packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    packets: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lost_percent: Option<u64>,
     sender: bool,
 }
 
+/// #383 r1 F1b: GT's UDP zeros end ALSO carries a bare `sum` block
+/// (streams, sum, sum_sent, sum_received, cpu — live-probed), and its
+/// sum_sent.sender is true; the TCP shape (#356-probed) has neither.
 #[derive(Serialize)]
 struct ZerosEnd {
     streams: [(); 0],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sum: Option<ZeroSum>,
     sum_sent: ZeroSum,
     sum_received: ZeroSum,
     cpu_utilization_percent: CpuUtilization,
 }
 
-fn zeros_end(cpu: &CpuUtilization) -> ZerosEnd {
-    let zero = || ZeroSum {
+fn zeros_end(udp: bool, cpu: &CpuUtilization) -> ZerosEnd {
+    let zero = |sender: bool| ZeroSum {
         start: 0,
         end: 0,
         seconds: 0,
         bytes: 0,
         bits_per_second: 0,
-        sender: false,
+        jitter_ms: udp.then_some(0),
+        lost_packets: udp.then_some(0),
+        packets: udp.then_some(0),
+        lost_percent: udp.then_some(0),
+        sender,
     };
     ZerosEnd {
         streams: [],
-        sum_sent: zero(),
-        sum_received: zero(),
+        sum: udp.then(|| zero(false)),
+        sum_sent: zero(udp),
+        sum_received: zero(false),
         cpu_utilization_percent: cpu.clone(),
     }
 }
@@ -311,7 +339,8 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
         connected: [(); 0],
         version: String,
         system_info: String,
-        sock_bufsize: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sock_bufsize: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sndbuf_actual: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,7 +348,8 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
         timestamp: Timestamp,
         accepted_connection: ConnectingTo,
         cookie: &'a str,
-        tcp_mss_default: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tcp_mss_default: Option<u32>,
         target_bitrate: u64,
         fq_rate: u64,
     }
@@ -350,7 +380,7 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
                 port: d.accepted_port,
             },
             cookie: &d.cookie,
-            tcp_mss_default: 0,
+            tcp_mss_default: d.tcp_mss_default,
             target_bitrate: d.target_bitrate,
             fq_rate: d.fq_rate,
         },
@@ -3915,9 +3945,11 @@ mod tests {
     #[test]
     fn setup_document_key_order_is_gt_server_order() {
         let d = SetupPhaseDoc {
-            sock_bufsize: 0,
+            sock_bufsize: Some(0),
             sndbuf_actual: Some(16384),
             rcvbuf_actual: Some(131072),
+            tcp_mss_default: Some(0),
+            udp: false,
             timemillisecs: 1_700_000_000_000,
             accepted_host: "127.0.0.1".into(),
             accepted_port: 5201,
