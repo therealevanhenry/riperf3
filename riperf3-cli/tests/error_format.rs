@@ -125,6 +125,92 @@ fn logfile_receives_the_error_line() {
     let _ = std::fs::remove_file(&log);
 }
 
+/// #364: with --logfile, the SERVER-ERROR relay line lands in the LOGFILE
+/// alongside the errexit line — GT's iperf_err writes to test->outfile when
+/// a logfile is open (iperf_error.c:67-71), the same chooser iperf_exit
+/// uses. Live-probed (GT 3.21, a --server-bitrate-limit refusal): the
+/// client's logfile carries BOTH `iperf3: SERVER ERROR - total required
+/// bandwidth is larger than server limit` and the `iperf3: error - <same>`
+/// exit line; stderr is EMPTY; exit 1. riperf3 kept the relay half on
+/// stderr — the client.rs KNOWN-CORNER record this pin retires.
+#[cfg(unix)]
+#[test]
+fn logfile_receives_the_relay_line() {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let log = dir.join(format!("riperf3-relaylog-{pid}.log"));
+    let srv_log = dir.join(format!("riperf3-relaylog-srv-{pid}.log"));
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&srv_log);
+    let bin = env!("CARGO_BIN_EXE_riperf3");
+    let ps = common::free_port().to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(bin)
+            .args([
+                "-s",
+                "-1",
+                "-p",
+                &ps,
+                "--server-bitrate-limit",
+                "1000",
+                "--logfile",
+                srv_log.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    // Readiness via the server's OWN logfile: the listen banner lands there
+    // once the redirect + bind are both up. The refused-retry runner can't
+    // gate a --logfile client (it keys off stderr, which --logfile empties).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_to_string(&srv_log)
+        .map(|s| s.contains("Server listening"))
+        .unwrap_or(false)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server banner in its logfile"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = std::process::Command::new(bin)
+        .args([
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-b",
+            "1M",
+            "-t",
+            "2",
+            "--logfile",
+            log.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run client");
+    let _ = common::wait_bounded(&mut server.0, std::time::Duration::from_secs(8));
+    assert_eq!(out.status.code(), Some(1), "refused-run errexit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "the relay line must not leak to stderr: {stderr:?}"
+    );
+    let logged = std::fs::read_to_string(&log).expect("logfile written");
+    assert!(
+        logged
+            .contains("riperf3: SERVER ERROR - total required bandwidth is larger than server limit"),
+        "the relay line lands in the logfile: {logged:?}"
+    );
+    assert!(
+        logged.contains("riperf3: error - total required bandwidth is larger than server limit"),
+        "the errexit line stays in the logfile too: {logged:?}"
+    );
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&srv_log);
+}
+
 /// #198 items 3+4: usage errors exit 1 like iperf3's getopt path (clap's
 /// default is 2), and the bare invocation prints iperf3's exact parameter
 /// error.

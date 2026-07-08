@@ -1012,3 +1012,45 @@ fn sigterm_during_params_read_emits_exactly_one_doc() {
         "the single doc carries the interrupt key: {doc}"
     );
 }
+
+/// #364: with --logfile, the interrupt notice lands in the LOGFILE —
+/// iperf_got_sigend exits through iperf_signormalexit → iperf_exit, whose
+/// sink is test->outfile when a logfile is open (iperf_error.c:107-115),
+/// stderr otherwise. Live-probed (GT 3.21, server signalled while
+/// listening): the logfile ends with `iperf3: interrupt - the server has
+/// terminated by signal Interrupt(2)`, stderr is EMPTY, exit 0. riperf3
+/// kept the notice on stderr. The client role rides the same shared
+/// notice site (main.rs's Exit::Signal arm), also GT-probed.
+#[test]
+fn logfile_receives_the_interrupt_notice() {
+    let ps = free_port().to_string();
+    let log = std::env::temp_dir().join(format!("riperf3-intlog-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let server = spawn(&["-s", "-p", &ps, "--logfile", log.to_str().unwrap()]);
+    // Readiness gate: the listen banner arriving IN THE FILE proves both the
+    // redirect and the bind are up before the signal goes out.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .map(|s| s.contains("Server listening"))
+        .unwrap_or(false)
+    {
+        assert!(Instant::now() < deadline, "server banner in the logfile");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let spid = server.0.id() as i32;
+    unsafe {
+        libc::kill(spid, libc::SIGTERM);
+    }
+    let (_sout, serr, scode) = wait_with_output_bounded(server, Duration::from_secs(8), "server");
+    assert_eq!(scode, 0, "signal-normal exit");
+    assert!(
+        serr.trim().is_empty(),
+        "the notice must not leak to stderr: {serr:?}"
+    );
+    let logged = std::fs::read_to_string(&log).expect("logfile read");
+    assert!(
+        logged.contains("riperf3: interrupt - the server has terminated by signal"),
+        "the interrupt notice lands in the logfile: {logged:?}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
