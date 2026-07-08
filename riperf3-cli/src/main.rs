@@ -428,8 +428,9 @@ fn main() -> std::process::ExitCode {
 
 /// The text-mode error-line sink (#198/#364): append to the logfile when
 /// one is set — GT's iperf_err and iperf_exit both write to test->outfile
-/// when a logfile is open (iperf_error.c:67-79, :107-115) — else stderr,
-/// which is also the fallback when the file cannot be opened.
+/// when a logfile is open (iperf_err at iperf_error.c:67-71, iperf_exit's
+/// text branch at :136-141) — else stderr, which is also the fallback when
+/// the file cannot be opened.
 fn err_line_to_logfile_or_stderr(logfile: Option<&str>, line: &str) {
     if let Some(path) = logfile {
         use std::io::Write;

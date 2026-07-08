@@ -1015,8 +1015,9 @@ fn sigterm_during_params_read_emits_exactly_one_doc() {
 
 /// #364: with --logfile, the interrupt notice lands in the LOGFILE —
 /// iperf_got_sigend exits through iperf_signormalexit → iperf_exit, whose
-/// sink is test->outfile when a logfile is open (iperf_error.c:107-115),
-/// stderr otherwise. Live-probed (GT 3.21, server signalled while
+/// sink is test->outfile when a logfile is open (iperf_error.c:136-141;
+/// :126-131 for the json branch), stderr otherwise. Live-probed (GT 3.21,
+/// server signalled while
 /// listening): the logfile ends with `iperf3: interrupt - the server has
 /// terminated by signal Interrupt(2)`, stderr is EMPTY, exit 0. riperf3
 /// kept the notice on stderr. The client role rides the same shared
