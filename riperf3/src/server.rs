@@ -623,6 +623,21 @@ impl Server {
                         );
                     }
                 }
+                Err(RiperfError::RecvDataCookieFailed) => {
+                    // #359 r1 F2: GT's hard-read-error kill at the DATA
+                    // cookie gate (IERECVCOOKIE via cleanup_server). The
+                    // populated setup doc emitted at the site; text prints
+                    // the prefixed dangling perr line (#248 errno-0 form —
+                    // GT appends the live/stale strerror, live "Bad file
+                    // descriptor"). Keep-serving, exit 0.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {}: ",
+                            crate::macros::output_timestamp_prefix(),
+                            RiperfError::RecvDataCookieFailed
+                        );
+                    }
+                }
                 // #330: the pre-test control failures. Unlike the classes
                 // above — which build a partial report inside handle_one_test
                 // and carried the error in it — these error BEFORE any report
@@ -1370,7 +1385,7 @@ impl Server {
                             accepted = listener.accept() => {
                                 let (mut candidate, _) = accepted?;
                                 // #359: GT's deny-and-continue cookie gate —
-                                // a wrong-cookie, silent, or died connect
+                                // a wrong-cookie or silent/FIN'd connect
                                 // gets ACCESS_DENIED on ITS socket
                                 // (iperf_tcp.c:161-166; the closed-socket
                                 // guard iperf_server_api.c:786) and the wait
@@ -1378,19 +1393,36 @@ impl Server {
                                 // a round with no real streams. The old gate
                                 // killed the round (CookieMismatch /
                                 // unexpected-EOF).
-                                // RECORDED DEVIATION: this inline cookie
-                                // read blinds the ctrl-EOF / rcv_timeout
-                                // arms for its ≤10 s Nread bound — GT's
-                                // cookie read joins its select instead.
-                                // Adversarial-only: a real client writes
-                                // the cookie immediately on connect.
+                                // PARITY NOTE (#384 r1 F1): this inline
+                                // cookie read blinding the ctrl/timeout arms
+                                // is GT-FAITHFUL — GT's data-cookie read is
+                                // an inline blocking Nread inside
+                                // iperf_tcp_accept (iperf_tcp.c:155-160),
+                                // probed identical (silent conn + ctrl-EOF
+                                // at t=2 → both tools notice at ~10 s); the
+                                // bounds are Nread's (10 s idle / 30 s
+                                // overall on a dripper), same as GT's
+                                // net.c:75-76 modulo the recorded nread_step
+                                // per-step-idle nuance.
                                 match protocol::recv_cookie(&mut candidate).await {
                                     Ok(c) if c == ctx.cookie => break candidate,
-                                    // Wrong cookie, the 10 s silent bound,
-                                    // or died mid-cookie: best-effort deny
+                                    // Wrong cookie, the silent Nread bound,
+                                    // or a clean FIN (nread collapses both
+                                    // to UnexpectedEof): best-effort deny
                                     // like GT's Nwrite-then-close (the peer
-                                    // may already be gone).
-                                    _ => {
+                                    // may already be gone; GT prints a
+                                    // "failed to send access denied" line
+                                    // when ITS deny write fails — riperf3
+                                    // stays silent, recorded, racy cell).
+                                    // RECORDED DEVIATION (#384 r1 F3, GT
+                                    // bug not mirrored): with negotiated
+                                    // TOS != 0, GT runs sockopts on the
+                                    // just-denied CLOSED fd before its
+                                    // is_closed guard
+                                    // (iperf_server_api.c:780 vs :786) and
+                                    // IESETTOS-kills the round; riperf3
+                                    // continues (the #271 ethos).
+                                    Ok(_) => {
                                         let _ = protocol::send_state(
                                             &mut candidate,
                                             TestState::AccessDenied,
@@ -1398,6 +1430,42 @@ impl Server {
                                         .await;
                                         // Dropped here; the slot stays
                                         // unclaimed and the select re-arms.
+                                    }
+                                    Err(RiperfError::Io(ref io))
+                                        if io.kind()
+                                            == std::io::ErrorKind::UnexpectedEof =>
+                                    {
+                                        let _ = protocol::send_state(
+                                            &mut candidate,
+                                            TestState::AccessDenied,
+                                        )
+                                        .await;
+                                    }
+                                    // #384 r1 F2: a HARD read error (e.g.
+                                    // ECONNRESET) is NOT a deny — GT's
+                                    // Nread < 0 arm takes IERECVCOOKIE
+                                    // through cleanup_server
+                                    // (iperf_tcp.c:155-159): the fe+106
+                                    // wire-back, the populated setup doc,
+                                    // round dead, keep-serving.
+                                    Err(_) => {
+                                        abort_setup_streams(ctx).await;
+                                        let _ = protocol::send_server_error(
+                                            &mut ctx.ctrl,
+                                            106,
+                                        )
+                                        .await;
+                                        self.emit_setup_phase_error(
+                                            ctx,
+                                            listener,
+                                            &format!(
+                                                "error - {}: ",
+                                                RiperfError::RecvDataCookieFailed
+                                            ),
+                                        );
+                                        return Err(
+                                            RiperfError::RecvDataCookieFailed,
+                                        );
                                     }
                                 }
                             }

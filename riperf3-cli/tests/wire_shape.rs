@@ -4691,6 +4691,61 @@ fn setup_wrong_cookie_conn_is_denied_and_the_round_continues() {
     assert!(status.success(), "one-off exits 0: {serr}");
 }
 
+/// #359 (#384 r1 F2): a HARD read error mid-cookie (RST) is NOT a deny —
+/// GT kills the round via IERECVCOOKIE (iperf_tcp.c:155-159 ->
+/// cleanup_server): the fe+106 wire-back on ctrl, the prefixed dangling
+/// doc/text key (GT live appends the stale strerror "Bad file
+/// descriptor" — the #336-class recorded deviation, errno-0 form here),
+/// exit 0, NO deny byte on the imposter.
+#[cfg(unix)]
+#[test]
+fn setup_rst_mid_cookie_kills_the_round_ierecvcookie() {
+    let frame = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frame_in = frame.clone();
+    let (_sout, serr, status) = drive_server_scenario(false, move |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // The imposter RSTs mid-cookie (SO_LINGER 0, nothing written).
+        let imposter = std::net::TcpStream::connect(("127.0.0.1", port)).expect("imposter");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                imposter.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER setsockopt failed");
+        drop(imposter);
+        // GT's kill: the SERVER_ERROR relay lands on ctrl.
+        *frame_in.lock().unwrap() = read_wireback(&mut ctrl);
+        drop(ctrl);
+    });
+    assert_eq!(
+        *frame.lock().unwrap(),
+        wireback_frame(106),
+        "fe + htonl(IERECVCOOKIE=106), GT's cleanup_server wire-back"
+    );
+    assert!(status.success(), "one-off exits 0 like GT");
+    // No whole-string trim: the dangling `: ` IS the pin (#248 form).
+    let lines: Vec<&str> = serr.lines().collect();
+    assert_eq!(
+        lines,
+        vec![&format!("riperf3: error - {RECV_COOKIE_MSG}: ") as &str],
+        "the prefixed dangling IERECVCOOKIE line, once: {serr:?}"
+    );
+}
+
 /// #359 cell 2: a silent connect is denied at the 10 s cookie-read bound
 /// and the round then IENOMSGs at the re-armed rcv-timeout (~13 s), GT's
 /// exact cadence (probed). The pre-fix path killed the round at 10 s with
