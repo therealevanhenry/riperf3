@@ -995,6 +995,13 @@ impl Server {
         // spawn_blocking UDP runner ignores abort() and exits via `done` +
         // its 500 ms read-timeout poll; joining it with `done` unset would
         // hang. Idempotent on the clean path (shutdown_and_flush set it).
+        // The interval reporter (ctx.interval_handle) is deliberately NOT
+        // reaped here (#379 r1 F2 record): on the Err paths it
+        // self-terminates detached via `done` (bounded: its ~1 s tick +
+        // 2 s wait), prints nothing post-done, and holds no peer-visible
+        // fd — while an abort could kill a text-mode emit mid-line. The
+        // done-store-BEFORE-abort order also keeps a post-close reporter
+        // tick from sampling a recycled raw_fd.
         ctx.done.store(true, Ordering::Relaxed);
         for s in &ctx.streams {
             s.task.abort();

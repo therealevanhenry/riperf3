@@ -396,101 +396,101 @@ impl Client {
         // exits the BLOCK, not run().
         let outcome: Result<Option<crate::json_report::Report>> = async {
             loop {
-            // #231: iperf_catch_sigend is armed for the WHOLE run, so the
-            // central state wait polls the interrupt watch like the
-            // TEST_RUNNING selects — covering the setup phases AND the
-            // post-test ExchangeResults/DisplayResults waits, which
-            // previously ignored a signal until the control read returned
-            // (against a wedged server: forever, with only the CLI's #211
-            // second-signal hard exit as the way out). iperf_got_sigend's
-            // client arm has NO phase gate: it dumps the accumulated stats
-            // from any phase (empty rows pre-data), tells the peer via
-            // CLIENT_TERMINATE, and exits signal-normal — the same shape as
-            // the run_test arm. recv_state is a single 1-byte read, so the
-            // select is cancel-safe.
-            let state = tokio::select! {
-                s = protocol::recv_state(&mut ctx.ctrl) => match s {
-                    Ok(state) => state,
-                    // #267: a CLEAN close (EOF) is GT's IECTRLCLOSE — dump
-                    // the populated doc. Io-class failures (e.g. a pre-data
-                    // RST, the #195 retry surface) keep their own classes
-                    // and propagate bare, as before.
-                    Err(e @ (RiperfError::PeerDisconnected | RiperfError::ControlSocketClosed)) => {
-                        return Err(self.on_ctrl_lost(&ctx, e))
+                // #231: iperf_catch_sigend is armed for the WHOLE run, so the
+                // central state wait polls the interrupt watch like the
+                // TEST_RUNNING selects — covering the setup phases AND the
+                // post-test ExchangeResults/DisplayResults waits, which
+                // previously ignored a signal until the control read returned
+                // (against a wedged server: forever, with only the CLI's #211
+                // second-signal hard exit as the way out). iperf_got_sigend's
+                // client arm has NO phase gate: it dumps the accumulated stats
+                // from any phase (empty rows pre-data), tells the peer via
+                // CLIENT_TERMINATE, and exits signal-normal — the same shape as
+                // the run_test arm. recv_state is a single 1-byte read, so the
+                // select is cancel-safe.
+                let state = tokio::select! {
+                    s = protocol::recv_state(&mut ctx.ctrl) => match s {
+                        Ok(state) => state,
+                        // #267: a CLEAN close (EOF) is GT's IECTRLCLOSE — dump
+                        // the populated doc. Io-class failures (e.g. a pre-data
+                        // RST, the #195 retry surface) keep their own classes
+                        // and propagate bare, as before.
+                        Err(e @ (RiperfError::PeerDisconnected | RiperfError::ControlSocketClosed)) => {
+                            return Err(self.on_ctrl_lost(&ctx, e))
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    msg = wait_interrupt(ctx.interrupt.as_mut()) => {
+                        return Ok(Some(self.on_interrupted_wait(&mut ctx, &msg).await));
                     }
-                    Err(e) => return Err(e),
-                },
-                msg = wait_interrupt(ctx.interrupt.as_mut()) => {
-                    return Ok(Some(self.on_interrupted_wait(&mut ctx, &msg).await));
+                };
+
+                let flow = match state {
+                    TestState::ParamExchange => {
+                        self.on_param_exchange(&mut ctx).await?;
+                        StepFlow::Continue
+                    }
+
+                    TestState::CreateStreams => {
+                        self.on_create_streams(&mut ctx).await?;
+                        StepFlow::Continue
+                    }
+
+                    TestState::TestStart => {
+                        self.on_test_start(&mut ctx);
+                        StepFlow::Continue
+                    }
+
+                    TestState::TestRunning => self.on_test_running(&mut ctx).await?,
+
+                    TestState::ExchangeResults => match self.on_exchange_results(&mut ctx).await? {
+                        // #268: a signal landed inside the bulk results read.
+                        Some(report) => return Ok(Some(report)),
+                        None => StepFlow::Continue,
+                    },
+
+                    TestState::DisplayResults => self.on_display_results(&mut ctx).await?,
+
+                    TestState::IperfDone => StepFlow::Break,
+
+                    TestState::AccessDenied => {
+                        return Err(RiperfError::AccessDenied);
+                    }
+                    TestState::ServerError => {
+                        // #261: a relay arriving before TestStart is the upfront
+                        // refusal (code 37 et al.) — its `end` is GT's bare {}.
+                        // After TestStart the dump keeps the full structure.
+                        let bare_end = !ctx.stage.started();
+                        return Err(self.on_server_error_relay(&mut ctx, bare_end).await);
+                    }
+
+                    // iperf_handle_message_client handles SERVER_TERMINATE in
+                    // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
+                    // server interrupt racing the client's TestEnd lands here
+                    // (the ExchangeResults wait) — dump the partial summary and
+                    // surface IESERVERTERM instead of dying later on a bare
+                    // peer-disconnect with no dump.
+                    TestState::ServerTerminate => {
+                        return Err(self.on_server_terminate(&ctx));
+                    }
+
+                    other => {
+                        self.on_unexpected_state(&ctx, other);
+                        StepFlow::Continue
+                    }
+                };
+
+                match flow {
+                    StepFlow::Continue => {}
+                    StepFlow::Break => break,
+                    StepFlow::Return(report) => return Ok(Some(*report)),
                 }
-            };
-
-            let flow = match state {
-                TestState::ParamExchange => {
-                    self.on_param_exchange(&mut ctx).await?;
-                    StepFlow::Continue
-                }
-
-                TestState::CreateStreams => {
-                    self.on_create_streams(&mut ctx).await?;
-                    StepFlow::Continue
-                }
-
-                TestState::TestStart => {
-                    self.on_test_start(&mut ctx);
-                    StepFlow::Continue
-                }
-
-                TestState::TestRunning => self.on_test_running(&mut ctx).await?,
-
-                TestState::ExchangeResults => match self.on_exchange_results(&mut ctx).await? {
-                    // #268: a signal landed inside the bulk results read.
-                    Some(report) => return Ok(Some(report)),
-                    None => StepFlow::Continue,
-                },
-
-                TestState::DisplayResults => self.on_display_results(&mut ctx).await?,
-
-                TestState::IperfDone => StepFlow::Break,
-
-                TestState::AccessDenied => {
-                    return Err(RiperfError::AccessDenied);
-                }
-                TestState::ServerError => {
-                    // #261: a relay arriving before TestStart is the upfront
-                    // refusal (code 37 et al.) — its `end` is GT's bare {}.
-                    // After TestStart the dump keeps the full structure.
-                    let bare_end = !ctx.stage.started();
-                    return Err(self.on_server_error_relay(&mut ctx, bare_end).await);
-                }
-
-                // iperf_handle_message_client handles SERVER_TERMINATE in
-                // ANY state, not just TEST_RUNNING (#210 review r1 n2): a
-                // server interrupt racing the client's TestEnd lands here
-                // (the ExchangeResults wait) — dump the partial summary and
-                // surface IESERVERTERM instead of dying later on a bare
-                // peer-disconnect with no dump.
-                TestState::ServerTerminate => {
-                    return Err(self.on_server_terminate(&ctx));
-                }
-
-                other => {
-                    self.on_unexpected_state(&ctx, other);
-                    StepFlow::Continue
-                }
-            };
-
-            match flow {
-                StepFlow::Continue => {}
-                StepFlow::Break => break,
-                StepFlow::Return(report) => return Ok(Some(*report)),
+                // #145: AUDITABILITY ONLY — advance the table cursor to the state
+                // just handled, before the next recv. Reached only by the arms that
+                // fall through (the break/return arms end the run anyway).
+                ctx.prev_state = state;
             }
-            // #145: AUDITABILITY ONLY — advance the table cursor to the state
-            // just handled, before the next recv. Reached only by the arms that
-            // fall through (the break/return arms end the run anyway).
-            ctx.prev_state = state;
-        }
-        Ok(None)
+            Ok(None)
         }
         .await;
 
@@ -507,17 +507,23 @@ impl Client {
         // at the data-phase end and the final report was captured at
         // DisplayResults. UDP receivers are spawn_blocking (abort is a
         // no-op there) and exit via `done` + their 500 ms read-timeout
-        // poll. The 100 ms catch-up grace is skipped when no streams were
-        // ever spawned (the pre-CreateStreams error paths have nothing to
-        // let land).
+        // poll.
         // RESIDUAL (the #352 join-site sibling record): GT closes its data
         // sockets at DISPLAY_RESULTS, BEFORE sending IPERF_DONE, and
         // sync-closes ctrl with a bounded drain-to-EOF
         // (iperf_client_api.c:562-566, net.c:877-886); riperf3's data FINs
-        // land ~100 ms later, at this abort, and ctrl closes abruptly —
-        // observable only by a peer that holds the round open.
-        ctx.done.store(true, Ordering::Relaxed);
-        if !ctx.streams.is_empty() {
+        // land later, at this abort (one state past GT's close point), and
+        // ctrl closes abruptly — observable only by a peer that holds the
+        // round open.
+        // `swap` (#379 r1 F3): run_test's end-of-data cleanup already set
+        // `done` and slept this same grace on every path that passes
+        // through it (the clean break and the mid-running error/event
+        // arms), so a second sleep there buys nothing. The grace is owed
+        // only when this gate is the FIRST to stop the streams (errors
+        // between CreateStreams and the data phase) — and never when no
+        // streams were spawned at all.
+        let grace_owed = !ctx.done.swap(true, Ordering::Relaxed);
+        if grace_owed && !ctx.streams.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         for s in &ctx.streams {
