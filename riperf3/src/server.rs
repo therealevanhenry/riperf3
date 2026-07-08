@@ -46,6 +46,29 @@ pub(crate) struct TestConfig {
 /// round ends CLEAN (exit 0, persistent keeps serving).
 const CTRL_CLOSED_MSG: &str = "the client has unexpectedly closed the connection";
 
+/// #371: map a POST-TEST_END exchange control-write failure to the
+/// IESENDMESSAGE class, preserving the live errno. `send_state`'s only
+/// fallible op is `write_all` (→ `RiperfError::Io`); the fallthrough keeps
+/// any already-typed error unchanged.
+fn exchange_send_message_error(e: RiperfError) -> RiperfError {
+    match e {
+        RiperfError::Io(io) => RiperfError::ExchangeSendMessageFailed(io),
+        other => other,
+    }
+}
+
+/// #371: the `send_results` sibling → IESENDRESULTS. `send_results`
+/// serializes before the socket write, so a (theoretical) serialize error
+/// would be non-Io; the fallthrough leaves it unchanged rather than
+/// mislabel it. In practice `TestResultsJson` never fails to serialize
+/// (non-finite f64 → JSON null, not Err), so the input is always Io.
+fn exchange_send_results_error(e: RiperfError) -> RiperfError {
+    match e {
+        RiperfError::Io(io) => RiperfError::ExchangeSendResultsFailed(io),
+        other => other,
+    }
+}
+
 /// i64→i32 for the adopted dg (#316 r2 F3 / r3 nit): GT's bundled cjson
 /// carries `int64_t valueint` (cjson.h:119) and the narrowing happens at
 /// the C `int` field assignment (iperf_api.c:2602) — an
@@ -297,6 +320,12 @@ struct TestRunCtx {
     /// IERECVRESULTS surface for every close-type and file upstream rather
     /// than reproduce the misleading flip.
     exchange_recv_failed: bool,
+    /// #371: a POST-TEST_END exchange-phase SEND failed (the state writes →
+    /// IESENDMESSAGE, `send_results` → IESENDRESULTS). Set instead of
+    /// propagating the raw io Err so the finalize renders the POPULATED doc
+    /// (the reporter ran at TEST_END) + this typed key; the post-emit gate
+    /// then returns it so the serve loop prints GT's line and keeps serving.
+    exchange_send_error: Option<RiperfError>,
     /// #330 r1 F1: a mid-test IPERF_DONE — GT's switch has an EXPLICIT
     /// no-error arm for it (iperf_server_api.c:287-288) and Nread wrote
     /// the byte into test->state, so its run loop exits CLEAN: no error
@@ -592,6 +621,22 @@ impl Server {
                             "{}riperf3: error - {}: ",
                             crate::macros::output_timestamp_prefix(),
                             RiperfError::RecvResultsFailed
+                        );
+                    }
+                }
+                Err(e @ RiperfError::ExchangeSendMessageFailed(_))
+                | Err(e @ RiperfError::ExchangeSendResultsFailed(_)) => {
+                    // #371: the POST-TEST_END exchange-send failure — the
+                    // POPULATED doc rendered at the site (GT's json_finish
+                    // over the TEST_END reporter output). Text prints GT's
+                    // IESENDMESSAGE/IESENDRESULTS line with the live strerror
+                    // (no dangling ": ", the Display carries the errno);
+                    // -J/json-stream carried it in the doc. Keep-serving,
+                    // exit 0 (GT's rc -1 class).
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {e}",
+                            crate::macros::output_timestamp_prefix()
                         );
                     }
                 }
@@ -913,6 +958,7 @@ impl Server {
             ctrl_closed: false,
             early_done: false,
             exchange_recv_failed: false,
+            exchange_send_error: None,
             bare_end: false,
             interrupted: None,
         };
@@ -1009,6 +1055,11 @@ impl Server {
                     // the field's deviation record).
                     end.report_error =
                         Some(format!("error - {}: ", RiperfError::RecvResultsFailed));
+                } else if let Some(err) = &ctx.exchange_send_error {
+                    // #371: GT's IESENDMESSAGE/IESENDRESULTS key over the
+                    // populated doc — prefixed like the self-terminate keys,
+                    // with the live strerror the variant's Display carries.
+                    end.report_error = Some(format!("error - {err}"));
                 }
             }
 
@@ -1110,6 +1161,12 @@ impl Server {
             // line (json keeps stderr to the warning alone) and keeps
             // serving — a failed test is rc -1, one-off exit 0.
             return Err(RiperfError::RecvResultsFailed);
+        }
+        if let Some(err) = ctx.exchange_send_error.take() {
+            // #371: the populated doc rendered above (its key came from
+            // report_error); the caller prints GT's IESENDMESSAGE/
+            // IESENDRESULTS line (text only) and keeps serving, exit 0.
+            return Err(err);
         }
         Ok(Some(report))
     }
@@ -2472,7 +2529,16 @@ impl Server {
                 streams: result_streams,
             };
 
-            protocol::send_state(&mut ctx.ctrl, TestState::ExchangeResults).await?;
+            // #371: an exchange-phase send failing against a peer that RST
+            // the ctrl after TEST_END is GT's IESENDMESSAGE — the reporter
+            // already ran, so render the POPULATED doc + the typed key
+            // (return Ok(()) into the finalize path), not the raw-io skeleton
+            // the generic serve-loop arm would emit. `send_state` maps to
+            // IESENDMESSAGE; `send_results` to IESENDRESULTS.
+            if let Err(e) = protocol::send_state(&mut ctx.ctrl, TestState::ExchangeResults).await {
+                ctx.exchange_send_error = Some(exchange_send_message_error(e));
+                return Ok(());
+            }
             // #319 (sibling of #268): both post-test reads race the
             // interrupt watch — a client wedging mid-results (or never
             // sending IperfDone) must not hold the server past a signal.
@@ -2509,10 +2575,16 @@ impl Server {
                     return Ok(());
                 }
             };
-            protocol::send_results(&mut ctx.ctrl, &server_results).await?;
+            if let Err(e) = protocol::send_results(&mut ctx.ctrl, &server_results).await {
+                ctx.exchange_send_error = Some(exchange_send_results_error(e));
+                return Ok(());
+            }
 
             // ---- DisplayResults / IperfDone ----
-            protocol::send_state(&mut ctx.ctrl, TestState::DisplayResults).await?;
+            if let Err(e) = protocol::send_state(&mut ctx.ctrl, TestState::DisplayResults).await {
+                ctx.exchange_send_error = Some(exchange_send_message_error(e));
+                return Ok(());
+            }
 
             // Wait for client to send IperfDone
             loop {
@@ -4469,6 +4541,7 @@ mod tests {
             ctrl_closed: false,
             early_done: false,
             exchange_recv_failed: false,
+            exchange_send_error: None,
             bare_end: false,
             interrupted: None,
         }

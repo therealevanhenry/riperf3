@@ -103,6 +103,32 @@ pub enum RiperfError {
     #[error("unable to send control message - port may not be available, the other side may have stopped running, etc.: {0}")]
     SendControlFailed(std::io::Error),
 
+    /// iperf3's IESENDMESSAGE(111) on the POST-TEST_END exchange phase — the
+    /// `send_state(EXCHANGE_RESULTS)` / `send_state(DISPLAY_RESULTS)` writes
+    /// failing against a peer that RST the control socket after TEST_END
+    /// (#371). Distinct from the pre-test [`Self::SendControlFailed`] only in
+    /// PHASE: the reporter already ran at TEST_END, so GT's json_finish emits
+    /// the POPULATED doc (start/intervals/end) + this error key, where the
+    /// pre-test sibling emits the skeleton. Same GT sentence (IESENDMESSAGE,
+    /// perr). Live errno rides per the #345 honest-errno convention (GT's
+    /// stale-global "Transport endpoint is not connected" is not mirrored).
+    #[error("unable to send control message - port may not be available, the other side may have stopped running, etc.: {0}")]
+    ExchangeSendMessageFailed(std::io::Error),
+
+    /// iperf3's IESENDRESULTS(116, iperf_api.h:465): the `send_results` write
+    /// in the post-TEST_END exchange failed (#371, iperf_api.c:2789). GT's
+    /// sentence, perr; the populated-doc surface of
+    /// [`Self::ExchangeSendMessageFailed`]. The mapping is GT-RULE-faithful
+    /// (send_results fail → IESENDRESULTS on both tools). RECORDED DEVIATION
+    /// (r1, probe-confirmed both tools): in the peer-RSTs-after-its-results
+    /// cell riperf3's `send_results` write FAILS deterministically (ECONNRESET)
+    /// → this class, whereas GT's write BUFFERS and succeeds and the failure
+    /// lands on the following `send_state(DISPLAY_RESULTS)` → IESENDMESSAGE.
+    /// So the class riperf3 surfaces here diverges from GT's for the same
+    /// scenario — an honest socket-buffering difference, not a mis-mapping.
+    #[error("unable to send results: {0}")]
+    ExchangeSendResultsFailed(std::io::Error),
+
     /// iperf3's IEACCEPT(104): the control accept() failed
     /// (iperf_server_api.c:163; herr+perr). The site-captured errno rides
     /// — and MATCHES GT's text surface in this pre-test cell (#387 r2 F1
