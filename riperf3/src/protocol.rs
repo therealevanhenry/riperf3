@@ -298,18 +298,29 @@ pub async fn json_write(stream: &mut TcpStream, value: &serde_json::Value) -> Re
 // Test parameters — exchanged as JSON during ParamExchange
 // ---------------------------------------------------------------------------
 
+/// UTF-8 BOM (#367 cell 1): cJSON's parse entry runs `skip_utf8_bom` before
+/// `parse_value` (cjson.c:1074-1088, :1131), so a leading BOM ahead of valid
+/// JSON parses on every blob. serde has no such skip; strip it here to match.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// #343: GT parses every length-prefixed blob with
 /// cJSON_Parse(require_null_terminated=0) — the first JSON value wins and
 /// trailing bytes inside the declared length are ignored. Deliberate wire
 /// leniency GT depends on (a peer that over-declares its length
-/// interoperates), mirrored per the #328 fidelity precedent; garbage from
-/// byte 0 still errors like both tools. SCOPE (r1 F2): the mirror covers
-/// self-delimiting first values with whitespace-separated tails — the
-/// residual cJSON cells (UTF-8 BOM, bare-scalar roots, scalar-adjacent
-/// garbage, nesting past serde's 128, raw control chars in strings) stay
-/// divergent and are tracked in the follow-up issue; none are reachable
-/// from a real iperf3 encoder.
+/// interoperates), mirrored per the #328 fidelity precedent.
+///
+/// SCOPE (#343 r1 F2 / #367): the mirror covers self-delimiting first values
+/// with whitespace-separated tails, plus a leading UTF-8 BOM (#367 cell 1,
+/// now stripped here — cJSON's skip_utf8_bom). The bare-scalar params root
+/// (#367 cell 2) is mirrored in `params_from_value`. Four residual cJSON
+/// cells stay divergent as RECORDED DEVIATIONS — serde is a conforming
+/// parser and mirroring them means a bespoke lenient parser for shapes no
+/// real iperf3 encoder emits: scalar-adjacent garbage (`42GARBAGE`), nesting
+/// past serde's 128-deep limit (cJSON's is 1000), raw control chars in
+/// strings, and cJSON's lenient strtod grammar (`01`, `1.`). Locked by
+/// `json_first_value_deviations_stay_strict`.
 fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
+    let buf = buf.strip_prefix(UTF8_BOM).unwrap_or(buf);
     let mut stream = serde_json::Deserializer::from_slice(buf).into_iter();
     match stream.next() {
         Some(v) => v,
@@ -580,8 +591,26 @@ pub async fn send_params(stream: &mut TcpStream, params: &TestParams) -> Result<
 /// into the IERECVPARAMS surface instead of parking the serve loop.
 pub async fn recv_params(stream: &mut TcpStream) -> Result<TestParams> {
     let value = json_read_bounded(stream, MAX_PARAMS_JSON_LEN).await?;
-    let params: TestParams = serde_json::from_value(value)?;
-    Ok(params)
+    Ok(params_from_value(value)?)
+}
+
+/// Deserialize a params blob's root JSON value into `TestParams`.
+///
+/// #367 cell 2: a NON-OBJECT root yields all-defaults. GT's `get_parameters`
+/// (iperf_api.c:2533+) is a sequence of `iperf_cJSON_GetObjectItemType`
+/// lookups (iperf_util.c:444); on a non-object root every lookup misses, so
+/// no field is set and GT proceeds to CREATE_STREAMS with defaults. serde's
+/// `from_value` instead hard-errors on a non-map, so map the non-object case
+/// to defaults to match. (A malformed object — e.g. a field of the wrong
+/// JSON type, where GT's wrapper warns and defaults the field but serde
+/// hard-errors — is a separate, broader cJSON-vs-serde gap, tracked in a
+/// follow-up, not this cell.)
+fn params_from_value(value: serde_json::Value) -> serde_json::Result<TestParams> {
+    if value.is_object() {
+        serde_json::from_value(value)
+    } else {
+        Ok(TestParams::default())
+    }
 }
 
 /// Send test results as length-prefixed JSON.
@@ -1526,6 +1555,78 @@ mod tests {
         assert!(
             (1..=6).contains(&n),
             "client sent {n} magics in ~1.1s under a stray flood; expected ~2–3 (rate-limited)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #367: residual cJSON-leniency cells beyond the #343 mirror. Two are
+    // now mirrored (BOM, bare-scalar params root); the other four are
+    // recorded deviations (serde is a conforming parser; mirroring them
+    // would mean a bespoke lenient parser for shapes no real iperf3 encoder
+    // emits). GT facts source-verified: cjson.c skip_utf8_bom (:1074-1088,
+    // run at every parse entry :1131); get_parameters typed key-lookup
+    // (iperf_api.c:2533+) so a non-object root sets no fields → defaults.
+    // -----------------------------------------------------------------------
+
+    /// #367 cell 1 (MIRRORED): a UTF-8 BOM ahead of valid JSON parses, like
+    /// cJSON's skip_utf8_bom. Red pre-fix (serde rejects the BOM bytes).
+    #[test]
+    fn json_first_value_skips_utf8_bom() {
+        let buf = b"\xEF\xBB\xBF{\"time\":10}";
+        let v = json_first_value(buf).expect("BOM-prefixed JSON parses like cJSON");
+        assert_eq!(v["time"], 10);
+    }
+
+    /// #367 cell 2 (MIRRORED): a bare-scalar params root yields all-defaults
+    /// (GT's get_parameters key-lookup misses every field on a non-object and
+    /// proceeds to CREATE_STREAMS). Red pre-fix (from_value::<TestParams> on a
+    /// scalar errors). An object root still deserializes normally.
+    #[test]
+    fn params_from_value_defaults_on_non_object_root() {
+        // Bare scalar, array, string, bool, null — all non-objects → defaults.
+        for v in [
+            serde_json::json!(42),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("hi"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let p = params_from_value(v.clone()).unwrap_or_else(|e| panic!("{v} → default: {e}"));
+            assert_eq!(p.time, None, "{v} yields defaults");
+            assert_eq!(p.tcp, None, "{v} yields defaults");
+        }
+        // An object root still parses its fields.
+        let p = params_from_value(serde_json::json!({"time": 10, "tcp": true})).unwrap();
+        assert_eq!(p.time, Some(10));
+        assert_eq!(p.tcp, Some(true));
+    }
+
+    /// #367 cells 3-6 (RECORDED DEVIATIONS): riperf3's serde parser is
+    /// stricter than cJSON for these non-conforming shapes no real iperf3
+    /// encoder emits. This locks the deviation — a future serde change that
+    /// silently started accepting any of them should trip here.
+    #[test]
+    fn json_first_value_deviations_stay_strict() {
+        // cell 3: scalar with adjacent (non-whitespace) garbage — cJSON stops
+        // at the first non-value byte; serde's non-self-delimiting first
+        // value must be whitespace/EOF-terminated.
+        assert!(json_first_value(b"42GARBAGE").is_err(), "adjacent garbage");
+        // cell 5: raw control character inside a string — cJSON copies it;
+        // serde (strict JSON) rejects unescaped control bytes.
+        assert!(
+            json_first_value(b"\"\x01\"").is_err(),
+            "raw control char in string"
+        );
+        // cell 6: cJSON's strtod number grammar — leading zero and bare
+        // trailing dot both parse in cJSON; serde rejects.
+        assert!(json_first_value(b"{\"omit\":01}").is_err(), "leading zero");
+        assert!(json_first_value(b"{\"time\":1.}").is_err(), "bare dot");
+        // cell 4: nesting past serde's 128-deep recursion limit — cJSON's
+        // CJSON_NESTING_LIMIT is 1000, so 128<n<=1000 diverges.
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert!(
+            json_first_value(deep.as_bytes()).is_err(),
+            "nesting past serde's 128 limit"
         );
     }
 }
