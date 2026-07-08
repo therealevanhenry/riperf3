@@ -990,18 +990,16 @@ impl Client {
         if self.json_output || self.json_stream {
             self.emit_results(ctx, None, bare_end, ctx.measured_secs, Some(&msg));
         } else {
-            // KNOWN CORNER (r1 n5): with --logfile set,
-            // iperf_err writes this line to the logfile;
-            // riperf3's logfile plumbing lives in the
-            // CLI (#198), so this lib line stays on
-            // stderr. Revisit with the sink plumbing.
             // #290: quiet runs surface the error via Err alone.
             if !crate::macros::output_quiet() {
-                // #348: GT stamps this line too (iperf_err route).
-                eprintln!(
+                // #348: GT stamps this line too (iperf_err route). #364:
+                // and iperf_err honors the logfile — err_println follows
+                // its logfile-or-stderr chooser (the binary arms the sink
+                // alongside its --logfile redirect).
+                crate::macros::err_println(&format!(
                     "{}riperf3: SERVER ERROR - {msg}",
                     crate::macros::output_timestamp_prefix()
-                );
+                ));
             }
         }
         RiperfError::ServerErrorRelayed(msg)

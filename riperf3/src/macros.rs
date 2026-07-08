@@ -186,6 +186,69 @@ impl Drop for OutputQuietGuard {
     }
 }
 
+/// The `--logfile` error-line sink (#364): when armed, the crate's
+/// iperf_err-shaped stderr lines (e.g. the client's SERVER-ERROR relay
+/// receipt) append to this file instead — iperf3's iperf_err writes to
+/// test->outfile whenever a logfile is open (iperf_error.c:67-71), the same
+/// chooser its exit paths use. The binary arms this alongside its --logfile
+/// stdout redirect; the lib itself has no logfile flag (#198).
+/// Process-global like OUTPUT_TITLE (one run at a time).
+static ERR_SINK: RwLock<Option<String>> = RwLock::new(None);
+
+/// RAII guard routing this crate's error lines to a logfile instead of
+/// stderr, matching iperf3's `--logfile` behavior (its iperf_err writes to
+/// the logfile whenever one is open). Currently routed: the client's
+/// `SERVER ERROR - …` relay receipt; the crate's remaining stderr
+/// diagnostics are tracked in #398 and still print to stderr. A quiet run
+/// (#290) suppresses these lines entirely — quiet wins over the sink.
+/// Lines are appended; stderr remains the fallback when the file cannot be
+/// opened. Construct ONLY when a logfile is active (callers gate then
+/// `.map(ErrorSinkGuard::set)`); Drop restores stderr routing.
+/// Process-global: one run at a time.
+// The private unit field makes `set()` the only constructor, like
+// OutputQuietGuard — a literal construction elsewhere would pair a no-op
+// arm with a sink-clearing Drop.
+#[must_use = "the sink disarms when the guard drops — bind it for the run's duration"]
+pub struct ErrorSinkGuard(());
+
+impl ErrorSinkGuard {
+    /// Arm the sink: error lines append to the file at `path` until drop.
+    pub fn set(path: &str) -> Self {
+        if let Ok(mut g) = ERR_SINK.write() {
+            *g = Some(path.to_string());
+        }
+        ErrorSinkGuard(())
+    }
+}
+
+impl Drop for ErrorSinkGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = ERR_SINK.write() {
+            *g = None;
+        }
+    }
+}
+
+/// Print one fully-formatted error line to the active sink (#364): append
+/// to the armed logfile, else stderr — stderr is also the fallback when the
+/// file cannot be opened, like the CLI's errexit sink (#198).
+pub(crate) fn err_println(line: &str) {
+    if let Ok(g) = ERR_SINK.read() {
+        if let Some(path) = g.as_deref() {
+            use std::io::Write;
+            let logged = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| writeln!(f, "{line}"));
+            if logged.is_ok() {
+                return;
+            }
+        }
+    }
+    eprintln!("{line}");
+}
+
 pub(crate) fn set_output_title(title: Option<String>) {
     if let Ok(mut g) = OUTPUT_TITLE.write() {
         *g = title;
