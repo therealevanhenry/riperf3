@@ -145,11 +145,15 @@ fn bitrate_limit_json_client_single_doc_with_relayed_error() {
     );
 }
 
-/// -J server: the full document still emits (intervals and all) with the
-/// error key carrying iperf_err's `error - ` prefix wart, stderr empty,
-/// exit 0 — live-verified against iperf 3.21.
+/// -J server: the accumulated intervals emit over a BARE `end: {}` (#368) —
+/// GT's rate-breach kill path (cleanup_server + return -1,
+/// iperf_server_api.c:624-646) never runs end processing, so the reader's
+/// document finishes with `end` as an empty object; the error key carries
+/// iperf_err's `error - ` prefix wart, stderr empty, exit 0. Live-verified
+/// against iperf 3.21 (`--server-bitrate-limit 1K` + `-t 5`: GT `end` keys
+/// `[]`, riperf3 pre-#368 rendered the full finalize end).
 #[test]
-fn bitrate_limit_json_server_doc_carries_prefixed_error() {
+fn bitrate_limit_json_server_doc_bare_end_and_prefixed_error() {
     let ps = common::free_port().to_string();
     let server = spawn_server(&["--server-bitrate-limit", "1K", "-J"], &ps);
     std::thread::sleep(Duration::from_millis(300));
@@ -172,6 +176,19 @@ fn bitrate_limit_json_server_doc_carries_prefixed_error() {
         doc["error"].as_str(),
         Some(format!("error - {BITRATE_MSG}").as_str()),
         "iperf_err's in-doc prefix wart, mirrored exactly: {doc}"
+    );
+    // #368: the kill path skips end processing — bare `end: {}`, NOT the
+    // populated finalize end (streams/sums/cpu/congestion).
+    assert_eq!(
+        doc["end"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "GT's rate-breach end is bare {{}}: {doc}"
+    );
+    // The accumulated interval rows still ride the doc (the start block too);
+    // only the end block is suppressed.
+    assert!(
+        doc["intervals"].is_array() && doc["start"].as_object().is_some_and(|m| !m.is_empty()),
+        "intervals + start survive the bare-end path: {doc}"
     );
 }
 
