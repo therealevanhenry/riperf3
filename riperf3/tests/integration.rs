@@ -1811,8 +1811,16 @@ mod unimplemented_flags {
             .expect("the interrupt must be honored in the setup-phase wait (#231)")
             .expect("join");
         // GT dumps + returns normally (iperf_got_sigend's client arm has no
-        // phase gate); the signal-normal EXIT is the CLI's business.
-        assert!(res.is_ok(), "{res:?}");
+        // phase gate); the signal-normal EXIT is the CLI's business. #293: the
+        // run is Ok(RunOutcome) with Termination::Interrupted — distinct from
+        // Completed, and since BOTH exit 0, this is the only assertion that
+        // catches an Interrupted↔Completed mis-map.
+        let outcome = res.expect("interrupt run returns Ok(RunOutcome)");
+        assert_eq!(
+            outcome.termination,
+            riperf3::Termination::Interrupted,
+            "a local signal ends Interrupted"
+        );
         mock.abort();
     }
 
