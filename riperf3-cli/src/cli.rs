@@ -2727,9 +2727,10 @@ mod cli_tests {
 
         // -- #124: server-side wiring coverage. `build_server` is now the single
         // source of truth, so cover its setters too (previously only one_off,
-        // idle_timeout, and server_max_duration had dedicated tests). `build_server`
-        // has no unconditional defaults, so the bare `ServerBuilder::new()` is the
-        // correct baseline (unlike the client's `expected_client`).
+        // idle_timeout, and server_max_duration had dedicated tests). #294:
+        // `build_server` sets `emit_output(true)` unconditionally, so each
+        // expected baseline carries `.emit_output(true)` (like the client's
+        // `expected_client`).
 
         #[test]
         fn server_port_wired() {

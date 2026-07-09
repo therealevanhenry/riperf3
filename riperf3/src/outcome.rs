@@ -7,12 +7,19 @@
 //! server-relayed-error run came back as `Err` — with the partial report
 //! built, printed, then discarded, unreachable to a library caller.
 //!
-//! [`RunOutcome`] unifies that: every run that produced a report returns
+//! [`RunOutcome`] unifies that: the four common endings — a clean run, a local
+//! signal, a server-terminate, and a relayed `SERVER_ERROR` — all return
 //! `Ok(RunOutcome)` carrying both the [`Report`] and a [`Termination`] saying
-//! how it ended. `Err` is reserved for runs that produced NO report at all — a
-//! failed connect or a control-handshake failure. A caller that only wants the
-//! data reads `outcome.report`; one that needs to branch on the ending matches
+//! how it ended. `Err` covers runs that produced no report (a failed connect
+//! or control handshake). A caller that only wants the data reads
+//! `outcome.report`; one that needs to branch on the ending matches
 //! `outcome.termination`.
+//!
+//! Two rarer abnormal endings are NOT yet folded in and still return `Err`
+//! even though they emit a populated document in the JSON modes:
+//! `RiperfError::ControlSocketClosed` (#267) and `RiperfError::RecvResultsFailed`
+//! (#374). Folding those (and the `Server::run_once` side) into `Termination`
+//! is a follow-up; the CLI already renders them faithfully.
 //!
 //! This changes only the Rust return shape: the wire bytes, the text/JSON the
 //! CLI prints, and the process exit codes are unchanged (the CLI maps
@@ -45,14 +52,6 @@ pub enum Termination {
 }
 
 impl Termination {
-    /// True for the endings iperf3 treats as a clean process exit (exit 0):
-    /// a completed run or a local signal. `ServerTerminated`/`ServerError` are
-    /// non-zero-exit endings. The CLI uses this for its exit-code mapping.
-    #[must_use]
-    pub fn is_clean_exit(&self) -> bool {
-        matches!(self, Termination::Completed | Termination::Interrupted)
-    }
-
     /// The iperf3 errexit-line message for an abnormal ending, or `None` for a
     /// clean exit. The CLI renders `riperf3: error - <msg>` from this on the
     /// non-zero-exit paths (the library already emitted its doc/receipt line
