@@ -397,7 +397,7 @@ async fn tcp_reverse_bytes_limit_terminates() {
     // rate the 100ms end-condition poll overshoots the target (a pre-existing
     // characteristic shared with forward `-n`), so this guards termination +
     // floor, not an exact byte count.
-    let transferred: u64 = res.end.sum_sent.as_ref().unwrap().bytes;
+    let transferred: u64 = res.report.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         transferred >= target,
         "transferred {transferred} < requested {target}"
@@ -433,7 +433,7 @@ async fn tcp_reverse_blocks_limit_terminates() {
     let result = tokio::time::timeout(Duration::from_secs(15), client.run()).await;
     assert!(result.is_ok(), "-R -k hung — issue #60 regression");
     let res = result.unwrap().expect("-R -k errored");
-    let transferred: u64 = res.end.sum_sent.as_ref().unwrap().bytes;
+    let transferred: u64 = res.report.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         transferred >= blocks * blksize as u64,
         "transferred {transferred} < requested {blocks} blocks"
@@ -470,7 +470,7 @@ async fn tcp_byte_limit_overshoot_bounded_forward() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_received.as_ref().unwrap().bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -505,7 +505,7 @@ async fn tcp_byte_limit_overshoot_bounded_reverse() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_sent.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_sent.as_ref().unwrap().bytes;
     assert!(
         bytes > target / 2,
         "transferred {bytes} far below target {target}"
@@ -548,7 +548,7 @@ async fn tcp_bitrate_is_paced() {
         .expect("client hung")
         .expect("client errored");
     // run() returns the rich report; forward → server received ≈ what we sent.
-    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_received.as_ref().unwrap().bytes;
     let achieved = bytes * 8 / secs;
     // Unpaced this is line rate (tens of Gbit/s, >100x target). Paced lands near
     // target; allow a generous band for burst/timing slack.
@@ -591,7 +591,7 @@ async fn tcp_low_bitrate_no_overshoot() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_received.as_ref().unwrap().bytes;
     let budget = (target / 8 * secs) as f64; // 250 KB
     let bound = budget * 1.25 + (128 * 1024) as f64;
     assert!(
@@ -623,7 +623,7 @@ async fn tcp_unlimited_is_not_paced() {
         .await
         .expect("client hung")
         .expect("client errored");
-    let bytes: u64 = result.end.sum_received.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_received.as_ref().unwrap().bytes;
     // A 200 Mbit cap would yield ~25 MB in 1 s; unthrottled loopback moves far
     // more. >200 MB confirms pacing didn't leak into the rate-0 path.
     assert!(
@@ -661,7 +661,7 @@ async fn tcp_bitrate_reverse_is_paced() {
         .expect("client hung")
         .expect("client errored");
     // Reverse: the server sends; its reported bytes ≈ what it paced out.
-    let bytes: u64 = result.end.sum_sent.as_ref().unwrap().bytes;
+    let bytes: u64 = result.report.end.sum_sent.as_ref().unwrap().bytes;
     let achieved = bytes * 8 / secs;
     assert!(
         achieved < target * 2,
@@ -1843,11 +1843,16 @@ mod unimplemented_flags {
             elapsed.as_secs() < 4,
             "the refusal is upfront — no transfer, no timer wait: {elapsed:?}"
         );
-        let err = result.expect_err("the relayed SERVER_ERROR is the client's error");
+        // #293: Ok(RunOutcome) carrying the adopted message.
+        let outcome = result.expect("the relayed SERVER_ERROR returns Ok(RunOutcome)");
         assert_eq!(
-            err.to_string(),
-            "client's requested duration exceeds the server's maximum permitted limit",
-            "{err:?}"
+            outcome.termination,
+            riperf3::Termination::ServerError(
+                "client's requested duration exceeds the server's maximum permitted limit"
+                    .to_string()
+            ),
+            "{:?}",
+            outcome.termination
         );
         // The server side errors to ITS sink but run() is Ok - iperf3's
         // one-off exits 0 on the refusal path (live-verified, the #224 wart).
@@ -1884,12 +1889,16 @@ mod unimplemented_flags {
             "bitrate limit didn't cut test: {elapsed:?}"
         );
         // #224 ground truth (iperf 3.21): SERVER_ERROR + IETOTALRATE, the
-        // client adopts iperf_strerror(27); no generic ServerTerminated.
-        let err = result.expect_err("the relayed SERVER_ERROR is the client's error");
+        // client adopts iperf_strerror(27). #293: Ok(RunOutcome) with the
+        // ServerError ending.
+        let outcome = result.expect("the relayed SERVER_ERROR returns Ok(RunOutcome)");
         assert_eq!(
-            err.to_string(),
-            "total required bandwidth is larger than server limit",
-            "{err:?}"
+            outcome.termination,
+            riperf3::Termination::ServerError(
+                "total required bandwidth is larger than server limit".to_string()
+            ),
+            "{:?}",
+            outcome.termination
         );
         let joined = server_task.await.expect("server task");
         assert!(
@@ -2378,7 +2387,8 @@ mod client_run_return_value {
             .build()
             .unwrap();
 
-        let report = client.run().await.expect("client run failed");
+        // #293: run() returns a RunOutcome; this test inspects the report.
+        let report = client.run().await.expect("client run failed").report;
 
         // The end block carries both halves on a forward run.
         assert!(
@@ -2540,9 +2550,15 @@ async fn server_refuses_over_limit_rate_upfront() {
         let server_result = server_task.await.expect("server task");
 
         if refused {
+            // #293: a relayed SERVER_ERROR is Ok(RunOutcome) now, carrying the
+            // partial report + Termination::ServerError(msg).
             match result {
-                Err(riperf3::RiperfError::ServerErrorRelayed(msg)) => {
-                    assert_eq!(msg, MSG, "GT strerror(27), perr=0 — no trailing colon");
+                Ok(outcome) => {
+                    assert_eq!(
+                        outcome.termination,
+                        riperf3::Termination::ServerError(MSG.to_string()),
+                        "GT strerror(27), perr=0 — no trailing colon"
+                    );
                 }
                 other => panic!(
                     "bw={bw} fq={fq} P={streams} bidir={bidir}: expected the \
@@ -2610,9 +2626,13 @@ async fn both_violations_relay_total_rate_like_gt() {
         .expect("client hung");
     let _ = server_task.await;
     match result {
-        Err(riperf3::RiperfError::ServerErrorRelayed(msg)) => {
+        // #293: Ok(RunOutcome) with the ServerError termination.
+        Ok(outcome) => {
             assert_eq!(
-                msg, "total required bandwidth is larger than server limit",
+                outcome.termination,
+                riperf3::Termination::ServerError(
+                    "total required bandwidth is larger than server limit".to_string()
+                ),
                 "the rate refusal wins over the duration refusal (GT last-assignment)"
             );
         }
@@ -2648,7 +2668,8 @@ async fn server_paces_reverse_with_the_client_fq_rate() {
     let report = tokio::time::timeout(Duration::from_secs(25), client.run())
         .await
         .expect("client hung")
-        .expect("client errored");
+        .expect("client errored")
+        .report;
     let bps = report.end.sum_received.as_ref().unwrap().bits_per_second;
     assert!(
         bps < 20_000_000.0,

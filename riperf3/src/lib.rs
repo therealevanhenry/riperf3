@@ -31,6 +31,12 @@ mod macros;
 mod error;
 pub use error::{ConfigError, Result, RiperfError};
 
+mod outcome;
+// The run-result model (#293): `Client::run`/`Server::run_once` return
+// `RunOutcome` (the measured `Report` + how the run ended) rather than
+// signaling an abnormal end through `Err`.
+pub use outcome::{RunOutcome, Termination};
+
 mod client;
 pub use client::{Client, ClientBuilder};
 

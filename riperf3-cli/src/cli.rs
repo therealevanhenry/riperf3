@@ -573,7 +573,10 @@ impl Cli {
             return Err(END_CONDITIONS_MSG.into());
         }
 
-        let mut builder = riperf3::ClientBuilder::new(host);
+        // #294: the CLI is the faithful-output surface, so it opts INTO the
+        // full iperf3 text/JSON output explicitly. The library default is now
+        // quiet (a bare `run()` returns the Report and prints nothing).
+        let mut builder = riperf3::ClientBuilder::new(host).emit_output(true);
 
         // Format (#241): case-sensitive [kmgtKMGT], uppercase = byte-rates;
         // absent → the library's adaptive default ('a'), like iperf3 (#221).
@@ -837,7 +840,9 @@ impl Cli {
     /// here: the binary daemonizes before building the runtime, since the
     /// library cannot fork safely from inside the async runtime (#81).
     pub fn build_server(&self) -> std::result::Result<riperf3::Server, Box<dyn std::error::Error>> {
-        let mut builder = riperf3::ServerBuilder::new();
+        // #294: the CLI opts into iperf3's full output; the library default is
+        // now quiet (see build_client).
+        let mut builder = riperf3::ServerBuilder::new().emit_output(true);
 
         // Format (#242): the server-side -f was silently dropped — never
         // wired through the builder, every render site hardcoded adaptive.
@@ -1719,9 +1724,11 @@ mod cli_tests {
 
         /// A `ClientBuilder` matching the CLI's no-flag defaults. Since #221
         /// the CLI no longer forces a format: absent -f, the library's
-        /// adaptive default ('a') stands, like iperf3.
+        /// adaptive default ('a') stands, like iperf3. #294: the CLI opts into
+        /// output (the library default is now quiet), so the expected builder
+        /// carries `emit_output(true)` too.
         fn expected_client(host: &str) -> riperf3::ClientBuilder {
-            riperf3::ClientBuilder::new(host)
+            riperf3::ClientBuilder::new(host).emit_output(true)
         }
 
         #[test]
@@ -2100,7 +2107,11 @@ mod cli_tests {
             let s = build_server_from_cli(&cli);
             assert_eq!(
                 s,
-                riperf3::ServerBuilder::new().one_off(true).build().unwrap()
+                riperf3::ServerBuilder::new()
+                    .emit_output(true)
+                    .one_off(true)
+                    .build()
+                    .unwrap()
             );
         }
 
@@ -2229,6 +2240,7 @@ mod cli_tests {
             assert_eq!(
                 s,
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .bind_dev("eth0")
                     .build()
                     .unwrap()
@@ -2406,6 +2418,7 @@ mod cli_tests {
             assert_eq!(
                 s,
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .rcv_timeout(3000)
                     .build()
                     .unwrap()
@@ -2419,6 +2432,7 @@ mod cli_tests {
             assert_eq!(
                 s,
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .idle_timeout(30)
                     .build()
                     .unwrap()
@@ -2432,6 +2446,7 @@ mod cli_tests {
             assert_eq!(
                 s,
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .server_max_duration(60)
                     .build()
                     .unwrap()
@@ -2722,6 +2737,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .port(Some(5201))
                     .build()
                     .unwrap()
@@ -2733,7 +2749,11 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-s", "-V"]);
             assert_eq!(
                 build_server_from_cli(&cli),
-                riperf3::ServerBuilder::new().verbose(true).build().unwrap()
+                riperf3::ServerBuilder::new()
+                    .emit_output(true)
+                    .verbose(true)
+                    .build()
+                    .unwrap()
             );
         }
 
@@ -2743,6 +2763,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .json_output(true)
                     .build()
                     .unwrap()
@@ -2755,6 +2776,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .json_stream(true)
                     .build()
                     .unwrap()
@@ -2767,6 +2789,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .forceflush(true)
                     .build()
                     .unwrap()
@@ -2779,6 +2802,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .bind_address("0.0.0.0")
                     .build()
                     .unwrap()
@@ -2790,7 +2814,11 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-s", "-4"]);
             assert_eq!(
                 build_server_from_cli(&cli),
-                riperf3::ServerBuilder::new().ip_version(4).build().unwrap()
+                riperf3::ServerBuilder::new()
+                    .emit_output(true)
+                    .ip_version(4)
+                    .build()
+                    .unwrap()
             );
         }
 
@@ -2799,7 +2827,11 @@ mod cli_tests {
             let cli = Cli::parse_from(["riperf3", "-s", "-6"]);
             assert_eq!(
                 build_server_from_cli(&cli),
-                riperf3::ServerBuilder::new().ip_version(6).build().unwrap()
+                riperf3::ServerBuilder::new()
+                    .emit_output(true)
+                    .ip_version(6)
+                    .build()
+                    .unwrap()
             );
         }
 
@@ -2809,6 +2841,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .timestamps("%H")
                     .build()
                     .unwrap()
@@ -2821,6 +2854,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .server_bitrate_limit_str("100M")
                     .unwrap()
                     .build()
@@ -2840,6 +2874,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .server_bitrate_limit(10_000_000)
                     .build()
                     .unwrap()
@@ -2848,6 +2883,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .server_bitrate_limit(10_000)
                     .build()
                     .unwrap()
@@ -2856,6 +2892,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .server_bitrate_limit(u64::MAX - 4)
                     .build()
                     .unwrap()
@@ -2868,6 +2905,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .authorized_users_path("/tmp/users")
                     .build()
                     .unwrap()
@@ -2880,6 +2918,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .rsa_private_key_path("/tmp/priv.pem")
                     .build()
                     .unwrap()
@@ -2892,6 +2931,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .time_skew_threshold(5)
                     .build()
                     .unwrap()
@@ -2904,6 +2944,7 @@ mod cli_tests {
             assert_eq!(
                 build_server_from_cli(&cli),
                 riperf3::ServerBuilder::new()
+                    .emit_output(true)
                     .use_pkcs1_padding(true)
                     .build()
                     .unwrap()

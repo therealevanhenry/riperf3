@@ -53,13 +53,20 @@ fn child_quiet_server_then_loud_pair() {
 
         // Phase 2: a fully LOUD pair in the same process — proves every quiet
         // guard dropped back to zero (a leaked increment would silence this).
-        let server = riperf3::ServerBuilder::new().port(Some(0)).build().unwrap();
+        // #294: the library default is now quiet, so the loud pair opts in
+        // explicitly with emit_output(true).
+        let server = riperf3::ServerBuilder::new()
+            .port(Some(0))
+            .emit_output(true)
+            .build()
+            .unwrap();
         let bound = server.bind().await.unwrap();
         let port = bound.local_addr().unwrap().port();
         let server_task = tokio::spawn(async move { bound.run_once().await });
         let client = riperf3::ClientBuilder::new("127.0.0.1")
             .port(Some(port))
             .duration(1)
+            .emit_output(true)
             .build()
             .unwrap();
         client.run().await.expect("phase-2 client");
@@ -91,7 +98,7 @@ fn child_quiet_json_stream() {
             .emit_output(false)
             .build()
             .unwrap();
-        let report = client.run().await.expect("client run");
+        let report = client.run().await.expect("client run").report;
         assert!(
             report.end.sum_sent.as_ref().unwrap().bytes > 0,
             "quiet json-stream still returns the report"
@@ -124,7 +131,7 @@ fn child_run(quiet: bool) {
             .emit_output(!quiet)
             .build()
             .unwrap();
-        let report = client.run().await.expect("client run");
+        let report = client.run().await.expect("client run").report;
         assert!(
             report.end.sum_sent.as_ref().unwrap().bytes > 0,
             "the quiet run still returns a real report"

@@ -181,11 +181,9 @@ pub enum RiperfError {
     #[error("received an unknown control message (ensure other side is iperf3 and not iperf)")]
     UnknownControlMessage,
 
-    /// iperf3's IESERVERTERM: the server sent SERVER_TERMINATE mid-test; a
-    /// partial summary is rendered from local data before this surfaces (#170).
-    #[error("the server has terminated")]
-    ServerTerminated,
-
+    // #293: IESERVERTERM is no longer a client `run` error — a
+    // server-terminated run returns `Ok(RunOutcome)` with
+    // `Termination::ServerTerminated` and the partial report.
     /// iperf3's IECLIENTTERM: the client sent CLIENT_TERMINATE mid-test; the
     /// server dumps its partial results before this surfaces (#210). iperf3
     /// prints it WITHOUT the "error - " prefix ("iperf3: the client has
@@ -197,15 +195,10 @@ pub enum RiperfError {
     /// the control connection (iperf_error.c).
     #[error("control socket has closed unexpectedly")]
     PeerDisconnected,
-
-    /// iperf3's SERVER_ERROR relay (#224): the server failed mid-test and
-    /// sent its (i_errno, errno) pair on the control connection; the client
-    /// ADOPTS the mapped iperf_strerror text as its own error, exactly like
-    /// iperf_handle_message_client (iperf_client_api.c:392). The Display is
-    /// the mapped message alone — the CLI prefixes it ("riperf3: error - …"),
-    /// matching iperf3's errexit line.
-    #[error("{0}")]
-    ServerErrorRelayed(String),
+    // #293: the SERVER_ERROR relay (#224) is no longer a client `run` error —
+    // a relayed-error run returns `Ok(RunOutcome)` with
+    // `Termination::ServerError(msg)` and the partial report. The mapped
+    // iperf_strerror text now rides `Termination::ServerError`.
 }
 
 /// iperf3's SERVER_ERROR relay rendering, client side (#224). The errno

@@ -365,20 +365,22 @@ fn main() -> std::process::ExitCode {
             // every -J consumer. iperf3 emits exactly one. Text mode is
             // exempt: its stderr line is iperf3's errexit shape, and the
             // lib's text dump carries no error line.
-            let lib_already_rendered = e.downcast_ref::<riperf3::RiperfError>().is_some_and(|le| {
-                matches!(
-                    le,
-                    riperf3::RiperfError::ServerTerminated
-                        | riperf3::RiperfError::ServerErrorRelayed(_)
+            let lib_already_rendered = e.downcast_ref::<AbnormalExit>().is_some()
+                || e.downcast_ref::<riperf3::RiperfError>().is_some_and(|le| {
+                    matches!(
+                        le,
                         // #267: the lib emits the populated ctrl-closed doc
                         // (bare end{}) before returning this class.
-                        | riperf3::RiperfError::ControlSocketClosed
+                        riperf3::RiperfError::ControlSocketClosed
                         // #374: the client's failed results read — the lib
                         // emitted the doc with the dangling IERECVRESULTS
                         // value before returning.
                         | riperf3::RiperfError::RecvResultsFailed
-                )
-            });
+                    )
+                    // #293: ServerTerminated / ServerErrorRelayed are no longer
+                    // errors — they come back as Ok(RunOutcome) and reach here
+                    // as AbnormalExit (above).
+                });
             // #374: GT marks IERECVRESULTS perr, so its errexit line carries
             // the strerror tail — at the wedge/EOF windows that is the #248
             // dangling `: ` (GT appends a STALE errno's strerror, live
@@ -781,6 +783,26 @@ enum Exit {
     Signal(&'static str),
 }
 
+/// #293: a client run that ended abnormally — server-terminated or a relayed
+/// SERVER_ERROR. `Client::run` returns these as `Ok(RunOutcome)` (the lib
+/// already emitted its doc / SERVER-ERROR receipt during the run), but iperf3
+/// errexits (exit 1) on them. This carries the errexit message up to `main`,
+/// which renders the `riperf3: error - <msg>` line in TEXT mode and suppresses
+/// a second render in the JSON modes (the lib's doc already carried the key) —
+/// exactly the old `ServerTerminated`/`ServerErrorRelayed` behavior, now that
+/// those are `Termination`s rather than errors. Its Display IS the errexit
+/// message so `main`'s text branch renders it verbatim.
+#[derive(Debug)]
+struct AbnormalExit(String);
+
+impl std::fmt::Display for AbnormalExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AbnormalExit {}
+
 /// Second-signal hard exit (#158): once the orderly shutdown is underway, a
 /// repeat SIGTERM/SIGINT/SIGHUP must not be swallowed by tokio's (now
 /// shutting-down) signal machinery. Registers plain libc handlers whose body
@@ -927,7 +949,14 @@ async fn async_main(
         // on a client are both rejected up front in `main` (#65/#100), before
         // any side effects. The arg→builder mapping lives in `Cli::build_client`
         // (cli.rs) so the wiring tests exercise the same code path (#124).
-        cli.build_client()?.with_interrupt(interrupt).run().await?;
+        // #293: `run` returns a RunOutcome. A server-terminated / relayed-error
+        // run is `Ok` now (the lib rendered its doc/line during the run), but
+        // iperf3 still errexits (exit 1) on those — map the non-clean endings
+        // to the already-rendered error exit. Completed/Interrupted exit 0.
+        let outcome = cli.build_client()?.with_interrupt(interrupt).run().await?;
+        if let Some(msg) = outcome.termination.errexit_message() {
+            return Err(Box::new(AbnormalExit(msg)));
+        }
     } else if cli.server {
         // Server mode. See `Cli::build_server` (cli.rs). `-D`/`--daemon` is
         // handled before the runtime is built (daemonize block in `main`).
