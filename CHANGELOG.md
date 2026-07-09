@@ -11,7 +11,19 @@ This changelog begins at 0.6.0. For earlier releases (0.1.1–0.5.4), see the
 [git history](https://github.com/therealevanhenry/riperf3/commits/main) and
 release tags.
 
-## [0.8.0] - 2026-06-28
+## [Unreleased]
+
+### Breaking
+
+- `Client::run` returns `RunOutcome { report, termination }` instead of `Report` (#293).
+  A server-terminated or relayed-error run is now `Ok` — carrying the partial report plus
+  `Termination::ServerTerminated`/`ServerError(msg)` — instead of an `Err` that discarded it;
+  `Err` is reserved for runs that produced no report. The `RiperfError::ServerTerminated` /
+  `ServerErrorRelayed` variants are removed. Migration: `client.run().await?` →
+  `client.run().await?.report`; branch on `outcome.termination` for the ending.
+- The builder output default flips to quiet (#294): a bare `run()`/`run_once()` returns the
+  report and prints nothing. Opt into iperf3's full text/JSON output with `.emit_output(true)`
+  (the CLI sets this). Wire protocol, CLI output, and exit codes are unchanged.
 
 Architecture-and-API release. Wire protocol and CLI flags unchanged; success-path
 `-J`/text output byte-identical. Breaking changes are library-API only.

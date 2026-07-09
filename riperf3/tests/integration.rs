@@ -2387,8 +2387,15 @@ mod client_run_return_value {
             .build()
             .unwrap();
 
-        // #293: run() returns a RunOutcome; this test inspects the report.
-        let report = client.run().await.expect("client run failed").report;
+        // #293: run() returns a RunOutcome; a clean run ends Completed, and
+        // this test inspects the report it carries.
+        let outcome = client.run().await.expect("client run failed");
+        assert_eq!(
+            outcome.termination,
+            riperf3::Termination::Completed,
+            "a clean run ends Completed"
+        );
+        let report = outcome.report;
 
         // The end block carries both halves on a forward run.
         assert!(
