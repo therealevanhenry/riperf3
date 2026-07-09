@@ -325,7 +325,7 @@ impl Client {
         self
     }
 
-    pub async fn run(&self) -> Result<crate::json_report::Report> {
+    pub async fn run(&self) -> Result<crate::outcome::RunOutcome> {
         // #290: run-scoped console silence, armed FIRST so even the -V
         // preamble honors it. Construct-only-when-quiet (see the guard doc).
         let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
@@ -394,7 +394,7 @@ impl Client {
         // that already rendered its output (the interrupt dumps); the
         // clean IperfDone break is `Ok(None)`. A `return` inside the block
         // exits the BLOCK, not run().
-        let outcome: Result<Option<crate::json_report::Report>> = async {
+        let outcome: Result<Option<(crate::json_report::Report, crate::outcome::Termination)>> = async {
             loop {
                 // #231: iperf_catch_sigend is armed for the WHOLE run, so the
                 // central state wait polls the interrupt watch like the
@@ -421,7 +421,10 @@ impl Client {
                         Err(e) => return Err(e),
                     },
                     msg = wait_interrupt(ctx.interrupt.as_mut()) => {
-                        return Ok(Some(self.on_interrupted_wait(&mut ctx, &msg).await));
+                        return Ok(Some((
+                            self.on_interrupted_wait(&mut ctx, &msg).await,
+                            crate::outcome::Termination::Interrupted,
+                        )));
                     }
                 };
 
@@ -445,7 +448,9 @@ impl Client {
 
                     TestState::ExchangeResults => match self.on_exchange_results(&mut ctx).await? {
                         // #268: a signal landed inside the bulk results read.
-                        Some(report) => return Ok(Some(report)),
+                        Some(report) => {
+                            return Ok(Some((report, crate::outcome::Termination::Interrupted)))
+                        }
                         None => StepFlow::Continue,
                     },
 
@@ -461,7 +466,11 @@ impl Client {
                         // refusal (code 37 et al.) — its `end` is GT's bare {}.
                         // After TestStart the dump keeps the full structure.
                         let bare_end = !ctx.stage.started();
-                        return Err(self.on_server_error_relay(&mut ctx, bare_end).await);
+                        let (report, msg) = self.on_server_error_relay(&mut ctx, bare_end).await;
+                        return Ok(Some((
+                            report,
+                            crate::outcome::Termination::ServerError(msg),
+                        )));
                     }
 
                     // iperf_handle_message_client handles SERVER_TERMINATE in
@@ -471,7 +480,10 @@ impl Client {
                     // surface IESERVERTERM instead of dying later on a bare
                     // peer-disconnect with no dump.
                     TestState::ServerTerminate => {
-                        return Err(self.on_server_terminate(&ctx));
+                        return Ok(Some((
+                            self.on_server_terminate(&ctx),
+                            crate::outcome::Termination::ServerTerminated,
+                        )));
                     }
 
                     other => {
@@ -483,7 +495,9 @@ impl Client {
                 match flow {
                     StepFlow::Continue => {}
                     StepFlow::Break => break,
-                    StepFlow::Return(report) => return Ok(Some(*report)),
+                    StepFlow::Return(report, termination) => {
+                        return Ok(Some((*report, termination)))
+                    }
                 }
                 // #145: AUDITABILITY ONLY — advance the table cursor to the state
                 // just handled, before the next recv. Reached only by the arms that
@@ -533,10 +547,11 @@ impl Client {
             let _ = s.task.await;
         }
 
-        // The early-exit rounds (the interrupt dumps, #210/#268) already
-        // rendered their output — only the teardown above was owed.
-        if let Some(report) = outcome? {
-            return Ok(report);
+        // The abnormal-end rounds (#293) — a signal dump, a server terminate,
+        // or a relayed server error — already rendered their output; only the
+        // teardown above was owed. Each carries its `Termination`.
+        if let Some((report, termination)) = outcome? {
+            return Ok(crate::outcome::RunOutcome::new(report, termination));
         }
 
         // #222: every clean text-mode client run closes with a blank line +
@@ -556,8 +571,15 @@ impl Client {
             vprintln!("");
             vprintln!("iperf Done.");
         }
-        ctx.final_report
-            .ok_or_else(|| RiperfError::Protocol("results not displayed before IPERF_DONE".into()))
+        // #293: the clean completion — the rich report captured at
+        // DisplayResults, paired with `Completed`.
+        let report = ctx.final_report.ok_or_else(|| {
+            RiperfError::Protocol("results not displayed before IPERF_DONE".into())
+        })?;
+        Ok(crate::outcome::RunOutcome::new(
+            report,
+            crate::outcome::Termination::Completed,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -694,6 +716,34 @@ impl Client {
             secs,
             error,
         )
+    }
+
+    /// #293: build the `Report` WITHOUT printing a text summary. The
+    /// server-error / ctrl-lost text paths print only iperf_err's one-line
+    /// receipt (GT renders no summary there), but a library caller still
+    /// wants the structured partial data in the `RunOutcome`. Same drain-once
+    /// discipline as [`emit_results`] — the collections move into the build.
+    /// (Distinct from `build_results`, which builds the client's own wire
+    /// `TestResultsJson` to SEND to the server.)
+    fn partial_report(
+        &self,
+        ctx: &RunCtx,
+        server_results: Option<&TestResultsJson>,
+        bare_end: bool,
+        secs: f64,
+        error: Option<&str>,
+    ) -> crate::json_report::Report {
+        let mut input = self.build_report_input(
+            &ctx.streams,
+            ctx.cpu_start.as_ref(),
+            server_results,
+            ctx.blksize,
+            crate::reporter::CollectedIntervals::drain(&ctx.interval_data),
+            &ctx.start_meta(bare_end),
+            secs,
+        );
+        input.error = error.map(str::to_owned);
+        input.build()
     }
 
     /// The central state wait's interrupt arm (#231): iperf_got_sigend's
@@ -879,9 +929,13 @@ impl Client {
         ctx.measured_secs = secs;
         match event {
             Some(ControlEvent::Terminated) => {
-                // SERVER_TERMINATE mid-test: same dump-and-errexit shape as
-                // the any-state arm (#170/#210) — see on_server_terminate.
-                return Err(self.on_server_terminate(ctx));
+                // SERVER_TERMINATE mid-test: same dump shape as the any-state
+                // arm (#170/#210) — see on_server_terminate. #293: Ok with the
+                // partial report + the ServerTerminated ending.
+                return Ok(StepFlow::Return(
+                    Box::new(self.on_server_terminate(ctx)),
+                    crate::outcome::Termination::ServerTerminated,
+                ));
             }
             Some(ControlEvent::Interrupted(msg)) => {
                 // iperf_got_sigend (#210): dump the accumulated
@@ -893,12 +947,20 @@ impl Client {
                 // #137: return the rich report we just dumped (the
                 // local-only partial — no peer half on a signal exit).
                 let report = self.emit_results(ctx, None, false, ctx.measured_secs, Some(&msg));
-                return Ok(StepFlow::Return(Box::new(report)));
+                return Ok(StepFlow::Return(
+                    Box::new(report),
+                    crate::outcome::Termination::Interrupted,
+                ));
             }
             Some(ControlEvent::ServerError) => {
                 // Mid-test the run is always past TestStart, so the dump
-                // keeps the full report structure (#261).
-                return Err(self.on_server_error_relay(ctx, false).await);
+                // keeps the full report structure (#261). #293: Ok with the
+                // partial report + the ServerError ending.
+                let (report, msg) = self.on_server_error_relay(ctx, false).await;
+                return Ok(StepFlow::Return(
+                    Box::new(report),
+                    crate::outcome::Termination::ServerError(msg),
+                ));
             }
             Some(ControlEvent::Closed) | None => {}
         }
@@ -982,15 +1044,23 @@ impl Client {
     /// generic re-render. `bare_end` is the caller's: a relay before
     /// TestStart is the upfront refusal (code 37 et al.) — emit GT's minimal
     /// doc (`end: {}`; the late start fields already gate on the stage) (#261).
-    async fn on_server_error_relay(&self, ctx: &mut RunCtx, bare_end: bool) -> RiperfError {
+    async fn on_server_error_relay(
+        &self,
+        ctx: &mut RunCtx,
+        bare_end: bool,
+    ) -> (crate::json_report::Report, String) {
         let msg = match protocol::read_server_error_payload(&mut ctx.ctrl).await {
             Some((i_errno, os_errno)) => crate::error::iperf3_strerror(i_errno, os_errno),
             None => "server error".to_string(),
         };
-        if self.json_output || self.json_stream {
-            self.emit_results(ctx, None, bare_end, ctx.measured_secs, Some(&msg));
+        // #293: return the partial report on every mode. JSON sinks emit the
+        // full document/events (iperf3's json_top); text prints iperf_err's
+        // one-line receipt only (GT renders no summary here) but the caller
+        // still gets the structured data via build_results.
+        let report = if self.json_output || self.json_stream {
+            self.emit_results(ctx, None, bare_end, ctx.measured_secs, Some(&msg))
         } else {
-            // #290: quiet runs surface the error via Err alone.
+            // #290: quiet runs surface the error via the RunOutcome alone.
             if !crate::macros::output_quiet() {
                 // #348: GT stamps this line too (iperf_err route). #364:
                 // and iperf_err honors the logfile — err_println follows
@@ -1001,8 +1071,9 @@ impl Client {
                     crate::macros::output_timestamp_prefix()
                 ));
             }
-        }
-        RiperfError::ServerErrorRelayed(msg)
+            self.partial_report(ctx, None, bare_end, ctx.measured_secs, Some(&msg))
+        };
+        (report, msg)
     }
 
     /// SERVER_TERMINATE, mid-test or in ANY state (#210 review r1 n2 — a
@@ -1011,15 +1082,17 @@ impl Client {
     /// renders a summary from the PARTIAL local data (no peer half), then
     /// errexits with IESERVERTERM (#170). A -J run carries the message in
     /// the blob's "error" key, like iperf_json_finish.
-    fn on_server_terminate(&self, ctx: &RunCtx) -> RiperfError {
+    fn on_server_terminate(&self, ctx: &RunCtx) -> crate::json_report::Report {
+        // #293: emit_results already builds+returns the partial report in
+        // every mode (GT dumps the summary here, #170) — hand it back so the
+        // RunOutcome carries it instead of discarding it behind an Err.
         self.emit_results(
             ctx,
             None,
             false,
             ctx.measured_secs,
             Some("the server has terminated"),
-        );
-        RiperfError::ServerTerminated
+        )
     }
 
     /// #267: the control connection was lost abruptly (GT's IECTRLCLOSE
@@ -2643,9 +2716,11 @@ enum StepFlow {
     /// The run is over (DisplayResults handled / IperfDone) — leave the loop
     /// for the cleanup tail and the captured final report.
     Break,
-    /// End the run NOW with this report (the signal-interrupt shape: dump and
-    /// exit without the cleanup tail). Boxed to keep the enum small.
-    Return(Box<crate::json_report::Report>),
+    /// End the run NOW with this report + how it ended (#293): the mid-test
+    /// abnormal endings (a signal, SERVER_TERMINATE, SERVER_ERROR) that dump
+    /// their partial report and leave without the clean cleanup tail. Boxed to
+    /// keep the enum small.
+    Return(Box<crate::json_report::Report>, crate::outcome::Termination),
 }
 
 /// The state `Client::run` threads through its per-state handlers (#289): the
@@ -2796,7 +2871,9 @@ impl Default for ClientBuilder {
             extra_data: None,
             verbose: false,
             json_output: false,
-            emit_output: true,
+            // #294: the library default is QUIET — a bare `run()` returns the
+            // Report and prints nothing. The CLI sets `emit_output(true)`.
+            emit_output: false,
             json_stream: false,
             interrupt: None,
             json_stream_full_output: false,
@@ -4737,11 +4814,17 @@ mod client_run_return_value {
             .duration(10)
             .build()
             .unwrap();
-        let err = client.run().await.expect_err("expected ServerTerminated");
+        // #293: a server-terminated run is Ok(RunOutcome) now, carrying the
+        // partial report + Termination::ServerTerminated.
+        let outcome = client
+            .run()
+            .await
+            .expect("server-terminate run returns Ok(RunOutcome)");
         let printed = capture.take();
-        assert!(
-            matches!(err, RiperfError::ServerTerminated),
-            "iperf3's IESERVERTERM class, got {err:?}"
+        assert_eq!(
+            outcome.termination,
+            crate::outcome::Termination::ServerTerminated,
+            "iperf3's IESERVERTERM class"
         );
         assert!(
             printed.contains("sender"),
@@ -4814,10 +4897,16 @@ mod client_run_return_value {
             .duration(10)
             .build()
             .unwrap();
-        let err = client.run().await.expect_err("expected ServerTerminated");
-        assert!(
-            matches!(err, RiperfError::ServerTerminated),
-            "IESERVERTERM class since #170, got {err:?}"
+        // #293: server-terminate is Ok(RunOutcome) with the ServerTerminated
+        // ending (was Err(ServerTerminated)).
+        let outcome = client
+            .run()
+            .await
+            .expect("server-terminate run returns Ok(RunOutcome)");
+        assert_eq!(
+            outcome.termination,
+            crate::outcome::Termination::ServerTerminated,
+            "IESERVERTERM class since #170"
         );
         // Kernel socket buffers legitimately hold a few MB in flight on
         // loopback; the LEAK signature is continued line-rate production

@@ -18,6 +18,7 @@ async fn run_client(port: u16) -> riperf3::Report {
         .await
         .expect("client hung")
         .expect("client errored")
+        .report
 }
 
 /// One bind, two sequential tests on the same listener — the accept()-style

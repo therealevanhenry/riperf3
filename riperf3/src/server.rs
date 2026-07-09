@@ -4099,7 +4099,8 @@ impl Default for ServerBuilder {
             time_skew_threshold: 10,
             use_pkcs1_padding: false,
             json_output: false,
-            emit_output: true,
+            // #294: quiet by default (see ClientBuilder); the CLI opts in.
+            emit_output: false,
             json_stream: false,
             interrupt: None,
             json_stream_full_output: false,

@@ -14,7 +14,7 @@ readme = "../README.md"
 
 [dependencies]
 # riperf3 workspace dependencies
-riperf3 = { path = "../riperf3", version = "0.8.0" }
+riperf3 = { path = "../riperf3", version = "0.9.0" }
 
 # external dependencies
 clap.workspace = true

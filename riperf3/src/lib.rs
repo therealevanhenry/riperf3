@@ -31,6 +31,13 @@ mod macros;
 mod error;
 pub use error::{ConfigError, Result, RiperfError};
 
+mod outcome;
+// The run-result model (#293): `Client::run` returns `RunOutcome` (the
+// measured `Report` + how the run ended) rather than signaling an abnormal
+// end through `Err`. (`Server::run_once` keeps its `Report` return for now;
+// its RunOutcome symmetry is a follow-up.)
+pub use outcome::{RunOutcome, Termination};
+
 mod client;
 pub use client::{Client, ClientBuilder};
 
@@ -41,11 +48,13 @@ pub use server::{BoundServer, Server, ServerBuilder};
 
 // The transport enum used across the public builder API. `TestResultsJson` /
 // `StreamResultJson` are the internal control-channel exchange model and are no
-// longer re-exported (0.8.0 breaking, #137) — `Client::run` now returns `Report`.
+// longer re-exported (0.8.0 breaking, #137).
 pub use protocol::TransportProtocol;
 
-// The rich iperf3-schema result model returned by `Client::run` and
-// `Server::run_once` — the same object `-J` / `--json` serializes (#137).
+// The rich iperf3-schema result model — the same object `-J` / `--json`
+// serializes (#137). Since 0.9.0 `Client::run` returns a `RunOutcome` carrying
+// this `Report` plus a `Termination` (#293); `Server::run_once` still returns
+// the `Report` directly.
 pub use json_report::Report;
 
 pub use net::set_cpu_affinity;
@@ -65,8 +74,9 @@ pub use macros::ErrorSinkGuard;
 // Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
 // few genuinely-public types are re-exported at the crate root above (#67).
 // `json_report` is the exception — it is the iperf3-schema result model that
-// `Client::run` / `Server::run_once` return, so it is a documented public
-// module (#137); its top-level `Report` is re-exported at the crate root above.
+// `Client::run` returns inside a `RunOutcome` and `Server::run_once` returns
+// directly, so it is a documented public module (#137); its top-level `Report`
+// is re-exported at the crate root above.
 // The module's PUBLIC surface is `Report` + its serialized sub-structs only;
 // the builder INPUT types (`ReportInput`/`StreamReport`/`TcpEndExtras`/
 // `UdpStreamStats`) are `pub(crate)` (incidentally exposed by #137, hidden in

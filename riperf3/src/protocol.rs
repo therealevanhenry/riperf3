@@ -2100,11 +2100,15 @@ mod protocol_error_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        let err = result.expect_err("client should error on ServerError");
+        // #293: a relayed SERVER_ERROR is Ok(RunOutcome) with the adopted
+        // message on Termination::ServerError.
+        let outcome = result.expect("relayed SERVER_ERROR returns Ok(RunOutcome)");
+        let crate::outcome::Termination::ServerError(msg) = outcome.termination else {
+            panic!("expected ServerError, got {:?}", outcome.termination);
+        };
         assert_eq!(
-            err.to_string(),
-            "total required bandwidth is larger than server limit",
-            "the client adopts the relayed iperf_strerror(27): {err:?}"
+            msg, "total required bandwidth is larger than server limit",
+            "the client adopts the relayed iperf_strerror(27)"
         );
         let _ = server_task.await;
     }
@@ -2141,17 +2145,21 @@ mod protocol_error_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        let err = result.expect_err("client should error on ServerError");
+        // #293: Ok(RunOutcome) with the adopted perr-class message.
+        let outcome = result.expect("relayed SERVER_ERROR returns Ok(RunOutcome)");
+        let crate::outcome::Termination::ServerError(msg) = outcome.termination else {
+            panic!("expected ServerError, got {:?}", outcome.termination);
+        };
         assert_eq!(
-            err.to_string(),
-            "server test duration expired: ",
-            "the client adopts the relayed perr-class strerror(160) with GT's dangling ': ' (#248): {err:?}"
+            msg, "server test duration expired: ",
+            "the client adopts the relayed perr-class strerror(160) with GT's dangling ': ' (#248)"
         );
         let _ = server_task.await;
     }
 
     /// A SERVER_ERROR whose payload never arrives (peer died mid-relay, or a
-    /// pre-payload sender): still an error, never a hang or a panic.
+    /// pre-payload sender): still classified as a server error (#293:
+    /// Ok(RunOutcome) with the "server error" fallback), never a hang or panic.
     #[tokio::test]
     async fn client_handles_server_error_without_payload() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2175,7 +2183,55 @@ mod protocol_error_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        assert!(result.is_err(), "bare SERVER_ERROR is still an error");
+        let outcome = result.expect("payload-less SERVER_ERROR returns Ok(RunOutcome)");
+        assert!(
+            matches!(
+                outcome.termination,
+                crate::outcome::Termination::ServerError(_)
+            ),
+            "bare SERVER_ERROR is still classified as a server error, got {:?}",
+            outcome.termination
+        );
+        let _ = server_task.await;
+    }
+
+    /// #293/#210: SERVER_TERMINATE arriving in ANY state (here pre-TestStart,
+    /// at the central state wait — distinct from the mid-test arm covered by
+    /// the client-side lib tests) returns Ok(RunOutcome) with
+    /// Termination::ServerTerminated, not an Err.
+    #[tokio::test]
+    async fn client_handles_server_terminate_any_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            // SERVER_TERMINATE before ParamExchange — the any-state arm.
+            protocol::send_state(&mut stream, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Hold the socket so the client reads the state, not a bare EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let outcome = client
+            .run()
+            .await
+            .expect("any-state SERVER_TERMINATE returns Ok(RunOutcome)");
+        assert_eq!(
+            outcome.termination,
+            crate::outcome::Termination::ServerTerminated,
+            "the central-wait ServerTerminate arm maps to Termination::ServerTerminated"
+        );
         let _ = server_task.await;
     }
 

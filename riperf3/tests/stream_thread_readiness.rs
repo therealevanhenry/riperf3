@@ -74,7 +74,8 @@ fn udp_bidir_window_waits_for_stream_threads() {
                 tokio::task::spawn_blocking(move || std::thread::sleep(HOG_LIFETIME));
             }
             match client.run().await {
-                Ok(r) => break r,
+                // #293: run() returns a RunOutcome; this test inspects the report.
+                Ok(r) => break r.report,
                 Err(RiperfError::Io(e))
                     if e.kind() == std::io::ErrorKind::ConnectionRefused
                         && tokio::time::Instant::now() < deadline =>
