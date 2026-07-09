@@ -2195,6 +2195,46 @@ mod protocol_error_tests {
         let _ = server_task.await;
     }
 
+    /// #293/#210: SERVER_TERMINATE arriving in ANY state (here pre-TestStart,
+    /// at the central state wait — distinct from the mid-test arm covered by
+    /// the client-side lib tests) returns Ok(RunOutcome) with
+    /// Termination::ServerTerminated, not an Err.
+    #[tokio::test]
+    async fn client_handles_server_terminate_any_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut cookie = [0u8; 37];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut cookie)
+                .await
+                .unwrap();
+            // SERVER_TERMINATE before ParamExchange — the any-state arm.
+            protocol::send_state(&mut stream, TestState::ServerTerminate)
+                .await
+                .unwrap();
+            // Hold the socket so the client reads the state, not a bare EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let client = crate::ClientBuilder::new("127.0.0.1")
+            .port(Some(addr.port()))
+            .duration(1)
+            .build()
+            .unwrap();
+        let outcome = client
+            .run()
+            .await
+            .expect("any-state SERVER_TERMINATE returns Ok(RunOutcome)");
+        assert_eq!(
+            outcome.termination,
+            crate::outcome::Termination::ServerTerminated,
+            "the central-wait ServerTerminate arm maps to Termination::ServerTerminated"
+        );
+        let _ = server_task.await;
+    }
+
     #[tokio::test]
     async fn client_handles_peer_disconnect_during_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
