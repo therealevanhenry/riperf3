@@ -1908,6 +1908,15 @@ mod unimplemented_flags {
             "{:?}",
             outcome.termination
         );
+        // #404 r1 F2: the relay report's end is BARE in every mode — this
+        // bare-builder (quiet-default) client rides the text-path
+        // partial_report, the half no CLI pin reaches; GT never
+        // end-processes a SERVER_ERROR kill at any stage.
+        assert!(
+            outcome.report.end.sum_sent.is_none() && outcome.report.end.sum_received.is_none(),
+            "the SERVER_ERROR relay report carries GT's bare end (#404): {:?}",
+            outcome.report.end
+        );
         let joined = server_task.await.expect("server task");
         assert!(
             joined.is_ok(),

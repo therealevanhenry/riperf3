@@ -52,6 +52,9 @@ release tags.
   u64-wrapped in the setup doc); the setup-doc buffer actuals are computed once at param
   ingest like iperf3, so emit-time fd exhaustion can't blank them, and on the listener's
   address family (#392).
+- The client's SERVER_ERROR relay renders iperf3's bare `end: {}` at any stage — a mid-run
+  breach no longer emits the populated finalize end; on a `Termination::ServerError` ending
+  `outcome.report.end` is bare in every mode (partial stats ride `intervals`) (#404).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual
