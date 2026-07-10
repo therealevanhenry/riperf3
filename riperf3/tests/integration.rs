@@ -2488,10 +2488,17 @@ mod client_run_return_value {
             .unwrap();
         let _ = client.run().await.expect("client run failed");
 
-        let report = server_task
+        // #293: run_once returns a RunOutcome; a clean round ends Completed.
+        let outcome = server_task
             .await
             .expect("server task panicked")
             .expect("server run_once failed");
+        assert_eq!(
+            outcome.termination,
+            riperf3::Termination::Completed,
+            "a clean server round ends Completed"
+        );
+        let report = outcome.report;
         assert!(
             !report.end.streams.is_empty(),
             "server report.end should carry the served test's streams"

@@ -570,25 +570,62 @@ impl Server {
             let mut idle_restart = false;
             match self.handle_one_test(&listener).await {
                 // #137: the daemon loop discards each test's Report; library
-                // users who want it call `run_once`.
-                Ok(_) => {}
+                // users who want it call `run_once`. #293: a completed round
+                // returns its Termination — the per-class stderr line that used
+                // to hang off the returned Err now hangs off this match.
+                Ok(Some((_report, termination))) => {
+                    if !json && !crate::macros::output_quiet() {
+                        use crate::outcome::Termination;
+                        let prefix = crate::macros::output_timestamp_prefix();
+                        match &termination {
+                            // #210: IECLIENTTERM, no "error - " prefix.
+                            Termination::ClientTerminated => {
+                                eprintln!("{prefix}riperf3: {}", RiperfError::ClientTerminated)
+                            }
+                            // #330: the mid/end-loop control EOF read-site line.
+                            Termination::ControlClosed => {
+                                eprintln!("{prefix}riperf3: {CTRL_CLOSED_MSG}")
+                            }
+                            // #325: IEMESSAGE, one line.
+                            Termination::UnknownMessage => eprintln!(
+                                "{prefix}riperf3: error - {}",
+                                RiperfError::UnknownControlMessage
+                            ),
+                            // #330: IERECVRESULTS, the #248 errno-0 dangling ": ".
+                            Termination::RecvResultsFailed => eprintln!(
+                                "{prefix}riperf3: error - {}: ",
+                                RiperfError::RecvResultsFailed
+                            ),
+                            // #371: IESENDMESSAGE/IESENDRESULTS — the live errno
+                            // rides the carried message (no dangling ": ").
+                            Termination::SendFailed(msg) => {
+                                eprintln!("{prefix}riperf3: error - {msg}")
+                            }
+                            // Completed / Interrupted / SelfTerminated print no
+                            // line here: a clean round is silent, and the
+                            // interrupt notice / self-terminate line are emitted
+                            // elsewhere (the CLI signal path / shutdown_and_flush).
+                            _ => {}
+                        }
+                    }
+                }
+                // A no-report round (idle-interrupt, refusal, mid-setup DONE):
+                // keep serving, nothing to print here.
+                Ok(None) => {}
                 Err(RiperfError::Aborted(msg)) if msg == "idle timeout" => {
                     idle_restart = true;
                 }
+                // #293: the MID/END-loop versions of these classes (a report
+                // exists) now arrive as `Ok(Some((_, termination)))` above and
+                // print via that arm's Termination match. The arms below remain
+                // for the PRE-REPORT / setup-phase versions, which still return
+                // `Err` (no report) after emitting their own setup doc — the arm
+                // matches (and, under -J, does nothing) so the generic `Err(e)`
+                // sink below does NOT append a second document.
                 Err(RiperfError::ControlSocketClosed) => {
-                    // #330: the mid-test / end-loop control EOF — GT prints
-                    // its read-site sentence once (iperf_server_api.c:
-                    // 249-254) and keeps serving; under -J the doc carried
-                    // it (sink rule). (r1 F3: the old PeerDisconnected arm
-                    // is gone — both server recv_state sites convert EOF to
-                    // this class now, so it had no constructor left.
-                    // Pre-test EOFs like port scans are caught earlier by the
-                    // cookie read and take GT's IERECVCOOKIE surface via the
-                    // RecvCookieFailed arm below (#330), not this mid-test one.)
-                    // #344: iperf_err stamps its stderr lines with the
-                    // --timestamps prefix (iperf_error.c:51-57, :77) — every
-                    // arm below rides output_timestamp_prefix() like the
-                    // pre-test emit (#339) and the stdout banner.
+                    // #330: a setup-phase control EOF. GT prints its read-site
+                    // sentence once and keeps serving; under -J the setup doc
+                    // already carried it. #344: --timestamps stamps the line.
                     if !json && !crate::macros::output_quiet() {
                         eprintln!(
                             "{}riperf3: {CTRL_CLOSED_MSG}",
@@ -597,11 +634,8 @@ impl Server {
                     }
                 }
                 Err(RiperfError::ClientTerminated) => {
-                    // iperf3 prints IECLIENTTERM WITHOUT the "error - "
-                    // prefix ("iperf3: the client has terminated",
-                    // live-captured) and keeps serving (#210). In the JSON
-                    // modes the doc/event carried it — stderr stays silent
-                    // like iperf_err (review r1 f1/f3).
+                    // #210: a setup-phase CLIENT_TERMINATE. IECLIENTTERM, no
+                    // "error - " prefix; -J carried it in the setup doc.
                     if !json && !crate::macros::output_quiet() {
                         eprintln!(
                             "{}riperf3: {}",
@@ -610,43 +644,9 @@ impl Server {
                         );
                     }
                 }
-                Err(RiperfError::RecvResultsFailed) => {
-                    // #330: GT text prints `iperf3: error - unable to
-                    // receive results: ` once (the #248 dangling perr form
-                    // at errno 0 — see the ctx field's deviation record);
-                    // under -J the doc carried it and stderr keeps only
-                    // the read-site warning.
-                    if !json && !crate::macros::output_quiet() {
-                        eprintln!(
-                            "{}riperf3: error - {}: ",
-                            crate::macros::output_timestamp_prefix(),
-                            RiperfError::RecvResultsFailed
-                        );
-                    }
-                }
-                Err(e @ RiperfError::ExchangeSendMessageFailed(_))
-                | Err(e @ RiperfError::ExchangeSendResultsFailed(_)) => {
-                    // #371: the POST-TEST_END exchange-send failure — the
-                    // POPULATED doc rendered at the site (GT's json_finish
-                    // over the TEST_END reporter output). Text prints GT's
-                    // IESENDMESSAGE/IESENDRESULTS line with the live strerror
-                    // (no dangling ": ", the Display carries the errno);
-                    // -J/json-stream carried it in the doc. Keep-serving,
-                    // exit 0 (GT's rc -1 class).
-                    if !json && !crate::macros::output_quiet() {
-                        eprintln!(
-                            "{}riperf3: error - {e}",
-                            crate::macros::output_timestamp_prefix()
-                        );
-                    }
-                }
                 Err(RiperfError::UnknownControlMessage) => {
-                    // #325: GT main.c:174 prints `iperf3: error - <IEMESSAGE
-                    // sentence>` once and keeps serving; a failed test is
-                    // rc -1, which main errexits on only below -1 (setup
-                    // failures), so one-off still exits 0 (r1 F1, #224).
-                    // Under -J iperf_err's sink carried it in the doc —
-                    // stderr stays silent, like the terminate arm above.
+                    // #325: a setup-phase unrecognized byte. IEMESSAGE, one
+                    // line; -J carried it in the setup doc.
                     if !json && !crate::macros::output_quiet() {
                         eprintln!(
                             "{}riperf3: error - {}",
@@ -770,15 +770,17 @@ impl Server {
     /// banner — it is a library entry point, not the daemon. The test report is
     /// still printed to stdout in `-J` / text mode, like `Client::run`.
     ///
-    /// Peer-caused test endings surface as errors AFTER the report was
-    /// rendered to the active sink: a CLIENT_TERMINATE returns
-    /// [`RiperfError::ClientTerminated`], an unhandled control byte
-    /// returns [`RiperfError::UnknownControlMessage`] (#325), a
-    /// control-connection EOF returns [`RiperfError::ControlSocketClosed`]
-    /// (#330), and a setup phase that makes no progress for `--rcv-timeout`
-    /// returns [`RiperfError::DataIdleTimeout`] (#338) — all mirror GT
-    /// rounds its one-off still exits 0 on.
-    pub async fn run_once(&self) -> Result<crate::json_report::Report> {
+    /// #293: returns a [`RunOutcome`](crate::RunOutcome) — the measured
+    /// [`Report`](crate::Report) plus a [`Termination`](crate::Termination)
+    /// saying how the round ended. A peer-caused ending that still produced a
+    /// report is `Ok` with the matching server-side `Termination`
+    /// (`ClientTerminated`, `ControlClosed`, `UnknownMessage`,
+    /// `RecvResultsFailed`, `SendFailed`), or `SelfTerminated` when the server
+    /// ended the test on its own limit; the report carries the partial stats.
+    /// `Err` is reserved for rounds that produced NO report — a pre-test
+    /// cookie/param/accept failure, or a round interrupted before any test
+    /// started.
+    pub async fn run_once(&self) -> Result<crate::outcome::RunOutcome> {
         let listener = self.listen().await?;
         self.serve_once(&listener).await
     }
@@ -816,15 +818,15 @@ impl Server {
     async fn serve_once(
         &self,
         listener: &tokio::net::TcpListener,
-    ) -> Result<crate::json_report::Report> {
+    ) -> Result<crate::outcome::RunOutcome> {
         // #290: run-scoped console silence for this test.
         let _quiet_guard = (!self.emit_output).then(crate::macros::OutputQuietGuard::set);
         match self.handle_one_test(listener).await? {
-            Some(report) => Ok(report),
+            // #293: every report-producing round returns its Termination.
+            Some((report, termination)) => Ok(crate::outcome::RunOutcome::new(report, termination)),
             // The no-report rounds: interrupted while idle (an interrupt
-            // watch), a refused test, or IPERF_DONE mid-setup (#356). The
-            // interrupt-flavored message for all three is a recorded
-            // #293/#294 candidate.
+            // watch), a refused test, or IPERF_DONE mid-setup (#356) — no
+            // report exists, so `Err` per the #293 rule.
             None => Err(RiperfError::Aborted(
                 "interrupted before a test started".into(),
             )),
@@ -834,7 +836,7 @@ impl Server {
     async fn handle_one_test(
         &self,
         listener: &tokio::net::TcpListener,
-    ) -> Result<Option<crate::json_report::Report>> {
+    ) -> Result<Option<(crate::json_report::Report, crate::outcome::Termination)>> {
         // ---- Accept control connection (with optional idle timeout) ----
         let (mut ctrl, peer_addr) = match self.accept_control(listener).await? {
             Some(accepted) => accepted,
@@ -1137,38 +1139,31 @@ impl Server {
 
         let report = outcome?;
 
-        if ctx.client_terminated {
-            // The dump above already rendered; the caller prints iperf3's
-            // "the client has terminated" (no "error - " prefix) (#210).
-            return Err(RiperfError::ClientTerminated);
-        }
-        if ctx.unknown_message {
-            // #325: the dump above rendered with the in-doc `error - ` form;
-            // the caller prints GT's single stderr line (text mode only) and
-            // keeps serving. A failed TEST is rc -1 in GT, which main.c does
-            // NOT errexit on even for one-off (`if (rc < -1)` — setup
-            // failures only), so this must not become a process error (#224).
-            return Err(RiperfError::UnknownControlMessage);
-        }
-        if ctx.ctrl_closed {
-            // #330: distinct from the broad PeerDisconnected so the serve
-            // loop prints GT's read-site line for exactly this class (the
-            // doc'd mid/end-loop EOF), while pre-test EOFs stay quiet.
-            return Err(RiperfError::ControlSocketClosed);
-        }
-        if ctx.exchange_recv_failed {
-            // #330: the doc rendered above; the caller prints GT's text
-            // line (json keeps stderr to the warning alone) and keeps
-            // serving — a failed test is rc -1, one-off exit 0.
-            return Err(RiperfError::RecvResultsFailed);
-        }
-        if let Some(err) = ctx.exchange_send_error.take() {
-            // #371: the populated doc rendered above (its key came from
-            // report_error); the caller prints GT's IESENDMESSAGE/
-            // IESENDRESULTS line (text only) and keeps serving, exit 0.
-            return Err(err);
-        }
-        Ok(Some(report))
+        // #293: the doc above already rendered on every abnormal path. Derive
+        // how the round ended — this drives BOTH run_once's RunOutcome and
+        // run()'s per-class stderr line (run() matches this Termination now,
+        // where it used to match the returned Err). The comments on each class
+        // (rc -1 keep-serving, GT's read-site line, the errno-0 dangling ": ",
+        // etc.) live on the corresponding run() arm.
+        let termination = if ctx.client_terminated {
+            crate::outcome::Termination::ClientTerminated
+        } else if ctx.unknown_message {
+            crate::outcome::Termination::UnknownMessage
+        } else if ctx.ctrl_closed {
+            crate::outcome::Termination::ControlClosed
+        } else if ctx.exchange_recv_failed {
+            crate::outcome::Termination::RecvResultsFailed
+        } else if let Some(err) = ctx.exchange_send_error.take() {
+            crate::outcome::Termination::SendFailed(err.to_string())
+        } else if ctx.interrupted.is_some() {
+            crate::outcome::Termination::Interrupted
+        } else if let Some(msg) = ctx.server_error {
+            crate::outcome::Termination::SelfTerminated(msg.to_string())
+        } else {
+            // Clean completion (incl. the #330 mid-test IPERF_DONE bare-end).
+            crate::outcome::Termination::Completed
+        };
+        Ok(Some((report, termination)))
     }
 
     // -----------------------------------------------------------------------
@@ -4037,13 +4032,13 @@ impl BoundServer {
         self.listener.local_addr().map_err(RiperfError::Io)
     }
 
-    /// Serve exactly one test on the held listener and return its rich
-    /// [`Report`](crate::Report) — the same contract as
+    /// Serve exactly one test on the held listener and return its
+    /// [`RunOutcome`](crate::RunOutcome) — the same contract as
     /// [`Server::run_once`], minus the per-call rebind. No "Server
     /// listening" banner (a library entry point, not the daemon); the test
     /// report still prints in `-J` / text mode unless the server was built
     /// with `emit_output(false)` (#290).
-    pub async fn run_once(&self) -> Result<crate::json_report::Report> {
+    pub async fn run_once(&self) -> Result<crate::outcome::RunOutcome> {
         self.server.serve_once(&self.listener).await
     }
 }
