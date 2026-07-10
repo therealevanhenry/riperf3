@@ -23,6 +23,11 @@ release tags.
   The `RiperfError::ServerTerminated` /
   `ServerErrorRelayed` variants are removed. Migration: `client.run().await?` →
   `client.run().await?.report`; branch on `outcome.termination` for the ending.
+- `Server::run_once` / `BoundServer::run_once` likewise return `RunOutcome` instead of `Report`
+  (#293): a report-producing abnormal end (client-terminate, control-close, a
+  `--server-bitrate-limit`/`--server-max-duration` self-terminate) is now `Ok` with the partial
+  report plus a server-side `Termination`, not an `Err` that discarded it. Migration:
+  `server.run_once().await?` → `server.run_once().await?.report`.
 - The builder output default flips to quiet (#294): a bare `run()`/`run_once()` returns the
   report and prints nothing. Opt into iperf3's full text/JSON output with `.emit_output(true)`
   (the CLI sets this). Wire protocol, CLI output, and exit codes are unchanged.

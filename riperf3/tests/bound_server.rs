@@ -43,7 +43,9 @@ async fn bind_once_serves_sequential_tests_on_one_port() {
             run_client(port).await
         };
         let (srv, cli) = tokio::join!(server_run, client_run);
-        let srv = srv.unwrap_or_else(|e| panic!("server run_once #{i} errored: {e}"));
+        let srv = srv
+            .unwrap_or_else(|e| panic!("server run_once #{i} errored: {e}"))
+            .report;
         assert!(
             srv.end.sum_received.as_ref().unwrap().bytes > 0,
             "test #{i}: the server measured the transfer"
@@ -68,6 +70,6 @@ async fn run_once_still_serves_one_test() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let cli = run_client(port).await;
     assert!(cli.end.sum_sent.as_ref().unwrap().bytes > 0);
-    let srv = server_task.await.unwrap().expect("run_once");
+    let srv = server_task.await.unwrap().expect("run_once").report;
     assert!(srv.end.sum_received.as_ref().unwrap().bytes > 0);
 }
