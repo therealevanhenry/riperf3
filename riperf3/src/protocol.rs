@@ -344,7 +344,7 @@ fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
 ///
 /// NUL is deliberately EXCLUDED (r1): iperf3's parse entry is
 /// strlen-based (JSON_read → cJSON_Parse, iperf_api.c:3053 →
-/// cjson.c:1099's strlen), so an interior/leading 0x00 TRUNCATES the blob
+/// cjson.c:1100's strlen), so an interior/leading 0x00 TRUNCATES the blob
 /// before cJSON's scanner ever runs — GT refuses those (live-probed
 /// SERVER_ERROR) exactly where serde's error at the NUL refuses too, and
 /// a TRAILING 0x00 sits after the first complete value where the
@@ -1807,23 +1807,32 @@ mod tests {
         );
     }
 
-    /// #401 (RECORDED DEVIATION, cell 8): a wrong-TYPED object field — GT's
-    /// iperf_cJSON_GetObjectItemType wrapper (iperf_util.c:444-477) warns
-    /// on stderr ("iperf_cJSON_GetObjectItemType mismatch time") and returns
-    /// NULL, so WRAPPER-READ fields keep their defaults and GT RUNS
-    /// (live-probed: byte 0x0a follows). r1 scoping: skip_rx_copy is read
-    /// RAW (no warning, truthiness-coerced) and client_version is never
-    /// read by get_parameters — the record covers the wrapper-read fields,
-    /// which is every field riperf3 deserializes. riperf3's serde derive
-    /// hard-errors → IERECVPARAMS. Mirroring means per-field lenient
-    /// deserialization — the same abandon-serde cost as cells 3-6, for
-    /// hostile-only input. Locked.
+    /// #401 (RECORDED DEVIATION, cell 8): a wrong-TYPED object field always
+    /// hard-errors on riperf3's serde derive → IERECVPARAMS, where GT runs
+    /// regardless — via THREE per-field behaviors (r1+r2 scoping, all
+    /// live-probed): (a) wrapper-read fields (iperf_cJSON_GetObjectItemType,
+    /// iperf_util.c:444-477) warn on stderr ("...mismatch time") and keep
+    /// their defaults; (b) skip_rx_copy is read RAW — no warning, valueint
+    /// assigned as-is (iperf_api.c:2657; a wrong-typed string reads 0);
+    /// (c) client_version (and authtoken on non-SSL GT builds) is NEVER
+    /// read by get_parameters — GT silently ignores any type there, while
+    /// riperf3 deserializes it and refuses. Mirroring means per-field
+    /// lenient deserialization — the same abandon-serde cost as cells 3-6,
+    /// for hostile-only input. Locked for a wrapper-read field and a
+    /// never-read field.
     #[test]
     fn params_wrong_typed_field_stays_strict() {
+        // (a) a wrapper-read field (GT: warn + default, then runs).
         let v = serde_json::json!({"tcp": true, "time": "foo", "parallel": 1});
         assert!(
             params_from_value(v).is_err(),
-            "a wrong-typed field stays a hard IERECVPARAMS error (#401 record)"
+            "a wrong-typed wrapper-read field stays IERECVPARAMS (#401 record)"
+        );
+        // (c) a never-read field (GT: silent ignore, then runs — r2).
+        let v = serde_json::json!({"tcp": true, "client_version": 42});
+        assert!(
+            params_from_value(v).is_err(),
+            "a wrong-typed never-read field stays IERECVPARAMS (#401 record)"
         );
     }
 
