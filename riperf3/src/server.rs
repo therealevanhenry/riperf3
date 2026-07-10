@@ -3845,6 +3845,12 @@ impl Server {
                             sc.recv_buffer_size().ok().map(|v| v as u64),
                         )
                     }
+                    // RECORDED DEVIATION (#416 r1, the no-re-listen
+                    // umbrella): fd exhaustion at INGEST time with -w set —
+                    // GT's re-listen socket() fails and IESTREAMLISTEN
+                    // aborts the round; riperf3 has no re-listen
+                    // (deliberate), caches absent keys, and the round
+                    // proceeds.
                     Err(_) => (None, None),
                 }
             }
