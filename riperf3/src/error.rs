@@ -45,11 +45,13 @@ pub enum RiperfError {
     #[error("test aborted: {0}")]
     Aborted(String),
 
-    /// iperf3's IECTRLCLOSE: the control connection died mid-test — the
-    /// client's class (#170), and since #330 the SERVER's doc'd mid/end-loop
-    /// EOF return from `run_once` (the doc/stderr carry GT's read-site
-    /// sentence "the client has unexpectedly closed the connection"; the
-    /// round is clean in GT, exit 0).
+    /// iperf3's IECTRLCLOSE: the control connection died — the client's mid-test
+    /// class (#170) and the SERVER's SETUP-phase EOF (since #330), before any
+    /// report exists. Post-#293/#409 the server's mid/end-loop EOF is instead
+    /// `Termination::ControlClosed` (an `Ok(RunOutcome)` carrying the partial
+    /// report), so on the server this `Err` is setup-phase-only. The doc/stderr
+    /// carry GT's read-site sentence "the client has unexpectedly closed the
+    /// connection"; the round is clean in GT, exit 0.
     #[error("control socket has closed unexpectedly")]
     ControlSocketClosed,
 
