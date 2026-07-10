@@ -405,6 +405,12 @@ impl Client {
         // `done` is set before ctx's fields (the control socket) drop, the
         // monolith's drop order (r1 F1).
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
+        // #380: if THIS FUTURE is dropped (timeout/select cancellation) the
+        // teardown gate below never runs and `done` can't wake a parked
+        // read — this guard abort()s the stream tasks instead. Armed at
+        // CreateStreams, disarmed at the gate (which then abort-and-JOINs
+        // as before).
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
 
         // ---- State machine: react to server-driven transitions ----
         // #375: the whole dispatch loop runs inside this block so EVERY
@@ -457,6 +463,8 @@ impl Client {
 
                     TestState::CreateStreams => {
                         self.on_create_streams(&mut ctx).await?;
+                        // #380: the spawned tasks are now cancel-exposed.
+                        abort_guard.arm(ctx.streams.iter().map(|s| s.task.abort_handle()));
                         StepFlow::Continue
                     }
 
@@ -555,6 +563,8 @@ impl Client {
         // only when this gate is the FIRST to stop the streams (errors
         // between CreateStreams and the data phase) — and never when no
         // streams were spawned at all.
+        // #380: the gate is running — it owns the stop from here.
+        abort_guard.disarm();
         let grace_owed = !ctx.done.swap(true, Ordering::Relaxed);
         if grace_owed && !ctx.streams.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;

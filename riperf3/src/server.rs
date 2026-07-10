@@ -1039,6 +1039,12 @@ impl Server {
         // `done` is set before ctx's fields (the control socket, the capture
         // guard) drop, the monolith's drop order (r1 F1).
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
+        // #380: if THIS FUTURE is dropped (a run_once wrapped in
+        // timeout/select) the abort/join gate below never runs and `done`
+        // can't wake a parked read — this guard abort()s the stream tasks
+        // (+ the UDP demux) instead. Armed after setup, disarmed at the
+        // gate (which then abort-and-JOINs as before).
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
 
         // ---- CreateStreams ----
         if let SetupFlow::ClientDone = self.setup_data_streams(&mut ctx, listener).await? {
@@ -1046,6 +1052,13 @@ impl Server {
             // no error surface, keep-serving like a refusal (Ok(None)).
             return Ok(None);
         }
+        // #380: the spawned tasks are now cancel-exposed.
+        abort_guard.arm(
+            ctx.streams
+                .iter()
+                .map(|s| s.task.abort_handle())
+                .chain(ctx.udp_demux_handle.iter().map(|h| h.abort_handle())),
+        );
 
         // #372: every phase from TestStart to the final output runs inside
         // this block, so every `?` — start_test's sends, await_test_end's
@@ -1198,6 +1211,8 @@ impl Server {
         // fd — while an abort could kill a text-mode emit mid-line. The
         // done-store-BEFORE-abort order also keeps a post-close reporter
         // tick from sampling a recycled raw_fd.
+        // #380: the gate is running — it owns the stop from here.
+        abort_guard.disarm();
         ctx.done.store(true, Ordering::Relaxed);
         for s in &ctx.streams {
             s.task.abort();

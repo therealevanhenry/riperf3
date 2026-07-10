@@ -1179,6 +1179,60 @@ impl Drop for DoneOnDrop {
     }
 }
 
+/// #380: abort-on-cancel guard for the spawned stream tasks. A `run()`
+/// future dropped mid-test (timeout/select cancellation — the pattern
+/// every library consumer reaches for) skips every teardown gate:
+/// [`DoneOnDrop`] still fires, but `done` cannot wake a task parked in
+/// `read()`/`write().await` (the recorded #372/#375 caveat) and Drop
+/// cannot await joins (the #372 async-RAII limitation). This non-async
+/// guard `abort()`s instead — armed right after the streams spawn,
+/// DISARMED at the teardown gate (the normal paths abort-and-JOIN there,
+/// exactly as before). Aborted tokio tasks drop their sockets at the next
+/// await point on the still-live runtime; the `spawn_blocking` UDP
+/// runners are out of abort's reach and keep riding `done` + their 500 ms
+/// poll (the recorded residual).
+pub struct AbortStreamsOnDrop {
+    handles: Vec<tokio::task::AbortHandle>,
+    armed: bool,
+}
+
+impl AbortStreamsOnDrop {
+    pub fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+            armed: false,
+        }
+    }
+
+    /// Arm with the current task set (idempotent: re-arming replaces).
+    pub fn arm(&mut self, handles: impl IntoIterator<Item = tokio::task::AbortHandle>) {
+        self.handles = handles.into_iter().collect();
+        self.armed = true;
+    }
+
+    /// The teardown gate owns the stop from here (abort + JOIN).
+    pub fn disarm(&mut self) {
+        self.armed = false;
+        self.handles.clear();
+    }
+}
+
+impl Default for AbortStreamsOnDrop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AbortStreamsOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            for h in &self.handles {
+                h.abort();
+            }
+        }
+    }
+}
+
 /// High-performance UDP sender using blocking I/O on a dedicated OS thread.
 /// No `unsafe` code — uses `std::net::UdpSocket` and batch pacing with
 /// `std::thread::sleep` + spin-loop for sub-microsecond precision.
