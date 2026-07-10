@@ -209,7 +209,7 @@ pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> Stri
 /// accept (iperf_udp.c:439-452), which never runs in a setup-phase wedge
 /// (live key-diff probed) — so the builder passes None for all four.
 pub(crate) struct SetupPhaseDoc {
-    pub sock_bufsize: Option<u64>,
+    pub sock_bufsize: Option<i64>,
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
     pub tcp_mss_default: Option<u32>,
@@ -349,7 +349,7 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
         #[serde(rename = "target_bitrate", skip_serializing_if = "Option::is_none")]
         early_target_bitrate: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        sock_bufsize: Option<u64>,
+        sock_bufsize: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sndbuf_actual: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -479,7 +479,7 @@ pub struct Start {
     // GT (iperf 3.21) OMITS them entirely — the document carries the early start
     // metadata (timestamp, cookie, connecting_to) and an empty `end`. Gated by
     // `stage == Started` in the manual Serialize impl (#261/#281).
-    pub sock_bufsize: Option<u64>,
+    pub sock_bufsize: Option<i64>,
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
     pub test_start: Option<TestStart>,
@@ -1066,7 +1066,7 @@ pub(crate) struct ReportInput {
     /// Socket buffer sizes (`start.sock_bufsize` / `sndbuf_actual` /
     /// `rcvbuf_actual`). `None` on a path that never set up data sockets (the
     /// upfront-refusal path), so `build()` omits them like GT (#261).
-    pub sock_bufsize: Option<u64>,
+    pub sock_bufsize: Option<i64>,
     pub sndbuf_actual: Option<u64>,
     pub rcvbuf_actual: Option<u64>,
     /// How far the run progressed when this document is built (#281): drives

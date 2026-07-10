@@ -2719,6 +2719,44 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     );
 }
 
+/// #392: GT renders a NEGATIVE requested window verbatim — `-w -1` is
+/// real-client-reachable (unit_atof keeps the sign; only the upper bound
+/// is range-checked, iperf_api.c:1446) and BOTH roles' `-J` docs carry
+/// `sock_bufsize: -1` with kernel-truth actuals (live-probed 3.21; the
+/// actuals were already identical on both tools — only the render
+/// diverged: riperf3's `.max(0)` clamps emitted 0).
+#[tokio::test]
+async fn negative_window_renders_minus_one_like_gt() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .window(-1)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let cli = tokio::time::timeout(Duration::from_secs(15), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    let srv = server_task.await.expect("join").expect("server run_once");
+    for (role, outcome) in [("client", &cli), ("server", &srv)] {
+        let v = serde_json::to_value(&outcome.report).unwrap();
+        assert_eq!(
+            v["start"]["sock_bufsize"].as_i64(),
+            Some(-1),
+            "the {role} doc renders the requested -w -1 verbatim (#392): {v}"
+        );
+    }
+}
+
 /// The server-side `Interrupted` cell of the same invisibility class: a
 /// mid-test interrupt on `run_once` comes back `Ok(RunOutcome)` with
 /// `Termination::Interrupted`. Like `SelfTerminated` above, an

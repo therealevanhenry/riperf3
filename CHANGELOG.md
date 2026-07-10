@@ -31,6 +31,8 @@ release tags.
 - The builder output default flips to quiet (#294): a bare `run()`/`run_once()` returns the
   report and prints nothing. Opt into iperf3's full text/JSON output with `.emit_output(true)`
   (the CLI sets this). Wire protocol, CLI output, and exit codes are unchanged.
+- `Start::sock_bufsize` is `Option<i64>` (was `Option<u64>`): iperf3 renders the requested
+  `-w` verbatim, negatives included (#392).
 
 ### Added
 
@@ -46,6 +48,10 @@ release tags.
 - `--get-server-output` no longer alphabetizes the embedded server document
   (serde_json `preserve_order`); the params/results wire blobs now match iperf3's key
   order too (#378).
+- `-w -1` renders `sock_bufsize: -1` like iperf3 in every document (was clamped to 0, or
+  u64-wrapped in the setup doc); the setup-doc buffer actuals are computed once at param
+  ingest like iperf3, so emit-time fd exhaustion can't blank them, and on the listener's
+  address family (#392).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual
