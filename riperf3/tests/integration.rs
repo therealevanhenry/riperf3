@@ -1826,12 +1826,13 @@ mod unimplemented_flags {
 
     /// #386: GT's refused round does not END at the relay — cleanup_server
     /// closes the ctrl through iperf_sync_close_socket (net.c:877-886):
-    /// shutdown(SHUT_WR), then READ UNTIL the client EOFs. The round (and
-    /// its refusal doc) completes only when the client closes; riperf3
+    /// shutdown(SHUT_WR), then the BOUNDED drain (per-Nread 10 s idle —
+    /// see the bound pin below). The round (and its refusal doc) completes
+    /// at the client's close or the bound, whichever first; riperf3
     /// completed immediately (probed 30/30 vs GT 10/10 under the #385 r1
     /// signal race). A mock that reads the fe+37 relay and HOLDS must see
     /// (a) the server's FIN promptly (the SHUT_WR half) while (b) run_once
-    /// stays parked; the mock's close ends the round.
+    /// stays parked well under the bound; the mock's close ends the round.
     #[tokio::test]
     async fn refused_round_parks_until_client_eof() {
         use std::io::{Read, Write};

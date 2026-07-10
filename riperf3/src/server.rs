@@ -3861,8 +3861,12 @@ impl Server {
     /// the doc is ABANDONED — GT's sigend longjmps past the unprinted doc
     /// and emits the interrupt skeleton alone; cells A/B live-probed
     /// 2026-07-10). The idle clock is per-read, like GT's per-Nread
-    /// select: a dripping peer can extend the park (the recorded
-    /// nread_step nuance in protocol.rs).
+    /// select: a dripping peer extends the park on BOTH tools (probed,
+    /// 1 byte/5 s). Recorded micro-deviation (#429 r2 F2): after the LAST
+    /// dripped byte riperf3 frees at exactly the bound (10.0 s) while
+    /// GT's >0 partial return restarts a full Nread, so its tail runs up
+    /// to ~2x (probed 15.2 s) — adversarial-peer-only, boundedness
+    /// matches.
     async fn park_refused_round(&self, ctrl: &mut tokio::net::TcpStream) -> Option<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = ctrl.shutdown().await; // GT's SHUT_WR half-close
