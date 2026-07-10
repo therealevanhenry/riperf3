@@ -1214,6 +1214,16 @@ impl AbortStreamsOnDrop {
         self.armed = true;
     }
 
+    /// Arm incrementally: cover a task the MOMENT it spawns, so a cancel
+    /// landing mid-setup (#381 — the loop's awaits between spawns) aborts
+    /// the already-spawned subset. A later [`Self::arm`] replaces the set
+    /// with the full collection — equivalent, since every pushed handle
+    /// is in it.
+    pub fn push(&mut self, handle: tokio::task::AbortHandle) {
+        self.handles.push(handle);
+        self.armed = true;
+    }
+
     /// The teardown gate reaped the tasks (abort + JOIN complete).
     pub fn disarm(&mut self) {
         self.armed = false;

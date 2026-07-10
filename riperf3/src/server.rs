@@ -1051,33 +1051,45 @@ impl Server {
         // guard) drop, the monolith's drop order (r1 F1).
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
-        // ---- CreateStreams ----
-        if let SetupFlow::ClientDone = self.setup_data_streams(&mut ctx, listener).await? {
-            // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends with
-            // no error surface, keep-serving like a refusal (Ok(None)).
-            return Ok(None);
-        }
-        // #380: the spawned tasks are now cancel-exposed.
-        // RESIDUAL: a cancel landing INSIDE setup_data_streams leaves the
-        // already-accepted subset unguarded (the tasks park un-wakeably
-        // from spawn) — the mid-setup teardown-skip class, #381's scope
-        // for both roles.
-        abort_guard.arm(
-            ctx.streams
-                .iter()
-                .map(|s| s.task.abort_handle())
-                .chain(ctx.udp_demux_handle.iter().map(|h| h.abort_handle())),
-        );
+        // #372: every phase from setup to the final output runs inside
+        // this block, so every `?` — the setup-phase sites (#381),
+        // start_test's sends, await_test_end's non-EOF recv errors, the
+        // exchange phase (#353) — falls through to the ONE unconditional
+        // abort/join gate below instead of skipping it. Per-arm teardown
+        // wrappers were whack-a-mole: this is the 4th site in the family
+        // (#331 gate, #353 exchange, #372 running phase, #381 setup). A
+        // `return` inside the block exits the BLOCK, not handle_one_test.
+        let outcome: Result<Option<crate::json_report::Report>> = async {
+            // ---- CreateStreams ----
+            // #381: setup runs INSIDE the block — its `?` sites (the
+            // post-accept configure/tos/meta, dispatch propagations, the
+            // UDP sub-setups) previously skipped the gate with earlier-
+            // iteration tasks already spawned in ctx.streams. The TCP
+            // loop also pushes each task into the abort guard AS IT
+            // SPAWNS (the #426 r1 F2 mid-setup cancel window). The
+            // classified arms still reap inline first — the gate below
+            // is a no-op on drained streams.
+            if let SetupFlow::ClientDone = self
+                .setup_data_streams(&mut ctx, listener, &mut abort_guard)
+                .await?
+            {
+                // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends
+                // with no error surface, keep-serving like a refusal
+                // (None maps to handle_one_test's Ok(None) after the gate).
+                return Ok(None);
+            }
+            // #380: the full arm — the TCP pushes are already in the set
+            // (arm replaces with the same handles); this adds the UDP
+            // stream tasks and the demux handle (queued-not-yet-started
+            // coverage only: spawn_blocking ignores abort() once running
+            // and rides `done` + its 500 ms poll either way).
+            abort_guard.arm(
+                ctx.streams
+                    .iter()
+                    .map(|s| s.task.abort_handle())
+                    .chain(ctx.udp_demux_handle.iter().map(|h| h.abort_handle())),
+            );
 
-        // #372: every phase from TestStart to the final output runs inside
-        // this block, so every `?` — start_test's sends, await_test_end's
-        // non-EOF recv errors, the exchange phase (#353) — falls through to
-        // the ONE unconditional abort/join gate below instead of skipping
-        // it. Per-arm teardown wrappers were whack-a-mole: this is the 4th
-        // site in the family (#331 gate, #353 exchange, #372 running
-        // phase). A `return` inside the block exits the BLOCK, not
-        // handle_one_test.
-        let outcome: Result<crate::json_report::Report> = async {
             // ---- TestStart / TestRunning ----
             self.start_test(&mut ctx).await?;
 
@@ -1183,7 +1195,7 @@ impl Server {
             };
 
             self.emit_final_output(&ctx, &end, &report, was_captured);
-            Ok(report)
+            Ok(Some(report))
         }
         .await;
 
@@ -1241,7 +1253,13 @@ impl Server {
         // idempotent, so the guard firing mid-join is free.
         abort_guard.disarm();
 
-        let report = outcome?;
+        let report = match outcome? {
+            Some(report) => report,
+            // #356 r1 F1 / #381: the clean IPERF_DONE round — keep-serving,
+            // no error surface. The gate above was a no-op (dispatch's
+            // IperfDone arm reaped inline via abort_setup_streams).
+            None => return Ok(None),
+        };
 
         // #293: the doc above already rendered on every abnormal path. Derive
         // how the round ended — this drives BOTH run_once's RunOutcome and
@@ -1535,6 +1553,7 @@ impl Server {
         &self,
         ctx: &mut TestRunCtx,
         listener: &tokio::net::TcpListener,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         // Determine how many streams to accept and their roles.
         // Normal: server receives. Reverse: server sends. Bidir: both.
@@ -1843,6 +1862,9 @@ impl Server {
                         })
                     };
 
+                    // #381: cancel-cover the task the moment it spawns —
+                    // the accept select's awaits sit between spawns.
+                    abort_guard.push(task.abort_handle());
                     ctx.streams.push(DataStream {
                         meta: StreamMeta {
                             id: stream_id,

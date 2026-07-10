@@ -327,6 +327,142 @@ fn server_cancelled_run_once_aborts_stream_tasks() {
     drop(rt);
 }
 
+/// #381 (client half): the mock completes setup through CreateStreams and
+/// accepts data conn 1 (cookie consumed — the client's receiver task for
+/// stream 1 spawns and parks), then CLOSES THE LISTENER so the client's
+/// SECOND data connect is refused. `create_streams` errors mid-loop with
+/// stream 1's task already spawned: a local-vec build drops that partial
+/// progress on the floor (the gate joins an empty `ctx.streams`) and the
+/// parked task leaks with its fd. The held conn-1 read tells leak from
+/// reap after `run()` returns.
+fn mock_refuse_second_data_conn(
+    listener: std::net::TcpListener,
+    hold: std::sync::mpsc::Receiver<()>,
+) -> Result<usize, std::io::ErrorKind> {
+    let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+    read_exact(&mut ctrl, 37); // cookie
+    ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+    let len = u32::from_be_bytes(read_exact(&mut ctrl, 4).try_into().unwrap()) as usize;
+    read_exact(&mut ctrl, len); // the client's params blob
+    ctrl.write_all(&[10u8]).unwrap(); // CreateStreams
+    let (mut data1, _) = listener.accept().expect("data 1 accept");
+    read_exact(&mut data1, 37); // data-stream cookie — stream 1 spawns
+    drop(listener); // data conn 2 → ECONNREFUSED mid-create_streams
+    let _ = hold.recv_timeout(Duration::from_secs(10));
+    data1
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .expect("set_read_timeout");
+    let mut buf = [0u8; 16];
+    let r = data1.read(&mut buf).map_err(|e| e.kind());
+    drop(ctrl);
+    r
+}
+
+/// #381: a mid-`create_streams` error (the second data connect refused)
+/// must still tear down the FIRST stream's already-spawned task — partial
+/// setup progress has to be visible to the teardown gate, not dropped in
+/// a local vec. Fully deterministic: no cancel timing, the refusal is
+/// immediate.
+#[test]
+fn client_error_mid_create_streams_tears_down_earlier_streams() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let port = listener.local_addr().unwrap().port();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+    let mock = std::thread::spawn(move || mock_refuse_second_data_conn(listener, returned_rx));
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .reverse(true)
+        .num_streams(2)
+        .duration(30)
+        .json_output(true)
+        .build()
+        .expect("build client");
+    let res = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(8), client.run()).await })
+        .expect("run() exits bounded after the refused connect");
+    assert!(res.is_err(), "the refused data connect surfaces an error");
+    returned_tx.send(()).expect("mock alive");
+
+    let read = mock.join().expect("mock");
+    assert!(
+        matches!(read, Ok(0) | Err(std::io::ErrorKind::ConnectionReset)),
+        "a mid-create_streams error must tear down stream 1's spawned \
+         task — the held data socket sees a bounded close (#381): {read:?}"
+    );
+    drop(rt);
+}
+
+/// #381 (server half, cancel flavor — the #426 r1 F2 window): a
+/// `run_once` future dropped while the server waits for the SECOND data
+/// connection must abort the FIRST stream's already-spawned task. The
+/// wait state is stable (the no-progress clock is 120 s), so the 3 s
+/// cancel lands deterministically mid-setup; pre-fix the abort guard is
+/// not yet armed there and the parked task leaks.
+#[test]
+fn server_cancelled_mid_setup_aborts_earlier_streams() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (bound, port) = rt.block_on(async {
+        let server = riperf3::ServerBuilder::new()
+            .port(Some(0))
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let bound = server.bind().await.expect("bind");
+        let port = bound.local_addr().unwrap().port();
+        (bound, port)
+    });
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+    let mock = std::thread::spawn(move || {
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        let params = br#"{"tcp":true,"time":30,"parallel":2,"len":4096}"#;
+        ctrl.write_all(&(params.len() as u32).to_be_bytes())
+            .unwrap();
+        ctrl.write_all(params).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        // Data conn 1 only — the server spawns its receiver (parked: no
+        // traffic follows) and keeps waiting for conn 2. NEVER connect it.
+        let mut data1 = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data 1");
+        data1.write_all(&cookie).unwrap();
+        let _ = dropped_rx.recv_timeout(Duration::from_secs(10));
+        data1
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 16];
+        let r = data1.read(&mut buf).map_err(|e| e.kind());
+        drop(ctrl);
+        r
+    });
+
+    let res = rt.block_on(async {
+        // 3 s: the mock's setup takes ms; the server then sits in the
+        // stable conn-2 accept wait, where the cancel lands.
+        tokio::time::timeout(Duration::from_secs(3), bound.run_once()).await
+    });
+    assert!(res.is_err(), "the timeout cancels run_once mid-setup");
+    dropped_tx.send(()).expect("mock alive");
+
+    let read = mock.join().expect("mock");
+    assert!(
+        matches!(read, Ok(0) | Err(std::io::ErrorKind::ConnectionReset)),
+        "a run_once cancelled mid-setup must abort stream 1's spawned \
+         task (#381): {read:?}"
+    );
+    drop(rt);
+}
+
 /// #375: reverse -P 2 (a partial teardown — stream 0 only — still reds),
 /// ctrl FIN mid-running.
 #[test]
