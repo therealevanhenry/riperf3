@@ -3649,7 +3649,15 @@ impl ClientBuilder {
             omit: self.omit,
             no_delay: self.no_delay,
             mss: self.mss,
-            window: self.window,
+            // #415: an explicit 0 IS "unset" — GT's socket_bufsize uses 0 as
+            // the unset sentinel and truthiness-gates every consumer (the
+            // apply sites, iperf_tcp.c:257/:434; the params-blob key,
+            // iperf_api.c:2451), so `-w 0` must ride every unset arm: no
+            // setsockopt, no "window" key on the wire, and the #163 UDP
+            // batch sizing treats the buffer as untouched. Normalizing here
+            // covers them all; the `start.sock_bufsize` render is unchanged
+            // (`unwrap_or(0)` — GT renders the verbatim 0 either way).
+            window: self.window.filter(|&w| w != 0),
             // Resolve the rate default now (UDP unset → 1 Mbit/s, like iperf3);
             // an explicit -b (incl. 0 = unlimited) is honored. TCP default is
             // unlimited (0). After this, bandwidth==0 unambiguously = unlimited.
