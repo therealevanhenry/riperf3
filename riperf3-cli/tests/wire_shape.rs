@@ -2220,6 +2220,53 @@ fn setup_phase_ctrl_eof_takes_gt_doc_shape_in_json() {
     );
 }
 
+/// #377 r2 F1: GT's auth gate runs AFTER get_parameters (iperf_api.c:2368
+/// vs :2662), so an auth-DENIED rate-set request still carries the early
+/// `target_bitrate` in the -J denial doc (live-probed 3.21: `start =
+/// {connected, version, system_info, target_bitrate}` + the error key).
+/// The tokenless deny arm needs no crypto: a server with auth configured
+/// denies a params blob that carries no authtoken. (GT's denial error
+/// STRING is a different, unrecorded divergence — tracked on #395.)
+#[test]
+fn auth_denied_rate_set_doc_carries_the_early_target_bitrate() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
+    let key = format!("{fixtures}/test_private.pem");
+    let users = format!("{fixtures}/test_users.csv");
+    let (sout, _serr, _status) = drive_server_scenario_with(
+        &[
+            "--rsa-private-key-path",
+            &key,
+            "--authorized-users-path",
+            &users,
+        ],
+        true,
+        |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, r#"{"tcp":true,"bandwidth":100000000}"#);
+            // The ACCESS_DENIED wire-back (state -1 as a byte).
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 0xFF, "AccessDenied");
+        },
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["start"]["target_bitrate"].as_u64(),
+        Some(100_000_000),
+        "the denial doc carries the ingested -b (#377 r2 F1): {doc}"
+    );
+    assert!(
+        doc["error"].as_str().is_some(),
+        "the denial doc keeps its error key: {doc}"
+    );
+    assert_eq!(
+        sout.matches("\"target_bitrate\"").count(),
+        1,
+        "ONE doc, ONE occurrence — no double emission: {sout}"
+    );
+}
+
 /// #357: with `-w` exchanged, GT re-listens with the window applied and
 /// reads the setup doc's sndbuf/rcvbuf actuals off THAT socket (probed
 /// 131072/131072 for window 65536 — the Linux doubling); riperf3 read
