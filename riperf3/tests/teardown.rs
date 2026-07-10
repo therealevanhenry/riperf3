@@ -137,8 +137,13 @@ fn mock_fin_after_create_streams(
         read_exact(&mut data, 37); // data-stream cookie
         datas.push(data);
     }
-    drop(ctrl); // FIN mid-setup — the gate will owe the grace
+    // setup_done BEFORE the FIN (#426 r2 F1): the grace clock starts at
+    // the client's FIN observation, the cancel clock at this send — a
+    // mock stall between the two must delay the GATE (safe: an early
+    // cancel lands pre-gate, still guarded), never the cancel (a late
+    // cancel could miss a finished gate and trip the res assert).
     let _ = setup_done.send(());
+    drop(ctrl); // FIN mid-setup — the gate will owe the grace
     let _ = hold.recv_timeout(Duration::from_secs(10));
     let mut reads = Vec::new();
     for data in &mut datas {
@@ -158,7 +163,7 @@ fn mock_fin_after_create_streams(
 /// absolute deadline, so a slow runner degrades to an earlier —
 /// still-guarded — cancel point instead of a mistimed miss. run() can't
 /// win the select: this path owes ≥100 ms of grace after a FIN that
-/// precedes setup_done.
+/// never precedes the setup_done send.
 #[test]
 fn client_cancelled_during_grace_window_aborts_stream_tasks() {
     let rt = tokio::runtime::Builder::new_multi_thread()

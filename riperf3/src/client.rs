@@ -404,7 +404,7 @@ impl Client {
         // read — this guard abort()s the stream tasks instead. Armed at
         // CreateStreams, disarmed after the gate's joins (which abort-and-
         // JOIN as before). Declared BEFORE _done_guard so the cancel-drop
-        // stores `done` first, then aborts — the gate's own order (r1 F1
+        // stores `done` first, then aborts — the gate's own order (r1 F3
         // of #426: a detached reporter tick must see `done` before any
         // stream fd can be recycled).
         let mut abort_guard = stream::AbortStreamsOnDrop::new();
