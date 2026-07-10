@@ -55,6 +55,9 @@ release tags.
 - The client's SERVER_ERROR relay renders iperf3's bare `end: {}` at any stage — a mid-run
   breach no longer emits the populated finalize end; on a `Termination::ServerError` ending
   `outcome.report.end` is bare in every mode (partial stats ride `intervals`) (#404).
+- A peer RST after the completed results exchange takes iperf3's IERECVMESSAGE class over
+  the populated document instead of a raw-io skeleton; `Termination::RecvMessageFailed` is
+  the new server-side ending (#406).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

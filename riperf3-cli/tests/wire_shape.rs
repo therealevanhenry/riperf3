@@ -110,6 +110,48 @@ fn drive_mock_round(port: u16, final_byte: u8, junk_mid_test: bool) {
 /// `final_action`: Some(byte) sends the byte; None closes both sockets —
 /// the abrupt-EOF cells (#330).
 fn drive_mock_round_full(port: u16, final_action: Option<u8>, mid_test: bool, params: &str) {
+    let (mut ctrl, data) = drive_round_sockets(port, mid_test, params);
+    match final_action {
+        Some(b) => ctrl.write_all(&[b]).unwrap(),
+        None => drop((ctrl, data)), // abrupt EOF, both sockets (#330)
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// #406: the completed-exchange RST cell — the round runs through
+/// DisplayResults, then the ctrl RSTs (SO_LINGER 0, the #345 helper's
+/// libc pattern) instead of sending IperfDone or a clean FIN. Linux-only
+/// like every RST-timing cell (the #339 SO_LINGER lesson).
+#[cfg(target_os = "linux")]
+fn drive_mock_round_rst(port: u16) {
+    let (ctrl, data) = drive_round_sockets(port, false, MOCK_PARAMS);
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let rc = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::setsockopt(
+            ctrl.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            std::ptr::from_ref(&linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "SO_LINGER(0)");
+    drop((ctrl, data));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// The shared round body: cookie → params → data stream → (unless
+/// `mid_test`) TestEnd → results exchange → DisplayResults. Returns the
+/// live sockets for the caller's final action.
+fn drive_round_sockets(
+    port: u16,
+    mid_test: bool,
+    params: &str,
+) -> (std::net::TcpStream, std::net::TcpStream) {
     let cookie = [b'x'; 37];
     let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
     ctrl.write_all(&cookie).unwrap();
@@ -128,11 +170,7 @@ fn drive_mock_round_full(port: u16, final_action: Option<u8>, mid_test: bool, pa
         read_json_blob(&mut ctrl); // server results
         assert_eq!(read_exact(&mut ctrl, 1)[0], 14); // DisplayResults
     }
-    match final_action {
-        Some(b) => ctrl.write_all(&[b]).unwrap(),
-        None => drop((ctrl, data)), // abrupt EOF, both sockets (#330)
-    }
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    (ctrl, data)
 }
 
 /// One scenario run against a one-off server: spawn, drive one mock round,
@@ -668,6 +706,59 @@ fn end_loop_eof_prints_summary_and_the_line_in_text() {
         "the completed round prints its summary: {sout}"
     );
     assert!(status.success(), "clean exit like GT");
+}
+
+/// #406: a peer RST after the COMPLETED exchange — GT's read site takes
+/// IERECVMESSAGE (iperf_server_api.c:256, rval<0) over the POPULATED end.
+/// RECORDED DEVIATION: GT's own loopback observable is IESENDMESSAGE + a
+/// stale ENOTCONN — its cleanup tries send_state(SERVER_ERROR) on the dead
+/// ctrl and the double-fault CLOBBERS i_errno (debug-traced:
+/// DISPLAY_RESULTS → SERVER_ERROR state-send fails). riperf3 keeps the
+/// honest read class + live errno (#248/#345 convention; the #371-B
+/// timing-deviation precedent). Pre-fix: skeleton doc + raw io key.
+/// Sentence-prefix asserts per the #387 CI lesson (strerror text is
+/// platform-local); Linux-gated like every RST-timing cell.
+#[cfg(target_os = "linux")]
+const RECVMSG_SENTENCE: &str = "unable to receive control message - port may not be available, \
+     the other side may have stopped running, etc.";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn end_loop_rst_takes_ierecvmessage_over_the_populated_doc() {
+    let (sout, serr, status) = drive_server_scenario(true, drive_mock_round_rst);
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    let key = doc["error"].as_str().unwrap_or_default();
+    assert!(
+        key.starts_with(&format!("error - {RECVMSG_SENTENCE}: ")),
+        "the honest IERECVMESSAGE class with the live strerror suffix (#406): {doc}"
+    );
+    assert!(
+        doc["end"]["streams"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "the exchange completed — end stays POPULATED, not the skeleton (#406): {doc}"
+    );
+    assert!(serr.trim().is_empty(), "-J stderr silent: {serr}");
+    assert!(status.success(), "keep-serving class — one-off exits 0");
+}
+
+/// #406, text half: one summary dump (the exchange completed) + the line.
+#[cfg(target_os = "linux")]
+#[test]
+fn end_loop_rst_prints_summary_and_the_line_in_text() {
+    let (sout, serr, status) = drive_server_scenario(false, drive_mock_round_rst);
+    assert!(
+        serr.trim()
+            .starts_with(&format!("riperf3: error - {RECVMSG_SENTENCE}: ")),
+        "GT's sentence + live strerror suffix: {serr:?}"
+    );
+    assert_eq!(
+        sout.matches(SUMMARY_SEPARATOR).count(),
+        1,
+        "the completed round prints its summary: {sout}"
+    );
+    assert!(status.success(), "one-off exits 0");
 }
 
 /// #330: a KNOWN state (ParamExchange=9) landing mid-test is GT's same

@@ -37,7 +37,8 @@ use crate::json_report::Report;
 /// [`Server::run_once`](crate::Server::run_once). Some variants are role-
 /// specific: `ServerTerminated`/`ServerError` only occur on the client side
 /// (the server told the client), and `ClientTerminated`/`ControlClosed`/
-/// `UnknownMessage`/`RecvResultsFailed`/`SendFailed`/`SelfTerminated` only on
+/// `UnknownMessage`/`RecvResultsFailed`/`SendFailed`/`RecvMessageFailed`/
+/// `SelfTerminated` only on
 /// the server side (what the server saw). `Completed` and `Interrupted` occur
 /// on both.
 ///
@@ -92,6 +93,13 @@ pub enum Termination {
     /// report carries the accumulated stats.
     SendFailed(String),
 
+    /// The post-exchange IperfDone wait read failed HARD — the client RST'd
+    /// after the completed exchange (iperf3's IERECVMESSAGE, #406; the
+    /// abrupt-EOF sibling is [`Self::ControlClosed`]). The `String` is
+    /// iperf3's mapped message with the live errno. The report carries the
+    /// FULL stats — the exchange completed.
+    RecvMessageFailed(String),
+
     /// The server ended the test on its OWN limit — `--server-bitrate-limit`,
     /// the `--server-max-duration` watchdog, or the idle watchdog (the symmetric
     /// counterpart, server-side, of the client's [`Self::ServerError`]). The
@@ -123,6 +131,7 @@ impl Termination {
             | Termination::UnknownMessage
             | Termination::RecvResultsFailed
             | Termination::SendFailed(_)
+            | Termination::RecvMessageFailed(_)
             | Termination::SelfTerminated(_) => None,
         }
     }
@@ -178,6 +187,7 @@ mod tests {
             Termination::UnknownMessage,
             Termination::RecvResultsFailed,
             Termination::SendFailed("send failed".into()),
+            Termination::RecvMessageFailed("recv failed".into()),
             Termination::SelfTerminated("limit".into()),
         ] {
             assert_eq!(none.errexit_message(), None, "{none:?} must not errexit");

@@ -326,6 +326,13 @@ struct TestRunCtx {
     /// IERECVRESULTS surface for every close-type and file upstream rather
     /// than reproduce the misleading flip.
     exchange_recv_failed: bool,
+    /// #406: the IperfDone-wait read failed HARD (peer RST after the
+    /// completed exchange) — GT's IERECVMESSAGE read-site class, the error
+    /// sibling of `ctrl_closed`'s EOF. Holds the typed
+    /// [`RiperfError::ExchangeRecvMessageFailed`] (the #371
+    /// exchange_send_error pattern) so the doc key and the Termination
+    /// share one rendering.
+    exchange_recv_message_error: Option<RiperfError>,
     /// #371: a POST-TEST_END exchange-phase SEND failed (the state writes →
     /// IESENDMESSAGE, `send_results` → IESENDRESULTS). Set instead of
     /// propagating the raw io Err so the finalize renders the POPULATED doc
@@ -623,6 +630,11 @@ impl Server {
                             // #371: IESENDMESSAGE/IESENDRESULTS — the live errno
                             // rides the carried message (no dangling ": ").
                             Termination::SendFailed(msg) => {
+                                eprintln!("{prefix}riperf3: error - {msg}")
+                            }
+                            // #406: IERECVMESSAGE — the completed-exchange RST
+                            // read; live errno in the carried message.
+                            Termination::RecvMessageFailed(msg) => {
                                 eprintln!("{prefix}riperf3: error - {msg}")
                             }
                             // Completed / Interrupted / SelfTerminated print no
@@ -1016,6 +1028,7 @@ impl Server {
             ctrl_closed: false,
             early_done: false,
             exchange_recv_failed: false,
+            exchange_recv_message_error: None,
             exchange_send_error: None,
             bare_end: false,
             interrupted: None,
@@ -1072,13 +1085,13 @@ impl Server {
             let (server_output_text, server_output_json, report_source) =
                 self.finish_server_output(&mut ctx, &end, collected);
             let was_captured = server_output_text.is_some();
-            // #353: an exchange Err reaches the gate through this `?` —
+            // #353: an exchange Err would reach the gate through this `?` —
             // counts are frozen at build_result_streams, so the teardown is
-            // safe on this path. Post-#405 the send failures (the
-            // ExchangeResults and DisplayResults state writes, send_results)
-            // are caught into ctx.exchange_send_error and return Ok instead,
-            // so the live Err here is the residual raw-Io recv_state error
-            // in the IperfDone loop.
+            // safe on this path. Post-#405 the send failures are caught into
+            // ctx.exchange_send_error, and post-#406 the IperfDone-loop hard
+            // read error is caught into ctx.exchange_recv_message_error —
+            // every exchange ending now returns Ok with its ctx flag, so no
+            // LIVE Err remains through this `?` (defensive only).
             self.exchange_results_phase(
                 &mut ctx,
                 &end,
@@ -1120,6 +1133,11 @@ impl Server {
                     // #371: GT's IESENDMESSAGE/IESENDRESULTS key over the
                     // populated doc — prefixed like the self-terminate keys,
                     // with the live strerror the variant's Display carries.
+                    end.report_error = Some(format!("error - {err}"));
+                } else if let Some(err) = &ctx.exchange_recv_message_error {
+                    // #406: GT's IERECVMESSAGE key over the populated doc —
+                    // prefixed, live strerror (see the variant's deviation
+                    // record for GT's clobbered loopback observable).
                     end.report_error = Some(format!("error - {err}"));
                 }
             }
@@ -1227,6 +1245,9 @@ impl Server {
             crate::outcome::Termination::RecvResultsFailed
         } else if let Some(err) = ctx.exchange_send_error.take() {
             crate::outcome::Termination::SendFailed(err.to_string())
+        } else if let Some(err) = ctx.exchange_recv_message_error.take() {
+            // #406: same slot order as report_error's site above.
+            crate::outcome::Termination::RecvMessageFailed(err.to_string())
         } else {
             // Clean completion (incl. the #330 mid-test IPERF_DONE bare-end).
             crate::outcome::Termination::Completed
@@ -2712,6 +2733,18 @@ impl Server {
                     Err(RiperfError::PeerDisconnected) => {
                         let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
                         ctx.ctrl_closed = true;
+                        break;
+                    }
+                    // #406: a HARD read error (the peer RST'd after the
+                    // completed exchange) — GT's read-site rval<0 arm is
+                    // IERECVMESSAGE (iperf_server_api.c:256) over the
+                    // POPULATED end, the error sibling of the EOF arm
+                    // above. No relay: the ctrl is dead. See the
+                    // ExchangeRecvMessageFailed deviation record for GT's
+                    // clobbered-class loopback observable.
+                    Err(RiperfError::Io(e)) => {
+                        ctx.exchange_recv_message_error =
+                            Some(RiperfError::ExchangeRecvMessageFailed(e));
                         break;
                     }
                     Err(e) => return Err(e),
@@ -4624,6 +4657,7 @@ mod tests {
             ctrl_closed: false,
             early_done: false,
             exchange_recv_failed: false,
+            exchange_recv_message_error: None,
             exchange_send_error: None,
             bare_end: false,
             interrupted: None,
