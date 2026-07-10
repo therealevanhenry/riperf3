@@ -1,5 +1,34 @@
 //! # riperf3
 //!
+//! A wire- and API-faithful replacement for iperf3 (3.21) in idiomatic Rust:
+//! the same protocol, flags, output, and JSON schema, usable as a CLI or as
+//! this library crate.
+//!
+//! Run a test and read its result — quiet by default (#294), with the
+//! measured [`Report`] and a [`Termination`] saying how the run ended
+//! (#293, see the [`outcome`] module):
+//!
+//! ```no_run
+//! # async fn demo() -> riperf3::Result<()> {
+//! let client = riperf3::ClientBuilder::new("198.51.100.7")
+//!     .duration(5)
+//!     .build()?;
+//! let outcome = client.run().await?;
+//! if outcome.termination != riperf3::Termination::Completed {
+//!     eprintln!("test ended early: {:?}", outcome.termination);
+//! }
+//! if let Some(sent) = &outcome.report.end.sum_sent {
+//!     println!("{} bytes sent", sent.bytes);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The server side mirrors it: [`ServerBuilder`] builds a [`Server`], and
+//! [`Server::run_once`] (or [`Server::bind`] + [`BoundServer::run_once`])
+//! returns the same [`RunOutcome`] per served test, while [`Server::run`]
+//! is the persistent daemon loop the CLI drives.
+//!
 //! ## Unsafe audit
 //!
 //! All unsafe blocks are raw kernel syscalls with no safe Rust wrapper.
@@ -31,10 +60,12 @@ mod macros;
 mod error;
 pub use error::{ConfigError, Result, RiperfError};
 
-mod outcome;
 // The run-result model (#293): `Client::run` and `Server::run_once` both return
 // `RunOutcome` (the measured `Report` + how the run ended) rather than signaling
-// an abnormal end through `Err`.
+// an abnormal end through `Err`. Public as a MODULE (review sweep): its
+// module-level narrative is the #293 contract documentation, which a private
+// `mod` would keep off docs.rs entirely (the `json_report` precedent).
+pub mod outcome;
 pub use outcome::{RunOutcome, Termination};
 
 mod client;

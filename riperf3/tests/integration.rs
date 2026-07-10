@@ -2719,6 +2719,68 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     );
 }
 
+/// The server-side `Interrupted` cell of the same invisibility class: a
+/// mid-test interrupt on `run_once` comes back `Ok(RunOutcome)` with
+/// `Termination::Interrupted`. Like `SelfTerminated` above, an
+/// `Interrupted`↔`Completed` mis-map hits `Server::run`'s silent `_ =>` arm
+/// and both exit 0, so only a lib-level assertion catches it. The client
+/// sees the SERVER_TERMINATE half (iperf_got_sigend's server arm).
+#[tokio::test]
+async fn server_run_once_interrupt_mid_test_ends_interrupted() {
+    let (tx, rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .interrupt(rx)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(6)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let client_task =
+        tokio::spawn(
+            async move { tokio::time::timeout(Duration::from_secs(20), client.run()).await },
+        );
+    // 1.5 s into a 6 s test: the loopback handshake is millis-class even
+    // under CI contention (the breach test above rides the same margin), so
+    // the watch fires in TEST_RUNNING, not the setup phase (which is the
+    // documented Err path instead).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tx.send(Some(
+        "interrupt - the server has terminated by signal Terminated(15)".into(),
+    ))
+    .unwrap();
+
+    let server_result = tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server hung after the interrupt")
+        .expect("server task");
+    let outcome = server_result.expect("an interrupted mid-test round still carries its report");
+    assert_eq!(
+        outcome.termination,
+        riperf3::Termination::Interrupted,
+        "a local signal mid-test ends Interrupted"
+    );
+
+    let cli = client_task
+        .await
+        .expect("client task")
+        .expect("client hung")
+        .expect("client run");
+    assert_eq!(
+        cli.termination,
+        riperf3::Termination::ServerTerminated,
+        "the client sees SERVER_TERMINATE — the symmetric half"
+    );
+}
+
 /// #302: GT enables SO_MAX_PACING_RATE on its ACCEPTED data sockets too
 /// (iperf_tcp.c:138-153), so a client's --fq-rate paces the server's
 /// reverse send path. Live GT reverse --fq-rate 5M ≈ 6.3 Mbps where the

@@ -767,7 +767,13 @@ pub fn apply_fq_rate(fd: &impl std::os::unix::io::AsFd, rate_bits_per_sec: u64) 
         return;
     }
     if set_fq_rate(fd, rate_bits_per_sec).is_err() {
-        eprintln!("warning: Unable to set socket pacing");
+        // The #290 quiet-guard contract wins for embedded library runs, like
+        // protocol.rs's gt_warning (the r1 F6 decision): a quiet caller gets
+        // silence, everyone else gets GT's exact line. Widened to matter by
+        // the #294 default flip — this was the one warning site left ungated.
+        if !crate::macros::output_quiet() {
+            eprintln!("warning: Unable to set socket pacing");
+        }
     }
 }
 

@@ -32,6 +32,22 @@ release tags.
   report and prints nothing. Opt into iperf3's full text/JSON output with `.emit_output(true)`
   (the CLI sets this). Wire protocol, CLI output, and exit codes are unchanged.
 
+### Added
+
+- `riperf3::ErrorSinkGuard`: the CLI's `--logfile` hook for the library's error lines (#364).
+- `Termination::errexit_message()`: the CLI's exit-code hook for the client's abnormal endings (#293).
+- `riperf3::outcome` is a public module documenting the #293 run contract.
+
+### Fixed
+
+- `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
+  `iperf_err` routing; both previously went to stderr (#364).
+- Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual
+  strictness divergences are recorded deviations (#367).
+- Rate-breach and duration-watchdog `-J` documents render a bare `end: {}` like iperf3 (#368).
+- Exchange-phase send failures map to iperf3's IESENDMESSAGE/IESENDRESULTS classes over the
+  populated document instead of a raw-io skeleton (#371).
+
 ## [0.8.0] - 2026-06-28
 
 Architecture-and-API release. Wire protocol and CLI flags unchanged; success-path

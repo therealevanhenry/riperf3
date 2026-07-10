@@ -993,7 +993,7 @@ fn atoi_like_os() -> impl clap::builder::TypedValueParser<Value = i64> {
 /// scanf can't push back more than one byte, so it FAILS outright where
 /// strtod would back up (`1e`, `0x`); modeling with strtod's backed-up
 /// prefix instead is outcome-identical for unit_atoi, because the leftover
-/// byte at the prefix boundary ('e', 'x', '.') is never in [tTgGmMkK] —
+/// byte at the prefix boundary ('e', 'x', '.') is never in `[tTgGmMkK]` —
 /// both roads end at IEUNITVAL (live-probed: `-n 1e`, `-n 1ex`, `-n 0x`
 /// all reject; `-n 0x10` parses as 16).
 fn c_strtod_prefix(s: &[u8]) -> Option<(f64, usize)> {
@@ -1125,7 +1125,7 @@ fn c_strtod_prefix(s: &[u8]) -> Option<(f64, usize)> {
 }
 
 /// The shared suffix step of GT's unit parsers: the number's C-double
-/// prefix, then AT MOST ONE suffix char in [tTgGmMkK] scaling by base^n;
+/// prefix, then AT MOST ONE suffix char in `[tTgGmMkK]` scaling by base^n;
 /// end-of-string means no scaling; junk AFTER a valid suffix is IGNORED
 /// (`10Kx` is 10240: sscanf never reads the x); any OTHER byte right after
 /// the number — or an unparseable number — is Err (IEUNITVAL).
@@ -1269,7 +1269,7 @@ fn unit_atoi_os(arg: &std::ffi::OsStr) -> Result<f64, String> {
 
 /// #263: GT's `-f` parse (iperf_api.c:1236-1256) reads `*optarg` — the
 /// FIRST character only, so `-f kilobits` is `-f k` — and accepts exactly
-/// [kmgtKMGT]; anything else is IEBADFORMAT. 'B'/'b' stay lib-only in both
+/// `[kmgtKMGT]`; anything else is IEBADFORMAT. 'B'/'b' stay lib-only in both
 /// tools (GT's getopt rejects them; unit_snprintf supports them).
 pub fn parse_format_char(arg: &str) -> Option<char> {
     arg.chars().next().filter(|c| "kmgtKMGT".contains(*c))
