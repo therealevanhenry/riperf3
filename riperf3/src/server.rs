@@ -728,13 +728,24 @@ impl Server {
                 | Err(e @ RiperfError::SetNoDelayFailed(_)) => {
                     self.emit_pretest_error(&e);
                 }
+                Err(e @ RiperfError::AccessDenied) => {
+                    // #377 r2 F1: the -J denial doc (with the ingested -b)
+                    // emitted at the auth site, where params is in scope;
+                    // only the text line prints here.
+                    if !json && !crate::macros::output_quiet() {
+                        eprintln!(
+                            "{}riperf3: error - {e}",
+                            crate::macros::output_timestamp_prefix()
+                        );
+                    }
+                }
                 Err(e) => {
                     // Any residual pre-report error rides the same sink: under
                     // -J iperf_err stays silent and puts the message in a
                     // skeleton doc, rather than the raw stderr line GT never
                     // emits in JSON mode (#330 divergence 1).
                     if json {
-                        self.emit_pretest_error_doc(&format!("error - {e}"));
+                        self.emit_pretest_error_doc(&format!("error - {e}"), None);
                     } else if !crate::macros::output_quiet() {
                         eprintln!(
                             "{}riperf3: error - {e}",
@@ -872,7 +883,7 @@ impl Server {
             None => {
                 if let Some(w) = &self.interrupt {
                     if let Some(msg) = w.0.borrow().clone() {
-                        self.emit_pretest_error_doc(&msg);
+                        self.emit_pretest_error_doc(&msg, None);
                     }
                 }
                 return Ok(None);
@@ -918,7 +929,7 @@ impl Server {
         let negotiated = tokio::select! {
             r = self.negotiate_test(&mut ctrl) => r?,
             msg = crate::client::wait_interrupt(neg_interrupt.as_mut()) => {
-                self.emit_pretest_error_doc(&msg);
+                self.emit_pretest_error_doc(&msg, None);
                 return Ok(None);
             }
         };
@@ -946,7 +957,23 @@ impl Server {
         self.print_connect_block(peer_addr, &cookie, &params, &cfg);
 
         // ---- Auth validation (after params, before streams) ----
-        self.authenticate(&mut ctrl, &params).await?;
+        if let Err(e) = self.authenticate(&mut ctrl, &params).await {
+            if matches!(e, RiperfError::AccessDenied) {
+                // #377 r2 F1: GT's auth gate runs AFTER get_parameters
+                // (iperf_api.c:2368 vs :2662), so the denial doc carries
+                // the early target_bitrate like the #260 refusal twins.
+                // Emitted HERE — params is out of scope at the serve
+                // loop's arm, which prints only the text line. (The rarer
+                // auth-failure subclasses — unreadable key, undecodable
+                // token — keep the residual rate-less sink until #395
+                // reworks the surface.)
+                self.emit_pretest_error_doc(
+                    &format!("error - {e}"),
+                    params.bandwidth.filter(|&b| b > 0),
+                );
+            }
+            return Err(e);
+        }
 
         // The test's accumulated state, threaded through the pipeline phases
         // (#289) — field docs on TestRunCtx.
@@ -3686,7 +3713,7 @@ impl Server {
     /// or the --json-stream error+empty-end event pair. No-op in text mode and
     /// under the #290 console-quiet scope. Shared by [`Self::emit_pretest_error`]
     /// and the serve loop's residual generic arm.
-    fn emit_pretest_error_doc(&self, doc_error: &str) {
+    fn emit_pretest_error_doc(&self, doc_error: &str, target_bitrate: Option<u64>) {
         if crate::macros::output_quiet() {
             return;
         }
@@ -3695,7 +3722,13 @@ impl Server {
                 doc_error,
             ));
         } else if self.json_output {
-            println!("{}", crate::json_report::error_document(doc_error));
+            // #377 r2 F1: the skeleton carries the ingested -b when the
+            // caller still had params in scope (the auth deny site) — GT's
+            // get_parameters stamps json_start before every later gate.
+            println!(
+                "{}",
+                crate::json_report::refusal_document(doc_error, target_bitrate)
+            );
         }
     }
 
@@ -3938,7 +3971,7 @@ impl Server {
             _ => format!("error - {err}: "),
         };
         if self.json_output || self.json_stream {
-            self.emit_pretest_error_doc(&doc_error);
+            self.emit_pretest_error_doc(&doc_error, None);
         } else if !crate::macros::output_quiet() {
             // #339 r2b F2: iperf_err stamps its stderr line with the
             // --timestamps prefix (iperf_error.c:51-57, :77) — same

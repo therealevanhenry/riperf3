@@ -4065,6 +4065,50 @@ mod tests {
         );
     }
 
+    /// #377 r2 F2: the early-key gate's stage clause — a stage-0
+    /// (Connecting) server doc stays exactly the three stage-0 keys even
+    /// with a rate ingested. Production server docs are always Started
+    /// (server.rs builds post-test), so the clause is defensive, but it
+    /// carries the #281 staging invariant and GT's stage-0 parallel
+    /// (get_parameters hasn't run at stage 0, so no early key exists
+    /// there either); this pin kills the clause's surviving mutant.
+    #[test]
+    fn rate_set_connecting_stage_doc_keeps_the_three_stage_zero_keys() {
+        let start = Start {
+            stage: StartStage::Connecting,
+            tcp: true,
+            connected: vec![],
+            version: "riperf3 test".into(),
+            system_info: String::new(),
+            timestamp: Timestamp {
+                time: String::new(),
+                timesecs: 0,
+                timemillisecs: 0,
+            },
+            connecting_to: None,
+            accepted_connection: Some(ConnectingTo {
+                host: "127.0.0.1".into(),
+                port: 5201,
+            }),
+            cookie: String::new(),
+            tcp_mss: None,
+            tcp_mss_default: None,
+            target_bitrate: 100_000_000,
+            fq_rate: 0,
+            sock_bufsize: None,
+            sndbuf_actual: None,
+            rcvbuf_actual: None,
+            test_start: None,
+        };
+        let raw = format!("{{\"start\":{}}}", serde_json::to_string(&start).unwrap());
+        assert_eq!(
+            raw_keys(&raw, "start"),
+            ["connected", "version", "system_info"],
+            "a Connecting-stage doc carries no early target_bitrate even \
+             rate-set (#377 r2 F2): {raw}"
+        );
+    }
+
     /// #377 guard: the CLIENT role is untouched — get_parameters is the
     /// server's param ingest, so a rate-set CLIENT doc keeps the single
     /// late (on_connect-slot) key (live-probed 3.21: client -b 100M).
