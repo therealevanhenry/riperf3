@@ -566,11 +566,14 @@ impl Client {
         // `done` and slept this same grace on every path that passes
         // through it (the clean break and the mid-running error/event
         // arms), so a second sleep there buys nothing. The grace is owed
-        // only when this gate is the FIRST to stop the streams (errors
-        // between CreateStreams and the data phase) — and never when no
-        // streams were spawned at all.
+        // only when this gate is the FIRST to stop the streams AND the
+        // test reached TestStart — never when no streams were spawned,
+        // and never on a mid-setup error (#427 r1 F2: pre-TestStart
+        // nothing is in flight to drain — the tasks are parked, `done`
+        // can't wake them, the abort below is what reaps them — and GT
+        // closes immediately on stream-creation failures).
         let grace_owed = !ctx.done.swap(true, Ordering::Relaxed);
-        if grace_owed && !ctx.streams.is_empty() {
+        if grace_owed && !ctx.streams.is_empty() && ctx.stage.started() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         for s in &ctx.streams {

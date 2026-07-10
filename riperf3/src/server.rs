@@ -1069,9 +1069,16 @@ impl Server {
             // SPAWNS (the #426 r1 F2 mid-setup cancel window). The
             // classified arms still reap inline first — the gate below
             // is a no-op on drained streams.
-            if let SetupFlow::ClientDone = self
-                .setup_data_streams(&mut ctx, listener, &mut abort_guard)
-                .await?
+            // Box::pin (#427: the Windows stack-overflow incident): nesting
+            // setup INSIDE this block put its entire poll frame on top of
+            // the block's own — MSVC debug frames tipped the CLI server
+            // (block_on on Windows' 1 MB main-thread stack) into
+            // "thread 'main' has overflowed its stack" at the first accept,
+            // killing every bidir_intervals cell while Linux (8 MB main)
+            // and worker/test threads (2 MB) never noticed. Boxing moves
+            // setup's state out of the enclosing frame; behavior identical.
+            if let SetupFlow::ClientDone =
+                Box::pin(self.setup_data_streams(&mut ctx, listener, &mut abort_guard)).await?
             {
                 // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends
                 // with no error surface, keep-serving like a refusal
@@ -1915,11 +1922,17 @@ impl Server {
                 // as the TCP arm, so they can dispatch ctrl bytes — a
                 // ClientDone (IPERF_DONE) surfaces here like TCP's.
                 let flow = if udp_use_demux {
-                    self.setup_udp_demux_streams(ctx, recv_count, total, max_duration)
+                    self.setup_udp_demux_streams(ctx, recv_count, total, max_duration, abort_guard)
                         .await?
                 } else {
-                    self.setup_udp_recycling_streams(ctx, recv_count, total, max_duration)
-                        .await?
+                    self.setup_udp_recycling_streams(
+                        ctx,
+                        recv_count,
+                        total,
+                        max_duration,
+                        abort_guard,
+                    )
+                    .await?
                 };
                 if let SetupFlow::ClientDone = flow {
                     return Ok(SetupFlow::ClientDone);
@@ -2898,6 +2911,7 @@ impl Server {
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         // The scalar knobs, copied out so the select arms below can borrow
         // ctx whole (dispatch_setup_ctrl_byte / emit_setup_phase_error).
@@ -3144,6 +3158,7 @@ impl Server {
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
