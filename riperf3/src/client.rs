@@ -483,11 +483,9 @@ impl Client {
                         return Err(RiperfError::AccessDenied);
                     }
                     TestState::ServerError => {
-                        // #261: a relay arriving before TestStart is the upfront
-                        // refusal (code 37 et al.) — its `end` is GT's bare {}.
-                        // After TestStart the dump keeps the full structure.
-                        let bare_end = !ctx.stage.started();
-                        let (report, msg) = self.on_server_error_relay(&mut ctx, bare_end).await;
+                        // The relay is a kill — bare end at ANY stage (#404;
+                        // the pre-TestStart refusal was already bare, #261).
+                        let (report, msg) = self.on_server_error_relay(&mut ctx).await;
                         return Ok(Some((
                             report,
                             crate::outcome::Termination::ServerError(msg),
@@ -974,10 +972,10 @@ impl Client {
                 ));
             }
             Some(ControlEvent::ServerError) => {
-                // Mid-test the run is always past TestStart, so the dump
-                // keeps the full report structure (#261). #293: Ok with the
-                // partial report + the ServerError ending.
-                let (report, msg) = self.on_server_error_relay(ctx, false).await;
+                // #404: the mid-test relay renders GT's BARE end too — the
+                // kill never end-processes (see on_server_error_relay).
+                // #293: Ok with the partial report + the ServerError ending.
+                let (report, msg) = self.on_server_error_relay(ctx).await;
                 return Ok(StepFlow::Return(
                     Box::new(report),
                     crate::outcome::Termination::ServerError(msg),
@@ -1062,13 +1060,15 @@ impl Client {
     /// receipt line only (iperf_err's shape; no summary dump — that is
     /// SERVER_TERMINATE's). JSON sinks: render the full document/events with
     /// the error inside, like iperf3's json_top; the CLI suppresses its
-    /// generic re-render. `bare_end` is the caller's: a relay before
-    /// TestStart is the upfront refusal (code 37 et al.) — emit GT's minimal
-    /// doc (`end: {}`; the late start fields already gate on the stage) (#261).
+    /// generic re-render. The `end` is BARE regardless of stage (#404): the
+    /// relay is a KILL, not a finalize — GT's client errexits via
+    /// iperf_json_finish before end processing (live-probed 3.21: bare on
+    /// the upfront refusal AND the mid-run breach; contrast
+    /// SERVER_TERMINATE, which GT end-processes and both tools populate).
+    /// The late start fields still gate on the stage (#261).
     async fn on_server_error_relay(
         &self,
         ctx: &mut RunCtx,
-        bare_end: bool,
     ) -> (crate::json_report::Report, String) {
         let msg = match protocol::read_server_error_payload(&mut ctx.ctrl).await {
             Some((i_errno, os_errno)) => crate::error::iperf3_strerror(i_errno, os_errno),
@@ -1079,7 +1079,7 @@ impl Client {
         // one-line receipt only (GT renders no summary here) but the caller
         // still gets the structured data via build_results.
         let report = if self.json_output || self.json_stream {
-            self.emit_results(ctx, None, bare_end, ctx.measured_secs, Some(&msg))
+            self.emit_results(ctx, None, true, ctx.measured_secs, Some(&msg))
         } else {
             // #290: quiet runs surface the error via the RunOutcome alone.
             if !crate::macros::output_quiet() {
@@ -1092,7 +1092,9 @@ impl Client {
                     crate::macros::output_timestamp_prefix()
                 ));
             }
-            self.partial_report(ctx, None, bare_end, ctx.measured_secs, Some(&msg))
+            // Bare end here too (#404): the RunOutcome's report carries the
+            // same shape in every output mode.
+            self.partial_report(ctx, None, true, ctx.measured_secs, Some(&msg))
         };
         (report, msg)
     }
