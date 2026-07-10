@@ -40,6 +40,12 @@ release tags.
 
 ### Fixed
 
+- Rate-set server documents place `target_bitrate` at iperf3's get_parameters slot (right
+  after `system_info`, shifting the TCP trio); the duplicate on_connect emission is a
+  recorded deviation (#377).
+- `--get-server-output` no longer alphabetizes the embedded server document
+  (serde_json `preserve_order`); the params/results wire blobs now match iperf3's key
+  order too (#378).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

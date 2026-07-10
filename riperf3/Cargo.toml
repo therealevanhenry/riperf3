@@ -27,7 +27,13 @@ sha2.workspace = true
 # serde_json::value::RawValue. A workspace-only feature does NOT flatten on
 # publish, which would leave the published crate free-riding on a consumer to
 # enable raw_value — the same socket2 #92 trap as `all` below.
-serde_json = { workspace = true, features = ["raw_value"] }
+# preserve_order (#378): GT is cJSON end-to-end — insertion order everywhere —
+# so an alphabetizing serde_json::Map is the ONE traitor to the #300-class key
+# order wherever a doc round-trips through Value (the --get-server-output
+# attach + re-emit, the params/results wire blobs). IndexMap-backed maps make
+# every Value round-trip order-preserving; the hand-written serializers
+# already emit GT's order. Crate-level for the same publish-flattening reason.
+serde_json = { workspace = true, features = ["raw_value", "preserve_order"] }
 socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
