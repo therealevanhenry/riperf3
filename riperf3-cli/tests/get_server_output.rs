@@ -192,6 +192,94 @@ fn json_client_gets_server_output_json() {
     );
 }
 
+/// Depth-1 keys of the object at the first `"obj":` in `raw` — a raw-string
+/// walk, because parsed `Value` asserts are order-blind (the json_report
+/// unit pins' technique). Slice `raw` first to scope into a nested object.
+fn raw_keys(raw: &str, obj: &str) -> Vec<String> {
+    let from = raw.find(&format!("\"{obj}\":")).unwrap() + obj.len() + 3;
+    let bytes = raw.as_bytes();
+    let mut depth = 0i32;
+    let mut i = from;
+    let mut out = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b'"' => {
+                let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                if depth == 1 && bytes.get(close + 1) == Some(&b':') {
+                    out.push(raw[i + 1..close].to_string());
+                }
+                i = close;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// #378: the embedded server doc must keep the SERVER's hand-serialized key
+/// order end-to-end — GT splices the cJSON subtree as received, so a GT-GT
+/// run shows `server_output_json.start` in the #355 server insertion order
+/// (live-probed 3.21). A `serde_json::Value` round-trip alphabetizes the
+/// whole subtree at BOTH hops (the server's attach and this client's
+/// re-emit), destroying the #300-class wire order.
+#[test]
+fn server_output_json_keeps_the_server_key_order() {
+    let port = free_port();
+    let ps = port.to_string();
+    let server = spawn_server_capturing(&["-J"], &ps);
+    let out = run_capturing(
+        &[
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &ps,
+            "-t",
+            "1",
+            "-J",
+            "--get-server-output",
+        ],
+        Duration::from_secs(20),
+        "client",
+    );
+    let _ = collect_stdout(server);
+
+    let soj_at = out.find("\"server_output_json\":").expect("attachment");
+    let embedded = &out[soj_at..];
+    assert_eq!(
+        raw_keys(embedded, "server_output_json"),
+        ["start", "intervals", "end"],
+        "the embedded doc keeps GT's top-level order (#378): {out}"
+    );
+    assert_eq!(
+        raw_keys(embedded, "start"),
+        [
+            "connected",
+            "version",
+            "system_info",
+            "sock_bufsize",
+            "sndbuf_actual",
+            "rcvbuf_actual",
+            "timestamp",
+            "accepted_connection",
+            "cookie",
+            "tcp_mss_default",
+            "target_bitrate",
+            "fq_rate",
+            "test_start"
+        ],
+        "the embedded start keeps the #355 server insertion order, not \
+         the alphabetized Value round-trip (#378): {out}"
+    );
+}
+
 /// Without the flag nothing changes: no Server output section, no keys.
 #[test]
 fn no_flag_no_server_output() {
