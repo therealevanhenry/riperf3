@@ -339,6 +339,14 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
         connected: [(); 0],
         version: String,
         system_info: String,
+        // #377: get_parameters' early key on rate-set requests
+        // (iperf_api.c:2662) — the kill doc rides the same GT json_start,
+        // so the shift shows here too (live-probed via a params-then-EOF
+        // mock). Exactly one of early/late is Some: GT also emits the
+        // on_connect occurrence (iperf_api.c:1029), a duplicate JSON key —
+        // the recorded #377 deviation riperf3 omits.
+        #[serde(rename = "target_bitrate", skip_serializing_if = "Option::is_none")]
+        early_target_bitrate: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sock_bufsize: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,7 +358,8 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
         cookie: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         tcp_mss_default: Option<u32>,
-        target_bitrate: u64,
+        #[serde(rename = "target_bitrate", skip_serializing_if = "Option::is_none")]
+        late_target_bitrate: Option<u64>,
         fq_rate: u64,
     }
     #[derive(Serialize)]
@@ -367,6 +376,7 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
             connected: [],
             version: format!("riperf3 {}", env!("CARGO_PKG_VERSION")),
             system_info: crate::utils::system_info(),
+            early_target_bitrate: (d.target_bitrate != 0).then_some(d.target_bitrate),
             sock_bufsize: d.sock_bufsize,
             sndbuf_actual: d.sndbuf_actual,
             rcvbuf_actual: d.rcvbuf_actual,
@@ -381,7 +391,7 @@ fn setup_phase_document<E: Serialize>(d: &SetupPhaseDoc, end: &E, error: Option<
             },
             cookie: &d.cookie,
             tcp_mss_default: d.tcp_mss_default,
-            target_bitrate: d.target_bitrate,
+            late_target_bitrate: (d.target_bitrate == 0).then_some(d.target_bitrate),
             fq_rate: d.fq_rate,
         },
         intervals: [],
@@ -482,6 +492,20 @@ impl Serialize for Start {
         m.serialize_entry("connected", &self.connected)?;
         m.serialize_entry("version", &self.version)?;
         m.serialize_entry("system_info", &self.system_info)?;
+        // #377: GT's get_parameters inserts target_bitrate right after
+        // system_info whenever the exchanged rate is nonzero
+        // (iperf_api.c:2662) — SERVER role only (it's the param ingest) —
+        // and on_connect then emits the key AGAIN (iperf_api.c:1029): a
+        // duplicate JSON key no strict serializer can express, and
+        // arguably a GT defect. riperf3 emits the EARLY occurrence only
+        // (both carry the same exchanged rate; cJSON's lookup reads the
+        // first) — the recorded #377 deviation; every other key stays
+        // byte-aligned, including the trio shifting to 5-7 on rate-set
+        // TCP (all cells live-probed 3.21).
+        let early_tb = self.accepted_connection.is_some() && self.target_bitrate != 0;
+        if early_tb && self.stage != StartStage::Connecting {
+            m.serialize_entry("target_bitrate", &self.target_bitrate)?;
+        }
         // #355: the TCP SERVER inserts the bufsize trio at listen time
         // (iperf_tcp.c:372-375) — positions 4-6, BEFORE timestamp; the
         // client takes them at TestStart, after fq_rate, and the UDP
@@ -516,7 +540,12 @@ impl Serialize for Start {
             if let Some(v) = &self.tcp_mss_default {
                 m.serialize_entry("tcp_mss_default", v)?;
             }
-            m.serialize_entry("target_bitrate", &self.target_bitrate)?;
+            // The on_connect slot — skipped when the #377 early occurrence
+            // already went out (GT emits BOTH; the dup is the recorded
+            // deviation).
+            if !early_tb {
+                m.serialize_entry("target_bitrate", &self.target_bitrate)?;
+            }
             m.serialize_entry("fq_rate", &self.fq_rate)?;
         }
         if self.stage == StartStage::Started {
@@ -3902,9 +3931,9 @@ mod tests {
     /// listener inserts it early (iperf_tcp.c:372-375); UDP's lands at
     /// CREATE_STREAMS via iperf_udp_buffercheck (iperf_udp.c:440-452,
     /// after on_connect), i.e. the client slot. A protocol-blind server
-    /// gate would regress this previously-GT-matching cell. (GT also
-    /// duplicates target_bitrate at position 4 on rate-set runs — the
-    /// recorded #377 divergence; riperf3 emits it once.)
+    /// gate would regress this previously-GT-matching cell. (Rate-set
+    /// runs move target_bitrate to position 4 — the #377 pins below;
+    /// this zero-rate cell keeps the late single occurrence.)
     #[test]
     fn udp_server_role_start_key_order_keeps_the_late_trio() {
         let mut input = base_input();
@@ -3934,6 +3963,132 @@ mod tests {
                 "test_start"
             ],
             "UDP server start keys must keep GT's late trio (#355 r1 F1): {raw}"
+        );
+    }
+
+    /// #377: GT's get_parameters inserts `target_bitrate` right after
+    /// system_info (iperf_api.c:2662) whenever the exchanged rate is
+    /// nonzero — SERVER role only — shifting the TCP early trio to
+    /// positions 5-7. GT then emits the key AGAIN at on_connect
+    /// (iperf_api.c:1029): a duplicate JSON key no strict serializer can
+    /// express. riperf3 emits the EARLY occurrence only — the recorded
+    /// #377 deviation (both occurrences carry the same exchanged rate;
+    /// cJSON's lookup reads the first) — leaving every other key
+    /// byte-aligned with GT (all cells live-probed 3.21, 2026-07-09).
+    #[test]
+    fn rate_set_tcp_server_start_moves_target_bitrate_to_gt_position_4() {
+        let mut input = base_input();
+        input.is_server = true;
+        input.connecting_host = String::new();
+        input.connecting_port = 0;
+        input.accepted_host = "127.0.0.1".into();
+        input.accepted_port = 5201;
+        input.target_bitrate = 100_000_000;
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+        assert_eq!(
+            raw_keys(&raw, "start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "target_bitrate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "tcp_mss_default",
+                "fq_rate",
+                "test_start"
+            ],
+            "rate-set TCP server start keys must match GT's get_parameters \
+             insertion (#377): {raw}"
+        );
+        assert_eq!(
+            raw_keys(&raw, "start")
+                .iter()
+                .filter(|k| *k == "target_bitrate")
+                .count(),
+            1,
+            "exactly ONE start-level occurrence — GT's on_connect duplicate \
+             is the recorded #377 deviation (test_start's own key is a \
+             different, legitimate field): {raw}"
+        );
+    }
+
+    /// #377, UDP cell: the early key lands right after system_info and the
+    /// late trio stays late — GT UDP default-rate order, minus the dup.
+    #[test]
+    fn rate_set_udp_server_start_moves_target_bitrate_to_gt_position_4() {
+        let mut input = base_input();
+        input.protocol = TransportProtocol::Udp;
+        input.is_server = true;
+        input.connecting_host = String::new();
+        input.connecting_port = 0;
+        input.accepted_host = "127.0.0.1".into();
+        input.accepted_port = 5201;
+        input.target_bitrate = 1_048_576; // GT's UDP default: rate-set is UDP's norm
+        input.streams = vec![udp_stream(1, true, 131072 * 96, None, 0.001, 0, 96)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+        assert_eq!(
+            raw_keys(&raw, "start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "target_bitrate",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "fq_rate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "test_start"
+            ],
+            "rate-set UDP server start keys must match GT's get_parameters \
+             insertion (#377): {raw}"
+        );
+        assert_eq!(
+            raw_keys(&raw, "start")
+                .iter()
+                .filter(|k| *k == "target_bitrate")
+                .count(),
+            1,
+            "exactly ONE start-level occurrence — the #377 dup stays \
+             omitted: {raw}"
+        );
+    }
+
+    /// #377 guard: the CLIENT role is untouched — get_parameters is the
+    /// server's param ingest, so a rate-set CLIENT doc keeps the single
+    /// late (on_connect-slot) key (live-probed 3.21: client -b 100M).
+    #[test]
+    fn rate_set_client_start_keeps_the_late_target_bitrate() {
+        let mut input = base_input();
+        input.target_bitrate = 100_000_000;
+        input.streams = vec![tcp_stream(1, true, 10, 10)];
+        let raw = serde_json::to_string(&input.build()).unwrap();
+        assert_eq!(
+            raw_keys(&raw, "start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "timestamp",
+                "connecting_to",
+                "cookie",
+                "tcp_mss_default",
+                "target_bitrate",
+                "fq_rate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "test_start"
+            ],
+            "a rate-set CLIENT start block keeps GT's client order (#377): {raw}"
         );
     }
 
@@ -4102,6 +4257,70 @@ mod tests {
                 "sender"
             ],
             "UDP sum_sent key order drifted from GT: {raw}"
+        );
+    }
+
+    /// #377, setup-doc cell: the kill doc rides the same GT json_start —
+    /// get_parameters ran before the kill, so a rate-set request shows the
+    /// early key + the shifted trio there too (live-probed 3.21 via a
+    /// params-then-EOF mock: `...system_info, target_bitrate, sock_bufsize,
+    /// sndbuf_actual, rcvbuf_actual, timestamp, ..., tcp_mss_default,
+    /// target_bitrate, fq_rate` — the second occurrence again the recorded
+    /// dup riperf3 omits).
+    #[test]
+    fn rate_set_setup_document_moves_target_bitrate_to_gt_position_4() {
+        let d = SetupPhaseDoc {
+            sock_bufsize: Some(0),
+            sndbuf_actual: Some(16384),
+            rcvbuf_actual: Some(131072),
+            tcp_mss_default: Some(0),
+            udp: false,
+            timemillisecs: 1_700_000_000_000,
+            accepted_host: "127.0.0.1".into(),
+            accepted_port: 5201,
+            cookie: "c".repeat(36),
+            target_bitrate: 100_000_000,
+            fq_rate: 0,
+        };
+        let raw = setup_terminate_document(
+            &d,
+            "the client has terminated",
+            &CpuUtilization {
+                host_total: 1.0,
+                host_user: 0.5,
+                host_system: 0.5,
+                remote_total: 0.0,
+                remote_user: 0.0,
+                remote_system: 0.0,
+            },
+        );
+        assert_eq!(
+            raw_keys(&raw, "start"),
+            [
+                "connected",
+                "version",
+                "system_info",
+                "target_bitrate",
+                "sock_bufsize",
+                "sndbuf_actual",
+                "rcvbuf_actual",
+                "timestamp",
+                "accepted_connection",
+                "cookie",
+                "tcp_mss_default",
+                "fq_rate"
+            ],
+            "rate-set setup start keys must match GT's get_parameters \
+             insertion (#377): {raw}"
+        );
+        assert_eq!(
+            raw_keys(&raw, "start")
+                .iter()
+                .filter(|k| *k == "target_bitrate")
+                .count(),
+            1,
+            "exactly ONE start-level occurrence — the #377 dup stays \
+             omitted: {raw}"
         );
     }
 
