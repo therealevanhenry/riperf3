@@ -42,6 +42,10 @@ release tags.
 
 ### Fixed
 
+- `-w 0` is a no-op like iperf3 (0 = kernel autotuning): the window is never applied to
+  data sockets — was clamping both buffers to kernel minimums, a live throughput hit — and
+  the params blob omits the `"window"` key, so a `-w 0` client no longer shrinks a riperf3
+  server's buffers either (#415).
 - Rate-set server documents place `target_bitrate` at iperf3's get_parameters slot (right
   after `system_info`, shifting the TCP trio); the duplicate on_connect emission is a
   recorded deviation (#377).
