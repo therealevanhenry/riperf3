@@ -453,8 +453,9 @@ enum SetupFlow {
     ClientDone,
 }
 
-/// GT's IETOTALRATE(27) strerror — the #260 upfront total-rate refusal
-/// (get_parameters, iperf_api.c:2672-2684) AND the in-flight 1 Hz breach.
+/// GT's IETOTALRATE(27) strerror, wired here to the #260 upfront
+/// total-rate refusal only (get_parameters, iperf_api.c:2672-2684); the
+/// in-flight 1 Hz breach carries the same strerror through its own site.
 const TOTAL_RATE_REFUSAL_MSG: &str = "total required bandwidth is larger than server limit";
 
 /// GT's IEMAXSERVERTESTDURATIONEXCEEDED(37) strerror — the #230 upfront
@@ -978,11 +979,13 @@ impl Server {
         let (cookie, params, cfg) = match negotiated {
             NegotiateOutcome::Proceed(negotiated) => *negotiated,
             // Refused before any test ran → no report. #386: the round does
-            // NOT end at the relay — it parks until the client closes (GT
-            // cleanup_server's sync-close drain), and only then renders the
-            // refusal sinks; a signal landing in the park ABANDONS the
-            // refusal doc and emits the interrupt skeleton alone, carrying
-            // the parked round's target_bitrate (GT stamps json_start at
+            // NOT end at the relay — it parks until the client closes OR
+            // 10 s of ctrl silence (GT cleanup_server's sync-close drain,
+            // which is BOUNDED by Nread's front-select — see
+            // park_refused_round), and only then renders the refusal
+            // sinks; a signal landing in the park ABANDONS the refusal doc
+            // and emits the interrupt skeleton alone, carrying the parked
+            // round's target_bitrate (GT stamps json_start at
             // get_parameters and sigend's json_finish renders it — cell B
             // live-probed). The park sits OUTSIDE the #361 select above so
             // that select's rate-less skeleton can't win the signal race.
@@ -1399,11 +1402,11 @@ impl Server {
 
     /// Cookie read + ParamExchange + config derivation, plus the #230/#260
     /// upfront refusal checks. A `Refused` outcome has SENT its relay but
-    /// NOT emitted its doc: the round must first PARK until client EOF
-    /// (#386 — GT cleanup_server's sync-close drain), owned by
-    /// handle_one_test so the park is not raced by the #361 negotiate-phase
-    /// interrupt select (whose skeleton carries no target_bitrate — the
-    /// parked round's must, GT cell B).
+    /// NOT emitted its doc: the round must first PARK until client EOF or
+    /// GT's 10 s drain bound (#386 — cleanup_server's sync-close drain),
+    /// owned by handle_one_test so the park is not raced by the #361
+    /// negotiate-phase interrupt select (whose skeleton carries no
+    /// target_bitrate — the parked round's must, GT cell B).
     async fn negotiate_test(&self, ctrl: &mut tokio::net::TcpStream) -> Result<NegotiateOutcome> {
         // ---- Cookie ----
         // #330: a failed cookie read is GT's IERECVCOOKIE(106) — iperf_accept
@@ -3847,14 +3850,19 @@ impl Server {
 
     /// #386: GT's refused round does not END at the relay — cleanup_server
     /// closes the ctrl through iperf_sync_close_socket (net.c:877-886):
-    /// shutdown(SHUT_WR), then READ UNTIL EOF. The round parks until the
-    /// CLIENT closes — unbounded, like GT (a signal is the only other
-    /// exit; a wedged client holds GT's server the same way). Returns the
-    /// interrupt message if a signal ended the park — the refusal doc is
-    /// then ABANDONED (GT's sigend longjmps past the unprinted doc and
-    /// emits the interrupt skeleton alone; cells A/B live-probed
-    /// 2026-07-10) — or None on client EOF/RST (emit the refusal doc,
-    /// GT's Nread <= 0 drain exit).
+    /// shutdown(SHUT_WR), then a drain loop `while (Nread(...) > 0)`. The
+    /// drain is BOUNDED, not read-until-EOF (#429 r1 F1 — GT's own "Read
+    /// until EOF" comment misleads): each Nread front-selects with
+    /// nread_read_timeout = 10 s (net.c:75, :415-436) and returns 0 on
+    /// silence, which fails the `> 0` test exactly like EOF — GT
+    /// live-probed self-freeing at ~10 s against a wedged holder, refusal
+    /// doc rendered. So the park ends on client EOF/RST, 10 s of ctrl
+    /// silence (both -> None: emit the refusal doc), or a signal (Some:
+    /// the doc is ABANDONED — GT's sigend longjmps past the unprinted doc
+    /// and emits the interrupt skeleton alone; cells A/B live-probed
+    /// 2026-07-10). The idle clock is per-read, like GT's per-Nread
+    /// select: a dripping peer can extend the park (the recorded
+    /// nread_step nuance in protocol.rs).
     async fn park_refused_round(&self, ctrl: &mut tokio::net::TcpStream) -> Option<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = ctrl.shutdown().await; // GT's SHUT_WR half-close
@@ -3866,6 +3874,7 @@ impl Server {
                     Ok(0) | Err(_) => return None,
                     Ok(_) => continue, // drain, like GT's read loop
                 },
+                _ = tokio::time::sleep(protocol::NREAD_IDLE_TIMEOUT) => return None,
                 msg = crate::client::wait_interrupt(interrupt.as_mut()) => {
                     return Some(msg);
                 }

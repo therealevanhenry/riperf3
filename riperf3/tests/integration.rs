@@ -1889,6 +1889,53 @@ mod unimplemented_flags {
         assert!(out.is_err(), "refusal has no report: {out:?}");
     }
 
+    /// #386 (#429 r1 F1): the park is BOUNDED — GT's drain rides Nread,
+    /// whose front-select times out at 10 s of silence and returns 0,
+    /// failing the `> 0` drain test exactly like EOF (net.c:75, :415-436;
+    /// GT live-probed self-freeing at ~10 s against a wedged holder, doc
+    /// rendered). A client that reads the relay and HOLDS silently must
+    /// not wedge the round forever: run_once ends within the bound. ~10 s
+    /// of wall clock by design (the 41 s watchdog cell made the opposite
+    /// call; this one IS the r1 blocker, so it stays pinned).
+    #[tokio::test]
+    async fn refused_round_park_is_bounded_at_nread_idle() {
+        use std::io::{Read, Write};
+
+        let server = ServerBuilder::new()
+            .port(Some(0))
+            .server_max_duration(2)
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let bound = server.bind().await.expect("bind");
+        let port = bound.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move { bound.run_once().await });
+
+        let _held = tokio::task::spawn_blocking(move || {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            let mut b = [0u8; 1];
+            ctrl.read_exact(&mut b).unwrap();
+            assert_eq!(b[0], 9, "ParamExchange");
+            let params = br#"{"tcp":true,"time":30,"parallel":1,"len":4096}"#;
+            ctrl.write_all(&(params.len() as u32).to_be_bytes())
+                .unwrap();
+            ctrl.write_all(params).unwrap();
+            let mut relay = [0u8; 9];
+            ctrl.read_exact(&mut relay).unwrap();
+            assert_eq!(relay[0], 0xfe, "SERVER_ERROR state");
+            ctrl // hold silently — never close
+        })
+        .await
+        .expect("mock");
+
+        let out = tokio::time::timeout(Duration::from_secs(14), handle)
+            .await
+            .expect("the park self-frees at ~10 s against a silent holder")
+            .expect("join");
+        assert!(out.is_err(), "refusal has no report: {out:?}");
+    }
+
     #[tokio::test]
     async fn server_max_duration() {
         // #230: --server-max-duration is an UPFRONT param-exchange check in
