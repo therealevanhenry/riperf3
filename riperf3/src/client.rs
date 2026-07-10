@@ -3438,7 +3438,12 @@ impl ClientBuilder {
     }
 
     /// Like [`Self::window`], accepting a KMG-suffixed size string
-    /// (`-w 4M`; binary, 1024-based).
+    /// (`-w 4M`; binary, 1024-based). The parsed value is cast to `i32`
+    /// without a range check (like iperf3's `(int) unit_atof(optarg)`), so an
+    /// out-of-range size wraps — `"4G"` wraps to 0, which [`Self::window`]
+    /// then treats as unset (#432 r2 F4). iperf3's CLI rejects anything over
+    /// 512M (IEBUFSIZE) before its cast; callers wanting that guard should
+    /// range-check before calling, as riperf3's own CLI does.
     pub fn window_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.window(parse_kmg(s)? as i32))
     }
