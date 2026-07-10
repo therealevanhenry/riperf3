@@ -63,6 +63,10 @@ pub enum Termination {
     /// The server relayed an error (`SERVER_ERROR`) — e.g. an upfront refusal
     /// (`--server-bitrate-limit`, `--server-max-duration`) or a mid-test
     /// breach. The `String` is iperf3's mapped `iperf_strerror` message.
+    /// The report's `end` is BARE (sums/CPU `None`) at any stage — iperf3
+    /// never end-processes this kill; the partial stats ride `intervals`
+    /// (#404). Contrast [`Self::ServerTerminated`], which iperf3
+    /// end-processes into a full `end`.
     ServerError(String),
 
     // --- Server-side endings (what the server observed) ---
