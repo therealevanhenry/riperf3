@@ -1824,6 +1824,119 @@ mod unimplemented_flags {
         mock.abort();
     }
 
+    /// #386: GT's refused round does not END at the relay — cleanup_server
+    /// closes the ctrl through iperf_sync_close_socket (net.c:877-886):
+    /// shutdown(SHUT_WR), then the BOUNDED drain (per-Nread 10 s idle —
+    /// see the bound pin below). The round (and its refusal doc) completes
+    /// at the client's close or the bound, whichever first; riperf3
+    /// completed immediately (probed 30/30 vs GT 10/10 under the #385 r1
+    /// signal race). A mock that reads the fe+37 relay and HOLDS must see
+    /// (a) the server's FIN promptly (the SHUT_WR half) while (b) run_once
+    /// stays parked well under the bound; the mock's close ends the round.
+    #[tokio::test]
+    async fn refused_round_parks_until_client_eof() {
+        use std::io::{Read, Write};
+
+        let server = ServerBuilder::new()
+            .port(Some(0))
+            .server_max_duration(2)
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let bound = server.bind().await.expect("bind");
+        let port = bound.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move { bound.run_once().await });
+
+        let held = tokio::task::spawn_blocking(move || {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            let mut b = [0u8; 1];
+            ctrl.read_exact(&mut b).unwrap();
+            assert_eq!(b[0], 9, "ParamExchange");
+            let params = br#"{"tcp":true,"time":30,"parallel":1,"len":4096}"#;
+            ctrl.write_all(&(params.len() as u32).to_be_bytes())
+                .unwrap();
+            ctrl.write_all(params).unwrap();
+            let mut relay = [0u8; 9];
+            ctrl.read_exact(&mut relay).unwrap();
+            assert_eq!(relay[0], 0xfe, "SERVER_ERROR state");
+            assert_eq!(
+                u32::from_be_bytes(relay[1..5].try_into().unwrap()),
+                37,
+                "IEMAXSERVERTESTDURATIONEXCEEDED"
+            );
+            // (a) the server half-closes promptly (GT's SHUT_WR): the next
+            // read is EOF, not a hang.
+            ctrl.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+            let n = ctrl.read(&mut b).expect("the shutdown FIN arrives bounded");
+            assert_eq!(n, 0, "EOF from the server's write-half shutdown");
+            ctrl
+        })
+        .await
+        .expect("mock");
+
+        // (b) the round is PARKED while the client holds.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !handle.is_finished(),
+            "#386: the refused round must park until the client closes"
+        );
+        drop(held); // client EOF → the round ends
+        let out = tokio::time::timeout(Duration::from_secs(4), handle)
+            .await
+            .expect("the round ends bounded after client EOF")
+            .expect("join");
+        // A refusal is a no-report round: Err per the #293 rule.
+        assert!(out.is_err(), "refusal has no report: {out:?}");
+    }
+
+    /// #386 (#429 r1 F1): the park is BOUNDED — GT's drain rides Nread,
+    /// whose front-select times out at 10 s of silence and returns 0,
+    /// failing the `> 0` drain test exactly like EOF (net.c:75, :415-436;
+    /// GT live-probed self-freeing at ~10 s against a wedged holder, doc
+    /// rendered). A client that reads the relay and HOLDS silently must
+    /// not wedge the round forever: run_once ends within the bound. ~10 s
+    /// of wall clock by design (the 41 s watchdog cell made the opposite
+    /// call; this one IS the r1 blocker, so it stays pinned).
+    #[tokio::test]
+    async fn refused_round_park_is_bounded_at_nread_idle() {
+        use std::io::{Read, Write};
+
+        let server = ServerBuilder::new()
+            .port(Some(0))
+            .server_max_duration(2)
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let bound = server.bind().await.expect("bind");
+        let port = bound.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move { bound.run_once().await });
+
+        let _held = tokio::task::spawn_blocking(move || {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            let mut b = [0u8; 1];
+            ctrl.read_exact(&mut b).unwrap();
+            assert_eq!(b[0], 9, "ParamExchange");
+            let params = br#"{"tcp":true,"time":30,"parallel":1,"len":4096}"#;
+            ctrl.write_all(&(params.len() as u32).to_be_bytes())
+                .unwrap();
+            ctrl.write_all(params).unwrap();
+            let mut relay = [0u8; 9];
+            ctrl.read_exact(&mut relay).unwrap();
+            assert_eq!(relay[0], 0xfe, "SERVER_ERROR state");
+            ctrl // hold silently — never close
+        })
+        .await
+        .expect("mock");
+
+        let out = tokio::time::timeout(Duration::from_secs(14), handle)
+            .await
+            .expect("the park self-frees at ~10 s against a silent holder")
+            .expect("join");
+        assert!(out.is_err(), "refusal has no report: {out:?}");
+    }
+
     #[tokio::test]
     async fn server_max_duration() {
         // #230: --server-max-duration is an UPFRONT param-exchange check in

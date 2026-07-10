@@ -709,7 +709,7 @@ fn gt_warning(msg: std::fmt::Arguments<'_>) {
 /// overall ends the read with the partial count — the warnings then carry
 /// that count like any short read (r1 F3: without these a peer that
 /// half-sends and HOLDS parked the exchange forever; GT self-recovers).
-const NREAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const NREAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const NREAD_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// GT's `NET_HARDERROR` (net.h:50): the value `Nrecv` returns on a hard read
