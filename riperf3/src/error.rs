@@ -131,6 +131,20 @@ pub enum RiperfError {
     #[error("unable to send results: {0}")]
     ExchangeSendResultsFailed(std::io::Error),
 
+    /// iperf3's IERECVMESSAGE: the IperfDone-wait read failed HARD after a
+    /// COMPLETED exchange — the peer RST'd instead of sending IperfDone or
+    /// a clean FIN (#406; iperf_server_api.c:256's rval<0 arm — the EOF
+    /// sibling is IECTRLCLOSE). GT's sentence, perr; the populated-doc
+    /// surface (TEST_END processing ran). RECORDED DEVIATION
+    /// (debug-traced 3.21): GT's loopback observable is usually
+    /// IESENDMESSAGE + a stale ENOTCONN — its cleanup tries
+    /// send_state(SERVER_ERROR) on the dead ctrl and the double-fault
+    /// CLOBBERS i_errno (State: DISPLAY_RESULTS → SERVER_ERROR). riperf3
+    /// keeps the honest read class + live errno (the #248/#345
+    /// convention; the #371-B timing-deviation precedent).
+    #[error("unable to receive control message - port may not be available, the other side may have stopped running, etc.: {0}")]
+    ExchangeRecvMessageFailed(std::io::Error),
+
     /// iperf3's IEACCEPT(104): the control accept() failed
     /// (iperf_server_api.c:163; herr+perr). The site-captured errno rides
     /// — and MATCHES GT's text surface in this pre-test cell (#387 r2 F1
