@@ -58,9 +58,10 @@ release tags.
 - A peer RST after the completed results exchange takes iperf3's IERECVMESSAGE class over
   the populated document instead of a raw-io skeleton; `Termination::RecvMessageFailed` is
   the new server-side ending (#406).
-- Control bytes (`<= 0x20`, NUL included) in whitespace positions of a wire blob parse like
-  cJSON's skip rule (#402); a wrong-typed params field stays a strict IERECVPARAMS error
-  where iperf3 warns and defaults the field — a recorded deviation (#401).
+- Control bytes (`0x01`-`0x1F`) in whitespace positions of a wire blob parse like cJSON's
+  skip rule; NUL stays a terminator like iperf3's strlen-based parse entry (#402). A
+  wrong-typed params field stays a strict IERECVPARAMS error where iperf3 warns and
+  defaults the field — a recorded deviation (#401).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

@@ -311,17 +311,18 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 ///
 /// SCOPE (#343 r1 F2 / #367 / #402): the mirror covers self-delimiting first
 /// values with whitespace-separated tails, a leading UTF-8 BOM (#367 cell 1,
-/// stripped here — cJSON's skip_utf8_bom), control-byte whitespace between
-/// tokens (#402 — normalized here, cJSON's `<= 0x20` skip rule), and the
-/// bare-scalar params root (#367 cell 2, in `params_from_value`). Five
-/// residual cJSON cells stay divergent as RECORDED DEVIATIONS — serde is a
-/// conforming parser and mirroring them means a bespoke lenient parser (or
-/// abandoning the derive) for shapes no real iperf3 encoder emits:
-/// scalar-adjacent garbage (`42GARBAGE`), nesting past serde's 128-deep
-/// limit (cJSON's is 1000), raw control chars in strings, cJSON's lenient
-/// strtod grammar (`01`, `1.`), and a wrong-TYPED object field (#401 —
-/// GT warns + defaults the field). Locked by
-/// `json_first_value_deviations_stay_strict` and
+/// stripped here — cJSON's skip_utf8_bom), control-byte whitespace 0x01-0x1F
+/// between tokens (#402 — normalized here; NUL is a TERMINATOR on GT's
+/// strlen-based parse entry, not whitespace, and serde's NUL error matches —
+/// see normalize_cjson_whitespace), and the bare-scalar params root (#367
+/// cell 2, in `params_from_value`). Five residual cJSON cells stay divergent
+/// as RECORDED DEVIATIONS — serde is a conforming parser and mirroring them
+/// means a bespoke lenient parser (or abandoning the derive) for shapes no
+/// real iperf3 encoder emits: scalar-adjacent garbage (`42GARBAGE`), nesting
+/// past serde's 128-deep limit (cJSON's is 1000), raw control chars in
+/// strings, cJSON's lenient strtod grammar (`01`, `1.`), and a wrong-TYPED
+/// object field (#401 — GT warns + defaults the wrapper-read fields). Locked
+/// by `json_first_value_deviations_stay_strict` and
 /// `params_wrong_typed_field_stays_strict`.
 fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
     let buf = buf.strip_prefix(UTF8_BOM).unwrap_or(buf);
@@ -334,16 +335,24 @@ fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
     }
 }
 
-/// #402 (#367's mirror-class sibling): cJSON treats EVERY byte <= 0x20 as
-/// skippable whitespace between tokens (buffer_skip_whitespace,
-/// cjson.c:1061 — NUL included), so a peer may pad its blob with control
-/// bytes anywhere whitespace is legal and GT interoperates (live-probed:
-/// GT proceeds to CREATE_STREAMS). serde accepts only the four JSON
-/// whitespace bytes; normalize the rest to ' ' OUTSIDE strings. In-string
-/// control bytes are untouched — serde rejects them and that stays the
-/// recorded #367 cell-5 deviation.
+/// #402 (#367's mirror-class sibling): cJSON's scanner treats every byte
+/// <= 0x20 as skippable whitespace between tokens (buffer_skip_whitespace,
+/// cjson.c:1061), so a peer may pad its blob with control bytes anywhere
+/// whitespace is legal and GT interoperates (live-probed: GT proceeds to
+/// CREATE_STREAMS). serde accepts only the four JSON whitespace bytes;
+/// normalize 0x01-0x1F (minus \t \n \r) to ' ' OUTSIDE strings.
+///
+/// NUL is deliberately EXCLUDED (r1): iperf3's parse entry is
+/// strlen-based (JSON_read → cJSON_Parse, iperf_api.c:3053 →
+/// cjson.c:1099's strlen), so an interior/leading 0x00 TRUNCATES the blob
+/// before cJSON's scanner ever runs — GT refuses those (live-probed
+/// SERVER_ERROR) exactly where serde's error at the NUL refuses too, and
+/// a TRAILING 0x00 sits after the first complete value where the
+/// StreamDeserializer never scans (accepted, like GT). Leaving NUL raw is
+/// the mirror. In-string control bytes are untouched — serde rejects
+/// them and that stays the recorded #367 cell-5 deviation.
 fn normalize_cjson_whitespace(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    let is_ctrl_ws = |b: u8| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r');
+    let is_ctrl_ws = |b: u8| (0x01..0x20).contains(&b) && !matches!(b, b'\t' | b'\n' | b'\r');
     // Fast path: conforming blobs (every real iperf3 encoder) borrow.
     if !buf.iter().copied().any(is_ctrl_ws) {
         return std::borrow::Cow::Borrowed(buf);
@@ -1757,18 +1766,34 @@ mod tests {
         assert_eq!(p.tcp, Some(true));
     }
 
-    /// #402 (MIRRORED, cell 7): cJSON treats EVERY byte <= 0x20 as skippable
-    /// whitespace between tokens (buffer_skip_whitespace, cjson.c:1061 —
-    /// NUL included), so a peer may pad its blob with control bytes anywhere
-    /// whitespace is legal and GT proceeds to CREATE_STREAMS (live-probed).
-    /// Red pre-fix (serde accepts only the four JSON whitespace bytes).
-    /// In-string control bytes stay REJECTED — the recorded #367 cell 5.
+    /// #402 (MIRRORED, cell 7): cJSON's scanner treats bytes <= 0x20 as
+    /// skippable whitespace between tokens (buffer_skip_whitespace,
+    /// cjson.c:1061), so 0x01-0x1F padding parses on GT — but NOT NUL
+    /// (r1): iperf3's strlen-based parse entry TRUNCATES at an
+    /// interior/leading 0x00, so GT refuses those (live-probed 0xFE) and
+    /// riperf3's serde error at the NUL matches. A trailing NUL sits after
+    /// the completed first value on both tools. Red pre-fix for the
+    /// 0x01-0x1F cell. In-string control bytes stay REJECTED — the
+    /// recorded #367 cell 5.
     #[test]
     fn json_first_value_normalizes_cjson_whitespace() {
-        let v = json_first_value(b"{\x01\"tcp\":\x1ftrue,\x00\"time\":\x0b1}")
+        let v = json_first_value(b"{\x01\"tcp\":\x1ftrue,\x1f\"time\":\x0b1}")
             .expect("control-byte whitespace parses like cJSON (#402)");
         assert_eq!(v["tcp"], true);
         assert_eq!(v["time"], 1);
+        // NUL is a TERMINATOR on GT (strlen entry), not whitespace —
+        // interior/leading NUL must stay an error on both tools...
+        assert!(
+            json_first_value(b"{\x00\"tcp\":true}").is_err(),
+            "interior NUL truncates on GT — stays an error here (r1)"
+        );
+        assert!(
+            json_first_value(b"\x00{\"tcp\":true}").is_err(),
+            "leading NUL empties GT's parse — stays an error here (r1)"
+        );
+        // ...while a trailing NUL follows the completed value (both accept).
+        let v = json_first_value(b"{\"tcp\":true}\x00\x01").expect("trailing NUL like GT");
+        assert_eq!(v["tcp"], true);
         // The in-string sibling stays strict (recorded, cell 5) — the
         // normalization must not reach inside strings...
         assert!(
@@ -1785,10 +1810,14 @@ mod tests {
     /// #401 (RECORDED DEVIATION, cell 8): a wrong-TYPED object field — GT's
     /// iperf_cJSON_GetObjectItemType wrapper (iperf_util.c:444-477) warns
     /// on stderr ("iperf_cJSON_GetObjectItemType mismatch time") and returns
-    /// NULL, so the field keeps its default and GT RUNS (live-probed: byte
-    /// 0x0a follows); riperf3's serde derive hard-errors → IERECVPARAMS.
-    /// Mirroring means per-field lenient deserialization — the same
-    /// abandon-serde cost as cells 3-6, for hostile-only input. Locked.
+    /// NULL, so WRAPPER-READ fields keep their defaults and GT RUNS
+    /// (live-probed: byte 0x0a follows). r1 scoping: skip_rx_copy is read
+    /// RAW (no warning, truthiness-coerced) and client_version is never
+    /// read by get_parameters — the record covers the wrapper-read fields,
+    /// which is every field riperf3 deserializes. riperf3's serde derive
+    /// hard-errors → IERECVPARAMS. Mirroring means per-field lenient
+    /// deserialization — the same abandon-serde cost as cells 3-6, for
+    /// hostile-only input. Locked.
     #[test]
     fn params_wrong_typed_field_stays_strict() {
         let v = serde_json::json!({"tcp": true, "time": "foo", "parallel": 1});
