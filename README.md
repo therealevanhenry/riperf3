@@ -2,7 +2,7 @@
 
 A ground-up, idiomatic Rust implementation of [iperf3](https://github.com/esnet/iperf), the standard network performance measurement tool — not a C port or a binding, but a faithful reimplementation in safe, async Rust.
 
-riperf3 speaks iperf3's exact wire protocol: a riperf3 client interoperates with an iperf3 server, and vice versa, across every mode. Fidelity is the guiding principle — riperf3 matches iperf3 flag for flag and quirk for quirk rather than reinventing the interface. Where iperf3 accepts an option, riperf3 implements it to behave the same way; it does not reject, rename, or work around iperf3's semantics. The goal is a drop-in you can swap in without your scripts, dashboards, or muscle memory noticing.
+riperf3 speaks iperf3's exact wire protocol: a riperf3 client interoperates with an iperf3 server, and vice versa, across every mode. It's a wire- and API-faithful replacement for iperf3 in idiomatic Rust — the protocol and the CLI/flag surface match iperf3, so where iperf3 accepts an option, riperf3 implements it to behave the same way; it does not reject, rename, or work around iperf3's semantics. The goal is a drop-in you can swap in without your scripts, dashboards, or muscle memory noticing.
 
 ## Highlights
 
