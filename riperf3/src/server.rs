@@ -1064,11 +1064,12 @@ impl Server {
             // #381: setup runs INSIDE the block — its `?` sites (the
             // post-accept configure/tos/meta, dispatch propagations, the
             // UDP sub-setups) previously skipped the gate with earlier-
-            // iteration tasks already spawned in ctx.streams. The TCP
-            // loop also pushes each task into the abort guard AS IT
-            // SPAWNS (the #426 r1 F2 mid-setup cancel window). The
-            // classified arms still reap inline first — the gate below
-            // is a no-op on drained streams.
+            // iteration tasks already spawned in ctx.streams. Every spawn
+            // site (the TCP loop, both UDP sub-setups, the demux) also
+            // pushes its task into the abort guard AS IT SPAWNS (the #426
+            // r1 F2 mid-setup cancel window). The classified arms still
+            // reap inline first — the gate below is a no-op on drained
+            // streams.
             // Box::pin (#427: the Windows stack-overflow incident): nesting
             // setup INSIDE this block put its entire poll frame on top of
             // the block's own — MSVC debug frames tipped the CLI server
@@ -1085,11 +1086,11 @@ impl Server {
                 // (None maps to handle_one_test's Ok(None) after the gate).
                 return Ok(None);
             }
-            // #380: the full arm — the TCP pushes are already in the set
-            // (arm replaces with the same handles); this adds the UDP
-            // stream tasks and the demux handle (queued-not-yet-started
-            // coverage only: spawn_blocking ignores abort() once running
-            // and rides `done` + its 500 ms poll either way).
+            // #380: the full arm — every real task was already pushed at
+            // its spawn site (arm replaces with the same set, plus the
+            // demux arm's already-resolved placeholder dummies, a no-op
+            // superset). Kept as the one canonical post-setup statement of
+            // the guarded set.
             abort_guard.arm(
                 ctx.streams
                     .iter()
@@ -3096,7 +3097,8 @@ impl Server {
                 // #381 (#427 r1 F3): a running spawn_blocking task ignores
                 // abort() (it exits via `done` + its 500 ms poll); the push
                 // still stops a queued-not-yet-started runner, like the
-                // client UDP arm.
+                // client UDP arm. Untested by design (#427 r2 F3): no
+                // deterministic pin can catch the not-yet-started window.
                 abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
