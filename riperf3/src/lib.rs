@@ -4,6 +4,12 @@
 //! the same protocol, flags, output, and JSON schema, usable as a CLI or as
 //! this library crate.
 //!
+//! Note for embedders: this crate enables serde_json's `preserve_order`
+//! feature (iperf3 is cJSON end-to-end, so JSON key order is part of the
+//! faithfulness contract, #378). Through Cargo feature unification your
+//! build's `serde_json::Map` becomes insertion-ordered too (`remove` takes
+//! on swap-remove semantics).
+//!
 //! Run a test and read its result — quiet by default (#294), with the
 //! measured [`Report`] and a [`Termination`] saying how the run ended
 //! (#293, see the [`outcome`] module):
