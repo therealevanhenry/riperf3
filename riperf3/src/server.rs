@@ -526,7 +526,8 @@ impl Server {
     ///
     /// A failed round does not end the loop: like iperf3's server, the round's
     /// error line is printed and the next client is served (#224). `Err` from
-    /// this method means a failed bind — never a failed test (even the one-off
+    /// this method means a failed listener setup (the bind, a bad bind
+    /// address, `--bind-dev`) — never a failed test (even the one-off
     /// `--idle-timeout` expiry ends the loop with `Ok(())`).
     ///
     /// Quiet by default like every lib run (#294): build with
