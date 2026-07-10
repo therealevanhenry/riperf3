@@ -399,6 +399,15 @@ impl Client {
             stage: RunStage::PreTestStart { connect_millis: 0 },
             prev_state: TestState::IperfStart,
         };
+        // #380: if THIS FUTURE is dropped (timeout/select cancellation) the
+        // teardown gate below never runs and `done` can't wake a parked
+        // read — this guard abort()s the stream tasks instead. Armed at
+        // CreateStreams, disarmed after the gate's joins (which abort-and-
+        // JOIN as before). Declared BEFORE _done_guard so the cancel-drop
+        // stores `done` first, then aborts — the gate's own order (r1 F3
+        // of #426: a detached reporter tick must see `done` before any
+        // stream fd can be recycled).
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
         // sender parked on the start barrier can't leak if setup fails (#5).
         // Declared AFTER ctx so an early return drops the guard FIRST —
@@ -457,6 +466,12 @@ impl Client {
 
                     TestState::CreateStreams => {
                         self.on_create_streams(&mut ctx).await?;
+                        // #380: the spawned tasks are now cancel-exposed.
+                        // RESIDUAL: a cancel landing INSIDE on_create_streams
+                        // leaves the already-spawned subset unguarded (the
+                        // tasks park un-wakeably from spawn) — the mid-setup
+                        // teardown-skip class, #381's scope for both roles.
+                        abort_guard.arm(ctx.streams.iter().map(|s| s.task.abort_handle()));
                         StepFlow::Continue
                     }
 
@@ -565,6 +580,12 @@ impl Client {
         for s in ctx.streams.drain(..) {
             let _ = s.task.await;
         }
+        // #380 (#426 r1 F1): disarmed only NOW — the guard stays armed
+        // through the gate's own awaits (the grace sleep, the joins),
+        // where a cancel would otherwise land disarmed-but-unaborted and
+        // leak. abort() is idempotent, so the guard firing mid-join is
+        // free.
+        abort_guard.disarm();
 
         // The abnormal-end rounds (#293) — a signal dump, a server terminate,
         // or a relayed server error — already rendered their output; only the
