@@ -1145,8 +1145,21 @@ impl Server {
         // where it used to match the returned Err). The comments on each class
         // (rc -1 keep-serving, GT's read-site line, the errno-0 dangling ": ",
         // etc.) live on the corresponding run() arm.
-        let termination = if ctx.client_terminated {
+        //
+        // r1 F4: the precedence matches report_error's derivation (the -J doc's
+        // `error` key) at both its sites — interrupt first, then the peer
+        // terminate, the self-terminate, then the exchange classes (server.rs
+        // ~2247 and ~1037). The flags are mutually exclusive today (each
+        // abnormal arm breaks the data loop and the exchange phase is gated off
+        // once any is set), so ordering is behavior-neutral now; keeping the two
+        // derivations in lockstep means run_once's Termination and the doc's key
+        // stay consistent if a future change ever let two co-occur.
+        let termination = if ctx.interrupted.is_some() {
+            crate::outcome::Termination::Interrupted
+        } else if ctx.client_terminated {
             crate::outcome::Termination::ClientTerminated
+        } else if let Some(msg) = ctx.server_error {
+            crate::outcome::Termination::SelfTerminated(msg.to_string())
         } else if ctx.unknown_message {
             crate::outcome::Termination::UnknownMessage
         } else if ctx.ctrl_closed {
@@ -1155,10 +1168,6 @@ impl Server {
             crate::outcome::Termination::RecvResultsFailed
         } else if let Some(err) = ctx.exchange_send_error.take() {
             crate::outcome::Termination::SendFailed(err.to_string())
-        } else if ctx.interrupted.is_some() {
-            crate::outcome::Termination::Interrupted
-        } else if let Some(msg) = ctx.server_error {
-            crate::outcome::Termination::SelfTerminated(msg.to_string())
         } else {
             // Clean completion (incl. the #330 mid-test IPERF_DONE bare-end).
             crate::outcome::Termination::Completed

@@ -2662,6 +2662,63 @@ async fn both_violations_relay_total_rate_like_gt() {
     }
 }
 
+/// #293 r1 F3: the SERVER half of a RUNTIME self-terminate through `run_once`.
+/// The upfront-refusal tests above assert the CLIENT's `ServerError` and leave
+/// the server report-less (`run_once` errs); this pins the OTHER half. A
+/// runtime `--server-bitrate-limit` breach BUILDS a partial server report, so
+/// `run_once` returns `Ok(RunOutcome)` with `Termination::SelfTerminated` (the
+/// server-side counterpart of the client's `ServerError`). Load-bearing
+/// because a `SelfTerminated`↔`Completed` mis-map is invisible to every other
+/// test — both hit `Server::run`'s silent `_ =>` arm (the stderr line is
+/// emitted independently), so only a lib-level `run_once` assertion catches it.
+#[tokio::test]
+async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
+    const MSG: &str = "total required bandwidth is larger than server limit";
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_bitrate_limit(1_000) // 1 Kbit/s: any real transfer trips the 1 Hz check
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    // Default TCP bandwidth is 0 (unlimited): the upfront total-rate check
+    // (total = 0) lets the test START, then loopback throughput blows past
+    // 1 Kbit/s and the RUNTIME breach fires. An explicit `-b 2M` would instead
+    // be refused UPFRONT (no server report — the other tests' path).
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(2)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(15), client.run())
+        .await
+        .expect("client hung");
+    let server_result = server_task.await.expect("server task");
+
+    // Server: the runtime breach produced a report → Ok (an Err here is exactly
+    // the pre-#293 regression, the partial report discarded); it ended
+    // SelfTerminated with the bare IETOTALRATE message.
+    let outcome =
+        server_result.expect("run_once errored on a runtime breach — partial report discarded");
+    assert_eq!(
+        outcome.termination,
+        riperf3::Termination::SelfTerminated(MSG.to_string()),
+        "the server's own rate-limit breach ends SelfTerminated"
+    );
+
+    // Client half of the SAME breach: the relayed SERVER_ERROR.
+    let cli = result.expect("client run errored");
+    assert_eq!(
+        cli.termination,
+        riperf3::Termination::ServerError(MSG.to_string()),
+        "the client sees the relayed SERVER_ERROR — the symmetric half"
+    );
+}
+
 /// #302: GT enables SO_MAX_PACING_RATE on its ACCEPTED data sockets too
 /// (iperf_tcp.c:138-153), so a client's --fq-rate paces the server's
 /// reverse send path. Live GT reverse --fq-rate 5M ≈ 6.3 Mbps where the
