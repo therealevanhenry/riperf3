@@ -733,11 +733,12 @@ pub struct End {
     /// True where GT's dump never end-processes — the whole object
     /// serializes as GT's bare `{}`: the upfront-refusal path (#261/#281),
     /// the mid-test IEMESSAGE dump (#325), the mid-test ctrl-EOF (#267),
-    /// the server's rate/duration/idle kills (#368), and the client's
-    /// SERVER_ERROR relay at ANY stage (#404). Every other dump (success,
-    /// mid-test or pre-TestStart interrupt, SERVER_TERMINATE — which GT
-    /// end-processes) renders the full structure, including `streams: []`
-    /// when no stream ever existed.
+    /// the failed results read (#374), the server's rate/duration/idle
+    /// kills (#368), and the client's SERVER_ERROR relay at ANY stage
+    /// (#404). Every other dump (success, mid-test or pre-TestStart
+    /// interrupt, SERVER_TERMINATE — which GT end-processes) renders the
+    /// full structure, including `streams: []` when no stream ever
+    /// existed.
     pub(crate) bare: bool,
     pub streams: Vec<EndStream>,
     /// UDP only: the datagram aggregate iperf3 emits as `sum` — BEFORE the

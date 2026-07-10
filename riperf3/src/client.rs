@@ -1061,10 +1061,12 @@ impl Client {
     /// SERVER_TERMINATE's). JSON sinks: render the full document/events with
     /// the error inside, like iperf3's json_top; the CLI suppresses its
     /// generic re-render. The `end` is BARE regardless of stage (#404): the
-    /// relay is a KILL, not a finalize — GT's client errexits via
-    /// iperf_json_finish before end processing (live-probed 3.21: bare on
-    /// the upfront refusal AND the mid-run breach; contrast
-    /// SERVER_TERMINATE, which GT end-processes and both tools populate).
+    /// relay is a KILL, not a finalize — GT's reporter switch no-ops on
+    /// state SERVER_ERROR (iperf_api.c:4622-4637, reached via
+    /// cleanup_and_fail → iperf_client_end), so json_end is never filled
+    /// before iperf_json_finish dumps (live-probed 3.21: bare on the
+    /// upfront refusal AND the mid-run breach; contrast SERVER_TERMINATE,
+    /// which flips to DISPLAY_RESULTS and populates on both tools).
     /// The late start fields still gate on the stage (#261).
     async fn on_server_error_relay(
         &self,

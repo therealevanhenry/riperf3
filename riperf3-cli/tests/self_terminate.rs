@@ -143,11 +143,11 @@ fn bitrate_limit_json_client_single_doc_with_relayed_error() {
         Some(BITRATE_MSG),
         "the doc adopts the relayed strerror: {doc}"
     );
-    // #404: the relay is a KILL, not a finalize — GT's client errexits via
-    // iperf_json_finish before end processing, so the doc's `end` is BARE
-    // regardless of stage (live-probed 3.21, -t 20 vs 1K limit: GT end
-    // keys [], riperf3 pre-fix rendered the populated finalize end). The
-    // accumulated intervals stay.
+    // #404: the relay is a KILL, not a finalize — GT's reporter switch
+    // no-ops on state SERVER_ERROR, so json_end is never filled and the
+    // doc's `end` is BARE regardless of stage (live-probed 3.21, -t 20 vs
+    // 1K limit: GT end keys [], riperf3 pre-fix rendered the populated
+    // finalize end). The accumulated intervals stay.
     assert!(
         doc["end"].as_object().is_some_and(|m| m.is_empty()),
         "a mid-run SERVER_ERROR relay renders GT's bare end (#404): {doc}"
