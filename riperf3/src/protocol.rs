@@ -309,24 +309,64 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 /// leniency GT depends on (a peer that over-declares its length
 /// interoperates), mirrored per the #328 fidelity precedent.
 ///
-/// SCOPE (#343 r1 F2 / #367): the mirror covers self-delimiting first values
-/// with whitespace-separated tails, plus a leading UTF-8 BOM (#367 cell 1,
-/// now stripped here — cJSON's skip_utf8_bom). The bare-scalar params root
-/// (#367 cell 2) is mirrored in `params_from_value`. Four residual cJSON
-/// cells stay divergent as RECORDED DEVIATIONS — serde is a conforming
-/// parser and mirroring them means a bespoke lenient parser for shapes no
-/// real iperf3 encoder emits: scalar-adjacent garbage (`42GARBAGE`), nesting
-/// past serde's 128-deep limit (cJSON's is 1000), raw control chars in
-/// strings, and cJSON's lenient strtod grammar (`01`, `1.`). Locked by
-/// `json_first_value_deviations_stay_strict`.
+/// SCOPE (#343 r1 F2 / #367 / #402): the mirror covers self-delimiting first
+/// values with whitespace-separated tails, a leading UTF-8 BOM (#367 cell 1,
+/// stripped here — cJSON's skip_utf8_bom), control-byte whitespace between
+/// tokens (#402 — normalized here, cJSON's `<= 0x20` skip rule), and the
+/// bare-scalar params root (#367 cell 2, in `params_from_value`). Five
+/// residual cJSON cells stay divergent as RECORDED DEVIATIONS — serde is a
+/// conforming parser and mirroring them means a bespoke lenient parser (or
+/// abandoning the derive) for shapes no real iperf3 encoder emits:
+/// scalar-adjacent garbage (`42GARBAGE`), nesting past serde's 128-deep
+/// limit (cJSON's is 1000), raw control chars in strings, cJSON's lenient
+/// strtod grammar (`01`, `1.`), and a wrong-TYPED object field (#401 —
+/// GT warns + defaults the field). Locked by
+/// `json_first_value_deviations_stay_strict` and
+/// `params_wrong_typed_field_stays_strict`.
 fn json_first_value(buf: &[u8]) -> serde_json::Result<serde_json::Value> {
     let buf = buf.strip_prefix(UTF8_BOM).unwrap_or(buf);
-    let mut stream = serde_json::Deserializer::from_slice(buf).into_iter();
+    let buf = normalize_cjson_whitespace(buf);
+    let mut stream = serde_json::Deserializer::from_slice(&buf).into_iter();
     match stream.next() {
         Some(v) => v,
         // Empty/whitespace-only: surface the standard EOF error shape.
-        None => serde_json::from_slice(buf),
+        None => serde_json::from_slice(&buf),
     }
+}
+
+/// #402 (#367's mirror-class sibling): cJSON treats EVERY byte <= 0x20 as
+/// skippable whitespace between tokens (buffer_skip_whitespace,
+/// cjson.c:1061 — NUL included), so a peer may pad its blob with control
+/// bytes anywhere whitespace is legal and GT interoperates (live-probed:
+/// GT proceeds to CREATE_STREAMS). serde accepts only the four JSON
+/// whitespace bytes; normalize the rest to ' ' OUTSIDE strings. In-string
+/// control bytes are untouched — serde rejects them and that stays the
+/// recorded #367 cell-5 deviation.
+fn normalize_cjson_whitespace(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let is_ctrl_ws = |b: u8| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r');
+    // Fast path: conforming blobs (every real iperf3 encoder) borrow.
+    if !buf.iter().copied().any(is_ctrl_ws) {
+        return std::borrow::Cow::Borrowed(buf);
+    }
+    let mut out = buf.to_vec();
+    let mut in_string = false;
+    let mut escaped = false;
+    for b in &mut out {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *b == b'\\' {
+                escaped = true;
+            } else if *b == b'"' {
+                in_string = false;
+            }
+        } else if *b == b'"' {
+            in_string = true;
+        } else if is_ctrl_ws(*b) {
+            *b = b' ';
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn is_false_opt(v: &Option<bool>) -> bool {
@@ -1715,6 +1755,47 @@ mod tests {
         let p = params_from_value(serde_json::json!({"time": 10, "tcp": true})).unwrap();
         assert_eq!(p.time, Some(10));
         assert_eq!(p.tcp, Some(true));
+    }
+
+    /// #402 (MIRRORED, cell 7): cJSON treats EVERY byte <= 0x20 as skippable
+    /// whitespace between tokens (buffer_skip_whitespace, cjson.c:1061 —
+    /// NUL included), so a peer may pad its blob with control bytes anywhere
+    /// whitespace is legal and GT proceeds to CREATE_STREAMS (live-probed).
+    /// Red pre-fix (serde accepts only the four JSON whitespace bytes).
+    /// In-string control bytes stay REJECTED — the recorded #367 cell 5.
+    #[test]
+    fn json_first_value_normalizes_cjson_whitespace() {
+        let v = json_first_value(b"{\x01\"tcp\":\x1ftrue,\x00\"time\":\x0b1}")
+            .expect("control-byte whitespace parses like cJSON (#402)");
+        assert_eq!(v["tcp"], true);
+        assert_eq!(v["time"], 1);
+        // The in-string sibling stays strict (recorded, cell 5) — the
+        // normalization must not reach inside strings...
+        assert!(
+            json_first_value(b"{\"title\":\"a\x01b\"}").is_err(),
+            "in-string control bytes stay rejected"
+        );
+        // ...including behind escaped quotes.
+        assert!(
+            json_first_value(b"{\"title\":\"a\\\"\x01b\"}").is_err(),
+            "in-string control bytes behind an escaped quote stay rejected"
+        );
+    }
+
+    /// #401 (RECORDED DEVIATION, cell 8): a wrong-TYPED object field — GT's
+    /// iperf_cJSON_GetObjectItemType wrapper (iperf_util.c:444-477) warns
+    /// on stderr ("iperf_cJSON_GetObjectItemType mismatch time") and returns
+    /// NULL, so the field keeps its default and GT RUNS (live-probed: byte
+    /// 0x0a follows); riperf3's serde derive hard-errors → IERECVPARAMS.
+    /// Mirroring means per-field lenient deserialization — the same
+    /// abandon-serde cost as cells 3-6, for hostile-only input. Locked.
+    #[test]
+    fn params_wrong_typed_field_stays_strict() {
+        let v = serde_json::json!({"tcp": true, "time": "foo", "parallel": 1});
+        assert!(
+            params_from_value(v).is_err(),
+            "a wrong-typed field stays a hard IERECVPARAMS error (#401 record)"
+        );
     }
 
     /// #367 cells 3-6 (RECORDED DEVIATIONS): riperf3's serde parser is
