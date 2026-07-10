@@ -2001,10 +2001,10 @@ impl Client {
             }
             if self.get_server_output {
                 if let Some(server) = remote_cpu {
-                    // Through the shared envelope helper — a hand-built
-                    // serde_json::json! map serializes alphabetically
-                    // ("data" before "event"), breaking the {"event":..,
-                    // "data":..} contract every other event keeps (#168 r1 n1).
+                    // Through the shared envelope helper, keeping the
+                    // {"event":.., "data":..} contract every other event
+                    // keeps (#168 r1 n1; pre-#378 a hand-built json! map
+                    // also alphabetized — moot under preserve_order).
                     if let Some(json) = &server.server_output_json {
                         crate::reporter::emit_json_stream_line(
                             &crate::json_report::json_stream_event("server_output_json", json),

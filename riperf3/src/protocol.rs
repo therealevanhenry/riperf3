@@ -377,15 +377,26 @@ pub struct TestParams {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub len: Option<i32>,
 
+    // #378 r1 F1: with preserve_order the wire bytes carry this FIELD
+    // order, so from here down the declaration mirrors GT's
+    // send_parameters insertion order exactly (iperf_api.c:2416-2519):
+    // bandwidth → fqrate → pacing_timer → burst → GSO/GRO; title/
+    // extra_data before congestion/congestion_used; authtoken before
+    // client_version. Deserialization is by-name, so reordering is
+    // wire-read-neutral. Pinned by params_blob_key_order_mirrors_gt_
+    // send_parameters.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bandwidth: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fqrate: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pacing_timer: Option<i32>,
 
     /// `-b rate/burst` block count; iperf3 sends it only when nonzero (#160).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub burst: Option<i32>,
-
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub fqrate: Option<u64>,
 
     // #316: GT sends the UDP GSO/GRO block unconditionally for UDP
     // ("Always send these fields to allow server to use GSO/GRO even if
@@ -402,9 +413,6 @@ pub struct TestParams {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub gro_bf_size: Option<i64>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub pacing_timer: Option<i32>,
-
     #[serde(rename = "TOS", skip_serializing_if = "Option::is_none", default)]
     pub tos: Option<i32>,
 
@@ -412,16 +420,16 @@ pub struct TestParams {
     pub flowlabel: Option<i32>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub congestion: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub congestion_used: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub title: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub extra_data: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub congestion: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub congestion_used: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub get_server_output: Option<i32>,
@@ -435,11 +443,13 @@ pub struct TestParams {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub dont_fragment: Option<i32>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub client_version: Option<String>,
-
+    // GT sends authtoken BEFORE client_version (iperf_api.c:2500-2516 —
+    // client_version is always last).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub authtoken: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_version: Option<String>,
 }
 
 impl TestParams {
@@ -1018,6 +1028,112 @@ pub async fn udp_connect_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #378 r1 F1: with preserve_order the params blob's wire bytes carry
+    /// TestParams' FIELD order, so the declaration must mirror GT's
+    /// send_parameters insertion order exactly (iperf_api.c:2416-2519) —
+    /// bandwidth → fqrate → pacing_timer → burst → the GSO/GRO block;
+    /// title/extra_data BEFORE congestion/congestion_used; authtoken
+    /// BEFORE client_version. Keys riperf3 doesn't implement (sctp,
+    /// server_affinity, mptcp, zerocopy, skip_rx_copy) drop out without
+    /// disturbing the relative order. All-Some so every key emits.
+    #[test]
+    fn params_blob_key_order_mirrors_gt_send_parameters() {
+        let p = TestParams {
+            tcp: Some(true),
+            // GT sends only the ACTIVE protocol key (tcp OR udp, never
+            // both) — a false udp stays off the wire.
+            udp: None,
+            omit: Some(1),
+            time: Some(10),
+            num: Some(1),
+            blockcount: Some(1),
+            mss: Some(1400),
+            nodelay: Some(true),
+            parallel: Some(2),
+            reverse: Some(false),
+            bidirectional: Some(false),
+            window: Some(65536),
+            len: Some(131072),
+            bandwidth: Some(5_000_000),
+            fqrate: Some(1_000_000),
+            pacing_timer: Some(1000),
+            burst: Some(10),
+            gso: Some(1),
+            gso_dg_size: Some(1400),
+            gso_bf_size: Some(65000),
+            gro: Some(1),
+            gro_bf_size: Some(65000),
+            tos: Some(2),
+            flowlabel: Some(3),
+            title: Some("t".into()),
+            extra_data: Some("x".into()),
+            congestion: Some("cubic".into()),
+            congestion_used: Some("cubic".into()),
+            get_server_output: Some(1),
+            udp_counters_64bit: Some(1),
+            repeating_payload: Some(1),
+            dont_fragment: Some(1),
+            authtoken: Some("a".into()),
+            client_version: Some("3.21".into()),
+        };
+        let raw = serde_json::to_string(&p).unwrap();
+        // Flat object with controlled values (no ':' after any in-string
+        // quote), so a quote-span followed by ':' is exactly a key.
+        let mut keys = Vec::new();
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                if bytes.get(close + 1) == Some(&b':') {
+                    keys.push(&raw[i + 1..close]);
+                }
+                i = close;
+            }
+            i += 1;
+        }
+        assert_eq!(
+            keys,
+            [
+                "tcp",
+                "omit",
+                "time",
+                "num",
+                "blockcount",
+                "MSS",
+                "nodelay",
+                "parallel",
+                "reverse",
+                "bidirectional",
+                "window",
+                "len",
+                "bandwidth",
+                "fqrate",
+                "pacing_timer",
+                "burst",
+                "gso",
+                "gso_dg_size",
+                "gso_bf_size",
+                "gro",
+                "gro_bf_size",
+                "TOS",
+                "flowlabel",
+                "title",
+                "extra_data",
+                "congestion",
+                "congestion_used",
+                "get_server_output",
+                "udp_counters_64bit",
+                "repeating_payload",
+                "dont_fragment",
+                "authtoken",
+                "client_version"
+            ],
+            "TestParams field order must mirror GT's send_parameters \
+             insertion order (#378 r1 F1): {raw}"
+        );
+    }
 
     #[test]
     fn normalize_unlimited_maps_zero_to_none() {

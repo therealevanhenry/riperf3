@@ -211,7 +211,20 @@ fn raw_keys(raw: &str, obj: &str) -> Vec<String> {
                 }
             }
             b'"' => {
-                let close = raw[i + 1..].find('"').unwrap() + i + 1;
+                // Skip escaped quotes (r1 F3): a value like "a \": b" must
+                // not fake a key.
+                let mut close = i;
+                loop {
+                    close += 1 + raw[close + 1..].find('"').unwrap();
+                    let backslashes = raw[..close]
+                        .bytes()
+                        .rev()
+                        .take_while(|b| *b == b'\\')
+                        .count();
+                    if backslashes % 2 == 0 {
+                        break;
+                    }
+                }
                 if depth == 1 && bytes.get(close + 1) == Some(&b':') {
                     out.push(raw[i + 1..close].to_string());
                 }

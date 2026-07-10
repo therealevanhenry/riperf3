@@ -168,9 +168,10 @@ pub fn error_document(error: &str) -> String {
 /// kinds carry it. `error_document` (public, signature frozen) delegates
 /// with `None`.
 pub(crate) fn refusal_document(error: &str, target_bitrate: Option<u64>) -> String {
-    // Field-ordered structs, not serde_json::json! — its maps serialize
-    // alphabetically, breaking iperf3's start/intervals/end/error order
-    // (the #168 envelope lesson).
+    // Field-ordered structs, not serde_json::json! — explicit declaration
+    // order documents iperf3's start/intervals/end/error contract (the
+    // #168 envelope lesson; json! also alphabetized before #378's
+    // preserve_order made maps insertion-ordered).
     #[derive(Serialize)]
     struct ErrStart {
         connected: [(); 0],
@@ -4384,15 +4385,15 @@ mod tests {
         input.congestion_used = None;
         let v = serde_json::to_value(input.build()).unwrap();
 
-        // serde_json::Value re-orders keys alphabetically, so assert the SET
-        // here; the on-wire order is the manual impl's entry order.
+        // #378: preserve_order makes to_value keep the manual impl's entry
+        // order, so this pins the ORDER outright (it used to sort and
+        // assert the set).
         let start = v["start"].as_object().expect("start object");
-        let mut keys: Vec<_> = start.keys().map(String::as_str).collect();
-        keys.sort_unstable();
+        let keys: Vec<_> = start.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["connected", "system_info", "version"],
-            "GT stage 0 is exactly these three: {v}"
+            ["connected", "version", "system_info"],
+            "GT stage 0 is exactly these three, in insertion order: {v}"
         );
         assert_eq!(v["end"]["streams"].as_array().map(Vec::len), Some(0));
     }
