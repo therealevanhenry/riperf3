@@ -228,6 +228,12 @@ struct TestRunCtx {
     /// the on-connect stamp, not the emit time (#356 r1 F4): at the default
     /// 120 s rcv-timeout those differ by two minutes.
     accepted_millis: u64,
+    /// #392: the setup-doc (sndbuf_actual, rcvbuf_actual) pair, computed
+    /// ONCE at ctx construction — GT computes its trio at param ingest
+    /// (protocol->listen right after get_parameters, iperf_api.c:2373-2382)
+    /// and caches it, so fd exhaustion at EMIT time can't blank the keys.
+    /// See [`Server::compute_setup_bufs`].
+    setup_bufs: (Option<u64>, Option<u64>),
     cookie: [u8; protocol::COOKIE_SIZE],
     params: TestParams,
     cfg: TestConfig,
@@ -981,6 +987,8 @@ impl Server {
             ctrl,
             accepted_host,
             accepted_port,
+            // #392: param ingest is GT's compute point for the setup trio.
+            setup_bufs: Self::compute_setup_bufs(&cfg, listener),
             accepted_millis: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -1575,7 +1583,6 @@ impl Server {
                                             RiperfError::StreamConnectFailed(e);
                                         self.emit_setup_phase_error(
                                             ctx,
-                                            listener,
                                             &format!("error - {err}"),
                                         );
                                         return Err(err);
@@ -1670,7 +1677,6 @@ impl Server {
                                         .await;
                                         self.emit_setup_phase_error(
                                             ctx,
-                                            listener,
                                             &format!(
                                                 "error - {}: ",
                                                 RiperfError::RecvDataCookieFailed
@@ -1693,12 +1699,12 @@ impl Server {
                                 Ok(CtrlActivity::Eof) => {
                                     abort_setup_streams(ctx).await;
                                     let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
-                                    self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                                    self.emit_setup_phase_error(ctx, CTRL_CLOSED_MSG);
                                     return Err(RiperfError::ControlSocketClosed);
                                 }
                                 Ok(CtrlActivity::Data) => {
                                     if let SetupFlow::ClientDone =
-                                        self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                                        self.dispatch_setup_ctrl_byte(ctx).await?
                                     {
                                         return Ok(SetupFlow::ClientDone);
                                     }
@@ -1714,7 +1720,6 @@ impl Server {
                                 let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
                                 self.emit_setup_phase_error(
                                     ctx,
-                                    listener,
                                     &format!("error - {}", RiperfError::DataIdleTimeout),
                                 );
                                 return Err(RiperfError::DataIdleTimeout);
@@ -1840,10 +1845,10 @@ impl Server {
                 // as the TCP arm, so they can dispatch ctrl bytes — a
                 // ClientDone (IPERF_DONE) surfaces here like TCP's.
                 let flow = if udp_use_demux {
-                    self.setup_udp_demux_streams(ctx, listener, recv_count, total, max_duration)
+                    self.setup_udp_demux_streams(ctx, recv_count, total, max_duration)
                         .await?
                 } else {
-                    self.setup_udp_recycling_streams(ctx, listener, recv_count, total, max_duration)
+                    self.setup_udp_recycling_streams(ctx, recv_count, total, max_duration)
                         .await?
                 };
                 if let SetupFlow::ClientDone = flow {
@@ -2808,7 +2813,6 @@ impl Server {
     async fn setup_udp_recycling_streams(
         &self,
         ctx: &mut TestRunCtx,
-        listener: &tokio::net::TcpListener,
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
@@ -2892,12 +2896,12 @@ impl Server {
                         Ok(CtrlActivity::Eof) => {
                             abort_setup_streams(ctx).await;
                             let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
-                            self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                            self.emit_setup_phase_error(ctx, CTRL_CLOSED_MSG);
                             return Err(RiperfError::ControlSocketClosed);
                         }
                         Ok(CtrlActivity::Data) => {
                             if let SetupFlow::ClientDone =
-                                self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                                self.dispatch_setup_ctrl_byte(ctx).await?
                             {
                                 return Ok(SetupFlow::ClientDone);
                             }
@@ -2912,7 +2916,6 @@ impl Server {
                         let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
                         self.emit_setup_phase_error(
                             ctx,
-                            listener,
                             &format!("error - {}", RiperfError::DataIdleTimeout),
                         );
                         return Err(RiperfError::DataIdleTimeout);
@@ -3056,7 +3059,6 @@ impl Server {
     async fn setup_udp_demux_streams(
         &self,
         ctx: &mut TestRunCtx,
-        listener: &tokio::net::TcpListener,
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
@@ -3166,12 +3168,12 @@ impl Server {
                     Ok(CtrlActivity::Eof) => {
                         abort_setup_streams(ctx).await;
                         let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
-                        self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                        self.emit_setup_phase_error(ctx, CTRL_CLOSED_MSG);
                         return Err(RiperfError::ControlSocketClosed);
                     }
                     Ok(CtrlActivity::Data) => {
                         if let SetupFlow::ClientDone =
-                            self.dispatch_setup_ctrl_byte(ctx, listener).await?
+                            self.dispatch_setup_ctrl_byte(ctx).await?
                         {
                             return Ok(SetupFlow::ClientDone);
                         }
@@ -3186,7 +3188,6 @@ impl Server {
                     let _ = protocol::send_server_error(&mut ctx.ctrl, 144).await;
                     self.emit_setup_phase_error(
                         ctx,
-                        listener,
                         &format!("error - {}", RiperfError::DataIdleTimeout),
                     );
                     return Err(RiperfError::DataIdleTimeout);
@@ -3606,7 +3607,9 @@ impl Server {
             tcp_mss_default: 0,
             mss: cfg.mss.filter(|&m| m > 0).map(|m| m as u32),
             fq_rate: params.fqrate.unwrap_or(0),
-            sock_bufsize: Some(cfg.window.map(|w| w.max(0) as u64).unwrap_or(0)),
+            // The exchanged -w, rendered VERBATIM like GT — negatives included
+            // (#392; the old .max(0) clamp rendered 0 where GT emits -1).
+            sock_bufsize: Some(cfg.window.map(i64::from).unwrap_or(0)),
             sndbuf_actual: Some(
                 streams
                     .first()
@@ -3744,11 +3747,7 @@ impl Server {
     /// (live: the report skeleton, an EXCHANGE_RESULTS byte, then a
     /// stale-errno IERECVRESULTS "Bad file descriptor" tangle) —
     /// nonconforming-only, not mirrored.
-    async fn dispatch_setup_ctrl_byte(
-        &self,
-        ctx: &mut TestRunCtx,
-        listener: &tokio::net::TcpListener,
-    ) -> Result<SetupFlow> {
+    async fn dispatch_setup_ctrl_byte(&self, ctx: &mut TestRunCtx) -> Result<SetupFlow> {
         match protocol::recv_state(&mut ctx.ctrl).await {
             // GT's no-op arm — keep waiting (the recreated sleep IS the
             // clock reset: a received byte is progress). RECORDED DEVIATION
@@ -3762,12 +3761,12 @@ impl Server {
             Ok(TestState::ClientTerminate) => {
                 abort_setup_streams(ctx).await;
                 let _ = protocol::send_server_error(&mut ctx.ctrl, 119).await;
-                self.emit_setup_phase_terminate(ctx, listener);
+                self.emit_setup_phase_terminate(ctx);
                 Err(RiperfError::ClientTerminated)
             }
             Ok(TestState::IperfDone) => {
                 abort_setup_streams(ctx).await;
-                self.emit_setup_phase_done(ctx, listener);
+                self.emit_setup_phase_done(ctx);
                 Ok(SetupFlow::ClientDone)
             }
             Ok(_) | Err(RiperfError::UnknownControlMessage) => {
@@ -3775,7 +3774,6 @@ impl Server {
                 let _ = protocol::send_server_error(&mut ctx.ctrl, 110).await;
                 self.emit_setup_phase_error(
                     ctx,
-                    listener,
                     &format!("error - {}", RiperfError::UnknownControlMessage),
                 );
                 Err(RiperfError::UnknownControlMessage)
@@ -3786,7 +3784,7 @@ impl Server {
             Err(RiperfError::PeerDisconnected) => {
                 abort_setup_streams(ctx).await;
                 let _ = protocol::send_server_error(&mut ctx.ctrl, 109).await;
-                self.emit_setup_phase_error(ctx, listener, CTRL_CLOSED_MSG);
+                self.emit_setup_phase_error(ctx, CTRL_CLOSED_MSG);
                 Err(RiperfError::ControlSocketClosed)
             }
             Err(e) => Err(e),
@@ -3798,58 +3796,85 @@ impl Server {
     /// same socket (best-effort: a failed getsockopt omits the key rather
     /// than inventing one). The timestamp is the on-connect stamp carried
     /// on ctx, not the emit time (#356 r1 F4).
-    fn setup_phase_doc_input(
-        &self,
-        ctx: &TestRunCtx,
+    ///
+    /// #357: with -w exchanged, GT re-listens with the window applied and
+    /// reads the actuals off THAT socket (probed 131072/131072 for window
+    /// 65536); riperf3 has no re-listen step (deliberate), so a scratch
+    /// socket with the same window applied yields the identical kernel
+    /// read-back. Without -w the un-windowed listener matches GT's
+    /// re-listened defaults.
+    /// RECORDED DEVIATION (#391 r1 F3, pre-existing design consequence):
+    /// at a window past 2x wmem_max GT fires IESETBUF2 at its re-listen
+    /// (error doc, no trio, fe frame instead of CreateStreams); riperf3
+    /// has no re-listen (deliberate) and its #97 check lives on data
+    /// sockets, which never arrive in wedge cells — the doc carries the
+    /// clamped actuals instead (probed w=16M: GT errors, riperf3 emits
+    /// 8388608/8388608).
+    /// #391 r1 F1: GT's buffer-APPLY guard is C truthiness (the re-listen
+    /// decision is iperf_tcp.c:195, the apply gate :257 — r2 F2 cite) —
+    /// an exchanged window:0 is NOT applied; it reads the listener like
+    /// the no-window state (probed: GT 16384/131072 for window:0, and the
+    /// nodelay-forced re-listen without buffer-apply reads the same
+    /// defaults). Negative windows ARE applied (truthiness; both tools
+    /// clamp identically — probed w=-1).
+    /// #392: all of the above runs ONCE, at ctx construction — GT
+    /// computes its trio at param ingest (protocol->listen right after
+    /// get_parameters, iperf_api.c:2373-2382) and caches, so fd
+    /// exhaustion at emit time can't blank the keys (the per-emit scratch
+    /// failed EMFILE there), and the scratch follows the LISTENER's
+    /// address family (the v6-only corner: an IPV4-hardcoded scratch read
+    /// nothing on a v6-only stack).
+    fn compute_setup_bufs(
+        cfg: &TestConfig,
         listener: &tokio::net::TcpListener,
-    ) -> crate::json_report::SetupPhaseDoc {
-        let sock = socket2::SockRef::from(listener);
-        // #383 r1 F1a: the four TCP-flavored keys are absent for UDP —
-        // see the SetupPhaseDoc doc for the GT gates.
-        let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
-        // #357: with -w exchanged, GT re-listens with the window applied
-        // and reads the actuals off THAT socket (probed 131072/131072 for
-        // window 65536); riperf3 has no re-listen step (deliberate), so a
-        // scratch socket with the same window applied yields the identical
-        // kernel read-back. Without -w the un-windowed listener matches
-        // GT's re-listened defaults.
-        // RECORDED DEVIATION (#391 r1 F3, pre-existing design consequence):
-        // at a window past 2x wmem_max GT fires IESETBUF2 at its re-listen
-        // (error doc, no trio, fe frame instead of CreateStreams); riperf3
-        // has no re-listen (deliberate) and its #97 check lives on data
-        // sockets, which never arrive in wedge cells — the doc carries the
-        // clamped actuals instead (probed w=16M: GT errors, riperf3 emits
-        // 8388608/8388608).
-        // #391 r1 F1: GT's buffer-APPLY guard is C truthiness (the
-        // re-listen decision is iperf_tcp.c:195, the apply gate :257 — r2
-        // F2 cite) — an exchanged window:0 is NOT applied; it reads the
-        // listener like the no-window state (probed: GT 16384/131072 for
-        // window:0, and the nodelay-forced re-listen without buffer-apply
-        // reads the same defaults). Negative windows ARE applied (truthiness; both tools
-        // clamp identically — probed w=-1).
-        let (sndbuf_actual, rcvbuf_actual) = match (udp, ctx.cfg.window) {
-            (false, Some(w)) if w != 0 => {
-                let scratch =
-                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).ok();
-                match scratch {
-                    Some(sc) => {
+    ) -> (Option<u64>, Option<u64>) {
+        if matches!(cfg.protocol, TransportProtocol::Udp) {
+            return (None, None);
+        }
+        match cfg.window {
+            Some(w) if w != 0 => {
+                let domain = match listener.local_addr() {
+                    Ok(std::net::SocketAddr::V6(_)) => socket2::Domain::IPV6,
+                    _ => socket2::Domain::IPV4,
+                };
+                match socket2::Socket::new(domain, socket2::Type::STREAM, None) {
+                    Ok(sc) => {
                         net::apply_socket_window(&socket2::SockRef::from(&sc), Some(w));
                         (
                             sc.send_buffer_size().ok().map(|v| v as u64),
                             sc.recv_buffer_size().ok().map(|v| v as u64),
                         )
                     }
-                    None => (None, None),
+                    // RECORDED DEVIATION (#416 r1, the no-re-listen
+                    // umbrella): fd exhaustion at INGEST time with -w set —
+                    // GT's re-listen socket() fails and IESTREAMLISTEN
+                    // aborts the round; riperf3 has no re-listen
+                    // (deliberate), caches absent keys, and the round
+                    // proceeds.
+                    Err(_) => (None, None),
                 }
             }
-            (false, _) => (
-                sock.send_buffer_size().ok().map(|v| v as u64),
-                sock.recv_buffer_size().ok().map(|v| v as u64),
-            ),
-            (true, _) => (None, None),
-        };
+            _ => {
+                let sock = socket2::SockRef::from(listener);
+                (
+                    sock.send_buffer_size().ok().map(|v| v as u64),
+                    sock.recv_buffer_size().ok().map(|v| v as u64),
+                )
+            }
+        }
+    }
+
+    fn setup_phase_doc_input(&self, ctx: &TestRunCtx) -> crate::json_report::SetupPhaseDoc {
+        // #383 r1 F1a: the four TCP-flavored keys are absent for UDP —
+        // see the SetupPhaseDoc doc for the GT gates.
+        let udp = matches!(ctx.cfg.protocol, TransportProtocol::Udp);
+        // #392: computed ONCE at ctx construction (GT's param-ingest
+        // timing) — see compute_setup_bufs for the machinery and records.
+        let (sndbuf_actual, rcvbuf_actual) = ctx.setup_bufs;
         crate::json_report::SetupPhaseDoc {
-            sock_bufsize: (!udp).then(|| ctx.cfg.window.map(|w| w as u64).unwrap_or(0)),
+            // Verbatim like GT, negatives included (#392 — `as u64` wrapped
+            // an exchanged -1 to 18446744073709551615).
+            sock_bufsize: (!udp).then(|| ctx.cfg.window.map(i64::from).unwrap_or(0)),
             sndbuf_actual,
             rcvbuf_actual,
             // The server never reads the ctrl MSS — 0, the #50 convention.
@@ -3871,12 +3896,7 @@ impl Server {
     /// live-probed — see json_report::setup_error_document); --json-stream:
     /// the same error+end event pair GT emits here (live-probed, no start
     /// event); text: nothing — the serve loop's arms print the stderr line.
-    fn emit_setup_phase_error(
-        &self,
-        ctx: &TestRunCtx,
-        listener: &tokio::net::TcpListener,
-        doc_error: &str,
-    ) {
+    fn emit_setup_phase_error(&self, ctx: &TestRunCtx, doc_error: &str) {
         if crate::macros::output_quiet() {
             return;
         }
@@ -3886,7 +3906,7 @@ impl Server {
             ));
         } else if self.json_output {
             let doc = crate::json_report::setup_error_document(
-                &self.setup_phase_doc_input(ctx, listener),
+                &self.setup_phase_doc_input(ctx),
                 doc_error,
             );
             println!("{doc}");
@@ -3898,7 +3918,7 @@ impl Server {
     /// ran); --json-stream the error + zeros-end pair; text prints the
     /// report skeleton on stdout here (the serve loop's arm adds the
     /// stderr sentence).
-    fn emit_setup_phase_terminate(&self, ctx: &TestRunCtx, listener: &tokio::net::TcpListener) {
+    fn emit_setup_phase_terminate(&self, ctx: &TestRunCtx) {
         if crate::macros::output_quiet() {
             return;
         }
@@ -3926,7 +3946,7 @@ impl Server {
             ));
         } else if self.json_output {
             let doc = crate::json_report::setup_terminate_document(
-                &self.setup_phase_doc_input(ctx, listener),
+                &self.setup_phase_doc_input(ctx),
                 &error,
                 &cpu,
             );
@@ -3939,15 +3959,14 @@ impl Server {
     /// #356 r1 F1: the IPERF_DONE-at-setup surfaces — GT's clean arm: the
     /// errorless setup doc under -J, one bare end event under
     /// --json-stream, silence in text.
-    fn emit_setup_phase_done(&self, ctx: &TestRunCtx, listener: &tokio::net::TcpListener) {
+    fn emit_setup_phase_done(&self, ctx: &TestRunCtx) {
         if crate::macros::output_quiet() {
             return;
         }
         if self.json_stream {
             crate::reporter::emit_json_stream_line(&crate::json_report::done_stream_events());
         } else if self.json_output {
-            let doc =
-                crate::json_report::setup_done_document(&self.setup_phase_doc_input(ctx, listener));
+            let doc = crate::json_report::setup_done_document(&self.setup_phase_doc_input(ctx));
             println!("{doc}");
         }
     }
@@ -4581,6 +4600,7 @@ mod tests {
             accepted_host: "127.0.0.1".into(),
             accepted_port: 0,
             accepted_millis: 0,
+            setup_bufs: (None, None),
             cookie: [b'x'; 37],
             params,
             cfg,
@@ -4642,7 +4662,7 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_recycling_streams(&mut ctx, &l, 0, 1, None)
+        srv.setup_udp_recycling_streams(&mut ctx, 0, 1, None)
             .await
             .unwrap();
         ctx.start.store(true, Ordering::Relaxed);
@@ -4686,7 +4706,7 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_demux_streams(&mut ctx, &l, 0, 1, None)
+        srv.setup_udp_demux_streams(&mut ctx, 0, 1, None)
             .await
             .unwrap();
         ctx.start.store(true, Ordering::Relaxed);

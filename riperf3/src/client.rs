@@ -2475,16 +2475,17 @@ impl Client {
             // suppresses tcp_mss_default. build() does the TCP/UDP gating.
             mss: self.mss.filter(|&m| m > 0).map(|m| m as u32),
             fq_rate: self.fq_rate.unwrap_or(0),
-            // iperf3's start.sock_bufsize is the requested -w value (0 if unset);
-            // sndbuf/rcvbuf_actual are the kernel's actual sizes on a data socket.
-            // .max(0): the public builder accepts an i32 window; clamp so a
-            // negative can't wrap to a huge u64 (the CLI path is already >= 0).
+            // iperf3's start.sock_bufsize is the requested -w value (0 if unset),
+            // rendered VERBATIM — negatives included: GT accepts `-w -1` (only
+            // the upper bound is range-checked, iperf_api.c:1446) and emits -1
+            // (#392; the old .max(0) clamp rendered 0). sndbuf/rcvbuf_actual
+            // are the kernel's actual sizes on a data socket.
             // #261: `Some(..)` on a run that set up streams (build() gates them
             // out on the upfront-refusal path via the stage gate, #281); a
             // success run always carries them, so the shape is unchanged. A
             // missing kernel readback still yields `Some(0)` on a real run, like
             // iperf3.
-            sock_bufsize: Some(self.window.map(|w| w.max(0) as u64).unwrap_or(0)),
+            sock_bufsize: Some(self.window.map(i64::from).unwrap_or(0)),
             sndbuf_actual: Some(
                 streams
                     .first()

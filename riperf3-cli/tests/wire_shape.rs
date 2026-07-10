@@ -2343,6 +2343,89 @@ fn setup_doc_window_zero_reads_the_listener_like_no_window() {
     assert!(zero.0.is_some() && zero.1.is_some(), "the trio is present");
 }
 
+/// #392: the setup doc renders a NEGATIVE exchanged window verbatim like
+/// GT (`-w -1` is real-client-reachable, iperf_api.c:1446 — GT's doc
+/// carries sock_bufsize: -1); pre-fix riperf3's `w as u64` wrapped it to
+/// 18446744073709551615.
+#[test]
+fn setup_doc_negative_window_renders_minus_one() {
+    let (sout, _serr, status) = drive_server_scenario(true, |port| {
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&[b'x'; 37]).unwrap();
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+        write_json_blob(&mut ctrl, r#"{"tcp":true,"window":-1}"#);
+        assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+        drop(ctrl);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    assert!(status.success());
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["start"]["sock_bufsize"].as_i64(),
+        Some(-1),
+        "a negative exchanged window renders verbatim, not u64-wrapped (#392): {doc}"
+    );
+}
+
+/// #392: GT computes the setup trio ONCE at param ingest (protocol->listen
+/// runs right after get_parameters, iperf_api.c:2373-2382) and caches it —
+/// fd exhaustion at EMIT time cannot blank the keys. riperf3's per-emit
+/// scratch socket() failed EMFILE there and dropped sndbuf/rcvbuf_actual
+/// (and the same per-emit alloc was IPv4-hardcoded, the v6-only corner).
+/// prlimit-after-params clamps the server's fd table to its first free
+/// slot (the #387 technique), then the EOF triggers the setup emit.
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_doc_trio_survives_emit_time_fd_exhaustion() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps, "-J"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    let pid = server.0.id();
+    let sout_reader =
+        riperf3_test_support::drain_reader(server.0.stdout.take().expect("piped stdout"));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, r#"{"tcp":true,"window":65536}"#);
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+    // Params are ingested; NOW exhaust the fd table, then kill the round.
+    clamp_fd_table(pid);
+    drop(ctrl);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server.0.try_wait().expect("try_wait").is_none() {
+        assert!(std::time::Instant::now() < deadline, "server did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let sout = sout_reader.join().expect("drain stdout");
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["start"]["sndbuf_actual"].as_u64(),
+        Some(131072),
+        "the windowed read-back survives emit-time EMFILE — computed once \
+         at param ingest like GT (#392): {doc}"
+    );
+    assert_eq!(
+        doc["start"]["rcvbuf_actual"].as_u64(),
+        Some(131072),
+        "the windowed read-back survives emit-time EMFILE (#392): {doc}"
+    );
+}
+
 const IDLE_TIMEOUT_MSG: &str = "idle timeout for receiving data";
 
 /// HOLD-variant driver: park in CREATE_STREAMS with the ctrl open, read the
