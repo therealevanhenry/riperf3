@@ -2879,6 +2879,146 @@ async fn negative_window_renders_minus_one_like_gt() {
     }
 }
 
+/// Run one full round and return both roles' `start` docs as
+/// `(sock_bufsize, sndbuf_actual, rcvbuf_actual)` trios — the #415 probes'
+/// actuals trio, client then server. A CONCRETE port (not `Some(0)`): a UDP
+/// round's data socket binds the CONFIGURED port, so an ephemeral control
+/// bind strands it on a random port and the round wedges (#431).
+async fn run_round_actuals(
+    window: Option<i32>,
+    udp: bool,
+) -> [(Option<i64>, Option<i64>, Option<i64>); 2] {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let mut builder = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .emit_output(false);
+    if udp {
+        builder = builder.protocol(TransportProtocol::Udp);
+    }
+    if let Some(w) = window {
+        builder = builder.window(w);
+    }
+    let client = builder.build().unwrap();
+    let cli = tokio::time::timeout(Duration::from_secs(15), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    let srv = server_task.await.expect("join").expect("server run_once");
+    [&cli, &srv].map(|outcome| {
+        let v = serde_json::to_value(&outcome.report).unwrap();
+        (
+            v["start"]["sock_bufsize"].as_i64(),
+            v["start"]["sndbuf_actual"].as_i64(),
+            v["start"]["rcvbuf_actual"].as_i64(),
+        )
+    })
+}
+
+/// #415: an explicit `-w 0` is a NO-OP in GT — the buffer-apply guard is C
+/// truthiness (`if ((opt = test->settings->socket_bufsize))`,
+/// iperf_tcp.c:257/:434), so `socket_bufsize = 0` never reaches setsockopt
+/// and the w=0 cell equals the unset cell exactly (the #391 equality-pin
+/// pattern, extended from the setup-doc to the live data path). Pre-fix
+/// riperf3 applied 0 to BOTH roles' data sockets — the client's directly,
+/// the server's via the params blob's `"window": 0` (GT omits the key,
+/// iperf_api.c:2451) — and the kernel clamped the buffers to its minimums
+/// (live-probed: 4608/2304 vs 3939840/131072 untouched), a real throughput
+/// divergence, not just a doc one.
+#[tokio::test]
+async fn tcp_window_zero_equals_unset_cell_both_roles() {
+    let unset = run_round_actuals(None, false).await;
+    let zero = run_round_actuals(Some(0), false).await;
+    for (role, i) in [("client", 0), ("server", 1)] {
+        assert_eq!(
+            zero[i], unset[i],
+            "the {role}'s -w 0 actuals trio must equal the unset cell (#415)"
+        );
+        assert_eq!(
+            zero[i].0,
+            Some(0),
+            "the {role}'s sock_bufsize renders 0 for -w 0, like GT's verbatim 0"
+        );
+    }
+}
+
+/// #415, UDP flavor: the UDP apply site is `capture_stream_meta`
+/// (apply_window=true, the #59 path), distinct from TCP's
+/// `configure_tcp_stream_full` — GT's guard is the same truthiness in
+/// `iperf_udp_buffercheck` (iperf_udp.c:384). Client doc only: the server's
+/// UDP start block carries no actuals (#383).
+#[tokio::test]
+async fn udp_window_zero_equals_unset_cell() {
+    let unset = run_round_actuals(None, true).await;
+    let zero = run_round_actuals(Some(0), true).await;
+    assert_eq!(
+        zero[0], unset[0],
+        "the client's UDP -w 0 actuals trio must equal the unset cell (#415)"
+    );
+}
+
+/// #415 (wire half): GT gates the params blob's `"window"` key on the same
+/// truthiness (`if (test->settings->socket_bufsize)` — iperf_api.c:2451), so
+/// a `-w 0` client sends NO window key. Pre-fix riperf3 sent `"window": 0`,
+/// which a pre-fix riperf3 server applied to its data sockets (the server
+/// half of the live bug; a GT server ingests 0 harmlessly but the wire bytes
+/// still diverge). A `-w 65536` control cell keeps the positive path pinned.
+#[tokio::test]
+async fn params_blob_omits_window_zero_like_gt() {
+    use std::io::{Read, Write};
+
+    async fn capture_params_blob(window: i32) -> serde_json::Value {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let mock = tokio::task::spawn_blocking(move || {
+            let (mut ctrl, _) = listener.accept().expect("ctrl accept");
+            let mut cookie = [0u8; 37];
+            ctrl.read_exact(&mut cookie).unwrap();
+            ctrl.write_all(&[9u8]).unwrap(); // ParamExchange
+            let mut len = [0u8; 4];
+            ctrl.read_exact(&mut len).unwrap();
+            let mut blob = vec![0u8; u32::from_be_bytes(len) as usize];
+            ctrl.read_exact(&mut blob).unwrap();
+            blob
+            // ctrl drops here — the client errors out of the round promptly.
+        });
+        let client = ClientBuilder::new("127.0.0.1")
+            .port(Some(port))
+            .duration(1)
+            .window(window)
+            .emit_output(false)
+            .build()
+            .unwrap();
+        let run = tokio::spawn(async move { client.run().await });
+        let blob = tokio::time::timeout(Duration::from_secs(10), mock)
+            .await
+            .expect("mock hung")
+            .expect("mock join");
+        // Reap the erroring client; its outcome is not this pin's business.
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+        serde_json::from_slice(&blob).expect("params blob is JSON")
+    }
+
+    let zero = capture_params_blob(0).await;
+    assert!(
+        zero.get("window").is_none(),
+        "-w 0 must omit the params blob's window key like GT (iperf_api.c:2451): {zero}"
+    );
+    let explicit = capture_params_blob(65536).await;
+    assert_eq!(
+        explicit["window"].as_i64(),
+        Some(65536),
+        "a nonzero -w still carries the window key: {explicit}"
+    );
+}
+
 /// #406 (r1): the `RecvMessageFailed`↔`SendFailed` cell of the same
 /// invisibility class — the repo's first RENDERING-IDENTICAL variant pair
 /// (both print `error - {msg}` with the carried message and both errexit

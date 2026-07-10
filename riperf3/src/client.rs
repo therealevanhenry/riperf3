@@ -3062,7 +3062,11 @@ impl ClientBuilder {
     }
 
     /// `-w/--window`: socket buffer size in bytes (indirectly sets the TCP
-    /// window size).
+    /// window size). `0` normalizes to unset at `build()` — kernel autotuning,
+    /// never applied, never sent on the wire — mirroring iperf3, whose
+    /// `socket_bufsize` 0 is the unset sentinel behind C truthiness guards
+    /// (#415). Negatives pass through verbatim like iperf3 (only the upper
+    /// bound is range-checked there); the kernel decides what they mean.
     pub fn window(mut self, window: i32) -> Self {
         self.window = Some(window);
         self
@@ -3434,7 +3438,12 @@ impl ClientBuilder {
     }
 
     /// Like [`Self::window`], accepting a KMG-suffixed size string
-    /// (`-w 4M`; binary, 1024-based).
+    /// (`-w 4M`; binary, 1024-based). The parsed value is cast to `i32`
+    /// without a range check (like iperf3's `(int) unit_atof(optarg)`), so an
+    /// out-of-range size wraps — `"4G"` wraps to 0, which [`Self::window`]
+    /// then treats as unset (#432 r2 F4). iperf3's CLI rejects anything over
+    /// 512M (IEBUFSIZE) before its cast; callers wanting that guard should
+    /// range-check before calling, as riperf3's own CLI does.
     pub fn window_str(self, s: &str) -> std::result::Result<Self, ConfigError> {
         Ok(self.window(parse_kmg(s)? as i32))
     }
@@ -3649,7 +3658,15 @@ impl ClientBuilder {
             omit: self.omit,
             no_delay: self.no_delay,
             mss: self.mss,
-            window: self.window,
+            // #415: an explicit 0 IS "unset" — GT's socket_bufsize uses 0 as
+            // the unset sentinel and truthiness-gates every consumer (the
+            // apply sites, iperf_tcp.c:257/:434; the params-blob key,
+            // iperf_api.c:2451), so `-w 0` must ride every unset arm: no
+            // setsockopt, no "window" key on the wire, and the #163 UDP
+            // batch sizing treats the buffer as untouched. Normalizing here
+            // covers them all; the `start.sock_bufsize` render is unchanged
+            // (`unwrap_or(0)` — GT renders the verbatim 0 either way).
+            window: self.window.filter(|&w| w != 0),
             // Resolve the rate default now (UDP unset → 1 Mbit/s, like iperf3);
             // an explicit -b (incl. 0 = unlimited) is honored. TCP default is
             // unlimited (0). After this, bandwidth==0 unambiguously = unlimited.

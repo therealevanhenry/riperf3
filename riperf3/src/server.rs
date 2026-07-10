@@ -159,7 +159,12 @@ impl TestConfig {
             omit: params.omit.unwrap_or(0) as u32,
             no_delay: params.nodelay.unwrap_or(false),
             mss: params.mss,
-            window: params.window,
+            // #415 (r1 F1): a wire `"window": 0` (pre-0.9.0 riperf3 clients
+            // sent the key; GT omits it, iperf_api.c:2451) is GT's unset
+            // sentinel — normalize here so every consumer rides the unset
+            // arm, the UDP senders' `uw` gates included. Nonzero values,
+            // negatives included (#392), ingest verbatim.
+            window: params.window.filter(|&w| w != 0),
             // A present rate (incl. 0 = unlimited) is used verbatim. An ABSENT
             // rate means unlimited (0), matching iperf3: it omits the param only
             // for -b 0 and sends it explicitly otherwise (incl. its 1 Mbit/s UDP
@@ -4623,6 +4628,43 @@ mod tests {
     /// #316: the server adopts the client's exchanged GSO/GRO request
     /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
     /// from the negotiated blksize (:2607-2613).
+    /// #415 (r1 F1): a wire `"window": 0` ingests as UNSET — GT's
+    /// socket_bufsize 0 is the unset sentinel in EVERY consumer, including
+    /// the UDP auto-increase arm (iperf_udp.c:563/:691, the GT analogue of
+    /// the #163 sndbuf bump). Pre-fix the two UDP-sender arms'
+    /// `uw = window.is_some()` treated a pre-0.9.0 client's `"window": 0`
+    /// as user-set and suppressed the bump. Nonzero values — negatives
+    /// included (#392) — ingest verbatim.
+    #[test]
+    fn from_params_window_zero_ingests_as_unset() {
+        let zero = crate::protocol::TestParams {
+            window: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            TestConfig::from_params(&zero).unwrap().window,
+            None,
+            "wire window 0 must ride every unset arm, like GT's 0 sentinel"
+        );
+        let explicit = crate::protocol::TestParams {
+            window: Some(65536),
+            ..Default::default()
+        };
+        assert_eq!(
+            TestConfig::from_params(&explicit).unwrap().window,
+            Some(65536)
+        );
+        let negative = crate::protocol::TestParams {
+            window: Some(-1),
+            ..Default::default()
+        };
+        assert_eq!(
+            TestConfig::from_params(&negative).unwrap().window,
+            Some(-1),
+            "negatives stay verbatim (#392) — GT applies them and lets the kernel decide"
+        );
+    }
+
     #[test]
     fn test_config_adopts_the_gsro_block() {
         let params = crate::protocol::TestParams {

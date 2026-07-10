@@ -657,10 +657,13 @@ impl Cli {
             // out-of-i32-range negative (`-w -3G`) saturates to i32::MIN on
             // both (GT's cvttsd2si also yields INT_MIN); positive overflow is
             // unreachable (IEBUFSIZE catches anything > MAX_TCP_BUFFER first).
-            // RECORDED DEVIATION (unobservable): the sole literal that
-            // diverges is `-w nan` — `nan as i32` = 0, GT's `(int)nan` =
-            // INT_MIN. socket_bufsize is not a wire/output field and `-w nan`
-            // never connects, so the value is never observable; not worth a
+            // RECORDED DEVIATION: the sole literal that diverges is `-w nan`
+            // — `nan as i32` = 0, GT's `(int)nan` = INT_MIN. Both tools DO
+            // connect and complete (#432 r2 probe): GT renders
+            // `sock_bufsize: -2147483648` with the negative applied (the
+            // kernel max-clamps it), riperf3 renders 0 and runs fully unset
+            // (#415 normalizes the 0 to kernel autotuning). Observable in
+            // `-J`, tolerated: a NaN-cast literal is not worth a
             // special-case for an absurd input.
             let farg = unit_atoi_os(s)?;
             builder = builder.window(farg as i32);

@@ -369,15 +369,30 @@ pub fn configure_tcp_stream(stream: &TcpStream, no_delay: bool) -> Result<()> {
 /// Apply the requested socket buffer size (`-w/--window`) to a socket's send and
 /// receive buffers (`SO_SNDBUF` / `SO_RCVBUF`).
 ///
-/// Best-effort: a kernel that clamps or rejects the size is not fatal — iperf3
-/// likewise proceeds, and the realized size is read back separately for the
-/// `sndbuf_actual` / `rcvbuf_actual` report. Used for both TCP and UDP data
-/// sockets so `-w` is honored on UDP too (#59), matching iperf3's
-/// `iperf_udp_buffercheck`. `None` is a no-op (kernel default).
+/// Best-effort at the syscall: a kernel that clamps the size is not fatal here —
+/// the realized size is read back separately for the `sndbuf_actual` /
+/// `rcvbuf_actual` report, and [`check_socket_window`] enforces GT's clamp abort
+/// (IESETBUF2). (An outright setsockopt REJECTION is IESETBUF in GT; Linux
+/// clamps rather than rejects — `-w -1` live-probes to identical max-size
+/// buffers on both tools — so the arm is not mirrored.) Used for both TCP and
+/// UDP data sockets so `-w` is honored on UDP too (#59), matching iperf3's
+/// `iperf_udp_buffercheck`.
+///
+/// `None` AND `Some(0)` are no-ops (kernel default): GT's apply guard is C
+/// truthiness on `socket_bufsize` (`if ((opt = test->settings->socket_bufsize))`,
+/// iperf_tcp.c:257/:434, iperf_udp.c:384), so an explicit `-w 0` never reaches
+/// setsockopt. Pre-#415 riperf3 applied the 0 and the kernel clamped both
+/// buffers to its minimums — a live throughput divergence. The guard sits HERE,
+/// not only at the boundaries, because a server can be handed `"window": 0`
+/// on the wire by pre-0.9.0 riperf3 clients (they sent the key where GT omits
+/// it) — the server's param ingest normalizes that 0 to unset (`from_params`,
+/// r1 F1), and this guard is the defense-in-depth layer behind it.
 pub(crate) fn apply_socket_window(sock: &socket2::SockRef<'_>, window: Option<i32>) {
     if let Some(size) = window {
-        let _ = sock.set_recv_buffer_size(size as usize);
-        let _ = sock.set_send_buffer_size(size as usize);
+        if size != 0 {
+            let _ = sock.set_recv_buffer_size(size as usize);
+            let _ = sock.set_send_buffer_size(size as usize);
+        }
     }
 }
 
@@ -1262,6 +1277,30 @@ mod tests {
         let before = s2.send_buffer_size().unwrap();
         apply_socket_window(&s2, None);
         assert_eq!(s2.send_buffer_size().unwrap(), before);
+    }
+
+    /// #415: `Some(0)` must be a no-op like `None` — GT's buffer-apply guard is
+    /// C truthiness (`if ((opt = test->settings->socket_bufsize))`,
+    /// iperf_tcp.c:257/:434, iperf_udp.c:384), so `-w 0` never reaches
+    /// setsockopt. Pre-fix riperf3 applied 0 and the kernel clamped both
+    /// buffers to its minimums (live-probed: 4608/2304 vs untouched defaults).
+    #[test]
+    fn apply_socket_window_zero_is_a_noop() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let s = socket2::SockRef::from(&sock);
+        let snd_before = s.send_buffer_size().unwrap();
+        let rcv_before = s.recv_buffer_size().unwrap();
+        apply_socket_window(&s, Some(0));
+        assert_eq!(
+            s.send_buffer_size().unwrap(),
+            snd_before,
+            "SO_SNDBUF must be untouched by -w 0 (GT truthiness skip)"
+        );
+        assert_eq!(
+            s.recv_buffer_size().unwrap(),
+            rcv_before,
+            "SO_RCVBUF must be untouched by -w 0 (GT truthiness skip)"
+        );
     }
 
     // #149: the server's listener and UDP socket honor --bind-dev pre-bind
