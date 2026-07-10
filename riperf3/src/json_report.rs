@@ -496,12 +496,14 @@ impl Serialize for Start {
         // system_info whenever the exchanged rate is nonzero
         // (iperf_api.c:2662) — SERVER role only (it's the param ingest) —
         // and on_connect then emits the key AGAIN (iperf_api.c:1029): a
-        // duplicate JSON key no strict serializer can express, and
-        // arguably a GT defect. riperf3 emits the EARLY occurrence only
-        // (both carry the same exchanged rate; cJSON's lookup reads the
-        // first) — the recorded #377 deviation; every other key stays
-        // byte-aligned, including the trio shifting to 5-7 on rate-set
-        // TCP (all cells live-probed 3.21).
+        // duplicate JSON key, RFC 8259 SHOULD-unique and collapsed
+        // silently by strict parsers. Reproducing it here is possible but
+        // DECLINED (the #271 don't-mirror-GT-bugs precedent) — riperf3
+        // emits the EARLY occurrence only (both carry the same exchanged
+        // rate; cJSON's lookup reads the first) — the recorded #377
+        // deviation; every other key stays byte-aligned, including the
+        // trio shifting to 5-7 on rate-set TCP (all cells live-probed
+        // 3.21).
         let early_tb = self.accepted_connection.is_some() && self.target_bitrate != 0;
         if early_tb && self.stage != StartStage::Connecting {
             m.serialize_entry("target_bitrate", &self.target_bitrate)?;
@@ -3970,8 +3972,9 @@ mod tests {
     /// system_info (iperf_api.c:2662) whenever the exchanged rate is
     /// nonzero — SERVER role only — shifting the TCP early trio to
     /// positions 5-7. GT then emits the key AGAIN at on_connect
-    /// (iperf_api.c:1029): a duplicate JSON key no strict serializer can
-    /// express. riperf3 emits the EARLY occurrence only — the recorded
+    /// (iperf_api.c:1029): a duplicate JSON key, declined per the #271
+    /// don't-mirror-GT-bugs precedent (reproducible, but RFC 8259
+    /// SHOULD-unique). riperf3 emits the EARLY occurrence only — the recorded
     /// #377 deviation (both occurrences carry the same exchanged rate;
     /// cJSON's lookup reads the first) — leaving every other key
     /// byte-aligned with GT (all cells live-probed 3.21, 2026-07-09).
