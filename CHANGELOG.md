@@ -69,6 +69,10 @@ release tags.
   the server's setup phase now runs inside the teardown gate's block, the client's
   `create_streams` pushes partial progress into `ctx.streams` instead of a local vec, and
   each task is abort-guarded the moment it spawns (#381).
+- Refused rounds (`--server-max-duration`/`--server-bitrate-limit`) park until the client
+  closes, mirroring iperf3's cleanup drain: the refusal doc renders at round end, and a
+  signal landing in the park abandons it — the interrupt skeleton emits alone, carrying the
+  refused round's `target_bitrate` (#386).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

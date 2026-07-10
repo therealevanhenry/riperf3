@@ -811,3 +811,67 @@ fn upfront_max_duration_line_carries_the_timestamps_prefix() {
     assert_eq!(scode, 0);
     assert_stamped_line(&serr, &format!("riperf3: error - {MAXDUR_MSG}"));
 }
+
+/// #386, the signal cell (GT live-probed both cells 2026-07-10): a refused
+/// round PARKS doc-less until client EOF — a SIGTERM landing in that park
+/// abandons the unprinted refusal doc, and the server emits the interrupt
+/// skeleton ALONE (one doc, carrying the parked round's target_bitrate —
+/// GT's json_start was stamped at get_parameters and json_finish renders
+/// it). riperf3 printed the refusal doc immediately, so the same sequence
+/// yielded TWO docs (probed 30/30 vs GT 10/10 in #385's r1 hammer). The
+/// park makes this cell deterministic: no race, the mock just holds.
+#[cfg(unix)]
+#[test]
+fn sigterm_during_refusal_park_abandons_the_refusal_doc() {
+    use std::io::Write;
+
+    let port = common::free_port();
+    let ps = port.to_string();
+    let server = spawn_server(&["-J", "--server-max-duration", "1"], &ps);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Raw mock: violate, read the fe+37 relay, HOLD the ctrl.
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    let mut b = [0u8; 1];
+    ctrl.read_exact(&mut b).unwrap();
+    assert_eq!(b[0], 9, "ParamExchange");
+    let params = br#"{"tcp":true,"time":30,"parallel":1,"len":4096,"bandwidth":2000000}"#;
+    ctrl.write_all(&(params.len() as u32).to_be_bytes())
+        .unwrap();
+    ctrl.write_all(params).unwrap();
+    let mut relay = [0u8; 9];
+    ctrl.read_exact(&mut relay).unwrap();
+    assert_eq!(relay[0], 0xfe, "SERVER_ERROR state");
+
+    // The park is stable state — signal lands inside it deterministically.
+    std::thread::sleep(Duration::from_millis(300));
+    let pid = server.0.id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    let (sout, _serr, scode) = finish(server, Duration::from_secs(10), "server");
+    assert_eq!(scode, 0, "signal-normal exit");
+    drop(ctrl);
+
+    let docs: Vec<serde_json::Value> = serde_json::Deserializer::from_str(&sout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("server -J stream ({e}): {sout}"));
+    assert_eq!(
+        docs.len(),
+        1,
+        "the abandoned refusal must not print — the interrupt skeleton \
+         ALONE (#386): {sout}"
+    );
+    let err = docs[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        err.starts_with("interrupt - "),
+        "the one doc is the interrupt skeleton: {err:?}"
+    );
+    assert_eq!(
+        docs[0]["start"]["target_bitrate"].as_u64(),
+        Some(2_000_000),
+        "the skeleton carries the PARKED round's -b (GT cell B): {}",
+        docs[0]
+    );
+}

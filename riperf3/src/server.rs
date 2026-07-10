@@ -453,6 +453,30 @@ enum SetupFlow {
     ClientDone,
 }
 
+/// GT's IETOTALRATE(27) strerror — the #260 upfront total-rate refusal
+/// (get_parameters, iperf_api.c:2672-2684) AND the in-flight 1 Hz breach.
+const TOTAL_RATE_REFUSAL_MSG: &str = "total required bandwidth is larger than server limit";
+
+/// GT's IEMAXSERVERTESTDURATIONEXCEEDED(37) strerror — the #230 upfront
+/// requested-duration refusal (get_parameters, iperf_api.c:2666).
+const MAX_DURATION_REFUSAL_MSG: &str =
+    "client's requested duration exceeds the server's maximum permitted limit";
+
+/// How the cookie/param phase ended (#386). A refusal has SENT its
+/// SERVER_ERROR relay but NOT emitted any doc — the round first parks
+/// until client EOF (GT cleanup_server's sync-close drain), and only the
+/// park's outcome decides between the refusal doc (EOF) and the interrupt
+/// skeleton (signal, doc abandoned).
+enum NegotiateOutcome {
+    /// Params accepted — run the test (boxed: the tuple dwarfs Refused).
+    Proceed(Box<([u8; protocol::COOKIE_SIZE], TestParams, TestConfig)>),
+    /// Refused upfront (#230/#260): relay sent, doc deferred to post-park.
+    Refused {
+        error_line: &'static str,
+        refused_rate: Option<u64>,
+    },
+}
+
 /// What the #338 setup-phase ctrl watch saw.
 enum CtrlActivity {
     /// The peer closed the control connection (read-half EOF).
@@ -952,9 +976,26 @@ impl Server {
             }
         };
         let (cookie, params, cfg) = match negotiated {
-            Some(negotiated) => negotiated,
-            // Refused before any test ran → no report.
-            None => return Ok(None),
+            NegotiateOutcome::Proceed(negotiated) => *negotiated,
+            // Refused before any test ran → no report. #386: the round does
+            // NOT end at the relay — it parks until the client closes (GT
+            // cleanup_server's sync-close drain), and only then renders the
+            // refusal sinks; a signal landing in the park ABANDONS the
+            // refusal doc and emits the interrupt skeleton alone, carrying
+            // the parked round's target_bitrate (GT stamps json_start at
+            // get_parameters and sigend's json_finish renders it — cell B
+            // live-probed). The park sits OUTSIDE the #361 select above so
+            // that select's rate-less skeleton can't win the signal race.
+            NegotiateOutcome::Refused {
+                error_line,
+                refused_rate,
+            } => {
+                match self.park_refused_round(&mut ctrl).await {
+                    None => self.emit_refusal(error_line, refused_rate),
+                    Some(msg) => self.emit_pretest_error_doc(&msg, refused_rate),
+                }
+                return Ok(None);
+            }
         };
 
         // --get-server-output (#33): when the client asks and this server is
@@ -1356,12 +1397,14 @@ impl Server {
         }
     }
 
-    /// Cookie read + ParamExchange + config derivation, plus the #230 upfront
-    /// max-duration check. `Ok(None)` = refused (no test ran, no report).
-    async fn negotiate_test(
-        &self,
-        ctrl: &mut tokio::net::TcpStream,
-    ) -> Result<Option<([u8; protocol::COOKIE_SIZE], TestParams, TestConfig)>> {
+    /// Cookie read + ParamExchange + config derivation, plus the #230/#260
+    /// upfront refusal checks. A `Refused` outcome has SENT its relay but
+    /// NOT emitted its doc: the round must first PARK until client EOF
+    /// (#386 — GT cleanup_server's sync-close drain), owned by
+    /// handle_one_test so the park is not raced by the #361 negotiate-phase
+    /// interrupt select (whose skeleton carries no target_bitrate — the
+    /// parked round's must, GT cell B).
+    async fn negotiate_test(&self, ctrl: &mut tokio::net::TcpStream) -> Result<NegotiateOutcome> {
         // ---- Cookie ----
         // #330: a failed cookie read is GT's IERECVCOOKIE(106) — iperf_accept
         // errors and cleanup_server relays SERVER_ERROR(-2) + the code before
@@ -1448,15 +1491,23 @@ impl Server {
         // (iperf_api.c:2662), so both refusal docs carry the client's -b.
         let refused_rate = params.bandwidth.filter(|&b| b > 0);
         if rate_violated {
-            // Refused before any test ran → no report.
-            self.refuse_total_rate(ctrl, refused_rate).await?;
-            return Ok(None);
+            // #260: cleanup_server's relay — SERVER_ERROR + (IETOTALRATE=27,
+            // errno) — then the #386 park before any doc renders.
+            protocol::send_server_error(ctrl, 27).await?;
+            return Ok(NegotiateOutcome::Refused {
+                error_line: TOTAL_RATE_REFUSAL_MSG,
+                refused_rate,
+            });
         }
         if duration_violated {
-            self.refuse_max_duration(ctrl, refused_rate).await?;
-            return Ok(None);
+            // #230: the IEMAXSERVERTESTDURATIONEXCEEDED(37) relay, same shape.
+            protocol::send_server_error(ctrl, 37).await?;
+            return Ok(NegotiateOutcome::Refused {
+                error_line: MAX_DURATION_REFUSAL_MSG,
+                refused_rate,
+            });
         }
-        Ok(Some((cookie, params, cfg)))
+        Ok(NegotiateOutcome::Proceed(Box::new((cookie, params, cfg))))
     }
 
     /// #222: the connect text block, in GT's order and GT's TIMING —
@@ -3794,36 +3845,61 @@ impl Server {
         }
     }
 
-    /// #260: the upfront IETOTALRATE(27) refusal — GT's get_parameters
-    /// total-rate check. Same sink shape as the max-duration refusal below;
-    /// iperf_strerror(27) is perr=0, so the message carries no trailing ': '.
-    async fn refuse_total_rate(
-        &self,
-        ctrl: &mut tokio::net::TcpStream,
-        target_bitrate: Option<u64>,
-    ) -> Result<()> {
-        const MSG: &str = "total required bandwidth is larger than server limit";
-        protocol::send_server_error(ctrl, 27).await?;
+    /// #386: GT's refused round does not END at the relay — cleanup_server
+    /// closes the ctrl through iperf_sync_close_socket (net.c:877-886):
+    /// shutdown(SHUT_WR), then READ UNTIL EOF. The round parks until the
+    /// CLIENT closes — unbounded, like GT (a signal is the only other
+    /// exit; a wedged client holds GT's server the same way). Returns the
+    /// interrupt message if a signal ended the park — the refusal doc is
+    /// then ABANDONED (GT's sigend longjmps past the unprinted doc and
+    /// emits the interrupt skeleton alone; cells A/B live-probed
+    /// 2026-07-10) — or None on client EOF/RST (emit the refusal doc,
+    /// GT's Nread <= 0 drain exit).
+    async fn park_refused_round(&self, ctrl: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = ctrl.shutdown().await; // GT's SHUT_WR half-close
+        let mut interrupt = self.interrupt.clone().map(|w| w.0);
+        let mut buf = [0u8; 128];
+        loop {
+            tokio::select! {
+                r = ctrl.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => return None,
+                    Ok(_) => continue, // drain, like GT's read loop
+                },
+                msg = crate::client::wait_interrupt(interrupt.as_mut()) => {
+                    return Some(msg);
+                }
+            }
+        }
+    }
+
+    /// The refusal sinks, rendered at ROUND END (post-park, #386) — GT's
+    /// refusal shapes per output mode (live-captured, iperf 3.21): text
+    /// gets the one stderr line (#344: iperf_err's --timestamps stamp —
+    /// the refusal reaches main.c:174's iperf_err via the -1 return); -J
+    /// gets the skeleton error document (no accepted_connection/cookie —
+    /// GT skips on_connect on this path); a --json-stream server gets the
+    /// error + empty-end event pair with no start event (#198's pre-test
+    /// tail, byte-identical to GT's refusal events). iperf_strerror is
+    /// perr=0 for both classes, so no trailing ': '.
+    fn emit_refusal(&self, msg: &str, target_bitrate: Option<u64>) {
         if self.json_stream {
             crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
-                &format!("error - {MSG}"),
+                &format!("error - {msg}"),
             ));
         } else if self.json_output {
             if !crate::macros::output_quiet() {
                 println!(
                     "{}",
-                    crate::json_report::refusal_document(&format!("error - {MSG}"), target_bitrate)
+                    crate::json_report::refusal_document(&format!("error - {msg}"), target_bitrate)
                 );
             }
         } else if !crate::macros::output_quiet() {
-            // #344: iperf_err's --timestamps stamp (the refusal reaches
-            // main.c:174's iperf_err via the -1 return).
             eprintln!(
-                "{}riperf3: error - {MSG}",
+                "{}riperf3: error - {msg}",
                 crate::macros::output_timestamp_prefix()
             );
         }
-        Ok(())
     }
 
     /// #330: the JSON half of a pre-test error's iperf_err sink — the -J
@@ -4115,47 +4191,6 @@ impl Server {
                 crate::macros::output_timestamp_prefix()
             );
         }
-    }
-
-    /// #230: refuse a test at param exchange (GT's upfront requested-duration
-    /// check). Sends cleanup_server's relay — SERVER_ERROR + the
-    /// (IEMAXSERVERTESTDURATIONEXCEEDED=37, errno) pair — then renders GT's
-    /// refusal shapes per output mode (live-captured, iperf 3.21): text gets
-    /// the one stderr line; -J gets the skeleton error document (no
-    /// accepted_connection/cookie — GT skips on_connect on this path); a
-    /// --json-stream server gets the error + empty-end event pair with no
-    /// start event. Returns Ok: iperf3's one-off exits 0 here, and a
-    /// persistent server goes on to serve the next test.
-    async fn refuse_max_duration(
-        &self,
-        ctrl: &mut tokio::net::TcpStream,
-        target_bitrate: Option<u64>,
-    ) -> Result<()> {
-        const MSG: &str =
-            "client's requested duration exceeds the server's maximum permitted limit";
-        protocol::send_server_error(ctrl, 37).await?;
-        if self.json_stream {
-            // #198's pre-test error tail (error event + empty end event) is
-            // byte-identical to GT's refusal events — reuse it (r1 item 8),
-            // routed through the stream emitter for its flush.
-            crate::reporter::emit_json_stream_line(&crate::json_report::error_stream_events(
-                &format!("error - {MSG}"),
-            ));
-        } else if self.json_output {
-            if !crate::macros::output_quiet() {
-                println!(
-                    "{}",
-                    crate::json_report::refusal_document(&format!("error - {MSG}"), target_bitrate)
-                );
-            }
-        } else if !crate::macros::output_quiet() {
-            // #344: iperf_err's --timestamps stamp, like the total-rate twin.
-            eprintln!(
-                "{}riperf3: error - {MSG}",
-                crate::macros::output_timestamp_prefix()
-            );
-        }
-        Ok(())
     }
 
     /// `--json-stream`: emit the server's `end` event (#62). The interval events
