@@ -718,6 +718,7 @@ fn end_loop_eof_prints_summary_and_the_line_in_text() {
 /// timing-deviation precedent). Pre-fix: skeleton doc + raw io key.
 /// Sentence-prefix asserts per the #387 CI lesson (strerror text is
 /// platform-local); Linux-gated like every RST-timing cell.
+#[cfg(target_os = "linux")]
 const RECVMSG_SENTENCE: &str = "unable to receive control message - port may not be available, \
      the other side may have stopped running, etc.";
 

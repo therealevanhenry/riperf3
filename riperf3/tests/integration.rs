@@ -2766,6 +2766,102 @@ async fn negative_window_renders_minus_one_like_gt() {
     }
 }
 
+/// #406 (r1): the `RecvMessageFailed`↔`SendFailed` cell of the same
+/// invisibility class — the repo's first RENDERING-IDENTICAL variant pair
+/// (both print `error - {msg}` with the carried message and both errexit
+/// to None), so only a lib-level `run_once` assertion discriminates them.
+/// A raw mock completes the full round through DisplayResults, then
+/// SO_LINGER(0)-RSTs instead of IperfDone — the IperfDone-wait read fails
+/// hard (IERECVMESSAGE) over the POPULATED report. Linux-gated like every
+/// RST-timing cell (the #339 lesson).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn server_run_once_exchange_rst_ends_recv_message_failed() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    // The raw round runs on a blocking thread (std sockets).
+    let mock = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let rd1 = |s: &mut std::net::TcpStream| {
+            let mut b = [0u8; 1];
+            s.read_exact(&mut b).expect("state byte");
+            b[0]
+        };
+        let blob_w = |s: &mut std::net::TcpStream, p: &str| {
+            s.write_all(&(p.len() as u32).to_be_bytes()).unwrap();
+            s.write_all(p.as_bytes()).unwrap();
+        };
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(rd1(&mut ctrl), 9, "ParamExchange");
+        blob_w(
+            &mut ctrl,
+            r#"{"tcp":true,"time":1,"parallel":1,"len":4096}"#,
+        );
+        assert_eq!(rd1(&mut ctrl), 10, "CreateStreams");
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(rd1(&mut ctrl), 1, "TestStart");
+        assert_eq!(rd1(&mut ctrl), 2, "TestRunning");
+        data.write_all(&[0u8; 4096]).unwrap();
+        ctrl.write_all(&[4u8]).unwrap(); // TestEnd
+        assert_eq!(rd1(&mut ctrl), 13, "ExchangeResults");
+        blob_w(
+            &mut ctrl,
+            r#"{"cpu_util_total":1.0,"cpu_util_user":0.5,"cpu_util_system":0.5,"sender_has_retransmits":1,"streams":[{"id":1,"bytes":4096,"retransmits":0,"jitter":0,"errors":0,"packets":0,"start_time":0,"end_time":1}]}"#,
+        );
+        // Read the server's results blob, then DisplayResults.
+        let mut len = [0u8; 4];
+        ctrl.read_exact(&mut len).unwrap();
+        let mut blob = vec![0u8; u32::from_be_bytes(len) as usize];
+        ctrl.read_exact(&mut blob).unwrap();
+        assert_eq!(rd1(&mut ctrl), 14, "DisplayResults");
+        // The #406 cell: RST instead of IperfDone/FIN.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::setsockopt(
+                ctrl.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "SO_LINGER(0)");
+        drop((ctrl, data));
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .expect("server hung")
+        .expect("join")
+        .expect("the completed-exchange RST is a report-producing round (#406)");
+    mock.await.expect("mock");
+    match &outcome.termination {
+        riperf3::Termination::RecvMessageFailed(msg) => assert!(
+            msg.starts_with("unable to receive control message"),
+            "the carried IERECVMESSAGE message: {msg:?}"
+        ),
+        other => panic!("expected RecvMessageFailed, got {other:?}"),
+    }
+    assert!(
+        !outcome.report.end.streams.is_empty(),
+        "the exchange completed — the report keeps the POPULATED end (#406)"
+    );
+}
+
 /// The server-side `Interrupted` cell of the same invisibility class: a
 /// mid-test interrupt on `run_once` comes back `Ok(RunOutcome)` with
 /// `Termination::Interrupted`. Like `SelfTerminated` above, an
