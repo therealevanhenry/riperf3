@@ -3062,7 +3062,11 @@ impl ClientBuilder {
     }
 
     /// `-w/--window`: socket buffer size in bytes (indirectly sets the TCP
-    /// window size).
+    /// window size). `0` normalizes to unset at `build()` — kernel autotuning,
+    /// never applied, never sent on the wire — mirroring iperf3, whose
+    /// `socket_bufsize` 0 is the unset sentinel behind C truthiness guards
+    /// (#415). Negatives pass through verbatim like iperf3 (only the upper
+    /// bound is range-checked there); the kernel decides what they mean.
     pub fn window(mut self, window: i32) -> Self {
         self.window = Some(window);
         self

@@ -383,9 +383,10 @@ pub fn configure_tcp_stream(stream: &TcpStream, no_delay: bool) -> Result<()> {
 /// iperf_tcp.c:257/:434, iperf_udp.c:384), so an explicit `-w 0` never reaches
 /// setsockopt. Pre-#415 riperf3 applied the 0 and the kernel clamped both
 /// buffers to its minimums — a live throughput divergence. The guard sits HERE,
-/// not only at the client boundary, because a server can be handed
-/// `"window": 0` on the wire by older riperf3 clients (≤0.9.0 sent the key
-/// where GT omits it).
+/// not only at the boundaries, because a server can be handed `"window": 0`
+/// on the wire by pre-0.9.0 riperf3 clients (they sent the key where GT omits
+/// it) — the server's param ingest normalizes that 0 to unset (`from_params`,
+/// r1 F1), and this guard is the defense-in-depth layer behind it.
 pub(crate) fn apply_socket_window(sock: &socket2::SockRef<'_>, window: Option<i32>) {
     if let Some(size) = window {
         if size != 0 {
