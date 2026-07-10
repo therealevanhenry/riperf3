@@ -49,7 +49,7 @@ fn child_quiet_server_then_loud_pair() {
             .emit_output(false)
             .build()
             .unwrap();
-        let _ = server.run().await; // idle timeout -> Err(Aborted), fine
+        let _ = server.run().await; // one-off idle timeout ends the loop Ok(())
 
         // Phase 2: a fully LOUD pair in the same process — proves every quiet
         // guard dropped back to zero (a leaked increment would silence this).
@@ -150,7 +150,10 @@ fn child_run(quiet: bool) {
 /// is process-global, so a same-process server's correct default would mask a
 /// reverted client default (which is exactly why a bare PAIR pins nothing —
 /// the review's revert probe survived the whole suite). A `true` client
-/// default prints the "Connecting to host" banner before the interrupt fires.
+/// default leaks the interrupt dump (the `- - - - -` separator + interval
+/// header) — r1: the connect banner does NOT leak here, it waits on a
+/// PARAM_EXCHANGE the mock never sends; the dump is synchronous with the
+/// interrupt in any phase, so the pin doesn't ride the 500 ms timing.
 fn child_bare_default_client() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -366,7 +369,7 @@ fn quiet_server_daemon_is_silent_and_loudness_recovers() {
 /// #294 (review sweep): a client built with NO `emit_output` call is quiet —
 /// the flipped DEFAULT itself is under test, in a process with no riperf3
 /// server whose own guard could mask a revert. Reverting the ClientBuilder
-/// default to `true` fails this (the connect banner leaks).
+/// default to `true` fails this (the interrupt dump lines leak).
 #[test]
 fn bare_default_client_is_quiet() {
     if std::env::var("RIPERF3_QUIET_CHILD").is_ok() {

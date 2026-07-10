@@ -337,9 +337,9 @@ impl Client {
     /// [`ServerTerminated`](crate::Termination::ServerTerminated), or
     /// [`ServerError`](crate::Termination::ServerError) carrying the server's
     /// relayed message — the report holds the partial stats on the abnormal
-    /// endings. `Err` is reserved for a run with no report: a failed connect
-    /// or control handshake (plus two rarer classes not yet folded in — see
-    /// the [`outcome`](crate::outcome) module notes). The CLI derives iperf3's
+    /// endings. `Err` is reserved for a run with no report — e.g. a failed
+    /// connect or control handshake (plus two rarer classes not yet folded
+    /// in; see the [`outcome`](crate::outcome) module notes). The CLI derives iperf3's
     /// exit code from the `Termination` via
     /// [`errexit_message`](crate::Termination::errexit_message).
     ///

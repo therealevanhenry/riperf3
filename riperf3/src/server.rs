@@ -526,8 +526,8 @@ impl Server {
     ///
     /// A failed round does not end the loop: like iperf3's server, the round's
     /// error line is printed and the next client is served (#224). `Err` from
-    /// this method means the LOOP ended abnormally — a failed bind, or the
-    /// one-off `--idle-timeout` expiring — never a failed test.
+    /// this method means a failed bind — never a failed test (even the one-off
+    /// `--idle-timeout` expiry ends the loop with `Ok(())`).
     ///
     /// Quiet by default like every lib run (#294): build with
     /// [`emit_output(true)`](ServerBuilder::emit_output) for iperf3's banners
@@ -1038,11 +1038,11 @@ impl Server {
             let was_captured = server_output_text.is_some();
             // #353: an exchange Err reaches the gate through this `?` —
             // counts are frozen at build_result_streams, so the teardown is
-            // safe on this path. Post-#405 the send failures (ExchangeResults
-            // state write, send_results) are caught into
-            // ctx.exchange_send_error and return Ok instead, so the live Err
-            // here is the residual raw-Io recv_state error in the IperfDone
-            // loop.
+            // safe on this path. Post-#405 the send failures (the
+            // ExchangeResults and DisplayResults state writes, send_results)
+            // are caught into ctx.exchange_send_error and return Ok instead,
+            // so the live Err here is the residual raw-Io recv_state error
+            // in the IperfDone loop.
             self.exchange_results_phase(
                 &mut ctx,
                 &end,
