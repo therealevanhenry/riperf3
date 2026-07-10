@@ -1033,18 +1033,23 @@ impl Server {
             bare_end: false,
             interrupted: None,
         };
+        // #380: if THIS FUTURE is dropped (a run_once wrapped in
+        // timeout/select) the abort/join gate below never runs and `done`
+        // can't wake a parked read — this guard abort()s the stream tasks
+        // instead. (The chained UDP demux handle only stops a queued-not-
+        // yet-started runner: the demux is spawn_blocking, and abort() is
+        // a no-op once it runs — it exits via `done` + its 500 ms poll.)
+        // Armed after setup, disarmed after the gate's joins. Declared
+        // BEFORE _done_guard so the cancel-drop stores `done` first, then
+        // aborts — the gate's done-store-BEFORE-abort order (the recycled-
+        // raw_fd record below).
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
         // Signal `done` on every exit path (incl. early `?` returns) so a UDP
         // sender parked on the start barrier can't leak if setup fails (#5).
         // Declared AFTER ctx so an early return drops the guard FIRST —
         // `done` is set before ctx's fields (the control socket, the capture
         // guard) drop, the monolith's drop order (r1 F1).
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
-        // #380: if THIS FUTURE is dropped (a run_once wrapped in
-        // timeout/select) the abort/join gate below never runs and `done`
-        // can't wake a parked read — this guard abort()s the stream tasks
-        // (+ the UDP demux) instead. Armed after setup, disarmed at the
-        // gate (which then abort-and-JOINs as before).
-        let mut abort_guard = stream::AbortStreamsOnDrop::new();
 
         // ---- CreateStreams ----
         if let SetupFlow::ClientDone = self.setup_data_streams(&mut ctx, listener).await? {
@@ -1053,6 +1058,10 @@ impl Server {
             return Ok(None);
         }
         // #380: the spawned tasks are now cancel-exposed.
+        // RESIDUAL: a cancel landing INSIDE setup_data_streams leaves the
+        // already-accepted subset unguarded (the tasks park un-wakeably
+        // from spawn) — the mid-setup teardown-skip class, #381's scope
+        // for both roles.
         abort_guard.arm(
             ctx.streams
                 .iter()
@@ -1211,8 +1220,6 @@ impl Server {
         // fd — while an abort could kill a text-mode emit mid-line. The
         // done-store-BEFORE-abort order also keeps a post-close reporter
         // tick from sampling a recycled raw_fd.
-        // #380: the gate is running — it owns the stop from here.
-        abort_guard.disarm();
         ctx.done.store(true, Ordering::Relaxed);
         for s in &ctx.streams {
             s.task.abort();
@@ -1228,6 +1235,11 @@ impl Server {
         if let Some(h) = ctx.udp_demux_handle.take() {
             let _ = h.await;
         }
+        // #380 (#426 r1 F1): disarmed only NOW — the guard stays armed
+        // through the gate's own join awaits, where a cancel would
+        // otherwise land disarmed-but-unaborted and leak. abort() is
+        // idempotent, so the guard firing mid-join is free.
+        abort_guard.disarm();
 
         let report = outcome?;
 

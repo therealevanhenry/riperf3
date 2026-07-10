@@ -64,7 +64,7 @@ release tags.
   defaults the field — a recorded deviation (#401).
 - A `run()`/`run_once()` future dropped mid-test (`tokio::time::timeout`, `select!`) no
   longer leaks parked stream tasks and their sockets: an abort guard fires on cancellation,
-  disarmed by the normal teardown paths (#380).
+  disarmed by the normal teardown paths; a cancel mid-setup remains #381's scope (#380).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

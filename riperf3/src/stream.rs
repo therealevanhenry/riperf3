@@ -1186,8 +1186,12 @@ impl Drop for DoneOnDrop {
 /// `read()`/`write().await` (the recorded #372/#375 caveat) and Drop
 /// cannot await joins (the #372 async-RAII limitation). This non-async
 /// guard `abort()`s instead — armed right after the streams spawn,
-/// DISARMED at the teardown gate (the normal paths abort-and-JOIN there,
-/// exactly as before). Aborted tokio tasks drop their sockets at the next
+/// DISARMED only after the teardown gate's joins (the normal paths
+/// abort-and-JOIN there, exactly as before): the guard must stay armed
+/// through the gate's own awaits — the grace sleep, the joins — where a
+/// cancel would otherwise land disarmed-but-unaborted (#426 r1 F1);
+/// `abort()` is idempotent, so the guard firing after the gate's own
+/// abort is free. Aborted tokio tasks drop their sockets at the next
 /// await point on the still-live runtime; the `spawn_blocking` UDP
 /// runners are out of abort's reach and keep riding `done` + their 500 ms
 /// poll (the recorded residual).
@@ -1210,7 +1214,7 @@ impl AbortStreamsOnDrop {
         self.armed = true;
     }
 
-    /// The teardown gate owns the stop from here (abort + JOIN).
+    /// The teardown gate reaped the tasks (abort + JOIN complete).
     pub fn disarm(&mut self) {
         self.armed = false;
         self.handles.clear();
