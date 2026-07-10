@@ -325,6 +325,27 @@ impl Client {
         self
     }
 
+    /// Run the configured test and return its [`RunOutcome`](crate::RunOutcome):
+    /// the measured [`Report`](crate::Report) — the same object `-J` / `--json`
+    /// serializes — plus a [`Termination`](crate::Termination) saying how the
+    /// run ended (#293).
+    ///
+    /// A run that produced a report comes back `Ok`, clean or not:
+    /// [`Completed`](crate::Termination::Completed),
+    /// [`Interrupted`](crate::Termination::Interrupted) (a wired
+    /// [`interrupt`](ClientBuilder::interrupt) watch fired),
+    /// [`ServerTerminated`](crate::Termination::ServerTerminated), or
+    /// [`ServerError`](crate::Termination::ServerError) carrying the server's
+    /// relayed message — the report holds the partial stats on the abnormal
+    /// endings. `Err` is reserved for a run with no report — e.g. a failed
+    /// connect or control handshake (plus two rarer classes not yet folded
+    /// in; see the [`outcome`](crate::outcome) module notes). The CLI derives iperf3's
+    /// exit code from the `Termination` via
+    /// [`errexit_message`](crate::Termination::errexit_message).
+    ///
+    /// Quiet by default (#294): nothing is printed unless the client was
+    /// built with [`emit_output(true)`](ClientBuilder::emit_output), which
+    /// prints iperf3's full text/JSON output exactly like the CLI.
     pub async fn run(&self) -> Result<crate::outcome::RunOutcome> {
         // #290: run-scoped console silence, armed FIRST so even the -V
         // preamble honors it. Construct-only-when-quiet (see the guard doc).
@@ -3075,13 +3096,13 @@ impl ClientBuilder {
         self
     }
 
-    /// Console output from `run` (#290). `true` (the default) keeps today's
-    /// behavior: the crate prints the mode's report (text banners/summary,
-    /// the `-J` document, or `--json-stream` events) to the host process's
-    /// stdout, exactly like the CLI. `false` runs silently — the returned
-    /// [`Report`](crate::Report) is the only output; nothing is written to
-    /// stdout or stderr. Wire behavior is unaffected either way (a quiet
-    /// server still relays `--get-server-output` text to the peer).
+    /// Console output from `run` (#290). `false` (the default since 0.9.0,
+    /// #294) runs silently — the returned [`RunOutcome`](crate::RunOutcome)
+    /// is the only output; nothing is written to stdout or stderr. `true`
+    /// prints the mode's report (text banners/summary, the `-J` document, or
+    /// `--json-stream` events) to the host process's stdout, exactly like
+    /// the CLI (which sets it). Wire behavior is unaffected either way (a
+    /// quiet server still relays `--get-server-output` text to the peer).
     ///
     /// Note: with authentication configured but no password provided, a run
     /// still BLOCKS reading the password from stdin — quiet suppresses the

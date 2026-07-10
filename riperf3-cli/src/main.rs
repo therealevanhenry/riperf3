@@ -955,7 +955,7 @@ async fn async_main(
         // to the already-rendered error exit. Completed/Interrupted exit 0.
         let outcome = cli.build_client()?.with_interrupt(interrupt).run().await?;
         if let Some(msg) = outcome.termination.errexit_message() {
-            return Err(Box::new(AbnormalExit(msg)));
+            return Err(Box::new(AbnormalExit(msg.to_string())));
         }
     } else if cli.server {
         // Server mode. See `Cli::build_server` (cli.rs). `-D`/`--daemon` is

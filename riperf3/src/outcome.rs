@@ -107,10 +107,10 @@ impl Termination {
     /// on setup failures (rc < -1), the #224 wart — so they do not drive a
     /// non-zero exit through this path.
     #[must_use]
-    pub fn errexit_message(&self) -> Option<String> {
+    pub fn errexit_message(&self) -> Option<&str> {
         match self {
-            Termination::ServerTerminated => Some("the server has terminated".to_string()),
-            Termination::ServerError(msg) => Some(msg.clone()),
+            Termination::ServerTerminated => Some("the server has terminated"),
+            Termination::ServerError(msg) => Some(msg),
             // Clean exits + all server-side endings (no client errexit).
             Termination::Completed
             | Termination::Interrupted
@@ -143,6 +143,40 @@ impl RunOutcome {
         Self {
             report,
             termination,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Termination;
+
+    /// The errexit contract: only the two client-side "the server ended it"
+    /// classes drive a non-zero exit through this path — iperf3's server
+    /// keeps serving (one-off exits 0) on a failed round, the #224 wart, so
+    /// every server-side ending is `None`. The CLI relies on the split; a
+    /// variant drifting across it flips a process exit code.
+    #[test]
+    fn errexit_message_is_some_only_for_the_client_server_ended_classes() {
+        assert_eq!(
+            Termination::ServerTerminated.errexit_message(),
+            Some("the server has terminated"),
+        );
+        assert_eq!(
+            Termination::ServerError("busy".into()).errexit_message(),
+            Some("busy"),
+        );
+        for none in [
+            Termination::Completed,
+            Termination::Interrupted,
+            Termination::ClientTerminated,
+            Termination::ControlClosed,
+            Termination::UnknownMessage,
+            Termination::RecvResultsFailed,
+            Termination::SendFailed("send failed".into()),
+            Termination::SelfTerminated("limit".into()),
+        ] {
+            assert_eq!(none.errexit_message(), None, "{none:?} must not errexit");
         }
     }
 }

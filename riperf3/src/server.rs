@@ -515,6 +515,24 @@ impl Server {
         }
     }
 
+    /// Run the persistent server: bind the configured listener, print the
+    /// "Server listening" banner, and serve iperf3's accept loop — one test
+    /// round per client, round after round — until a wired
+    /// [`interrupt`](ServerBuilder::interrupt) fires or `-1/--one-off` ends
+    /// it after the first round. This is the daemon-shaped entry the CLI
+    /// drives; per-round reports are not returned — use [`Server::run_once`]
+    /// or [`Server::bind`] + [`BoundServer::run_once`] to get each round's
+    /// [`RunOutcome`](crate::RunOutcome).
+    ///
+    /// A failed round does not end the loop: like iperf3's server, the round's
+    /// error line is printed and the next client is served (#224). `Err` from
+    /// this method means a failed listener setup (the bind, a bad bind
+    /// address, `--bind-dev`) — never a failed test (even the one-off
+    /// `--idle-timeout` expiry ends the loop with `Ok(())`).
+    ///
+    /// Quiet by default like every lib run (#294): build with
+    /// [`emit_output(true)`](ServerBuilder::emit_output) for iperf3's banners
+    /// and reports.
     pub async fn run(&self) -> Result<()> {
         // #290: run-scoped console silence, armed FIRST so the listening
         // banner honors it. Construct-only-when-quiet (see the guard doc).
@@ -760,15 +778,18 @@ impl Server {
         Ok(())
     }
 
-    /// Serve exactly one test and return its rich JSON [`Report`](crate::Report) — the same
-    /// object [`Client::run`](crate::Client::run) returns and `-s -J` prints.
+    /// Serve exactly one test and return its [`RunOutcome`](crate::RunOutcome)
+    /// — the rich JSON [`Report`](crate::Report) the test measured (the same
+    /// object [`Client::run`](crate::Client::run) returns and `-s -J` prints)
+    /// plus how the round ended.
     ///
     /// Binds its own listener, accepts one client, runs the test to completion,
     /// and returns. This is the one-shot building block, mirroring
     /// `tokio::net::TcpListener::accept`; use [`Server::run`] for the long-lived
     /// accept loop. Unlike `run`, it does not print the "Server listening"
-    /// banner — it is a library entry point, not the daemon. The test report is
-    /// still printed to stdout in `-J` / text mode, like `Client::run`.
+    /// banner — it is a library entry point, not the daemon. Like `Client::run`,
+    /// it is quiet by default (#294): build with `emit_output(true)` to print
+    /// iperf3's full `-J` / text output.
     ///
     /// #293: returns a [`RunOutcome`](crate::RunOutcome) — the measured
     /// [`Report`](crate::Report) plus a [`Termination`](crate::Termination)
@@ -1016,10 +1037,13 @@ impl Server {
             let (server_output_text, server_output_json, report_source) =
                 self.finish_server_output(&mut ctx, &end, collected);
             let was_captured = server_output_text.is_some();
-            // #353: the exchange's own Err (e.g. the ExchangeResults state
-            // write failing against an RST'd ctrl) reaches the gate through
-            // this `?` — counts are frozen at build_result_streams, so the
-            // teardown is safe on this path.
+            // #353: an exchange Err reaches the gate through this `?` —
+            // counts are frozen at build_result_streams, so the teardown is
+            // safe on this path. Post-#405 the send failures (the
+            // ExchangeResults and DisplayResults state writes, send_results)
+            // are caught into ctx.exchange_send_error and return Ok instead,
+            // so the live Err here is the residual raw-Io recv_state error
+            // in the IperfDone loop.
             self.exchange_results_phase(
                 &mut ctx,
                 &end,
@@ -4044,9 +4068,9 @@ impl BoundServer {
     /// Serve exactly one test on the held listener and return its
     /// [`RunOutcome`](crate::RunOutcome) — the same contract as
     /// [`Server::run_once`], minus the per-call rebind. No "Server
-    /// listening" banner (a library entry point, not the daemon); the test
-    /// report still prints in `-J` / text mode unless the server was built
-    /// with `emit_output(false)` (#290).
+    /// listening" banner (a library entry point, not the daemon); quiet by
+    /// default like every lib run (#294) — the test report prints in `-J` /
+    /// text mode only if the server was built with `emit_output(true)`.
     pub async fn run_once(&self) -> Result<crate::outcome::RunOutcome> {
         self.server.serve_once(&self.listener).await
     }
@@ -4145,10 +4169,11 @@ impl ServerBuilder {
         self
     }
 
-    /// Console output from `run`/`run_once` (#290). `true` (the default)
-    /// keeps today's behavior; `false` runs silently — reports flow only via
-    /// the return value and the wire (`--get-server-output` still relays the
-    /// text report to the requesting client). See
+    /// Console output from `run`/`run_once` (#290). `false` (the default
+    /// since 0.9.0, #294) runs silently — reports flow only via the return
+    /// value and the wire (`--get-server-output` still relays the text
+    /// report to the requesting client); `true` prints iperf3's full
+    /// text/JSON output, exactly like the CLI (which sets it). See
     /// [`ClientBuilder::emit_output`](crate::ClientBuilder::emit_output).
     pub fn emit_output(mut self, enabled: bool) -> Self {
         self.emit_output = enabled;
