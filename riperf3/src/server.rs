@@ -1051,33 +1051,53 @@ impl Server {
         // guard) drop, the monolith's drop order (r1 F1).
         let _done_guard = stream::DoneOnDrop(ctx.done.clone());
 
-        // ---- CreateStreams ----
-        if let SetupFlow::ClientDone = self.setup_data_streams(&mut ctx, listener).await? {
-            // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends with
-            // no error surface, keep-serving like a refusal (Ok(None)).
-            return Ok(None);
-        }
-        // #380: the spawned tasks are now cancel-exposed.
-        // RESIDUAL: a cancel landing INSIDE setup_data_streams leaves the
-        // already-accepted subset unguarded (the tasks park un-wakeably
-        // from spawn) — the mid-setup teardown-skip class, #381's scope
-        // for both roles.
-        abort_guard.arm(
-            ctx.streams
-                .iter()
-                .map(|s| s.task.abort_handle())
-                .chain(ctx.udp_demux_handle.iter().map(|h| h.abort_handle())),
-        );
+        // #372: every phase from setup to the final output runs inside
+        // this block, so every `?` — the setup-phase sites (#381),
+        // start_test's sends, await_test_end's non-EOF recv errors, the
+        // exchange phase (#353) — falls through to the ONE unconditional
+        // abort/join gate below instead of skipping it. Per-arm teardown
+        // wrappers were whack-a-mole: this is the 4th site in the family
+        // (#331 gate, #353 exchange, #372 running phase, #381 setup). A
+        // `return` inside the block exits the BLOCK, not handle_one_test.
+        let outcome: Result<Option<crate::json_report::Report>> = async {
+            // ---- CreateStreams ----
+            // #381: setup runs INSIDE the block — its `?` sites (the
+            // post-accept configure/tos/meta, dispatch propagations, the
+            // UDP sub-setups) previously skipped the gate with earlier-
+            // iteration tasks already spawned in ctx.streams. Every spawn
+            // site (the TCP loop, both UDP sub-setups, the demux) also
+            // pushes its task into the abort guard AS IT SPAWNS (the #426
+            // r1 F2 mid-setup cancel window). The classified arms still
+            // reap inline first — the gate below is a no-op on drained
+            // streams.
+            // Box::pin (#427: the Windows stack-overflow incident): nesting
+            // setup INSIDE this block put its entire poll frame on top of
+            // the block's own — MSVC debug frames tipped the CLI server
+            // (block_on on Windows' 1 MB main-thread stack) into
+            // "thread 'main' has overflowed its stack" at the first accept,
+            // killing every bidir_intervals cell while Linux (8 MB main)
+            // and worker/test threads (2 MB) never noticed. Boxing moves
+            // setup's state out of the enclosing frame; behavior identical.
+            if let SetupFlow::ClientDone =
+                Box::pin(self.setup_data_streams(&mut ctx, listener, &mut abort_guard)).await?
+            {
+                // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends
+                // with no error surface, keep-serving like a refusal
+                // (None maps to handle_one_test's Ok(None) after the gate).
+                return Ok(None);
+            }
+            // #380: the full arm — every real task was already pushed at
+            // its spawn site (arm replaces with the same set, plus the
+            // demux arm's already-resolved placeholder dummies, a no-op
+            // superset). Kept as the one canonical post-setup statement of
+            // the guarded set.
+            abort_guard.arm(
+                ctx.streams
+                    .iter()
+                    .map(|s| s.task.abort_handle())
+                    .chain(ctx.udp_demux_handle.iter().map(|h| h.abort_handle())),
+            );
 
-        // #372: every phase from TestStart to the final output runs inside
-        // this block, so every `?` — start_test's sends, await_test_end's
-        // non-EOF recv errors, the exchange phase (#353) — falls through to
-        // the ONE unconditional abort/join gate below instead of skipping
-        // it. Per-arm teardown wrappers were whack-a-mole: this is the 4th
-        // site in the family (#331 gate, #353 exchange, #372 running
-        // phase). A `return` inside the block exits the BLOCK, not
-        // handle_one_test.
-        let outcome: Result<crate::json_report::Report> = async {
             // ---- TestStart / TestRunning ----
             self.start_test(&mut ctx).await?;
 
@@ -1183,7 +1203,7 @@ impl Server {
             };
 
             self.emit_final_output(&ctx, &end, &report, was_captured);
-            Ok(report)
+            Ok(Some(report))
         }
         .await;
 
@@ -1241,7 +1261,13 @@ impl Server {
         // idempotent, so the guard firing mid-join is free.
         abort_guard.disarm();
 
-        let report = outcome?;
+        let report = match outcome? {
+            Some(report) => report,
+            // #356 r1 F1 / #381: the clean IPERF_DONE round — keep-serving,
+            // no error surface. The gate above was a no-op (dispatch's
+            // IperfDone arm reaped inline via abort_setup_streams).
+            None => return Ok(None),
+        };
 
         // #293: the doc above already rendered on every abnormal path. Derive
         // how the round ended — this drives BOTH run_once's RunOutcome and
@@ -1535,6 +1561,7 @@ impl Server {
         &self,
         ctx: &mut TestRunCtx,
         listener: &tokio::net::TcpListener,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         // Determine how many streams to accept and their roles.
         // Normal: server receives. Reverse: server sends. Bidir: both.
@@ -1843,6 +1870,9 @@ impl Server {
                         })
                     };
 
+                    // #381: cancel-cover the task the moment it spawns —
+                    // the accept select's awaits sit between spawns.
+                    abort_guard.push(task.abort_handle());
                     ctx.streams.push(DataStream {
                         meta: StreamMeta {
                             id: stream_id,
@@ -1893,11 +1923,17 @@ impl Server {
                 // as the TCP arm, so they can dispatch ctrl bytes — a
                 // ClientDone (IPERF_DONE) surfaces here like TCP's.
                 let flow = if udp_use_demux {
-                    self.setup_udp_demux_streams(ctx, recv_count, total, max_duration)
+                    self.setup_udp_demux_streams(ctx, recv_count, total, max_duration, abort_guard)
                         .await?
                 } else {
-                    self.setup_udp_recycling_streams(ctx, recv_count, total, max_duration)
-                        .await?
+                    self.setup_udp_recycling_streams(
+                        ctx,
+                        recv_count,
+                        total,
+                        max_duration,
+                        abort_guard,
+                    )
+                    .await?
                 };
                 if let SetupFlow::ClientDone = flow {
                     return Ok(SetupFlow::ClientDone);
@@ -2876,6 +2912,7 @@ impl Server {
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         // The scalar knobs, copied out so the select arms below can borrow
         // ctx whole (dispatch_setup_ctrl_byte / emit_setup_phase_error).
@@ -3057,6 +3094,12 @@ impl Server {
                         std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
+                // #381 (#427 r1 F3): a running spawn_blocking task ignores
+                // abort() (it exits via `done` + its 500 ms poll); the push
+                // still stops a queued-not-yet-started runner, like the
+                // client UDP arm. Untested by design (#427 r2 F3): no
+                // deterministic pin can catch the not-yet-started window.
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3080,6 +3123,8 @@ impl Server {
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
+                // #381 (#427 r1 F3): queued-runner coverage, as above.
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3122,6 +3167,7 @@ impl Server {
         recv_count: u32,
         total: u32,
         max_duration: Option<std::time::Duration>,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
     ) -> Result<SetupFlow> {
         use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
@@ -3353,6 +3399,13 @@ impl Server {
                         md,
                     )
                 });
+                // #381 (#427 r1 F3): queued-runner coverage — a running
+                // spawn_blocking task ignores abort() and rides `done` +
+                // its 500 ms poll; the push only stops one that has not
+                // started yet. (The receiving arm's placeholder tasks are
+                // NOT pushed: they are already-resolved dummies — the real
+                // handle is the demux receiver's, pushed below.)
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3411,10 +3464,12 @@ impl Server {
             let s = shared.clone();
             let d = ctx.done.clone();
             let bs = blksize;
-            ctx.udp_demux_handle =
-                Some(thread_gate.spawn(move || {
-                    stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
-                }));
+            let demux = thread_gate
+                .spawn(move || stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit));
+            // #381 (#427 r1 F3): queued-runner coverage for the demux too,
+            // mirroring the post-setup arm()'s chain.
+            abort_guard.push(demux.abort_handle());
+            ctx.udp_demux_handle = Some(demux);
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun
@@ -4723,9 +4778,11 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_recycling_streams(&mut ctx, 0, 1, None)
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
+        srv.setup_udp_recycling_streams(&mut ctx, 0, 1, None, &mut abort_guard)
             .await
             .unwrap();
+        abort_guard.disarm();
         ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();
@@ -4767,9 +4824,11 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_demux_streams(&mut ctx, 0, 1, None)
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
+        srv.setup_udp_demux_streams(&mut ctx, 0, 1, None, &mut abort_guard)
             .await
             .unwrap();
+        abort_guard.disarm();
         ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();

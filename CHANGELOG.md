@@ -65,6 +65,10 @@ release tags.
 - A `run()`/`run_once()` future dropped mid-test (`tokio::time::timeout`, `select!`) no
   longer leaks parked stream tasks and their sockets: an abort guard fires on cancellation,
   disarmed by the normal teardown paths; a cancel mid-setup remains #381's scope (#380).
+- Mid-setup errors and cancellations tear down earlier-spawned stream tasks on both roles:
+  the server's setup phase now runs inside the teardown gate's block, the client's
+  `create_streams` pushes partial progress into `ctx.streams` instead of a local vec, and
+  each task is abort-guarded the moment it spawns (#381).
 - `--logfile` receives the SERVER-ERROR relay receipt and the interrupt notice like iperf3's
   `iperf_err` routing; both previously went to stderr (#364).
 - Wire-blob parsing mirrors cJSON's UTF-8 BOM skip and non-object params root; four residual

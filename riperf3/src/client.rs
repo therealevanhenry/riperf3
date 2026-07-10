@@ -465,13 +465,12 @@ impl Client {
                     }
 
                     TestState::CreateStreams => {
-                        self.on_create_streams(&mut ctx).await?;
-                        // #380: the spawned tasks are now cancel-exposed.
-                        // RESIDUAL: a cancel landing INSIDE on_create_streams
-                        // leaves the already-spawned subset unguarded (the
-                        // tasks park un-wakeably from spawn) — the mid-setup
-                        // teardown-skip class, #381's scope for both roles.
-                        abort_guard.arm(ctx.streams.iter().map(|s| s.task.abort_handle()));
+                        // #380/#381: each stream task enters ctx.streams AND
+                        // the abort guard AS IT SPAWNS (create_streams pushes
+                        // both), so a mid-loop Err reaches the gate with the
+                        // partial subset visible and a cancel between spawns
+                        // aborts it — the #426 r1 F2 pre-arm window, closed.
+                        self.on_create_streams(&mut ctx, &mut abort_guard).await?;
                         StepFlow::Continue
                     }
 
@@ -567,11 +566,14 @@ impl Client {
         // `done` and slept this same grace on every path that passes
         // through it (the clean break and the mid-running error/event
         // arms), so a second sleep there buys nothing. The grace is owed
-        // only when this gate is the FIRST to stop the streams (errors
-        // between CreateStreams and the data phase) — and never when no
-        // streams were spawned at all.
+        // only when this gate is the FIRST to stop the streams AND the
+        // test reached TestStart — never when no streams were spawned,
+        // and never on a mid-setup error (#427 r1 F2: pre-TestStart
+        // nothing is in flight to drain — the tasks are parked, `done`
+        // can't wake them, the abort below is what reaps them — and GT
+        // closes immediately on stream-creation failures).
         let grace_owed = !ctx.done.swap(true, Ordering::Relaxed);
-        if grace_owed && !ctx.streams.is_empty() {
+        if grace_owed && !ctx.streams.is_empty() && ctx.stage.started() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         for s in &ctx.streams {
@@ -880,9 +882,22 @@ impl Client {
         Ok(())
     }
 
-    async fn on_create_streams(&self, ctx: &mut RunCtx) -> Result<()> {
-        (ctx.streams, ctx.byte_budget) = self
-            .create_streams(&ctx.cookie, &ctx.done, &ctx.start, ctx.blksize)
+    async fn on_create_streams(
+        &self,
+        ctx: &mut RunCtx,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
+    ) -> Result<()> {
+        // #381: streams land in ctx.streams (and the guard) as they spawn —
+        // see create_streams' doc for the partial-progress leak this closes.
+        ctx.byte_budget = self
+            .create_streams(
+                &ctx.cookie,
+                &ctx.done,
+                &ctx.start,
+                ctx.blksize,
+                &mut ctx.streams,
+                abort_guard,
+            )
             .await?;
         // #222: the per-stream preamble, unconditional in text
         // mode (iperf3 prints it for every stream on connect).
@@ -1288,15 +1303,22 @@ impl Client {
         p
     }
 
+    /// #381: pushes each stream into `streams` (the caller passes
+    /// `ctx.streams`) and its abort handle into the guard AS IT SPAWNS —
+    /// a local-vec build dropped partial progress on a mid-loop `?`
+    /// (the gate joined an empty `ctx.streams` while the spawned subset
+    /// leaked parked), and a cancel between spawns found the guard
+    /// unarmed (the #426 r1 F2 window). Returns the `-n`/`-k` byte
+    /// budget pair.
     async fn create_streams(
         &self,
         cookie: &[u8; protocol::COOKIE_SIZE],
         done: &Arc<AtomicBool>,
         start: &Arc<AtomicBool>,
         blksize: usize,
-    ) -> Result<(Vec<DataStream>, Option<(Arc<AtomicI64>, i64)>)> {
-        let mut streams = Vec::new();
-
+        streams: &mut Vec<DataStream>,
+        abort_guard: &mut stream::AbortStreamsOnDrop,
+    ) -> Result<Option<(Arc<AtomicI64>, i64)>> {
         // In normal mode: client sends. Reverse: client receives. Bidir: both.
         let send_count = if self.reverse && !self.bidir {
             0
@@ -1472,6 +1494,7 @@ impl Client {
                         })
                     };
 
+                    abort_guard.push(task.abort_handle());
                     streams.push(DataStream {
                         meta: StreamMeta {
                             id: stream_id,
@@ -1596,6 +1619,10 @@ impl Client {
                         let task = thread_gate.spawn(move || {
                             stream::run_udp_receiver_blocking(std_sock, c, sc, bs, d, u64bit)
                         });
+                        // #381: a running spawn_blocking task ignores abort()
+                        // (it exits via `done` + its 500 ms poll); the push
+                        // still stops a queued-not-yet-started runner.
+                        abort_guard.push(task.abort_handle());
                         streams.push(DataStream {
                             meta: StreamMeta {
                                 id: stream_id,
@@ -1612,6 +1639,8 @@ impl Client {
                         continue;
                     };
 
+                    // #381: same queued-runner coverage as the receiver arm.
+                    abort_guard.push(task.abort_handle());
                     streams.push(DataStream {
                         meta: StreamMeta {
                             id: stream_id,
@@ -1642,7 +1671,7 @@ impl Client {
             }
         }
 
-        Ok((streams, byte_budget.zip(budget_target)))
+        Ok(byte_budget.zip(budget_target))
     }
 
     /// Wait out a `-n`/`-k` run (#31): iperf3 gates the end-condition check

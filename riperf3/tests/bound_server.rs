@@ -73,3 +73,31 @@ async fn run_once_still_serves_one_test() {
     let srv = server_task.await.unwrap().expect("run_once").report;
     assert!(srv.end.sum_received.as_ref().unwrap().bytes > 0);
 }
+
+/// #427 (the Windows stack-overflow incident): `run_once`'s future must
+/// stay SMALL — `Box::pin` at the setup await moves the setup machinery's
+/// state (incl. the UDP arms' 64 KB bufs) to the heap. Without the box the
+/// composed state is ~70 KB and, worse, the extra generator layer's MSVC
+/// debug poll frames overflowed Windows' 1 MB main-thread stack (the CLI's
+/// `block_on`) at the first accept — invisible on Linux (8 MB mains) and
+/// on 2 MB worker/test threads, so this size bound is the only LOCAL
+/// tripwire for the class (Windows CI is the authoritative gate). 16 KB
+/// bounds "the box stays" and "no future large-buffer re-inlining"
+/// (currently ~5.5 KB).
+#[tokio::test]
+async fn run_once_future_stays_small() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let fut = bound.run_once();
+    let size = std::mem::size_of_val(&fut);
+    assert!(
+        size < 16 * 1024,
+        "run_once future grew to {size} B — a dropped Box::pin or a \
+         re-inlined large buffer risks the Windows 1 MB main-thread \
+         stack (#427)"
+    );
+}
