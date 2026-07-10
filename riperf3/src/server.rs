@@ -3093,6 +3093,11 @@ impl Server {
                         std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
                     )
                 });
+                // #381 (#427 r1 F3): a running spawn_blocking task ignores
+                // abort() (it exits via `done` + its 500 ms poll); the push
+                // still stops a queued-not-yet-started runner, like the
+                // client UDP arm.
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3116,6 +3121,8 @@ impl Server {
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_receiver_blocking(std_sock, c, stats_clone, bs, d, u64bit)
                 });
+                // #381 (#427 r1 F3): queued-runner coverage, as above.
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3390,6 +3397,13 @@ impl Server {
                         md,
                     )
                 });
+                // #381 (#427 r1 F3): queued-runner coverage — a running
+                // spawn_blocking task ignores abort() and rides `done` +
+                // its 500 ms poll; the push only stops one that has not
+                // started yet. (The receiving arm's placeholder tasks are
+                // NOT pushed: they are already-resolved dummies — the real
+                // handle is the demux receiver's, pushed below.)
+                abort_guard.push(task.abort_handle());
                 ctx.streams.push(DataStream {
                     meta: StreamMeta {
                         id: stream_id,
@@ -3448,10 +3462,12 @@ impl Server {
             let s = shared.clone();
             let d = ctx.done.clone();
             let bs = blksize;
-            ctx.udp_demux_handle =
-                Some(thread_gate.spawn(move || {
-                    stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit)
-                }));
+            let demux = thread_gate
+                .spawn(move || stream::run_udp_server_demux_receiver(s, routes, bs, d, u64bit));
+            // #381 (#427 r1 F3): queued-runner coverage for the demux too,
+            // mirroring the post-setup arm()'s chain.
+            abort_guard.push(demux.abort_handle());
+            ctx.udp_demux_handle = Some(demux);
         }
         // #178: hold TestStart (sent by the caller right after this returns)
         // until every data thread is running — the test clock must not outrun
@@ -4760,9 +4776,11 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_recycling_streams(&mut ctx, 0, 1, None)
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
+        srv.setup_udp_recycling_streams(&mut ctx, 0, 1, None, &mut abort_guard)
             .await
             .unwrap();
+        abort_guard.disarm();
         ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();
@@ -4804,9 +4822,11 @@ mod tests {
 
         let client = udp_tos_probe_client(format!("127.0.0.1:{port}").parse().unwrap());
 
-        srv.setup_udp_demux_streams(&mut ctx, 0, 1, None)
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
+        srv.setup_udp_demux_streams(&mut ctx, 0, 1, None, &mut abort_guard)
             .await
             .unwrap();
+        abort_guard.disarm();
         ctx.start.store(true, Ordering::Relaxed);
 
         let tos = client.join().unwrap();
