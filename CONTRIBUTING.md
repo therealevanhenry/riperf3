@@ -1,6 +1,6 @@
 # Contributing to riperf3
 
-Thanks for your interest! riperf3 is a faithful, wire-compatible iperf3 drop-in — the ethos is **fidelity first**: where iperf3 accepts an option, riperf3 implements it to behave the same way (quirks included); it never rejects, renames, or works around iperf3's semantics. Behavioral claims in PRs should cite the iperf3 source (file/function) or a live run against a real iperf3 binary.
+Thanks for your interest! riperf3 is a wire- and API-faithful replacement for iperf3 in idiomatic Rust — the ethos is **fidelity first**: where iperf3 accepts an option, riperf3 implements it to behave the same way; it never rejects, renames, or works around iperf3's semantics. Behavioral claims in PRs should cite the iperf3 source (file/function) or a live run against a real iperf3 binary.
 
 ## Workflow
 
