@@ -4562,7 +4562,10 @@ impl ServerBuilder {
     /// The `--server-bitrate-limit rate/N` averaging window in seconds —
     /// iperf3's bitrate_limit_interval (default 5): the breach check is a
     /// moving average over the last `round(N)` one-second samples and
-    /// evaluates only once that many have accumulated (#410).
+    /// evaluates only once that many have accumulated (#410). Hardened
+    /// input contract: a non-finite or non-positive value falls back to
+    /// the default 5 s window, and the sample count is capped at 86 400
+    /// (a day at 1 Hz). iperf3's own CLI bounds the value to 0.1..=60.
     pub fn server_bitrate_limit_interval(mut self, secs: f64) -> Self {
         self.server_bitrate_limit_interval = Some(secs);
         self

@@ -772,7 +772,7 @@ fn bitrate_limit_line_carries_the_timestamps_prefix() {
     let server = spawn_server(&["--server-bitrate-limit", "1K", "--timestamps=XTSX "], &ps);
     std::thread::sleep(Duration::from_millis(300));
     let _ = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "5"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "9"],
         Duration::from_secs(40),
         "client",
     );
