@@ -38,6 +38,18 @@ pub(crate) struct TestConfig {
     pub tos: i32,
     pub congestion: Option<String>,
     pub udp_counters_64bit: bool,
+    /// #414: the client asked for the repeating 0x00..0xFF payload — GT
+    /// fills it in iperf_new_stream on BOTH roles (iperf_api.c:4891), so
+    /// the server's reverse/bidir senders honor it too. PRESENCE-triggered
+    /// on the wire (GT sets 1 whatever the value, iperf_api.c:2645-2646).
+    pub repeating_payload: bool,
+    /// #414: the client's --dont-fragment — GT sets DF in iperf_new_stream
+    /// on BOTH roles, gated UDP && AF_INET (iperf_api.c:4964-4975), so the
+    /// server's UDP v4 data sockets carry it on server-sent datagrams.
+    /// (The wire `flowlabel` key is deliberately NOT plumbed here: GT's
+    /// server ingests it but never applies it to any socket — the only
+    /// apply site is the client's iperf_tcp_connect, iperf_tcp.c:521.)
+    pub dont_fragment: bool,
 }
 
 /// GT's IECTRLCLOSE read-site sentence (iperf_server_api.c:249-254,
@@ -200,6 +212,8 @@ impl TestConfig {
             tos: params.tos.unwrap_or(0),
             congestion: params.congestion.clone(),
             udp_counters_64bit: params.udp_counters_64bit.unwrap_or(0) != 0,
+            repeating_payload: params.repeating_payload.is_some(),
+            dont_fragment: params.dont_fragment.unwrap_or(0) != 0,
         })
     }
 }
@@ -1918,7 +1932,10 @@ impl Server {
                     let congestion_used = net::tcp_congestion_used(&data_stream);
 
                     let task = if is_sender {
-                        let buf = make_send_buffer(ctx.cfg.blksize, false);
+                        // #414: honor the client's wire repeating_payload —
+                        // GT fills the pattern in iperf_new_stream on BOTH
+                        // roles (iperf_api.c:4891).
+                        let buf = make_send_buffer(ctx.cfg.blksize, ctx.cfg.repeating_payload);
                         let c = counters.clone();
                         let d = ctx.done.clone();
                         // `-b` paces the sender in reverse/bidir too (negotiated
@@ -3158,11 +3175,12 @@ impl Server {
                 let u64bit = udp_counters_64bit;
                 let bu = burst;
                 let uw = window.is_some();
+                let df = ctx.cfg.dont_fragment;
                 let st = ctx.start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
                     stream::run_udp_sender_blocking(
-                        std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
+                        std_sock, c, bs, d, rate, pt, bu, uw, df, u64bit, st, md,
                     )
                 });
                 // #381 (#427 r1 F3): a running spawn_blocking task ignores
@@ -3452,6 +3470,7 @@ impl Server {
                 let d = ctx.done.clone();
                 let bu = burst;
                 let uw = window.is_some();
+                let df = ctx.cfg.dont_fragment;
                 let st = ctx.start.clone();
                 let md = max_duration;
                 let task = thread_gate.spawn(move || {
@@ -3465,6 +3484,7 @@ impl Server {
                         pt,
                         bu,
                         uw,
+                        df,
                         u64bit,
                         st,
                         md,
@@ -4640,6 +4660,33 @@ mod tests {
     /// #316: the server adopts the client's exchanged GSO/GRO request
     /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
     /// from the negotiated blksize (:2607-2613).
+    /// #414: the wire trio's ingest semantics, per GT's get_parameters.
+    #[test]
+    fn from_params_ingests_the_414_trio_like_gt() {
+        // repeating_payload is PRESENCE-triggered (GT sets 1 whatever the
+        // value, iperf_api.c:2645-2646); dont_fragment takes the value
+        // truthily (:2650-2651).
+        let set = crate::protocol::TestParams {
+            repeating_payload: Some(0), // presence wins — GT ignores the value
+            dont_fragment: Some(1),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&set).unwrap();
+        assert!(cfg.repeating_payload, "presence-triggered like GT");
+        assert!(cfg.dont_fragment);
+
+        let unset = crate::protocol::TestParams::default();
+        let cfg = TestConfig::from_params(&unset).unwrap();
+        assert!(!cfg.repeating_payload);
+        assert!(!cfg.dont_fragment);
+
+        let df_zero = crate::protocol::TestParams {
+            dont_fragment: Some(0), // falsy value → off, GT truthiness
+            ..Default::default()
+        };
+        assert!(!TestConfig::from_params(&df_zero).unwrap().dont_fragment);
+    }
+
     /// #415 (r1 F1): a wire `"window": 0` ingests as UNSET — GT's
     /// socket_bufsize 0 is the unset sentinel in EVERY consumer, including
     /// the UDP auto-increase arm (iperf_udp.c:563/:691, the GT analogue of
