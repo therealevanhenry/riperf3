@@ -1217,12 +1217,46 @@ impl Server {
             // killing every bidir_intervals cell while Linux (8 MB main)
             // and worker/test threads (2 MB) never noticed. Boxing moves
             // setup's state out of the enclosing frame; behavior identical.
-            if let SetupFlow::ClientDone =
-                Box::pin(self.setup_data_streams(&mut ctx, listener, &mut abort_guard)).await?
-            {
+            let setup_flow =
+                match Box::pin(self.setup_data_streams(&mut ctx, listener, &mut abort_guard)).await
+                {
+                    Ok(flow) => flow,
+                    Err(e) => {
+                        // #390: GT sync-closes the ctrl on every round exit
+                        // (cleanup_server → iperf_sync_close_socket) — the
+                        // bounded drain holds the round, and with it the
+                        // one-off listener, open until the peer consumed
+                        // the setup-kill wire-back.
+                        match self.park_refused_round(&mut ctx.ctrl).await {
+                            None => return Err(e),
+                            Some(_msg) => {
+                                // #445 r1 F1 (live-probed): GT's sigend
+                                // longjmps out of the drain and emits ONLY
+                                // the interrupt surface — the original
+                                // class line is ABANDONED. Consuming the
+                                // round here suppresses the text line (the
+                                // interrupt watcher prints its own).
+                                // RECORDED DEVIATION (-J/json-stream): the
+                                // kill site already emitted its doc with
+                                // the ORIGINAL error where GT's single doc
+                                // carries the interrupt line — deferring
+                                // that emission to post-park is the #386
+                                // refusal shape, left as a follow-up with
+                                // the pre-CreateStreams sync-close family.
+                                return Ok(None);
+                            }
+                        }
+                    }
+                };
+            if let SetupFlow::ClientDone = setup_flow {
                 // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends
                 // with no error surface, keep-serving like a refusal
                 // (None maps to handle_one_test's Ok(None) after the gate).
+                // #445 r1 F3: GT's IPERF_DONE exit ALSO runs
+                // cleanup_server's sync-close; a conforming DONE-sender
+                // EOFs the drain instantly, so this only matters against
+                // an adversarial holder.
+                let _ = self.park_refused_round(&mut ctx.ctrl).await;
                 return Ok(None);
             }
             // #380: the full arm — every real task was already pushed at
@@ -3983,6 +4017,14 @@ impl Server {
     /// GT's >0 partial return restarts a full Nread, so its tail runs up
     /// to ~2x (probed 15.2 s) — adversarial-peer-only, boundedness
     /// matches.
+    /// #390: the SAME drain runs after a setup-kill wire-back (the
+    /// handle_one_test setup-Err choke point) — GT's cleanup_server calls
+    /// iperf_sync_close_socket on EVERY round exit (iperf_server_api.c:519),
+    /// which is what holds a one-off's LISTENER open until the peer
+    /// consumed the fe relay; without it, the listener close RSTs the
+    /// client's queued data socket out of iperf_init_stream (live-proven
+    /// 4/4 on #387 r2). A dead peer EOFs the drain instantly, so the
+    /// unconditional call is self-limiting.
     async fn park_refused_round(&self, ctrl: &mut tokio::net::TcpStream) -> Option<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = ctrl.shutdown().await; // GT's SHUT_WR half-close
