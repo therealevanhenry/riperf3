@@ -53,6 +53,9 @@ release tags.
   byte — 0xFF is the busy-server signal only), no "Accepted connection" block, and the
   unstamped `error - no error` line/doc string. A client receiving 0xFF reports iperf3's
   IEACCESSDENIED text; new lib variant `RiperfError::ServerBusy` (#395).
+- `--cport` binds `port + i` per stream like iperf3 (`-P 2` no longer dies on a source-port
+  collision; 65536 wraps to ephemeral), UDP honors `--cport` at all (was silently ephemeral),
+  and a failed data-stream dial reports iperf3's `unable to connect stream: …` class (#428).
 - `-w 0` is a no-op like iperf3 (0 = kernel autotuning): the window is never applied to
   data sockets — was clamping both buffers to kernel minimums, a live throughput hit — and
   the params blob omits the `"window"` key, so a `-w 0` client no longer shrinks a riperf3

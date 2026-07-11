@@ -3055,6 +3055,165 @@ async fn params_blob_omits_window_zero_like_gt() {
     );
 }
 
+/// #428 harness: find a base with `span` CONSECUTIVE free ports. NOT
+/// `free_port()`-derived: that allocator hands out consecutive values, so
+/// one test's `base + 1` is a parallel test's base (live collision in this
+/// very suite). Own pid-keyed window (36000+, clear of the #176 7000-32000
+/// windows) with a stride of 8 per claim, full-span bind-probed. Recorded
+/// residual (r1 F5): the window sits inside Linux's default ephemeral
+/// range (32768-60999), so a kernel ephemeral allocation landing in a
+/// claimed span between probe-drop and bind can red an exact-equality pin
+/// (~0.01-0.1%/run); no port range is clear of every allocator.
+fn free_cport_base(span: u16) -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    // Window stride 512 covers the full claim range (64 claims × 8) so
+    // adjacent pid windows can't overlap (r2 F2).
+    let window = 36000 + (std::process::id() % 57) as u16 * 512;
+    'outer: for _ in 0..64 {
+        let base = window + NEXT.fetch_add(1, Ordering::Relaxed) % 64 * 8;
+        let mut holds = Vec::new();
+        for off in 0..span {
+            let Some(p) = base.checked_add(off) else {
+                continue 'outer;
+            };
+            match std::net::TcpListener::bind(("0.0.0.0", p)) {
+                Ok(l) => holds.push(l),
+                Err(_) => continue 'outer,
+            }
+        }
+        drop(holds);
+        return base;
+    }
+    panic!("no {span}-wide free port range found");
+}
+
+/// #428 harness: one full round with `--cport`, returning the client
+/// report's `start.connected[i].local_port` in creation order. A CONCRETE
+/// server port because of #431 (the UDP data socket binds the CONFIGURED
+/// port).
+async fn run_round_cport_ports(cport: u16, streams: u32, bidir: bool, udp: bool) -> Vec<u16> {
+    let port = next_port();
+    let server = ServerBuilder::new()
+        .port(Some(port))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let mut builder = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(1)
+        .num_streams(streams)
+        .cport(cport)
+        .emit_output(false);
+    if bidir {
+        builder = builder.bidir(true);
+    }
+    if udp {
+        builder = builder.protocol(TransportProtocol::Udp);
+    }
+    let client = builder.build().unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    server_task.await.expect("join").expect("server run_once");
+    let v = serde_json::to_value(&outcome.report).unwrap();
+    v["start"]["connected"]
+        .as_array()
+        .expect("connected block")
+        .iter()
+        .map(|c| c["local_port"].as_u64().expect("local_port") as u16)
+        .collect()
+}
+
+/// #428: GT increments the bound source port per stream —
+/// `bind_port + i` over creation order (iperf_create_streams,
+/// iperf_client_api.c:113-124; live-probed fwd/rev: N, N+1). Pre-fix
+/// riperf3 reused the FIXED cport for every TCP stream, so `-P 2` died
+/// EADDRNOTAVAIL/EADDRINUSE on the second dial. The control connect stays
+/// EPHEMERAL on both tools (netdial's literal 0 + "using an ephemeral
+/// port" comment, iperf_client_api.c:437-439 — riperf3 passes None).
+#[tokio::test]
+async fn tcp_cport_increments_per_stream_like_gt() {
+    let base = free_cport_base(2);
+    let ports = run_round_cport_ports(base, 2, false, false).await;
+    assert_eq!(
+        ports,
+        vec![base, base + 1],
+        "TCP -P 2 --cport binds N, N+1 in creation order (#428)"
+    );
+}
+
+/// #428, bidir flavor: GT's receive half adds `+ num_streams`
+/// (iperf_client_api.c:119-121), and GT creates the send half first — so
+/// the mapping is still `cport + creation_index` over riperf3's flat
+/// sender-first loop. Live-probed: bidir -P 2 --cport N uses N..N+3 (the
+/// server saw all four).
+#[tokio::test]
+async fn tcp_bidir_cport_covers_both_halves_like_gt() {
+    let base = free_cport_base(4);
+    let ports = run_round_cport_ports(base, 2, true, false).await;
+    assert_eq!(
+        ports,
+        vec![base, base + 1, base + 2, base + 3],
+        "bidir -P 2 --cport binds N..N+3, senders first (#428)"
+    );
+}
+
+/// #428, the second bug: riperf3's UDP arm IGNORED `--cport` outright
+/// (udp_bind got a literal 0) — every UDP stream was ephemeral where GT
+/// binds N, N+1, … (netdial(test->bind_port), iperf_udp.c:670;
+/// live-probed).
+#[tokio::test]
+async fn udp_cport_increments_per_stream_like_gt() {
+    let base = free_cport_base(2);
+    let ports = run_round_cport_ports(base, 2, false, true).await;
+    assert_eq!(
+        ports,
+        vec![base, base + 1],
+        "UDP -P 2 --cport binds N, N+1 like GT (#428)"
+    );
+}
+
+/// #428 r1 F1: GT's `if (orig_bind_port)` ZERO-GATE
+/// (iperf_client_api.c:117) — a cport of 0 never increments; every stream
+/// dials ephemeral (GT's no-bind path). Without the gate, stream 2 binds
+/// port 0+1 = 1: EACCES for a non-root run (the run errors and the length
+/// assert reds), a wrong explicit port under root (the != 1 assert reds).
+#[tokio::test]
+async fn cport_zero_never_increments() {
+    let ports = run_round_cport_ports(0, 2, false, false).await;
+    assert_eq!(ports.len(), 2, "both streams connected");
+    assert!(
+        ports.iter().all(|&p| p != 1),
+        "no stream lands on port 1 — GT's zero-gate (#428 r1): {ports:?}"
+    );
+}
+
+/// #428, the wrap edge: GT's `bind_port + i` passes 65536 through
+/// getaddrinfo/htons where it truncates to 0 = EPHEMERAL (live-probed:
+/// `--cport 65535 -P 2` → stream 1 on 65535, stream 2 ephemeral, exit 0;
+/// the int 65536 stays truthy through GT's zero-gate, so this is the
+/// EXPLICIT-bind-0 path, distinct from cport-0's no-bind path).
+/// riperf3 mirrors with `u16::wrapping_add` + the existing 0-is-ephemeral
+/// dial path. A saturating mutant re-collides on 65535 and reds here.
+#[tokio::test]
+async fn cport_65535_wraps_to_ephemeral_like_gt() {
+    if std::net::TcpListener::bind(("0.0.0.0", 65535)).is_err() {
+        eprintln!("SKIP: port 65535 busy in this environment");
+        return;
+    }
+    let ports = run_round_cport_ports(65535, 2, false, false).await;
+    assert_eq!(ports.len(), 2, "both streams connected");
+    assert_eq!(ports[0], 65535, "stream 1 keeps the requested port");
+    assert_ne!(
+        ports[1], 65535,
+        "stream 2 wrapped to ephemeral, not a re-collision (#428)"
+    );
+}
+
 /// #406 (r1): the `RecvMessageFailed`↔`SendFailed` cell of the same
 /// invisibility class — the repo's first RENDERING-IDENTICAL variant pair
 /// (both print `error - {msg}` with the carried message and both errexit
