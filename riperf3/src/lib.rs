@@ -105,6 +105,18 @@ pub use macros::render_timestamp as render_timestamp_prefix;
 /// follows iperf_err's logfile-or-stderr chooser.
 pub use macros::ErrorSinkGuard;
 
+/// Parse-time RSA key-file validation (#395) — iperf3 loads auth keys inside
+/// its argument post-loop and stamps IESETCLIENTAUTH/IESETSERVERAUTH when
+/// they don't load; the CLI mirrors that by validating here before any run.
+/// The `Err` display supplies the pre-parameter-error line's payload.
+pub use auth::{validate_private_key_file, validate_public_key_file};
+
+/// Parse-time client auth password resolution (#395):
+/// `RIPERF3_PASSWORD`/`IPERF3_PASSWORD` env, else an interactive `Password: `
+/// prompt — iperf3's getpass slot in the same post-loop (iperf_api.c:1859),
+/// so a headless half-configured client fails at PARSE, before any connect.
+pub use auth::read_password as read_auth_password;
+
 // --- Internal modules: implementation detail, NOT part of the public API. ---
 // Crate-private (`pub(crate)`), so nothing here is a semver commitment; the
 // few genuinely-public types are re-exported at the crate root above (#67).

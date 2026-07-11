@@ -2294,11 +2294,17 @@ mod protocol_error_tests {
             .build()
             .unwrap();
         let result = client.run().await;
-        assert!(result.is_err(), "client should error on AccessDenied");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("access denied") || err.contains("protocol"),
-            "error should mention access denied, got: {err}"
+        // #395: 0xFF is GT's busy-server signal — the client surfaces
+        // IEACCESSDENIED's exact string, not an access-denied message.
+        match result {
+            Err(crate::RiperfError::ServerBusy) => {}
+            Err(other) => panic!("expected ServerBusy on the 0xFF byte, got {other}"),
+            Ok(_) => panic!("expected ServerBusy on the 0xFF byte, got Ok"),
+        }
+        assert_eq!(
+            format!("{}", crate::RiperfError::ServerBusy),
+            "the server is busy running a test. try again later",
+            "GT's IEACCESSDENIED rendering, verbatim"
         );
         let _ = server_task.await;
     }

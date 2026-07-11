@@ -494,7 +494,11 @@ impl Client {
                     TestState::IperfDone => StepFlow::Break,
 
                     TestState::AccessDenied => {
-                        return Err(RiperfError::AccessDenied);
+                        // #395: 0xFF is GT's BUSY-server signal
+                        // (IEACCESSDENIED, "the server is busy running a
+                        // test. try again later") — an auth deny arrives as
+                        // a bare close, never as this byte.
+                        return Err(RiperfError::ServerBusy);
                     }
                     TestState::ServerError => {
                         // The relay is a kill — bare end at ANY stage (#404;

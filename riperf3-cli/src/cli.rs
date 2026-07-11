@@ -493,10 +493,16 @@ impl Cli {
     ///
     /// iperf3 raises `IESERVERONLY` when a client (`-c`) is given an option that
     /// only makes sense on the server — every option whose parse arm sets
-    /// `server_flag`, plus `--authorized-users-path` (caught by a separate role
-    /// check). This mirrors that exact set so a riperf3 client rejects the same
-    /// options iperf3 would, before any side effects. Companion to
+    /// `server_flag`. This mirrors that exact set so a riperf3 client rejects
+    /// the same options iperf3 would, before any side effects. Companion to
     /// `first_client_only_violation` (#65); see #100.
+    ///
+    /// `--authorized-users-path` is deliberately ABSENT (#395 r1 F2): its
+    /// getopt case never sets `server_flag` (iperf_api.c:1757-1759), so GT
+    /// catches it only at the post-loop :1874 leg, AFTER the client-auth
+    /// checks — the dedicated late leg in `parse_class_rejection` mirrors
+    /// that slot (live-probed: `-c --username u --authorized-users-path f`
+    /// is IESETCLIENTAUTH on GT, not IESERVERONLY).
     ///
     /// `--use-pkcs1-padding` is included deliberately: iperf3 marks it
     /// server-only (the server uses PKCS#1 v1.5 to decode tokens from legacy
@@ -506,7 +512,7 @@ impl Cli {
     pub fn first_server_only_violation(&self) -> Option<&'static str> {
         // (was-it-set, canonical flag name) — order is the report priority.
         // Cross-checked against iperf3's `server_flag` set in iperf_api.c.
-        let checks: [(bool, &'static str); 9] = [
+        let checks: [(bool, &'static str); 8] = [
             (self.daemon, "-D/--daemon"),
             (self.one_off, "-1/--one-off"),
             (
@@ -518,10 +524,6 @@ impl Cli {
             (
                 self.rsa_private_key_path.is_some(),
                 "--rsa-private-key-path",
-            ),
-            (
-                self.authorized_users_path.is_some(),
-                "--authorized-users-path",
             ),
             (self.time_skew_threshold.is_some(), "--time-skew-threshold"),
             (self.use_pkcs1_padding, "--use-pkcs1-padding"),
@@ -563,7 +565,10 @@ impl Cli {
     /// mapping rather than a hand-maintained copy. Process-level concerns
     /// (daemonize, pidfile, logfile, CPU affinity) stay in `main`; this is pure
     /// arg → builder → `build()`.
-    pub fn build_client(&self) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
+    pub fn build_client(
+        &self,
+        auth_password: Option<&str>,
+    ) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
         let host = self
             .client
             .as_deref()
@@ -824,6 +829,12 @@ impl Cli {
         }
         if let Some(ref name) = self.username {
             builder = builder.username(name);
+        }
+        // #395: the password is resolved at PARSE time (GT's getpass slot in
+        // the argument post-loop) and handed in here, so the lib's own
+        // runtime prompt fallback never fires from the CLI path.
+        if let Some(pw) = auth_password {
+            builder = builder.password(pw);
         }
         if let Some(ref path) = self.rsa_public_key_path {
             builder = builder.rsa_public_key_path(path);
@@ -1685,10 +1696,6 @@ mod cli_tests {
                     vec!["--rsa-private-key-path", "/tmp/priv.pem"],
                     "--rsa-private-key-path",
                 ),
-                (
-                    vec!["--authorized-users-path", "/tmp/users"],
-                    "--authorized-users-path",
-                ),
                 (vec!["--time-skew-threshold", "5"], "--time-skew-threshold"),
                 (vec!["--use-pkcs1-padding"], "--use-pkcs1-padding"),
             ] {
@@ -1701,6 +1708,18 @@ mod cli_tests {
                     "expected {want} flagged for args {args:?}"
                 );
             }
+
+            // #395 r1 F2: `--authorized-users-path` is NOT in the generic
+            // set — its getopt case never sets GT's server_flag
+            // (iperf_api.c:1757-1759); the post-loop :1874 slot handles it
+            // in `parse_class_rejection`, AFTER the client-auth legs (the
+            // ordering pin lives in error_format.rs).
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "--authorized-users-path", "/f"]);
+            assert_eq!(
+                cli.first_server_only_violation(),
+                None,
+                "--authorized-users-path is the late leg, not the generic set"
+            );
         }
     }
 
@@ -1716,7 +1735,7 @@ mod cli_tests {
         /// path as `main`, instead of a hand-maintained copy that can drift (the
         /// blind spot the `-J` bug exploited). See #124.
         fn build_client_from_cli(cli: &Cli) -> riperf3::Client {
-            cli.build_client().unwrap()
+            cli.build_client(None).unwrap()
         }
 
         /// Server counterpart of [`build_client_from_cli`] — exercises the real
@@ -1958,7 +1977,7 @@ mod cli_tests {
         #[test]
         fn tos_flag_rejects_out_of_range() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "256"]);
-            let err = cli.build_client().unwrap_err().to_string();
+            let err = cli.build_client(None).unwrap_err().to_string();
             assert!(err.contains("bad TOS value"), "got: {err}");
         }
 
@@ -2259,7 +2278,7 @@ mod cli_tests {
         #[test]
         fn bind_dev_rejected_on_unsupported_platforms() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
-            let err = cli.build_client().unwrap_err().to_string();
+            let err = cli.build_client(None).unwrap_err().to_string();
             assert!(err.contains("--bind-dev"), "got: {err}");
         }
 
@@ -2565,7 +2584,7 @@ mod cli_tests {
             ] {
                 let cli = Cli::parse_from(args);
                 let err = cli
-                    .build_client()
+                    .build_client(None)
                     .expect_err("conflicting end conditions must be rejected")
                     .to_string();
                 assert!(
@@ -2592,7 +2611,7 @@ mod cli_tests {
             ] {
                 let cli = Cli::parse_from(args);
                 assert!(
-                    cli.build_client().is_ok(),
+                    cli.build_client(None).is_ok(),
                     "iperf3 accepts {args:?}; riperf3 must not reject it"
                 );
             }

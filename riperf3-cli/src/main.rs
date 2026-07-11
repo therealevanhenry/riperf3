@@ -298,27 +298,38 @@ fn main() -> std::process::ExitCode {
         }
     }
 
-    if let Some(msg) = parse_class_rejection(&cli) {
-        // #270: GT routes the parse-error class through 'parameter error - '
-        // with the usage trailer (live-probed for all three classes here:
-        // end-conditions, client-only, server-only). #328: the -l range
-        // checks live INSIDE parse_class_rejection at GT's post-loop slot.
-        // #365: post-loop parameter errors are stamped UNCONDITIONALLY in
-        // GT (the format is always parsed by the post-loop checks,
-        // iperf_api.c ~:1825+; live: stamped with --timestamps LAST) — the
-        // #348 mid-loop ordering note applies only to in-loop errors (the
-        // range checks above, which stay bare — the #301-F4 recorded
-        // deviation). GT stamps the error line only; the trailer is bare.
-        eprintln!(
-            "{}riperf3: parameter error - {msg}",
-            cli.timestamps
+    let auth_password = match parse_class_rejection(&cli) {
+        Ok(pw) => pw,
+        Err(rej) => {
+            // #270: GT routes the parse-error class through 'parameter error - '
+            // with the usage trailer (live-probed for all three classes here:
+            // end-conditions, client-only, server-only). #328: the -l range
+            // checks live INSIDE parse_class_rejection at GT's post-loop slot.
+            // #365: post-loop parameter errors are stamped UNCONDITIONALLY in
+            // GT (the format is always parsed by the post-loop checks,
+            // iperf_api.c ~:1825+; live: stamped with --timestamps LAST) — the
+            // #348 mid-loop ordering note applies only to in-loop errors (the
+            // range checks above, which stay bare — the #301-F4 recorded
+            // deviation). GT stamps the error line only; the trailer is bare.
+            let prefix = cli
+                .timestamps
                 .as_deref()
                 .map(riperf3::render_timestamp_prefix)
-                .unwrap_or_default()
-        );
-        print_usage_trailer();
-        return std::process::ExitCode::FAILURE;
-    }
+                .unwrap_or_default();
+            // #395: the key-load failures print the loader's error first,
+            // like GT's iperf_err(ERR_error_string(..)) — whose explicit
+            // `\n` on top of iperf_err's own leaves a blank line before the
+            // parameter error (live-probed shape). The line CONTENT is
+            // riperf3's loader text where GT prints OpenSSL internals — a
+            // recorded string deviation; the shape and classes match.
+            if let Some(line) = rej.pre_line {
+                eprintln!("{prefix}riperf3: {line}\n");
+            }
+            eprintln!("{prefix}riperf3: parameter error - {}", rej.msg);
+            print_usage_trailer();
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     // #263: GT warns when an explicit -f rides JSON output — end of
     // iperf_parse_arguments (iperf_api.c:2015-2017), both roles, and
@@ -355,7 +366,7 @@ fn main() -> std::process::ExitCode {
     // AT PRINT TIME — GT strftimes per line, and a stamp captured before a
     // multi-second run would be stale on the exit line.
     let ts_format = cli.timestamps.clone();
-    match run(cli) {
+    match run(cli, auth_password) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             // #225: on ServerTerminated the lib has ALREADY rendered the
@@ -491,25 +502,137 @@ fn print_unit_val_error(arg: &[u8]) {
     print_usage_trailer();
 }
 
+/// A post-loop parameter-error rejection: the message, plus GT's optional
+/// PRECEDING error line — the auth key-load failures print the loader's
+/// error through iperf_err before stamping the parameter error
+/// (iperf_api.c:1855/:1900), rendered as `riperf3: {line}` + a blank line
+/// (iperf_err's explicit `\n` on top of its own) ahead of the usual
+/// `parameter error - ` line.
+struct ParseRejection {
+    pre_line: Option<String>,
+    msg: String,
+}
+
+impl ParseRejection {
+    fn new(msg: impl Into<String>) -> Self {
+        Self {
+            pre_line: None,
+            msg: msg.into(),
+        }
+    }
+}
+
+/// #395 r1 F7: the pre-line is a parse-time FILE diagnostic — strip the
+/// lib's `protocol violation: ` Display wrapper so it reads
+/// `riperf3: invalid RSA private key: …`, not a wire-protocol event. (GT
+/// prints raw OpenSSL internals here; the content is riperf3's own, a
+/// recorded deviation.)
+fn plain_diagnostic(e: riperf3::RiperfError) -> String {
+    match e {
+        riperf3::RiperfError::Protocol(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
+/// GT's IESETCLIENTAUTH sentence (iperf_error.c:214) — the string names the
+/// password even though the flag check is only username⊕pubkey; the password
+/// is resolved separately (env else prompt) in the same slot (#395).
+const CLIENT_AUTH_MSG: &str =
+    "you must specify a username, password, and path to a valid RSA public key";
+/// GT's IESETSERVERAUTH sentence (iperf_error.c:217) (#395).
+const SERVER_AUTH_MSG: &str =
+    "you must specify a path to a valid RSA private key and a user credential file";
+/// GT's IESERVERAUTHUSERS sentence (iperf_error.c:220) (#395).
+const AUTH_USERS_MSG: &str = "cannot access authorized users file";
+
 /// The parse-class rejections (#65 client-only-on-server, #100
-/// server-only-on-client, #140 conflicting end conditions): iperf3 raises
-/// these in parse_arguments, before any output sink exists, so they print to
-/// stderr in every mode. The messages embed iperf3's canonical IE* text as a
-/// substring and add the offending flag name, which iperf3 omits.
-fn parse_class_rejection(cli: &Cli) -> Option<String> {
+/// server-only-on-client, #140 conflicting end conditions, #395 auth
+/// parameter checks): iperf3 raises these in parse_arguments, before any
+/// output sink exists, so they print to stderr in every mode. The messages
+/// embed iperf3's canonical IE* text as a substring and (for the role
+/// checks) add the offending flag name, which iperf3 omits.
+///
+/// `Ok(password)` carries the client auth password resolved at GT's getpass
+/// slot (#395) — `Some` only when the full `--username`/`--rsa-public-key-path`
+/// pair is present and valid.
+fn parse_class_rejection(cli: &Cli) -> Result<Option<String>, ParseRejection> {
+    let mut auth_password = None;
     if cli.server {
         if let Some(flag) = cli.first_client_only_violation() {
-            return Some(format!(
+            return Err(ParseRejection::new(format!(
                 "some option you are trying to set is client only: \
                  {flag} cannot be used with -s/--server"
-            ));
+            )));
+        }
+        // #395: GT's server auth-pair check + the users-file access probe +
+        // the parse-time private-key load (iperf_api.c:1884-1913), in GT's
+        // order — the fopen probe fires BEFORE the key load (live-probed:
+        // bogus key + missing users file reports the users file). All fire
+        // AFTER the client-only role check (:1843 precedes :1884).
+        match (
+            cli.rsa_private_key_path.as_deref(),
+            cli.authorized_users_path.as_deref(),
+        ) {
+            (Some(key), Some(users)) => {
+                if std::fs::File::open(users).is_err() {
+                    return Err(ParseRejection::new(AUTH_USERS_MSG));
+                }
+                if let Err(e) = riperf3::validate_private_key_file(std::path::Path::new(key)) {
+                    return Err(ParseRejection {
+                        pre_line: Some(plain_diagnostic(e)),
+                        msg: SERVER_AUTH_MSG.into(),
+                    });
+                }
+            }
+            (None, None) => {}
+            // Exactly one half of the pair — GT's IESETSERVERAUTH (#395).
+            _ => return Err(ParseRejection::new(SERVER_AUTH_MSG)),
         }
     }
     if cli.client.is_some() {
         if let Some(flag) = cli.first_server_only_violation() {
-            return Some(format!(
+            return Err(ParseRejection::new(format!(
                 "some option you are trying to set is server only: \
                  {flag} cannot be used with -c/--client"
+            )));
+        }
+        // #395: GT's client auth-pair check, parse-time public-key load, and
+        // password resolution (env else interactive getpass) — all in the
+        // post-loop (iperf_api.c:1846-1872), AFTER the generic role checks
+        // for the `server_flag` set (`--rsa-private-key-path` on a client is
+        // IESERVERONLY via the in-loop flag, not IESETCLIENTAUTH —
+        // live-probed) and BEFORE the rcv-timeout leg (:1880; live-probed:
+        // `--username`-only + `--rcv-timeout` reports the auth sentence). A
+        // headless run with no `IPERF3_PASSWORD` fails HERE, before any
+        // connect attempt.
+        match (cli.username.as_deref(), cli.rsa_public_key_path.as_deref()) {
+            (Some(_), Some(path)) => {
+                if let Err(e) = riperf3::validate_public_key_file(std::path::Path::new(path)) {
+                    return Err(ParseRejection {
+                        pre_line: Some(plain_diagnostic(e)),
+                        msg: CLIENT_AUTH_MSG.into(),
+                    });
+                }
+                match riperf3::read_auth_password() {
+                    Ok(pw) => auth_password = Some(pw),
+                    Err(_) => return Err(ParseRejection::new(CLIENT_AUTH_MSG)),
+                }
+            }
+            (None, None) => {}
+            // Exactly one half of the pair — GT's IESETCLIENTAUTH (#395).
+            _ => return Err(ParseRejection::new(CLIENT_AUTH_MSG)),
+        }
+        // #395 r1 F2: `--authorized-users-path` never sets GT's server_flag
+        // (iperf_api.c:1757-1759), so on a client it survives the generic
+        // in-loop role check and is caught only at the post-loop :1874 leg —
+        // AFTER the client-auth legs above (live-probed: `-c --username u
+        // --authorized-users-path f` is IESETCLIENTAUTH, and the full client
+        // trio resolves the password before this rejects) and BEFORE the
+        // rcv-timeout leg (:1880).
+        if cli.authorized_users_path.is_some() {
+            return Err(ParseRejection::new(
+                "some option you are trying to set is server only: \
+                 --authorized-users-path cannot be used with -c/--client",
             ));
         }
         // #328: GT's IERVRSONLYRCVTIMEOUT (iperf_api.c:1880-1882) — a
@@ -518,7 +641,9 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
         // end-conditions check (:1992). perr-shaped: the trailing ": " is
         // part of the live-probed line (errno 0 at parse time).
         if cli.rcv_timeout.is_some() && !cli.reverse && !cli.bidir {
-            return Some("client receive timeout is valid only in receiving mode: ".to_string());
+            return Err(ParseRejection::new(
+                "client receive timeout is valid only in receiving mode: ",
+            ));
         }
         // #335: GT rejects `-F` under UDP with IEUDPFILETRANSFER
         // (iperf_api.c:1919-1923) — a UDP datagram carries its own header
@@ -529,7 +654,7 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
         // IEUDPBLOCKSIZE). `-u` is client-only, so on a server it takes
         // IECLIENTONLY first — this leg only matters for a client.
         if cli.file.is_some() && cli.udp {
-            return Some("cannot transfer file using UDP".to_string());
+            return Err(ParseRejection::new("cannot transfer file using UDP"));
         }
         // #328 (r1 F1): GT's -l range checks sit BETWEEN the rvrs-rcv check
         // (:1881) and the end-conditions check (:1992) in the parse
@@ -555,22 +680,27 @@ fn parse_class_rejection(cli: &Cli) -> Option<String> {
             // different sentence (live: `-u -l -5 -t 5 -n 5` → GT
             // IEENDCONDITIONS vs our IEUDPBLOCKSIZE — same class + exit).
             if (!cli.udp && v < 0) || v > 1_048_576 {
-                return Some("block size too large (maximum = 1048576 bytes)".to_string());
+                return Err(ParseRejection::new(
+                    "block size too large (maximum = 1048576 bytes)",
+                ));
             }
             if cli.udp && v != 0 && !(16..=65_507).contains(&v) {
-                return Some(
-                    "block size invalid (minimum = 16 bytes, maximum = 65507 bytes)".to_string(),
-                );
+                return Err(ParseRejection::new(
+                    "block size invalid (minimum = 16 bytes, maximum = 65507 bytes)",
+                ));
             }
         }
         if cli.end_conditions_conflict() {
-            return Some(cli::END_CONDITIONS_MSG.to_string());
+            return Err(ParseRejection::new(cli::END_CONDITIONS_MSG));
         }
     }
-    None
+    Ok(auth_password)
 }
 
-fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn run(
+    cli: Cli,
+    auth_password: Option<String>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // #328: GT levels are open-ended (--debug=100 runs); everything past 4
     // is max verbosity here, matching the `_ => Trace` arm.
     configure_log4rs(u8::try_from(cli.debug.unwrap_or(0)).unwrap_or(u8::MAX));
@@ -685,7 +815,7 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // future is the entire client/server state machine — inline it
         // overflows Windows' 1 MiB main-thread stack (unix's 8 MiB masked
         // it). Heap-pin the big one; the signal future is tiny.
-        let mut app = Box::pin(async_main(cli, interrupt_rx));
+        let mut app = Box::pin(async_main(cli, auth_password, interrupt_rx));
         tokio::select! {
             r = &mut app => r,
             sig = sigend.recv() => {
@@ -722,7 +852,7 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     });
     #[cfg(not(any(unix, windows)))]
-    let outcome = rt.block_on(async_main(cli, interrupt_rx));
+    let outcome = rt.block_on(async_main(cli, auth_password, interrupt_rx));
 
     // A SECOND signal during teardown exits immediately (#158): the first
     // one resolved the select, but a still-blasting UDP peer can hold the
@@ -942,6 +1072,7 @@ impl Sigend {
 
 async fn async_main(
     cli: Cli,
+    auth_password: Option<String>,
     interrupt: tokio::sync::watch::Receiver<Option<String>>,
 ) -> std::result::Result<Exit, Box<dyn std::error::Error>> {
     if cli.client.is_some() {
@@ -953,7 +1084,11 @@ async fn async_main(
         // run is `Ok` now (the lib rendered its doc/line during the run), but
         // iperf3 still errexits (exit 1) on those — map the non-clean endings
         // to the already-rendered error exit. Completed/Interrupted exit 0.
-        let outcome = cli.build_client()?.with_interrupt(interrupt).run().await?;
+        let outcome = cli
+            .build_client(auth_password.as_deref())?
+            .with_interrupt(interrupt)
+            .run()
+            .await?;
         if let Some(msg) = outcome.termination.errexit_message() {
             return Err(Box::new(AbnormalExit(msg.to_string())));
         }

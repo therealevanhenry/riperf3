@@ -776,13 +776,17 @@ impl Server {
                 | Err(e @ RiperfError::SetNoDelayFailed(_)) => {
                     self.emit_pretest_error(&e);
                 }
-                Err(e @ RiperfError::AccessDenied) => {
+                Err(RiperfError::AccessDenied) => {
                     // #377 r2 F1: the -J denial doc (with the ingested -b)
                     // emitted at the auth site, where params is in scope;
-                    // only the text line prints here.
+                    // only the text line prints here. #395: GT's runtime
+                    // auth deny never stamps i_errno, so the line renders
+                    // iperf_strerror(0) — "no error" — not the lib error's
+                    // Display. (Fresh-process string; the stale-i_errno
+                    // multi-round wrinkle is recorded at the auth gate.)
                     if !json && !crate::macros::output_quiet() {
                         eprintln!(
-                            "{}riperf3: error - {e}",
+                            "{}riperf3: error - no error",
                             crate::macros::output_timestamp_prefix()
                         );
                     }
@@ -1021,26 +1025,36 @@ impl Server {
         // banner (#216) — so the capture above tees PREFIXED lines like
         // iperf3's linebuffer (#168) with nothing to do per test.
 
-        self.print_connect_block(peer_addr, &cookie, &params, &cfg);
-
         // ---- Auth validation (after params, before streams) ----
-        if let Err(e) = self.authenticate(&mut ctrl, &params).await {
-            if matches!(e, RiperfError::AccessDenied) {
-                // #377 r2 F1: GT's auth gate runs AFTER get_parameters
-                // (iperf_api.c:2368 vs :2662), so the denial doc carries
-                // the early target_bitrate like the #260 refusal twins.
-                // Emitted HERE — params is out of scope at the serve
-                // loop's arm, which prints only the text line. (The rarer
-                // auth-failure subclasses — unreadable key, undecodable
-                // token — keep the residual rate-less sink until #395
-                // reworks the surface.)
-                self.emit_pretest_error_doc(
-                    &format!("error - {e}"),
-                    params.bandwidth.filter(|&b| b > 0),
-                );
-            }
-            return Err(e);
+        if self.authenticate(&params).await.is_err() {
+            // #377 r2 F1: GT's auth gate runs AFTER get_parameters
+            // (iperf_api.c:2368 vs :2662), so the denial doc carries
+            // the early target_bitrate like the #260 refusal twins.
+            // Emitted HERE — params is out of scope at the serve
+            // loop's arm, which prints only the text line.
+            // #395: EVERY runtime auth failure (tokenless, undecodable
+            // token, failed credential check) shares GT's deny surface —
+            // test_is_authorized returns -1 WITHOUT stamping i_errno
+            // (iperf_api.c:2313-2343), so a fresh GT process renders
+            // iperf_strerror(0), "no error". RECORDED DEVIATION (r1 F1,
+            // r2 F1): GT never RESETS the global i_errno between rounds,
+            // so a multi-round GT server whose EARLIER round stamped an
+            // errno renders that stale string on a later deny (live-
+            // probed: cookie-EOF round, then deny → "unable to receive
+            // cookie" twice) AND writes a 0xFE SERVER_ERROR block instead
+            // of the bare FIN (cleanup_server's wire-back gates on
+            // `i_errno != IENONE`, iperf_server_api.c:465-473). riperf3
+            // always takes the fresh-process surface — bare close, "no
+            // error". The underlying error never reaches a surface; the
+            // lib normalizes to `AccessDenied`.
+            self.emit_pretest_error_doc("error - no error", params.bandwidth.filter(|&b| b > 0));
+            return Err(RiperfError::AccessDenied);
         }
+
+        // #395: GT's on_connect fires only after iperf_exchange_parameters —
+        // auth gate included — succeeds (iperf_server_api.c:207-214); a
+        // denied round prints the listen banner and nothing else.
+        self.print_connect_block(peer_addr, &cookie, &params, &cfg);
 
         // The test's accumulated state, threaded through the pipeline phases
         // (#289) — field docs on TestRunCtx.
@@ -1519,10 +1533,13 @@ impl Server {
     }
 
     /// #222: the connect text block, in GT's order and GT's TIMING —
-    /// iperf_on_connect fires post-param-exchange, which also puts these
-    /// lines inside the --get-server-output capture (r1 item 6). The
-    /// banner is unconditional in text mode; the rest is -V. The server's
-    /// control MSS is 0 "(default)" (ctrl_sck_mss, r1 item 2).
+    /// iperf_on_connect fires post-param-exchange AND post-auth (#395:
+    /// iperf_server_api.c:213 runs only after iperf_exchange_parameters,
+    /// auth gate included, succeeds — a denied round prints no block),
+    /// which also puts these lines inside the --get-server-output capture
+    /// (r1 item 6). The banner is unconditional in text mode; the rest is
+    /// -V. The server's control MSS is 0 "(default)" (ctrl_sck_mss, r1
+    /// item 2).
     fn print_connect_block(
         &self,
         peer_addr: std::net::SocketAddr,
@@ -1574,12 +1591,13 @@ impl Server {
         }
     }
 
-    /// Auth validation (after params, before streams).
-    async fn authenticate(
-        &self,
-        ctrl: &mut tokio::net::TcpStream,
-        params: &TestParams,
-    ) -> Result<()> {
+    /// Auth validation (after params, before streams). #395: GT signals an
+    /// auth deny with a bare control-socket close — test_is_authorized's -1
+    /// aborts iperf_exchange_parameters before any state byte
+    /// (iperf_api.c:2368); the 0xFF `ACCESS_DENIED` byte is exclusively the
+    /// busy-server signal (iperf_server_api.c:222). No wire write here on
+    /// ANY failure leg.
+    async fn authenticate(&self, params: &TestParams) -> Result<()> {
         if let (Some(ref privkey_path), Some(ref users_path)) =
             (&self.rsa_private_key_path, &self.authorized_users_path)
         {
@@ -1587,27 +1605,21 @@ impl Server {
                 let privkey_pem = std::fs::read(privkey_path).map_err(|e| {
                     RiperfError::Protocol(format!("cannot read RSA private key: {e}"))
                 })?;
-                match crate::auth::decode_auth_token(token, &privkey_pem, self.use_pkcs1_padding) {
-                    Ok((username, password, ts)) => {
-                        crate::auth::check_credentials(
-                            &username,
-                            &password,
-                            ts,
-                            users_path,
-                            self.time_skew_threshold,
-                        )?;
-                        if self.verbose {
-                            vprintln!("Authenticated user: {username}");
-                        }
-                    }
-                    Err(e) => {
-                        protocol::send_state(ctrl, TestState::AccessDenied).await?;
-                        return Err(e);
-                    }
+                let (username, password, ts) =
+                    crate::auth::decode_auth_token(token, &privkey_pem, self.use_pkcs1_padding)?;
+                crate::auth::check_credentials(
+                    &username,
+                    &password,
+                    ts,
+                    users_path,
+                    self.time_skew_threshold,
+                )?;
+                if self.verbose {
+                    vprintln!("Authenticated user: {username}");
                 }
             } else {
-                // Server requires auth but client didn't send token
-                protocol::send_state(ctrl, TestState::AccessDenied).await?;
+                // Server requires auth but client didn't send token — same
+                // bare close.
                 return Err(RiperfError::AccessDenied);
             }
         }

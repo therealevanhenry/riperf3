@@ -2316,8 +2316,23 @@ fn setup_phase_ctrl_eof_takes_gt_doc_shape_in_json() {
 /// `target_bitrate` in the -J denial doc (live-probed 3.21: `start =
 /// {connected, version, system_info, target_bitrate}` + the error key).
 /// The tokenless deny arm needs no crypto: a server with auth configured
-/// denies a params blob that carries no authtoken. (GT's denial error
-/// STRING is a different, unrecorded divergence — tracked on #395.)
+/// denies a params blob that carries no authtoken.
+///
+/// #395 deny surface: GT writes NOTHING on an auth deny — test_is_authorized
+/// fails inside iperf_exchange_parameters (iperf_api.c:2368) before the
+/// stream listen and before any state byte, and the -1 propagates to a bare
+/// control-socket close (the 0xFF ACCESS_DENIED byte is exclusively the
+/// BUSY-server signal, iperf_server_api.c:222). The deny doc's error string
+/// is GT's unstamped-i_errno rendering, "error - no error" (live-probed
+/// 3.21 -J deny doc; test_is_authorized never sets i_errno). RECORDED
+/// DEVIATION (r1 F1, r2 F1): that's the FRESH-process surface — GT never
+/// resets the global i_errno, so a multi-round GT server whose earlier
+/// round stamped an errno renders that stale string on a later deny AND
+/// writes a 0xFE SERVER_ERROR block instead of the bare FIN
+/// (cleanup_server's wire-back gates on `i_errno != IENONE`,
+/// iperf_server_api.c:465-473 — live-probed: cookie-EOF round then deny →
+/// `FE` + stale pair on the wire). riperf3 always takes the fresh-process
+/// surface: bare close, "no error".
 #[test]
 fn auth_denied_rate_set_doc_carries_the_early_target_bitrate() {
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
@@ -2336,8 +2351,14 @@ fn auth_denied_rate_set_doc_carries_the_early_target_bitrate() {
             ctrl.write_all(&[b'x'; 37]).unwrap();
             assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
             write_json_blob(&mut ctrl, r#"{"tcp":true,"bandwidth":100000000}"#);
-            // The ACCESS_DENIED wire-back (state -1 as a byte).
-            assert_eq!(read_exact(&mut ctrl, 1)[0], 0xFF, "AccessDenied");
+            // GT sends NO deny byte — bare FIN (#395).
+            let mut tail = Vec::new();
+            ctrl.read_to_end(&mut tail)
+                .expect("clean FIN like GT, not RST");
+            assert!(
+                tail.is_empty(),
+                "no wire bytes after denied params (0xFF is busy-only), got {tail:?}"
+            );
         },
     );
     let doc: serde_json::Value =
@@ -2347,15 +2368,276 @@ fn auth_denied_rate_set_doc_carries_the_early_target_bitrate() {
         Some(100_000_000),
         "the denial doc carries the ingested -b (#377 r2 F1): {doc}"
     );
-    assert!(
-        doc["error"].as_str().is_some(),
-        "the denial doc keeps its error key: {doc}"
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("error - no error"),
+        "GT's unstamped-i_errno deny string (#395): {doc}"
     );
     assert_eq!(
         sout.matches("\"target_bitrate\"").count(),
         1,
         "ONE doc, ONE occurrence — no double emission: {sout}"
     );
+}
+
+/// #395: the bad-token deny leg (an authtoken that fails to decode) takes
+/// the same bare-close surface as the tokenless leg — GT's decode failure
+/// returns -1 from test_is_authorized with i_errno still unstamped
+/// (iperf_api.c:2323), so: no wire byte, clean FIN, and the same verbatim
+/// "error - no error" doc string.
+#[test]
+fn auth_bad_token_denies_with_bare_close_too() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
+    let key = format!("{fixtures}/test_private.pem");
+    let users = format!("{fixtures}/test_users.csv");
+    let (sout, _serr, status) = drive_server_scenario_with(
+        &[
+            "--rsa-private-key-path",
+            &key,
+            "--authorized-users-path",
+            &users,
+        ],
+        true,
+        |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(
+                &mut ctrl,
+                r#"{"tcp":true,"authtoken":"bm90LWEtcmVhbC10b2tlbg=="}"#,
+            );
+            let mut tail = Vec::new();
+            ctrl.read_to_end(&mut tail)
+                .expect("clean FIN like GT, not RST");
+            assert!(
+                tail.is_empty(),
+                "no wire bytes after a denied bad token, got {tail:?}"
+            );
+        },
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(sout.trim()).unwrap_or_else(|e| panic!("one -J doc ({e}): {sout}"));
+    assert_eq!(
+        doc["error"].as_str(),
+        Some("error - no error"),
+        "the bad-token leg shares the unstamped deny string (#395): {doc}"
+    );
+    assert!(status.success(), "one-off deny round still exits 0");
+}
+
+/// #395: the denied round's TEXT surface, live-probed on GT 3.21 — the
+/// listen banner prints, the "Accepted connection" block does NOT
+/// (on_connect runs only after iperf_exchange_parameters succeeds,
+/// iperf_server_api.c:213), and stderr carries GT's unstamped-i_errno line
+/// `error - no error` (the fresh-process surface — the stale-i_errno
+/// multi-round wrinkle, string AND wire byte, is a recorded deviation:
+/// see the -J twin above). The one-off round still exits 0 (GT's server
+/// loop treats a denied round as a completed one-off).
+#[test]
+fn auth_denied_text_round_prints_no_connect_block_and_unstamped_error() {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
+    let key = format!("{fixtures}/test_private.pem");
+    let users = format!("{fixtures}/test_users.csv");
+    let (sout, serr, status) = drive_server_scenario_with(
+        &[
+            "--rsa-private-key-path",
+            &key,
+            "--authorized-users-path",
+            &users,
+        ],
+        false,
+        |port| {
+            let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+            ctrl.write_all(&[b'x'; 37]).unwrap();
+            assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+            write_json_blob(&mut ctrl, r#"{"tcp":true}"#);
+            let mut tail = Vec::new();
+            let _ = ctrl.read_to_end(&mut tail); // drain to let the round finish
+        },
+    );
+    assert!(
+        sout.contains("Server listening on"),
+        "the listen banner still prints: {sout}"
+    );
+    assert!(
+        !sout.contains("Accepted connection"),
+        "no connect block on a denied round — GT's on_connect is post-auth (#395): {sout}"
+    );
+    assert_eq!(
+        serr.trim_end(),
+        "riperf3: error - no error",
+        "GT's unstamped-i_errno text line, verbatim (#395)"
+    );
+    assert!(status.success(), "one-off deny round still exits 0");
+}
+
+/// #395: the 0xFF wire byte is GT's BUSY-server signal — its client renders
+/// IEACCESSDENIED as "the server is busy running a test. try again later"
+/// (iperf_error.c:344), NOT an access-denied message. Live-probed 3.21 busy
+/// cells: text mode prints NOTHING to stdout (the byte lands before the
+/// "Connecting to host" banner) and the -J doc keeps the pre-connect
+/// truncated start (connected/version/system_info only, no timestamp or
+/// cookie), with the same string unprefixed in the error key.
+#[test]
+fn busy_server_byte_renders_gt_busy_string_both_modes() {
+    const BUSY: &str = "the server is busy running a test. try again later";
+    for json in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port_s = listener.local_addr().unwrap().port().to_string();
+        let mock = std::thread::spawn(move || {
+            let (mut ctrl, _) = listener.accept().expect("accept");
+            let _ = read_exact(&mut ctrl, 37); // cookie
+            ctrl.write_all(&[0xFF]).unwrap(); // ACCESS_DENIED = busy
+        });
+        let mut args = vec!["-c", "127.0.0.1", "-p", &port_s, "-t", "1"];
+        if json {
+            args.push("-J");
+        }
+        let run = common::run_client(&args, Duration::from_secs(10), "busy-cell client");
+        mock.join().expect("mock");
+        assert!(!run.status.success(), "busy cell fails (json={json})");
+        if json {
+            let doc: serde_json::Value = serde_json::from_str(run.stdout.trim())
+                .unwrap_or_else(|e| panic!("one -J doc ({e}): {out}", out = run.stdout));
+            assert_eq!(
+                doc["error"].as_str(),
+                Some(BUSY),
+                "GT's IEACCESSDENIED string, unprefixed in -J (#395): {doc}"
+            );
+            assert!(
+                doc["start"]["timestamp"].is_null() && doc["start"]["cookie"].is_null(),
+                "pre-connect truncated start, like GT's busy doc: {doc}"
+            );
+        } else {
+            assert_eq!(
+                run.stdout, "",
+                "GT prints nothing to stdout on a busy refusal"
+            );
+            assert_eq!(
+                run.stderr.trim_end(),
+                format!("riperf3: error - {BUSY}"),
+                "GT's IEACCESSDENIED text line (#395)"
+            );
+        }
+    }
+}
+
+/// One-shot client run WITHOUT the #176/#195 retry classifiers: the denied
+/// cell's EXPECTED stderr — "control socket has closed unexpectedly" — is
+/// itself a #195 reset token, so `common::run_client` would classify the
+/// legitimate deny as a transient, retry against the spent server, and hand
+/// back a refused attempt with an empty stdout.
+fn run_client_once(
+    args: &[&str],
+    timeout: Duration,
+    who: &str,
+) -> (String, String, std::process::ExitStatus) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{who}: spawn failed: {e}"));
+    let out_reader = riperf3_test_support::drain_reader(child.stdout.take().expect("piped stdout"));
+    let err_reader = riperf3_test_support::drain_reader(child.stderr.take().expect("piped stderr"));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{who}: timed out");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    (
+        out_reader.join().expect("stdout reader"),
+        err_reader.join().expect("stderr reader"),
+        status,
+    )
+}
+
+/// #395 convergence: with no deny byte on the wire, a tokenless client
+/// against an auth-requiring riperf3 server sees exactly what it sees
+/// against GT — the control socket closing after params. Live-probed 3.21
+/// client cells (tokenless and bad-password both): text mode keeps the
+/// "Connecting to host" banner and errors "control socket has closed
+/// unexpectedly"; -J carries the FULL post-connect start (timestamp,
+/// connecting_to, cookie) with the same string in the error key.
+///
+/// The server is multi-shot: the listen probe below consumes an accept
+/// (which a `-1` server would treat as its one round), and the retry-free
+/// [`run_client_once`] needs the port deterministically live.
+#[test]
+fn denied_client_sees_gt_eof_surface_both_modes() {
+    const CLOSED: &str = "control socket has closed unexpectedly";
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
+    let key = format!("{fixtures}/test_private.pem");
+    let users = format!("{fixtures}/test_users.csv");
+    for json in [false, true] {
+        let port = common::free_port();
+        let port_s = port.to_string();
+        let _server = common::ChildGuard(
+            std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+                .args([
+                    "-s",
+                    "-p",
+                    &port_s,
+                    "--rsa-private-key-path",
+                    &key,
+                    "--authorized-users-path",
+                    &users,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn server"),
+        );
+        // Probe until the server listens (the probe's bare connect+close is
+        // an errored round the multi-shot serve loop absorbs).
+        let listen_deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                Instant::now() < listen_deadline,
+                "server never listened (json={json})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut args = vec!["-c", "127.0.0.1", "-p", &port_s, "-t", "1"];
+        if json {
+            args.push("-J");
+        }
+        let (stdout, stderr, status) =
+            run_client_once(&args, Duration::from_secs(10), "denied client");
+        assert!(!status.success(), "denied cell fails (json={json})");
+        if json {
+            let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|e| panic!("one -J doc ({e}): {stdout}"));
+            assert_eq!(
+                doc["error"].as_str(),
+                Some(CLOSED),
+                "the denied client sees GT's EOF surface (#395): {doc}"
+            );
+            for key in ["timestamp", "connecting_to", "cookie"] {
+                assert!(
+                    !doc["start"][key].is_null(),
+                    "{key} present — the FULL post-connect start, like GT: {doc}"
+                );
+            }
+        } else {
+            assert!(
+                stdout.contains("Connecting to host 127.0.0.1, port "),
+                "the connect banner printed before the deny: {stdout}"
+            );
+            assert_eq!(
+                stderr.trim_end(),
+                format!("riperf3: error - {CLOSED}"),
+                "GT's EOF text line (#395)"
+            );
+        }
+    }
 }
 
 /// #357: with `-w` exchanged, GT re-listens with the window applied and
