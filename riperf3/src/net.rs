@@ -1870,6 +1870,13 @@ mod tests {
         let s6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
         configure_udp_sender(&s6, None, true)
             .expect("v6 + flag is a clean no-op, GT's AF_INET gate");
+        // The kernel accepts IP-level opts on v6 sockets, so no-error alone
+        // can't prove the gate skipped — read the option back.
+        assert_ne!(
+            mtu_discover(&s6),
+            libc::IP_PMTUDISC_DO,
+            "the v4-only gate must not stamp a v6 socket"
+        );
     }
 
     #[cfg(unix)]
