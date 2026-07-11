@@ -1226,17 +1226,37 @@ impl Server {
                         // (cleanup_server → iperf_sync_close_socket) — the
                         // bounded drain holds the round, and with it the
                         // one-off listener, open until the peer consumed
-                        // the setup-kill wire-back. An interrupt abandons
-                        // the drain (GT's sigend longjmps out the same
-                        // way); the original error propagates either way.
-                        let _ = self.park_refused_round(&mut ctx.ctrl).await;
-                        return Err(e);
+                        // the setup-kill wire-back.
+                        match self.park_refused_round(&mut ctx.ctrl).await {
+                            None => return Err(e),
+                            Some(_msg) => {
+                                // #445 r1 F1 (live-probed): GT's sigend
+                                // longjmps out of the drain and emits ONLY
+                                // the interrupt surface — the original
+                                // class line is ABANDONED. Consuming the
+                                // round here suppresses the text line (the
+                                // interrupt watcher prints its own).
+                                // RECORDED DEVIATION (-J/json-stream): the
+                                // kill site already emitted its doc with
+                                // the ORIGINAL error where GT's single doc
+                                // carries the interrupt line — deferring
+                                // that emission to post-park is the #386
+                                // refusal shape, left as a follow-up with
+                                // the pre-CreateStreams sync-close family.
+                                return Ok(None);
+                            }
+                        }
                     }
                 };
             if let SetupFlow::ClientDone = setup_flow {
                 // #356 r1 F1: GT's clean IPERF_DONE arm — the round ends
                 // with no error surface, keep-serving like a refusal
                 // (None maps to handle_one_test's Ok(None) after the gate).
+                // #445 r1 F3: GT's IPERF_DONE exit ALSO runs
+                // cleanup_server's sync-close; a conforming DONE-sender
+                // EOFs the drain instantly, so this only matters against
+                // an adversarial holder.
+                let _ = self.park_refused_round(&mut ctx.ctrl).await;
                 return Ok(None);
             }
             // #380: the full arm — every real task was already pushed at
