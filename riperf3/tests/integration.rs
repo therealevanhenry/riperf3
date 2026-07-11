@@ -2924,28 +2924,56 @@ async fn run_round_actuals(
 
 /// #415: an explicit `-w 0` is a NO-OP in GT — the buffer-apply guard is C
 /// truthiness (`if ((opt = test->settings->socket_bufsize))`,
-/// iperf_tcp.c:257/:434), so `socket_bufsize = 0` never reaches setsockopt
-/// and the w=0 cell equals the unset cell exactly (the #391 equality-pin
-/// pattern, extended from the setup-doc to the live data path). Pre-fix
-/// riperf3 applied 0 to BOTH roles' data sockets — the client's directly,
-/// the server's via the params blob's `"window": 0` (GT omits the key,
-/// iperf_api.c:2451) — and the kernel clamped the buffers to its minimums
-/// (live-probed: 4608/2304 vs 3939840/131072 untouched), a real throughput
-/// divergence, not just a doc one.
+/// iperf_tcp.c:257/:434), so `socket_bufsize = 0` never reaches setsockopt.
+/// Pre-fix riperf3 applied 0 to BOTH roles' data sockets — the client's
+/// directly, the server's via the params blob's `"window": 0` (GT omits the
+/// key, iperf_api.c:2451) — and the kernel clamped the buffers to its
+/// minimums (live-probed: 4608/2304 vs 3939840/131072 untouched), a real
+/// throughput divergence, not just a doc one.
+///
+/// The regression signature is therefore "actuals collapse to the kernel
+/// clamp floor", asserted directly. Cross-run EQUALITY with an unset cell
+/// (the #391 pattern, as first merged) proved flaky on macOS, whose TCP
+/// receive-buffer autosizing lands run-dependently (observed rcvbuf_actual
+/// 881928 vs 1045248 for identical settings, CI run 29135962755).
+/// `sock_bufsize` is riperf3's own rendering, not a kernel readback, so it
+/// stays an exact equality; the unset cell remains as the control that the
+/// floor fits the environment.
 #[tokio::test]
-async fn tcp_window_zero_equals_unset_cell_both_roles() {
+async fn tcp_window_zero_leaves_buffers_untouched_both_roles() {
+    // Above the kernel clamp minimums (Linux SOCK_MIN_SNDBUF 4608 /
+    // SOCK_MIN_RCVBUF 2304), below every CI platform's untouched default
+    // (>= 16 KiB).
+    const CLAMP_FLOOR: i64 = 8192;
     let unset = run_round_actuals(None, false).await;
     let zero = run_round_actuals(Some(0), false).await;
     for (role, i) in [("client", 0), ("server", 1)] {
-        assert_eq!(
-            zero[i], unset[i],
-            "the {role}'s -w 0 actuals trio must equal the unset cell (#415)"
-        );
         assert_eq!(
             zero[i].0,
             Some(0),
             "the {role}'s sock_bufsize renders 0 for -w 0, like GT's verbatim 0"
         );
+        assert_eq!(
+            zero[i].0, unset[i].0,
+            "the {role}'s -w 0 sock_bufsize must equal the unset cell (#415)"
+        );
+        for (name, z, u) in [
+            ("sndbuf_actual", zero[i].1, unset[i].1),
+            ("rcvbuf_actual", zero[i].2, unset[i].2),
+        ] {
+            let u = u.expect("unset actual present");
+            assert!(
+                u > CLAMP_FLOOR,
+                "control: the {role}'s unset {name} ({u}) sits under the floor — \
+                 the floor misfits this environment, not the code"
+            );
+            let z = z.expect("w=0 actual present");
+            assert!(
+                z > CLAMP_FLOOR,
+                "the {role}'s -w 0 {name} ({z}) collapsed toward the kernel \
+                 clamp floor — 0 reached setsockopt (#415)"
+            );
+        }
     }
 }
 
