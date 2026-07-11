@@ -1769,13 +1769,13 @@ fn auth_param_valid_combos_pass_parse() {
         "the run proceeded to the connect attempt: {stderr:?}"
     );
 
-    // Server: parse passes, the banner prints. Bounded spawn + kill; the
-    // banner is well under FreeBSD's 8KiB single-write pipe bound, so
-    // wait-then-read is safe here (#305 rule). r1 F4: poll the LISTEN
-    // instead of a fixed sleep — a loaded 2-core runner can outlast any
-    // constant.
-    let port = common::free_port();
-    let port_s = port.to_string();
+    // Server: parse passes, the banner prints. r1 F4 + r2 F2: poll the
+    // BANNER itself, not a fixed sleep and not the listen socket — the
+    // listen is accept-ready BEFORE the banner write, so a kill on
+    // connect-success could still beat the write on a starved runner.
+    // A reader thread streams stdout into a shared buffer; the poll waits
+    // for the first bytes (bounded 10 s), then kills.
+    let port_s = common::free_port().to_string();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
         .args([
             "-s",
@@ -1791,17 +1791,34 @@ fn auth_param_valid_combos_pass_parse() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    let mut sout_pipe = child.stdout.take().expect("piped stdout");
+    let sout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let sout_buf2 = std::sync::Arc::clone(&sout_buf);
+    let sout_reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match sout_pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => sout_buf2.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+    let serr_reader =
+        riperf3_test_support::drain_reader(child.stderr.take().expect("piped stderr"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+    while sout_buf.lock().unwrap().is_empty()
         && std::time::Instant::now() < deadline
         && child.try_wait().unwrap().is_none()
     {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = child.wait();
+    sout_reader.join().expect("stdout reader");
+    let stderr = serr_reader.join().expect("stderr reader");
+    let sout_bytes = sout_buf.lock().unwrap().clone();
+    let stdout = String::from_utf8_lossy(&sout_bytes);
     assert!(
         !stderr.contains("parameter error"),
         "valid server auth pair passes the parse: {stderr:?}"

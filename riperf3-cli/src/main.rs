@@ -628,7 +628,7 @@ fn parse_class_rejection(cli: &Cli) -> Result<Option<String>, ParseRejection> {
         // AFTER the client-auth legs above (live-probed: `-c --username u
         // --authorized-users-path f` is IESETCLIENTAUTH, and the full client
         // trio resolves the password before this rejects) and BEFORE the
-        // rcv-timeout leg (:1879).
+        // rcv-timeout leg (:1880).
         if cli.authorized_users_path.is_some() {
             return Err(ParseRejection::new(
                 "some option you are trying to set is server only: \

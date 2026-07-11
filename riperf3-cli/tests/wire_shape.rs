@@ -2325,9 +2325,14 @@ fn setup_phase_ctrl_eof_takes_gt_doc_shape_in_json() {
 /// BUSY-server signal, iperf_server_api.c:222). The deny doc's error string
 /// is GT's unstamped-i_errno rendering, "error - no error" (live-probed
 /// 3.21 -J deny doc; test_is_authorized never sets i_errno). RECORDED
-/// DEVIATION (r1 F1): that's the FRESH-process string — GT never resets
-/// the global i_errno, so a multi-round GT server can render a stale
-/// earlier errno here; riperf3 always prints the fresh-process string.
+/// DEVIATION (r1 F1, r2 F1): that's the FRESH-process surface — GT never
+/// resets the global i_errno, so a multi-round GT server whose earlier
+/// round stamped an errno renders that stale string on a later deny AND
+/// writes a 0xFE SERVER_ERROR block instead of the bare FIN
+/// (cleanup_server's wire-back gates on `i_errno != IENONE`,
+/// iperf_server_api.c:465-473 — live-probed: cookie-EOF round then deny →
+/// `FE` + stale pair on the wire). riperf3 always takes the fresh-process
+/// surface: bare close, "no error".
 #[test]
 fn auth_denied_rate_set_doc_carries_the_early_target_bitrate() {
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");
@@ -2424,10 +2429,10 @@ fn auth_bad_token_denies_with_bare_close_too() {
 /// listen banner prints, the "Accepted connection" block does NOT
 /// (on_connect runs only after iperf_exchange_parameters succeeds,
 /// iperf_server_api.c:213), and stderr carries GT's unstamped-i_errno line
-/// `error - no error` (the fresh-process string — the stale-i_errno
-/// multi-round wrinkle is a recorded deviation, see the -J twin above).
-/// The one-off round still exits 0 (GT's server loop treats a denied round
-/// as a completed one-off).
+/// `error - no error` (the fresh-process surface — the stale-i_errno
+/// multi-round wrinkle, string AND wire byte, is a recorded deviation:
+/// see the -J twin above). The one-off round still exits 0 (GT's server
+/// loop treats a denied round as a completed one-off).
 #[test]
 fn auth_denied_text_round_prints_no_connect_block_and_unstamped_error() {
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../riperf3/tests/fixtures");

@@ -1036,13 +1036,16 @@ impl Server {
             // token, failed credential check) shares GT's deny surface —
             // test_is_authorized returns -1 WITHOUT stamping i_errno
             // (iperf_api.c:2313-2343), so a fresh GT process renders
-            // iperf_strerror(0), "no error". RECORDED DEVIATION (r1 F1):
-            // GT never RESETS the global i_errno between rounds, so a
-            // multi-round GT server whose EARLIER round stamped an errno
-            // renders that stale string on a later deny (live-probed:
-            // cookie-EOF round, then deny → "unable to receive cookie"
-            // twice); riperf3 always prints the fixed fresh-process
-            // string. The underlying error never reaches a surface; the
+            // iperf_strerror(0), "no error". RECORDED DEVIATION (r1 F1,
+            // r2 F1): GT never RESETS the global i_errno between rounds,
+            // so a multi-round GT server whose EARLIER round stamped an
+            // errno renders that stale string on a later deny (live-
+            // probed: cookie-EOF round, then deny → "unable to receive
+            // cookie" twice) AND writes a 0xFE SERVER_ERROR block instead
+            // of the bare FIN (cleanup_server's wire-back gates on
+            // `i_errno != IENONE`, iperf_server_api.c:465-473). riperf3
+            // always takes the fresh-process surface — bare close, "no
+            // error". The underlying error never reaches a surface; the
             // lib normalizes to `AccessDenied`.
             self.emit_pretest_error_doc("error - no error", params.bandwidth.filter(|&b| b > 0));
             return Err(RiperfError::AccessDenied);
