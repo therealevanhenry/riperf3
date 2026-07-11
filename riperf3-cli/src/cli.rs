@@ -1696,10 +1696,6 @@ mod cli_tests {
                     vec!["--rsa-private-key-path", "/tmp/priv.pem"],
                     "--rsa-private-key-path",
                 ),
-                (
-                    vec!["--authorized-users-path", "/tmp/users"],
-                    "--authorized-users-path",
-                ),
                 (vec!["--time-skew-threshold", "5"], "--time-skew-threshold"),
                 (vec!["--use-pkcs1-padding"], "--use-pkcs1-padding"),
             ] {
@@ -1712,6 +1708,18 @@ mod cli_tests {
                     "expected {want} flagged for args {args:?}"
                 );
             }
+
+            // #395 r1 F2: `--authorized-users-path` is NOT in the generic
+            // set — its getopt case never sets GT's server_flag
+            // (iperf_api.c:1757-1759); the post-loop :1874 slot handles it
+            // in `parse_class_rejection`, AFTER the client-auth legs (the
+            // ordering pin lives in error_format.rs).
+            let cli = Cli::parse_from(["riperf3", "-c", "host", "--authorized-users-path", "/f"]);
+            assert_eq!(
+                cli.first_server_only_violation(),
+                None,
+                "--authorized-users-path is the late leg, not the generic set"
+            );
         }
     }
 
