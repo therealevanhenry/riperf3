@@ -1769,12 +1769,13 @@ fn auth_param_valid_combos_pass_parse() {
         "the run proceeded to the connect attempt: {stderr:?}"
     );
 
-    // Server: parse passes, the banner prints. r1 F4 + r2 F2: poll the
-    // BANNER itself, not a fixed sleep and not the listen socket — the
-    // listen is accept-ready BEFORE the banner write, so a kill on
-    // connect-success could still beat the write on a starved runner.
-    // A reader thread streams stdout into a shared buffer; the poll waits
-    // for the first bytes (bounded 10 s), then kills.
+    // Server: parse passes, the banner prints. r1 F4 + r2 F2 + r3 F1: poll
+    // for the BANNER LINE itself, not a fixed sleep, not the listen socket
+    // (accept-ready before the banner write), and not merely first-bytes
+    // (the banner is multiple line-buffered writes — the first chunk can
+    // be the separator alone). A reader thread streams stdout into a
+    // shared buffer; the poll waits until "Server listening" lands
+    // (bounded 10 s), then kills.
     let port_s = common::free_port().to_string();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
         .args([
@@ -1807,7 +1808,8 @@ fn auth_param_valid_combos_pass_parse() {
     let serr_reader =
         riperf3_test_support::drain_reader(child.stderr.take().expect("piped stderr"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while sout_buf.lock().unwrap().is_empty()
+    let banner_landed = |buf: &[u8]| String::from_utf8_lossy(buf).contains("Server listening");
+    while !banner_landed(&sout_buf.lock().unwrap())
         && std::time::Instant::now() < deadline
         && child.try_wait().unwrap().is_none()
     {
