@@ -36,6 +36,14 @@ pub enum RiperfError {
     #[error("access denied by server")]
     AccessDenied,
 
+    /// The server refused the connection because a test is already running —
+    /// GT's `IEACCESSDENIED`, signaled by the `0xFF` `ACCESS_DENIED` wire
+    /// byte a busy server writes to an unsolicited connection. Distinct from
+    /// an authentication denial, which GT signals with a bare control-socket
+    /// close (#395).
+    #[error("the server is busy running a test. try again later")]
+    ServerBusy,
+
     #[error("connection timed out")]
     ConnectionTimeout,
 
