@@ -49,6 +49,10 @@ release tags.
   UNAUTHENTICATED. RSA key PEMs now accept PKCS#1 alongside PKCS#8/SPKI, like OpenSSL.
   New lib API: `validate_public_key_file`, `validate_private_key_file`,
   `read_auth_password` (#395).
+- Runtime auth denials now match iperf3's surface: bare control-socket close (no wire
+  byte — 0xFF is the busy-server signal only), no "Accepted connection" block, and the
+  unstamped `error - no error` line/doc string. A client receiving 0xFF reports iperf3's
+  IEACCESSDENIED text; new lib variant `RiperfError::ServerBusy` (#395).
 - `-w 0` is a no-op like iperf3 (0 = kernel autotuning): the window is never applied to
   data sockets — was clamping both buffers to kernel minimums, a live throughput hit — and
   the params blob omits the `"window"` key, so a `-w 0` client no longer shrinks a riperf3
