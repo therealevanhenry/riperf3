@@ -42,6 +42,13 @@ release tags.
 
 ### Fixed
 
+- Auth flag combinations are validated at parse time like iperf3 (IESETCLIENTAUTH /
+  IESETSERVERAUTH / IESERVERAUTHUSERS sentences, key files loaded up front, client
+  password resolved at the getpass slot — env else TTY-only prompt): a half-configured
+  client no longer connects and a half-configured server no longer listens and serves
+  UNAUTHENTICATED. RSA key PEMs now accept PKCS#1 alongside PKCS#8/SPKI, like OpenSSL.
+  New lib API: `validate_public_key_file`, `validate_private_key_file`,
+  `read_auth_password` (#395).
 - `-w 0` is a no-op like iperf3 (0 = kernel autotuning): the window is never applied to
   data sockets — was clamping both buffers to kernel minimums, a live throughput hit — and
   the params blob omits the `"window"` key, so a `-w 0` client no longer shrinks a riperf3

@@ -1059,10 +1059,10 @@ async fn async_main(
         // iperf3 still errexits (exit 1) on those — map the non-clean endings
         // to the already-rendered error exit. Completed/Interrupted exit 0.
         let outcome = cli
-                .build_client(auth_password.as_deref())?
-                .with_interrupt(interrupt)
-                .run()
-                .await?;
+            .build_client(auth_password.as_deref())?
+            .with_interrupt(interrupt)
+            .run()
+            .await?;
         if let Some(msg) = outcome.termination.errexit_message() {
             return Err(Box::new(AbnormalExit(msg.to_string())));
         }

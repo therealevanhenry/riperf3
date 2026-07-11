@@ -1482,12 +1482,22 @@ fn auth_param_validations_match_gt() {
     let cases: Vec<(Vec<String>, Option<&str>, &str)> = vec![
         // The two halves of the client pair, each alone.
         (
-            vec!["-c".into(), "127.0.0.1".into(), "--username".into(), "u".into()],
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--username".into(),
+                "u".into(),
+            ],
             None,
             CLIENT_MSG,
         ),
         (
-            vec!["-c".into(), "127.0.0.1".into(), "--rsa-public-key-path".into(), p(&pub_pem)],
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--rsa-public-key-path".into(),
+                p(&pub_pem),
+            ],
             None,
             CLIENT_MSG,
         ),
@@ -1589,7 +1599,10 @@ fn auth_param_validations_match_gt() {
         let out = run_bounded(&mut cmd);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: exit 1: {stderr:?}");
-        assert!(stderr.contains(want), "{args:?}: wanted {want:?}: {stderr:?}");
+        assert!(
+            stderr.contains(want),
+            "{args:?}: wanted {want:?}: {stderr:?}"
+        );
         assert!(
             stderr.contains("Usage: riperf3 [-s|-c host] [options]"),
             "{args:?}: the usage trailer rides the parameter error: {stderr:?}"
