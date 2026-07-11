@@ -58,8 +58,9 @@ release tags.
   and a failed data-stream dial reports iperf3's `unable to connect stream: …` class (#428).
 - The client's params blob carries `repeating_payload` / `dont_fragment` / `flowlabel` like
   iperf3, and the server honors the first two on its send paths: reverse/bidir TCP payload
-  fills the repeating pattern, and UDP v4 egress sets DF (iperf3's gate — UDP+IPv4 only;
-  the TCP client no longer sets DF where iperf3 never did) (#414).
+  fills the repeating pattern — now iperf3's ASCII-digit fill; the previous 0x00..0xFF ramp
+  the client sent was a wire divergence — and UDP v4 egress sets DF (iperf3's gate —
+  UDP+IPv4 only; the TCP client no longer sets DF where iperf3 never did) (#414).
 - `-w 0` is a no-op like iperf3 (0 = kernel autotuning): the window is never applied to
   data sockets — was clamping both buffers to kernel minimums, a live throughput hit — and
   the params blob omits the `"window"` key, so a `-w 0` client no longer shrinks a riperf3
