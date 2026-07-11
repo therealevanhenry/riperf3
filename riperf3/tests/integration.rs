@@ -3059,7 +3059,11 @@ async fn params_blob_omits_window_zero_like_gt() {
 /// `free_port()`-derived: that allocator hands out consecutive values, so
 /// one test's `base + 1` is a parallel test's base (live collision in this
 /// very suite). Own pid-keyed window (36000+, clear of the #176 7000-32000
-/// windows) with a stride of 8 per claim, full-span bind-probed.
+/// windows) with a stride of 8 per claim, full-span bind-probed. Recorded
+/// residual (r1 F5): the window sits inside Linux's default ephemeral
+/// range (32768-60999), so a kernel ephemeral allocation landing in a
+/// claimed span between probe-drop and bind can red an exact-equality pin
+/// (~0.01-0.1%/run); no port range is clear of every allocator.
 fn free_cport_base(span: u16) -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
@@ -3171,9 +3175,26 @@ async fn udp_cport_increments_per_stream_like_gt() {
     );
 }
 
+/// #428 r1 F1: GT's `if (orig_bind_port)` ZERO-GATE
+/// (iperf_client_api.c:117) — a cport of 0 never increments; every stream
+/// dials ephemeral (GT's no-bind path). Without the gate, stream 2 binds
+/// port 0+1 = 1: EACCES for a non-root run (the run errors and the length
+/// assert reds), a wrong explicit port under root (the != 1 assert reds).
+#[tokio::test]
+async fn cport_zero_never_increments() {
+    let ports = run_round_cport_ports(0, 2, false, false).await;
+    assert_eq!(ports.len(), 2, "both streams connected");
+    assert!(
+        ports.iter().all(|&p| p != 1),
+        "no stream lands on port 1 — GT's zero-gate (#428 r1): {ports:?}"
+    );
+}
+
 /// #428, the wrap edge: GT's `bind_port + i` passes 65536 through
 /// getaddrinfo/htons where it truncates to 0 = EPHEMERAL (live-probed:
-/// `--cport 65535 -P 2` → stream 1 on 65535, stream 2 ephemeral, exit 0).
+/// `--cport 65535 -P 2` → stream 1 on 65535, stream 2 ephemeral, exit 0;
+/// the int 65536 stays truthy through GT's zero-gate, so this is the
+/// EXPLICIT-bind-0 path, distinct from cport-0's no-bind path).
 /// riperf3 mirrors with `u16::wrapping_add` + the existing 0-is-ephemeral
 /// dial path. A saturating mutant re-collides on 65535 and reds here.
 #[tokio::test]

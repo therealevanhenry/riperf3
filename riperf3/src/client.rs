@@ -95,26 +95,6 @@ pub struct Client {
 /// subtract for the post-omit summary (#31) — this also reads a real iperf3
 /// server's omit results correctly. `is_udp` gates the datagram columns so a
 /// TCP pair line stays a plain byte line.
-/// #428: fold a DATA-stream dial failure into GT's `IESTREAMCONNECT`
-/// class — GT stamps it for the whole netdial (bind + connect alike,
-/// iperf_tcp.c:404 / iperf_udp.c:670-672), the same class the server side
-/// stamps on a setup accept() failure (the shared variant). The io
-/// rendering keeps the recorded `(os error N)` suffix; a local-bind
-/// failure keeps riperf3's bind-context message (recorded extra context vs
-/// GT's bare strerror); the timeout rendering matches the control-connect
-/// fold's recorded text.
-fn stream_dial_error(e: RiperfError) -> RiperfError {
-    let io = match e {
-        RiperfError::Io(io) => io,
-        RiperfError::ConnectionTimeout => {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")
-        }
-        RiperfError::Protocol(msg) => std::io::Error::other(msg),
-        other => std::io::Error::other(other.to_string()),
-    };
-    RiperfError::StreamConnectFailed(io)
-}
-
 /// This host's own omitted count for a stream (#271): omitted SENT
 /// datagrams on sending streams, omitted RECEIVED datagrams on receiving
 /// ones — the local estimate the old-peer resolution nets with. 0 without
@@ -178,6 +158,40 @@ fn peer_half_summary(
 }
 
 /// Bytes transferred so far against an `-n`/`-k` limit. Faithful to iperf3's
+/// #428: fold a DATA-stream dial failure into GT's `IESTREAMCONNECT`
+/// class — GT stamps it for the whole netdial (bind + connect alike,
+/// iperf_tcp.c:404 / iperf_udp.c:670-672), the same class the server side
+/// stamps on a setup accept() failure (the shared variant). The io
+/// rendering keeps the recorded `(os error N)` suffix; a local-bind
+/// failure keeps riperf3's bind-context message (recorded extra context vs
+/// GT's bare strerror); the timeout rendering matches the control-connect
+/// fold's recorded text.
+fn stream_dial_error(e: RiperfError) -> RiperfError {
+    let io = match e {
+        RiperfError::Io(io) => io,
+        RiperfError::ConnectionTimeout => {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")
+        }
+        RiperfError::Protocol(msg) => std::io::Error::other(msg),
+        other => std::io::Error::other(other.to_string()),
+    };
+    RiperfError::StreamConnectFailed(io)
+}
+
+/// #428: GT's per-stream source port — `bind_port + i` over creation order
+/// behind the `if (orig_bind_port)` ZERO-GATE (iperf_client_api.c:117): a
+/// cport of 0 NEVER increments (every stream ephemeral, GT's no-bind path
+/// → None here). A nonzero cport wraps like GT's htons truncation
+/// (65535 + 1 → int 65536, still truthy → explicit bind of port 0 =
+/// ephemeral), so the wrap result stays Some.
+fn stream_cport(cport: Option<u16>, i: u32) -> Option<u16> {
+    match cport {
+        Some(0) => None,
+        Some(p) => Some(p.wrapping_add(i as u16)),
+        None => None,
+    }
+}
+
 /// `bytes_sent >= N || bytes_received >= N` end check (`iperf_client_api.c`):
 /// the client's senders accumulate in forward, its receivers in reverse, and in
 /// bidir whichever direction reaches the limit first ends the test. Counting
@@ -1391,13 +1405,12 @@ impl Client {
                     // order (iperf_create_streams, iperf_client_api.c:113-124
                     // — the bidir receive half's `+ num_streams` collapses
                     // into the flat index because senders are created first,
-                    // both tools). wrapping_add mirrors GT's htons truncation
-                    // at 65536 → 0 = ephemeral (live-probed).
+                    // both tools). Zero-gate + wrap semantics on the helper.
                     let mut data_stream = net::tcp_connect(
                         &self.host,
                         self.port,
                         self.connect_timeout,
-                        self.cport.map(|p| p.wrapping_add(i as u16)),
+                        stream_cport(self.cport, i),
                         self.bind_address.as_deref(),
                         self.bind_dev.as_deref(),
                         self.mptcp,
@@ -1570,7 +1583,7 @@ impl Client {
                     // passed a literal 0 and --cport was a UDP no-op. The
                     // whole dial (bind/dev/connect) folds into GT's
                     // IESTREAMCONNECT like netdial's.
-                    let cport = self.cport.map_or(0, |p| p.wrapping_add(i as u16));
+                    let cport = stream_cport(self.cport, i).unwrap_or(0);
                     let udp_sock = net::udp_bind(bind_ip.as_deref(), cport, remote.is_ipv6())
                         .await
                         .map_err(stream_dial_error)?;
@@ -3298,7 +3311,13 @@ impl ClientBuilder {
         self
     }
 
-    /// `--cport`: bind to a specific local client port (default: ephemeral).
+    /// `--cport`: the local source port for the DATA streams — stream `i`
+    /// binds `port + i` over creation order like iperf3
+    /// (iperf_client_api.c:113-124; bidir's receive half follows the send
+    /// half, so a `-P n --bidir` run spans `port..port+2n`). Wraps at
+    /// 65536 to an ephemeral port (iperf3's htons truncation), and 0 is
+    /// iperf3's unset sentinel: no stream binds a fixed port (#428). The
+    /// CONTROL connection is always ephemeral, both tools.
     pub fn cport(mut self, port: u16) -> Self {
         self.cport = Some(port);
         self

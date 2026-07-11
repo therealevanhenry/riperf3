@@ -1853,12 +1853,25 @@ fn stream_connect_failure_renders_gt_class() {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(400));
         // Hold cport+1 so stream 2's bind collides deterministically.
-        let base = common::free_port();
-        let _holder = loop {
-            match std::net::TcpListener::bind(("0.0.0.0", base + 1)) {
-                Ok(l) => break l,
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        // r1 F2: the pair comes from its OWN window OUTSIDE free_port()'s
+        // 7000-32000 range — holding an in-window port for the test's
+        // lifetime steals a parallel test's probe-claimed port — and the
+        // hunt is bounded, not an unbounded spin.
+        let (base, _holder) = {
+            let window = 33000u16 + (std::process::id() % 60) as u16 * 40;
+            let mut found = None;
+            for slot in 0..20u16 {
+                let b = window + slot * 2;
+                let Ok(probe) = std::net::TcpListener::bind(("0.0.0.0", b)) else {
+                    continue;
+                };
+                drop(probe);
+                if let Ok(h) = std::net::TcpListener::bind(("0.0.0.0", b + 1)) {
+                    found = Some((b, h));
+                    break;
+                }
             }
+            found.expect("no free cport pair in the test window")
         };
         let cport = base.to_string();
         let mut args = vec![
