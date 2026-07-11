@@ -1264,6 +1264,7 @@ pub fn run_udp_sender_sendmmsg(
     pacing_timer_us: u32,
     burst: u32,
     user_window: bool,
+    dont_fragment: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1300,7 +1301,11 @@ pub fn run_udp_sender_sendmmsg(
     // batch and bound a wedged link with SO_SNDTIMEO (issue #6).
     // None under an explicit -w: iperf3 applies the user's window and never
     // a batch-derived size (#163 review r1 n1).
-    crate::net::configure_udp_sender(&socket, (!user_window).then_some(batch_size * blksize))?;
+    crate::net::configure_udp_sender(
+        &socket,
+        (!user_window).then_some(batch_size * blksize),
+        dont_fragment,
+    )?;
 
     let fd = socket.as_raw_fd();
 
@@ -1404,6 +1409,7 @@ pub fn run_udp_sender_sendmmsg(
     pacing_timer_us: u32,
     burst: u32,
     user_window: bool,
+    dont_fragment: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1417,6 +1423,7 @@ pub fn run_udp_sender_sendmmsg(
         pacing_timer_us,
         burst,
         user_window,
+        dont_fragment,
         use_64bit,
         start,
         max_duration,
@@ -1522,6 +1529,7 @@ fn udp_send_loop(
     pacing_timer_us: u32,
     burst: u32,
     user_window: bool,
+    dont_fragment: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1547,6 +1555,7 @@ fn udp_send_loop(
     crate::net::configure_udp_sender(
         socket,
         (!user_window).then_some(batch_size as usize * blksize),
+        dont_fragment,
     )?;
 
     let pacing = if rate_bits_per_sec > 0 {
@@ -1642,6 +1651,7 @@ pub fn run_udp_sender_blocking(
     pacing_timer_us: u32,
     burst: u32,
     user_window: bool,
+    dont_fragment: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1656,6 +1666,7 @@ pub fn run_udp_sender_blocking(
         pacing_timer_us,
         burst,
         user_window,
+        dont_fragment,
         use_64bit,
         start,
         max_duration,
@@ -1678,6 +1689,7 @@ pub(crate) fn run_udp_server_demux_sender(
     pacing_timer_us: u32,
     burst: u32,
     user_window: bool,
+    dont_fragment: bool,
     use_64bit: bool,
     start: Arc<AtomicBool>,
     max_duration: Option<Duration>,
@@ -1692,6 +1704,7 @@ pub(crate) fn run_udp_server_demux_sender(
         pacing_timer_us,
         burst,
         user_window,
+        dont_fragment,
         use_64bit,
         start,
         max_duration,
@@ -2668,6 +2681,7 @@ mod tests {
                 1000,
                 false,
                 false,
+                false,
                 started(),
                 None,
             )
@@ -2826,6 +2840,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2868,6 +2883,7 @@ mod tests {
             100_000_000, // rate>0 → batched (batch_size > 1)
             1000,
             0,
+            false,
             false,
             false,
             started(),
@@ -2923,6 +2939,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             started(),
             Some(Duration::from_millis(150)),
         )
@@ -2955,6 +2972,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             started(),
             Some(Duration::from_millis(200)),
         )
@@ -2985,6 +3003,7 @@ mod tests {
             0,
             1000,
             0,
+            false,
             false,
             false,
             started(),
@@ -3021,6 +3040,7 @@ mod tests {
             0, // unlimited → full batch ceiling
             1000,
             0,
+            false,
             false,
             false,
             started(),
@@ -3066,6 +3086,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             started(),
             None,
         )
@@ -3097,6 +3118,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 false,
                 s2,
@@ -3142,6 +3164,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             start,
             Some(Duration::from_secs(10)),
         )
@@ -3172,6 +3195,7 @@ mod tests {
                 0,
                 1000,
                 0,
+                false,
                 false,
                 false,
                 s,

@@ -1305,6 +1305,21 @@ impl Client {
         if self.tos != 0 {
             p.tos = Some(self.tos);
         }
+        // #414: GT sends all three when set (truthy gates,
+        // iperf_api.c:2475 flowlabel / :2489 repeating_payload — the
+        // field's value, 1 for every CLI-reachable state / :2494
+        // dont_fragment) — without them the peer server can't fill
+        // the repeating pattern or set DF on ITS send paths. flowlabel
+        // rides for wire parity although GT's SERVER never applies it
+        // (client-connect-only, iperf_tcp.c:521 in iperf_tcp_connect;
+        // nothing in the accept path or iperf_udp.c).
+        p.flowlabel = self.flowlabel.filter(|&l| l != 0);
+        if self.repeating_payload {
+            p.repeating_payload = Some(1);
+        }
+        if self.dont_fragment {
+            p.dont_fragment = Some(1);
+        }
         p.congestion = self.congestion.clone();
         p.title = self.title.clone();
         p.extra_data = self.extra_data.clone();
@@ -1427,10 +1442,10 @@ impl Client {
                         self.window,
                         self.congestion.as_deref(),
                     )?;
-                    // Apply socket options (no-ops on non-Linux)
-                    if self.dont_fragment {
-                        net::set_dont_fragment(&data_stream)?;
-                    }
+                    // Apply socket options (no-ops on non-Linux).
+                    // #414: NO DF here — GT's gate is UDP && AF_INET only
+                    // (iperf_init_stream, iperf_api.c:4964-4975); a TCP
+                    // --dont-fragment run leaves the socket untouched.
                     // #302: GT warns and continues on a pacing failure.
                     net::apply_fq_rate(&data_stream, self.fq_rate.unwrap_or(0));
                     if let Some(ms) = self.rcv_timeout {
@@ -1651,6 +1666,7 @@ impl Client {
                         let pt = self.pacing_timer;
                         let bu = self.burst;
                         let uw = self.window.is_some();
+                        let df = self.dont_fragment;
                         let u64bit = self.udp_counters_64bit;
                         let use_sendmmsg = self.sendmmsg;
                         let st = start.clone();
@@ -1658,11 +1674,11 @@ impl Client {
                         thread_gate.spawn(move || {
                             if use_sendmmsg {
                                 stream::run_udp_sender_sendmmsg(
-                                    std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, uw, df, u64bit, st, md,
                                 )
                             } else {
                                 stream::run_udp_sender_blocking(
-                                    std_sock, c, bs, d, rate, pt, bu, uw, u64bit, st, md,
+                                    std_sock, c, bs, d, rate, pt, bu, uw, df, u64bit, st, md,
                                 )
                             }
                         })
@@ -4650,6 +4666,35 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(c.build_params(1460).bandwidth, Some(5_000_000));
+        }
+
+        /// #414: GT sends all three when set (truthy gates,
+        /// iperf_api.c:2475 flowlabel / :2489 repeating_payload (value 1) /
+        /// :2494 dont_fragment) and omits them otherwise. Pre-fix riperf3
+        /// never populated them — the peer server couldn't fill the
+        /// repeating pattern or set DF on ITS send paths.
+        #[test]
+        fn build_params_sends_the_414_trio_under_gt_gates() {
+            let c = ClientBuilder::new("h")
+                .repeating_payload(true)
+                .dont_fragment(true)
+                .flowlabel(3)
+                .build()
+                .unwrap();
+            let p = c.build_params(1460);
+            assert_eq!(
+                p.repeating_payload,
+                Some(1),
+                "GT sends the field's value, 1 from the CLI"
+            );
+            assert_eq!(p.dont_fragment, Some(1));
+            assert_eq!(p.flowlabel, Some(3));
+
+            let c = ClientBuilder::new("h").build().unwrap();
+            let p = c.build_params(1460);
+            assert_eq!(p.repeating_payload, None, "absent when unset, like GT");
+            assert_eq!(p.dont_fragment, None);
+            assert_eq!(p.flowlabel, None);
         }
 
         // #32: iperf3 ALWAYS sends pacing_timer in the param exchange (default

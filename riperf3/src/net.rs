@@ -605,10 +605,20 @@ const UDP_SEND_TIMEOUT_MS: u64 = 1000;
 pub fn configure_udp_sender(
     socket: &std::net::UdpSocket,
     sndbuf_target: Option<usize>,
+    dont_fragment: bool,
 ) -> Result<()> {
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
     socket.set_nonblocking(false)?;
+    // #414: GT's DF gate — iperf_init_stream sets IP-level DF only for
+    // UDP && AF_INET (iperf_api.c:4964-4975), both roles; v6 and TCP never.
+    // Applied at this egress choke point so every UDP sender (client,
+    // server recycling, server demux) carries it. (GT also stamps its
+    // RECEIVING UDP sockets — invisible on the wire, receivers don't send
+    // post-handshake — deliberately not mirrored.)
+    if dont_fragment && socket.local_addr().map(|a| a.is_ipv4()).unwrap_or(false) {
+        set_dont_fragment(socket)?;
+    }
     let sock = socket2::SockRef::from(socket);
     // GROW-ONLY, and not at all under an explicit -w (#163; callers pass
     // None then): iperf3 never sets UDP SO_SNDBUF except for -w. The
@@ -645,8 +655,13 @@ pub fn configure_udp_sender(
 pub fn configure_udp_sender(
     socket: &std::net::UdpSocket,
     _sndbuf_target: Option<usize>,
+    dont_fragment: bool,
 ) -> Result<()> {
     socket.set_nonblocking(false)?;
+    // #414: same GT gate as the unix variant — UDP && AF_INET only.
+    if dont_fragment && socket.local_addr().map(|a| a.is_ipv4()).unwrap_or(false) {
+        set_dont_fragment(socket)?;
+    }
     Ok(())
 }
 
@@ -1192,7 +1207,7 @@ mod tests {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let sock = socket2::SockRef::from(&s);
         let default_buf = sock.send_buffer_size().unwrap();
-        configure_udp_sender(&s, Some(4096)).unwrap();
+        configure_udp_sender(&s, Some(4096), false).unwrap();
         assert!(
             sock.send_buffer_size().unwrap() >= default_buf,
             "a small batch target must not shrink the send buffer below the default"
@@ -1212,7 +1227,7 @@ mod tests {
         let sock = socket2::SockRef::from(&s);
         let _ = sock.set_send_buffer_size(64 * 1024);
         let before = sock.send_buffer_size().unwrap();
-        configure_udp_sender(&s, None).unwrap();
+        configure_udp_sender(&s, None, false).unwrap();
         assert_eq!(
             sock.send_buffer_size().unwrap(),
             before,
@@ -1240,7 +1255,7 @@ mod tests {
         let sock = socket2::SockRef::from(&s);
         let _ = sock.set_send_buffer_size(1024 * 1024);
         let bumped = sock.send_buffer_size().unwrap();
-        configure_udp_sender(&s, Some(11_584)).unwrap();
+        configure_udp_sender(&s, Some(11_584), false).unwrap();
         assert!(
             sock.send_buffer_size().unwrap() >= bumped,
             "-w's bump must not be clobbered down to batch x blksize"
@@ -1814,6 +1829,56 @@ mod tests {
         );
     }
 
+    /// #414: the DF gate at the UDP egress choke point — GT's
+    /// iperf_init_stream sets IP-level DF only for UDP && AF_INET
+    /// (iperf_api.c:4964-4975). Real-socket readback: IP_MTU_DISCOVER
+    /// lands PMTUDISC_DO on a v4 socket with the flag, stays default
+    /// without it, and a v6 socket passes through untouched (no error).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_udp_sender_applies_gt_df_gate() {
+        use std::os::fd::AsRawFd;
+        fn mtu_discover(s: &std::net::UdpSocket) -> libc::c_int {
+            let mut v: libc::c_int = -1;
+            let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    s.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_MTU_DISCOVER,
+                    std::ptr::from_mut(&mut v).cast(),
+                    &mut l,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt IP_MTU_DISCOVER");
+            v
+        }
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_sender(&s, None, true).unwrap();
+        assert_eq!(
+            mtu_discover(&s),
+            libc::IP_PMTUDISC_DO,
+            "v4 + flag sets DF like GT"
+        );
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        configure_udp_sender(&s, None, false).unwrap();
+        assert_ne!(
+            mtu_discover(&s),
+            libc::IP_PMTUDISC_DO,
+            "no flag leaves the socket at the kernel default"
+        );
+        let s6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        configure_udp_sender(&s6, None, true)
+            .expect("v6 + flag is a clean no-op, GT's AF_INET gate");
+        // The kernel accepts IP-level opts on v6 sockets, so no-error alone
+        // can't prove the gate skipped — read the option back.
+        assert_ne!(
+            mtu_discover(&s6),
+            libc::IP_PMTUDISC_DO,
+            "the v4-only gate must not stamp a v6 socket"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn configure_udp_sender_switches_to_blocking() {
@@ -1828,7 +1893,7 @@ mod tests {
             "precondition: socket starts non-blocking"
         );
 
-        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460), false).unwrap();
         assert!(
             !is_nonblocking(socket.as_raw_fd()),
             "sender socket must be switched to blocking"
@@ -1843,7 +1908,7 @@ mod tests {
         // is a no-op on UDP and would leave the timeout unset (#6 review).
         use nix::sys::socket::{getsockopt, sockopt};
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        configure_udp_sender(&socket, Some(128 * 1460)).unwrap();
+        configure_udp_sender(&socket, Some(128 * 1460), false).unwrap();
         let tv = getsockopt(&socket, sockopt::SendTimeout).unwrap();
         assert!(
             tv.tv_sec() > 0 || tv.tv_usec() > 0,

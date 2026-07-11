@@ -3214,6 +3214,63 @@ async fn cport_65535_wraps_to_ephemeral_like_gt() {
     );
 }
 
+/// #414 (server half): GT fills the repeating pattern — ASCII '0'..'9',
+/// period 10 (fill_with_repeating_pattern, iperf_util.c:85-99) — in
+/// iperf_new_stream on BOTH roles (iperf_api.c:4891), so a server whose
+/// client sent `"repeating_payload"` sends the pattern in reverse
+/// (live-probed against GT 3.21, #441 r1). The riperf3 server hardcoded
+/// `make_send_buffer(blksize, false)` (zeros), ignoring the wire key
+/// entirely. A raw mock client drives a reverse round and reads the
+/// server's first block off the data socket: it must be GT's pattern,
+/// byte-for-byte.
+#[tokio::test]
+async fn reverse_server_honors_repeating_payload_key() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+
+    let first_block = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let rd1 = |s: &mut std::net::TcpStream| {
+            let mut b = [0u8; 1];
+            s.read_exact(&mut b).expect("state byte");
+            b[0]
+        };
+        let cookie = [b'x'; 37];
+        let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+        ctrl.write_all(&cookie).unwrap();
+        assert_eq!(rd1(&mut ctrl), 9, "ParamExchange");
+        let p =
+            r#"{"tcp":true,"reverse":true,"time":1,"parallel":1,"len":4096,"repeating_payload":1}"#;
+        ctrl.write_all(&(p.len() as u32).to_be_bytes()).unwrap();
+        ctrl.write_all(p.as_bytes()).unwrap();
+        assert_eq!(rd1(&mut ctrl), 10, "CreateStreams");
+        let mut data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data");
+        data.write_all(&cookie).unwrap();
+        assert_eq!(rd1(&mut ctrl), 1, "TestStart");
+        assert_eq!(rd1(&mut ctrl), 2, "TestRunning");
+        let mut block = vec![0u8; 4096];
+        data.read_exact(&mut block).expect("first server block");
+        // The round ends unceremoniously — the payload is the pin.
+        drop((ctrl, data));
+        block
+    })
+    .await
+    .expect("mock");
+    let _ = tokio::time::timeout(Duration::from_secs(15), server_task).await;
+
+    let want: Vec<u8> = (0..4096usize).map(|i| b'0' + (i % 10) as u8).collect();
+    assert_eq!(
+        first_block, want,
+        "the server's reverse payload is the repeating pattern when the wire key rode (#414)"
+    );
+}
+
 /// #406 (r1): the `RecvMessageFailed`↔`SendFailed` cell of the same
 /// invisibility class — the repo's first RENDERING-IDENTICAL variant pair
 /// (both print `error - {msg}` with the carried message and both errexit
