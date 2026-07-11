@@ -2857,6 +2857,40 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     );
 }
 
+/// #410 r1 F2: a limit of ZERO disables the check entirely — GT's first
+/// gate (`bitrate_limit == 0 → return`, iperf_api.c:2149-2151;
+/// live-probed: GT ran `--server-bitrate-limit 0` for a full 7 s where an
+/// unfiltered runtime arm self-terminated at the window boundary).
+#[tokio::test]
+async fn zero_bitrate_limit_disables_the_check() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_bitrate_limit(0)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(7)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let cli = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    assert_eq!(
+        cli.termination,
+        riperf3::Termination::Completed,
+        "limit 0 = no limit, like GT (#410 r1 F2)"
+    );
+    let srv = server_task.await.expect("join").expect("server run_once");
+    assert_eq!(srv.termination, riperf3::Termination::Completed);
+}
+
 /// #410 (M2 discriminator): a COMPLIANT steady sender must never breach —
 /// the moving window drains as traffic flows at a sub-limit rate, where a
 /// cumulative feed (the pre-#410 whole-test shape smuggled into the ring)

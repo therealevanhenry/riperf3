@@ -8,9 +8,6 @@ use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportPro
 use crate::stream::{self, DataStream, StreamCounters, StreamMeta, UdpRecvStats};
 use crate::utils::*;
 
-/// Shared test configuration derived from the client's parameter JSON.
-/// Crate-internal (#67): retracted from the public API, so `pub(crate)` keeps a
-/// future stray `pub use` from silently re-leaking it.
 /// #410: GT's `iperf_check_total_rate` window (iperf_api.c:2142-2179) — a
 /// ring of the last N interval byte counts. `push` returns the window
 /// average in bits/s once the ring has filled (GT gates on
@@ -28,12 +25,21 @@ impl RateLimitWindow {
     /// riperf3's stats_interval pinned at 1.0 s (there is no server `-i`
     /// knob): `interval <= 1 → 1` sample, else `round(interval)`. The
     /// interval is `--server-bitrate-limit rate/N`'s N, default 5
-    /// (iperf_api.c:3291).
+    /// (iperf_api.c:3291). HARDENED beyond GT (r1 F1 — this is a lib
+    /// surface): a non-finite or non-positive interval falls back to the
+    /// default 5, and the ring is capped at 86 400 samples (a day at 1 Hz)
+    /// so a huge value can't abort on allocation. GT's own CLI bounds the
+    /// value to 0.1..=60 before it ever reaches the math.
     pub(crate) fn from_interval_secs(interval: f64) -> Self {
+        let interval = if interval.is_finite() && interval > 0.0 {
+            interval
+        } else {
+            5.0
+        };
         let samples = if interval <= 1.0 {
             1
         } else {
-            interval.round() as usize
+            (interval.round() as usize).min(86_400)
         };
         Self {
             ring: vec![0; samples],
@@ -43,9 +49,12 @@ impl RateLimitWindow {
     }
 
     /// Push one interval's byte count; returns the moving average over the
-    /// window in bits/s once enough samples accumulated (GT :2153-2169:
-    /// ring insert, count gate, `sum * 8 / (stats_interval × samples)`).
-    pub(crate) fn push(&mut self, interval_bytes: u64) -> Option<f64> {
+    /// window once enough samples accumulated (GT :2153-2169: ring insert,
+    /// count gate, `sum * 8 / (stats_interval × samples)`). INTEGER bits/s
+    /// like GT's `uint64_t bits_per_second` (:2146/:2169 — the C double
+    /// division truncates on assignment), so a fractional average never
+    /// breaches a limit its integer part equals (r1 F4).
+    pub(crate) fn push(&mut self, interval_bytes: u64) -> Option<u64> {
         self.idx = (self.idx + 1) % self.ring.len();
         self.ring[self.idx] = interval_bytes;
         self.count += 1;
@@ -53,10 +62,13 @@ impl RateLimitWindow {
             return None;
         }
         let total: u64 = self.ring.iter().sum();
-        Some(total as f64 * 8.0 / self.ring.len() as f64)
+        Some((total as f64 * 8.0 / self.ring.len() as f64) as u64)
     }
 }
 
+/// Shared test configuration derived from the client's parameter JSON.
+/// Crate-internal (#67): retracted from the public API, so `pub(crate)` keeps a
+/// future stray `pub use` from silently re-leaking it.
 pub(crate) struct TestConfig {
     pub protocol: TransportProtocol,
     pub duration: u32,
@@ -2215,7 +2227,12 @@ impl Server {
     /// and the interrupt watch; records how the test ended in the context
     /// flags (`server_error` / `client_terminated` / `interrupted`).
     async fn await_test_end(&self, ctx: &mut TestRunCtx) -> Result<()> {
-        let bitrate_limit = self.server_bitrate_limit;
+        // #410 r1 F2: GT's first gate — a limit of 0 DISABLES the check
+        // entirely (iperf_check_total_rate, iperf_api.c:2149-2151); the
+        // upfront param check already filters `> 0`, the runtime arm must
+        // too (live-probed: GT ran `--server-bitrate-limit 0` clean where
+        // the unfiltered arm self-terminated at the window boundary).
+        let bitrate_limit = self.server_bitrate_limit.filter(|&l| l > 0);
         let test_start = ctx.report_start;
         // #230: GT's in-flight 160-watchdog (create_server_timers,
         // iperf_server_api.c:380-395) arms for EVERY test with a nonzero
@@ -2411,7 +2428,7 @@ impl Server {
                         rate_prev_total = total_bytes;
                         let verdict = rate_window.push(interval_bytes);
                         if let (Some(limit), Some(bits_per_sec)) = (bitrate_limit, verdict) {
-                            if bits_per_sec > limit as f64 {
+                            if bits_per_sec > limit {
                                 // #350 RECORDED DEVIATION: GT relays this
                                 // frame TWICE — the explicit rate-path write
                                 // (iperf_server_api.c:626-643), then
@@ -4731,9 +4748,12 @@ mod tests {
         assert_eq!(super::DEFAULT_RCV_TIMEOUT_MS, 120_000);
     }
 
-    /// #316: the server adopts the client's exchanged GSO/GRO request
-    /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
-    /// from the negotiated blksize (:2607-2613).
+    // #316 (the from_params cluster below, generally): the server adopts
+    // the client's exchanged GSO/GRO request (GT iperf_api.c:2599-2619),
+    // including the zero-dg_size recompute from the negotiated blksize
+    // (:2607-2613). A plain comment on purpose — as a doc comment it kept
+    // re-attaching to whichever test was inserted first (#443 r1 F3).
+
     /// #410: GT's iperf_check_total_rate window semantics in isolation —
     /// the fill gate, the ring aging, the average math, and the sample
     /// derivation formula (iperf_api.c:2142-2179 + :2008-2012).
@@ -4744,8 +4764,9 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(w.push(1_000_000), None, "no verdict before 5 samples");
         }
-        // 5th sample: 5 x 1 MB over 5 s = 8 Mbit/s.
-        assert_eq!(w.push(1_000_000), Some(8_000_000.0));
+        // 5th sample: 5 x 1 MB over 5 s = 8 Mbit/s. INTEGER bits/s —
+        // GT's uint64_t assignment truncates (r1 F4).
+        assert_eq!(w.push(1_000_000), Some(8_000_000));
 
         // Aging: a burst leaves the window once the ring wraps over it —
         // the pre-#410 whole-test average never forgot.
@@ -4755,10 +4776,10 @@ mod tests {
             w.push(0);
         }
         let with_burst = w.push(0).expect("ring full");
-        assert!(with_burst > 0.0, "burst still inside the window");
+        assert!(with_burst > 0, "burst still inside the window");
         assert_eq!(
             w.push(0),
-            Some(0.0),
+            Some(0),
             "the next push overwrites the burst slot — aged out"
         );
 
@@ -4768,7 +4789,7 @@ mod tests {
         let mut w1 = RateLimitWindow::from_interval_secs(1.0);
         assert_eq!(
             w1.push(125_000),
-            Some(1_000_000.0),
+            Some(1_000_000),
             "1-sample window verdicts immediately"
         );
         let mut w06 = RateLimitWindow::from_interval_secs(0.6);
@@ -4780,6 +4801,27 @@ mod tests {
         assert!(w25.push(1).is_none());
         assert!(w25.push(1).is_none());
         assert!(w25.push(1).is_some(), "2.5 rounds half-away to 3 samples");
+
+        // Truncation (r1 F4): GT's uint64_t drops the fraction — a window
+        // averaging 1001.6 bits/s reads 1001 and does NOT breach a 1001
+        // limit. 626 bytes over 5 s = 1001.6.
+        let mut wt = RateLimitWindow::from_interval_secs(5.0);
+        for _ in 0..4 {
+            wt.push(0);
+        }
+        assert_eq!(wt.push(626), Some(1001), "integer bits/s like GT");
+
+        // Hardening (r1 F1, lib surface beyond GT's CLI bounds): NaN,
+        // negatives, and zero fall back to the default window; huge
+        // intervals cap the ring instead of aborting on allocation.
+        let mut wn = RateLimitWindow::from_interval_secs(f64::NAN);
+        assert!(wn.push(1).is_none(), "NaN → default 5-sample window");
+        let mut wz = RateLimitWindow::from_interval_secs(0.0);
+        assert!(wz.push(1).is_none(), "0 → default window, not 1-sample");
+        let mut wneg = RateLimitWindow::from_interval_secs(-3.0);
+        assert!(wneg.push(1).is_none(), "negative → default window");
+        let wh = RateLimitWindow::from_interval_secs(1e30);
+        assert_eq!(wh.ring.len(), 86_400, "huge interval caps the ring");
     }
 
     /// #414: the wire trio's ingest semantics, per GT's get_parameters.

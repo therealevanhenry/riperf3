@@ -902,10 +902,12 @@ impl Cli {
             // #410: the `/N` averaging window rides into the lib (GT's
             // bitrate_limit_interval, iperf_api.c:1371 — un-recording the
             // old "validated but not wired" deviation). RECORDED DEVIATION
-            // (`/0` only): GT's interval=0 leaves its sample derivation
-            // degenerate (per_interval stays 0 → a division by zero inside
-            // iperf_check_total_rate); riperf3 reads 0 as the default 5 s
-            // window instead of reproducing the UB.
+            // (`/0` only, r1 F5 live probe): GT's interval=0 leaves
+            // per_interval at 0 → 0.0/0.0 = NaN → uint64 conversion UB —
+            // on x86-64 that reads 2^63 bps and GT SELF-TERMINATES every
+            // test at the FIRST tick (aarch64's NaN→0 would never breach).
+            // Platform-divergent UB is not mirrorable; riperf3 reads 0 as
+            // the default 5 s window.
             if let Some(iv) = interval.map(atof_like_bytes) {
                 if iv != 0.0 {
                     builder = builder.server_bitrate_limit_interval(iv);
