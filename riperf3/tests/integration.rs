@@ -2004,9 +2004,11 @@ mod unimplemented_flags {
         let start = std::time::Instant::now();
         let result = client.run().await;
         let elapsed = start.elapsed();
-        // Should terminate well before 10 seconds
+        // Terminates before the 10 s duration — at ~5 s, GT's 5-sample
+        // moving-average gate (#410; the precise timing window is pinned in
+        // server_run_once_self_terminates_on_runtime_bitrate_breach).
         assert!(
-            elapsed.as_secs() < 5,
+            elapsed.as_secs() < 8,
             "bitrate limit didn't cut test: {elapsed:?}"
         );
         // #224 ground truth (iperf 3.21): SERVER_ERROR + IETOTALRATE, the
@@ -2798,7 +2800,7 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     const MSG: &str = "total required bandwidth is larger than server limit";
     let server = ServerBuilder::new()
         .port(Some(0))
-        .server_bitrate_limit(1_000) // 1 Kbit/s: any real transfer trips the 1 Hz check
+        .server_bitrate_limit(1_000) // 1 Kbit/s: any real transfer breaches
         .emit_output(false)
         .build()
         .unwrap();
@@ -2810,15 +2812,29 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     // (total = 0) lets the test START, then loopback throughput blows past
     // 1 Kbit/s and the RUNTIME breach fires. An explicit `-b 2M` would instead
     // be refused UPFRONT (no server report — the other tests' path).
+    // #410: the duration must OUTLIVE GT's 5-sample moving-average gate
+    // (iperf_check_total_rate needs bitrate_limit_stats_per_interval = 5
+    // interval samples before it evaluates; live-probed GT breach = 5.0 s).
+    let t0 = std::time::Instant::now();
     let client = ClientBuilder::new("127.0.0.1")
         .port(Some(port))
-        .duration(2)
+        .duration(10)
         .emit_output(false)
         .build()
         .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(15), client.run())
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
         .await
         .expect("client hung");
+    let breach_at = t0.elapsed();
+    assert!(
+        breach_at >= Duration::from_millis(4500),
+        "the breach must wait for GT's 5-sample window, not fire on a \
+         whole-test average at the first tick (#410): fired at {breach_at:?}"
+    );
+    assert!(
+        breach_at <= Duration::from_millis(8000),
+        "the breach fires at the window boundary, ~5 s (#410): {breach_at:?}"
+    );
     let server_result = server_task.await.expect("server task");
 
     // Server: the runtime breach produced a report → Ok (an Err here is exactly
@@ -2838,6 +2854,118 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
         cli.termination,
         riperf3::Termination::ServerError(MSG.to_string()),
         "the client sees the relayed SERVER_ERROR — the symmetric half"
+    );
+}
+
+/// #410 r1 F2: a limit of ZERO disables the check entirely — GT's first
+/// gate (`bitrate_limit == 0 → return`, iperf_api.c:2149-2151;
+/// live-probed: GT ran `--server-bitrate-limit 0` for a full 7 s where an
+/// unfiltered runtime arm self-terminated at the window boundary).
+#[tokio::test]
+async fn zero_bitrate_limit_disables_the_check() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_bitrate_limit(0)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(7)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let cli = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    assert_eq!(
+        cli.termination,
+        riperf3::Termination::Completed,
+        "limit 0 = no limit, like GT (#410 r1 F2)"
+    );
+    let srv = server_task.await.expect("join").expect("server run_once");
+    assert_eq!(srv.termination, riperf3::Termination::Completed);
+}
+
+/// #410 (M2 discriminator): a COMPLIANT steady sender must never breach —
+/// the moving window drains as traffic flows at a sub-limit rate, where a
+/// cumulative feed (the pre-#410 whole-test shape smuggled into the ring)
+/// keeps growing and false-breaches within ~5 ticks. 400 Kbit/s against a
+/// 1 Mbit/s limit, 8 s, SMALL blksize — the default 128 KiB block is one
+/// whole burst above the per-tick budget and legitimately trips the
+/// window on both tools (the #260 "controls need small blksize" lesson).
+#[tokio::test]
+async fn compliant_steady_rate_never_breaches_the_window() {
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_bitrate_limit(1_000_000)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(8)
+        .bandwidth(400_000)
+        .blksize(1_400)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let cli = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung")
+        .expect("client run");
+    assert_eq!(
+        cli.termination,
+        riperf3::Termination::Completed,
+        "a sub-limit steady rate never trips GT's moving window (#410)"
+    );
+    let srv = server_task.await.expect("join").expect("server run_once");
+    assert_eq!(srv.termination, riperf3::Termination::Completed);
+}
+
+/// #410 (the `/N` knob): `--server-bitrate-limit rate/2` shrinks the
+/// window to 2 samples — GT breaches at 2.0 s (live-probed; `/10` at
+/// 10.0 s). An unwired knob leaves the default 5-sample gate and fires
+/// ~5 s, red here.
+#[tokio::test]
+async fn rate_window_interval_knob_scales_the_gate() {
+    const MSG: &str = "total required bandwidth is larger than server limit";
+    let server = ServerBuilder::new()
+        .port(Some(0))
+        .server_bitrate_limit(1_000)
+        .server_bitrate_limit_interval(2.0)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let bound = server.bind().await.expect("bind");
+    let port = bound.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move { bound.run_once().await });
+    let t0 = std::time::Instant::now();
+    let client = ClientBuilder::new("127.0.0.1")
+        .port(Some(port))
+        .duration(8)
+        .emit_output(false)
+        .build()
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(20), client.run())
+        .await
+        .expect("client hung");
+    let breach_at = t0.elapsed();
+    assert!(
+        (Duration::from_millis(1500)..=Duration::from_millis(4000)).contains(&breach_at),
+        "a 2 s window breaches at ~2 s like GT (#410): {breach_at:?}"
+    );
+    let srv = server_task.await.expect("join").expect("server run_once");
+    assert_eq!(
+        srv.termination,
+        riperf3::Termination::SelfTerminated(MSG.to_string())
     );
 }
 

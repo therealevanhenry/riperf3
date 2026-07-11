@@ -56,6 +56,12 @@ release tags.
 - `--cport` binds `port + i` per stream like iperf3 (`-P 2` no longer dies on a source-port
   collision; 65536 wraps to ephemeral), UDP honors `--cport` at all (was silently ephemeral),
   and a failed data-stream dial reports iperf3's `unable to connect stream: …` class (#428).
+- `--server-bitrate-limit` breaches on iperf3's moving average — the last `rate/N` seconds
+  (default 5) of one-second samples, evaluated only once the window fills — instead of a
+  whole-test average at 1 Hz (breach at ~5 s like iperf3, not ~1 s; bursts age out; a quiet
+  prefix no longer dilutes). The `/N` averaging-interval half now wires through (new
+  `ServerBuilder::server_bitrate_limit_interval`), and a limit of 0 disables the check
+  like iperf3 instead of killing every test (#410).
 - The client's params blob carries `repeating_payload` / `dont_fragment` / `flowlabel` like
   iperf3, and the server honors the first two on its send paths: reverse/bidir TCP payload
   fills the repeating pattern — now iperf3's ASCII-digit fill; the previous 0x00..0xFF ramp

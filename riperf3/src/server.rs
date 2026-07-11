@@ -8,6 +8,64 @@ use crate::protocol::{self, TestParams, TestResultsJson, TestState, TransportPro
 use crate::stream::{self, DataStream, StreamCounters, StreamMeta, UdpRecvStats};
 use crate::utils::*;
 
+/// #410: GT's `iperf_check_total_rate` window (iperf_api.c:2142-2179) — a
+/// ring of the last N interval byte counts. `push` returns the window
+/// average in bits/s once the ring has filled (GT gates on
+/// `stats_count < bitrate_limit_stats_per_interval`, :2160), `None`
+/// before. The push cadence is the server's fixed 1 Hz rate arm —
+/// riperf3's stats_interval.
+pub(crate) struct RateLimitWindow {
+    ring: Vec<u64>,
+    idx: usize,
+    count: u64,
+}
+
+impl RateLimitWindow {
+    /// GT's parse-time sample derivation (iperf_api.c:2008-2012) with
+    /// riperf3's stats_interval pinned at 1.0 s (there is no server `-i`
+    /// knob): `interval <= 1 → 1` sample, else `round(interval)`. The
+    /// interval is `--server-bitrate-limit rate/N`'s N, default 5
+    /// (iperf_api.c:3291). HARDENED beyond GT (r1 F1 — this is a lib
+    /// surface): a non-finite or non-positive interval falls back to the
+    /// default 5, and the ring is capped at 86 400 samples (a day at 1 Hz)
+    /// so a huge value can't abort on allocation. GT's own CLI bounds the
+    /// value to 0.1..=60 before it ever reaches the math.
+    pub(crate) fn from_interval_secs(interval: f64) -> Self {
+        let interval = if interval.is_finite() && interval > 0.0 {
+            interval
+        } else {
+            5.0
+        };
+        let samples = if interval <= 1.0 {
+            1
+        } else {
+            (interval.round() as usize).min(86_400)
+        };
+        Self {
+            ring: vec![0; samples],
+            idx: 0,
+            count: 0,
+        }
+    }
+
+    /// Push one interval's byte count; returns the moving average over the
+    /// window once enough samples accumulated (GT :2153-2169: ring insert,
+    /// count gate, `sum * 8 / (stats_interval × samples)`). INTEGER bits/s
+    /// like GT's `uint64_t bits_per_second` (:2146/:2169 — the C double
+    /// division truncates on assignment), so a fractional average never
+    /// breaches a limit its integer part equals (r1 F4).
+    pub(crate) fn push(&mut self, interval_bytes: u64) -> Option<u64> {
+        self.idx = (self.idx + 1) % self.ring.len();
+        self.ring[self.idx] = interval_bytes;
+        self.count += 1;
+        if self.count < self.ring.len() as u64 {
+            return None;
+        }
+        let total: u64 = self.ring.iter().sum();
+        Some((total as f64 * 8.0 / self.ring.len() as f64) as u64)
+    }
+}
+
 /// Shared test configuration derived from the client's parameter JSON.
 /// Crate-internal (#67): retracted from the public API, so `pub(crate)` keeps a
 /// future stray `pub use` from silently re-leaking it.
@@ -406,6 +464,9 @@ pub struct Server {
     /// DEFAULT_NO_MSG_RCVD_TIMEOUT, iperf_api.h:70).
     pub(crate) rcv_timeout: Option<u64>,
     pub(crate) server_bitrate_limit: Option<u64>,
+    /// #410: `--server-bitrate-limit rate/N`'s N — the averaging window in
+    /// seconds (GT's bitrate_limit_interval, default 5, iperf_api.c:3291).
+    pub(crate) server_bitrate_limit_interval: Option<f64>,
     pub(crate) server_max_duration: Option<u32>,
     pub(crate) forceflush: bool,
     pub(crate) bind_address: Option<String>,
@@ -2166,7 +2227,12 @@ impl Server {
     /// and the interrupt watch; records how the test ended in the context
     /// flags (`server_error` / `client_terminated` / `interrupted`).
     async fn await_test_end(&self, ctx: &mut TestRunCtx) -> Result<()> {
-        let bitrate_limit = self.server_bitrate_limit;
+        // #410 r1 F2: GT's first gate — a limit of 0 DISABLES the check
+        // entirely (iperf_check_total_rate, iperf_api.c:2149-2151); the
+        // upfront param check already filters `> 0`, the runtime arm must
+        // too (live-probed: GT ran `--server-bitrate-limit 0` clean where
+        // the unfiltered arm self-terminated at the window boundary).
+        let bitrate_limit = self.server_bitrate_limit.filter(|&l| l > 0);
         let test_start = ctx.report_start;
         // #230: GT's in-flight 160-watchdog (create_server_timers,
         // iperf_server_api.c:380-395) arms for EVERY test with a nonzero
@@ -2184,6 +2250,13 @@ impl Server {
         let mut rate_check = tokio::time::interval(std::time::Duration::from_secs(1));
         rate_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         rate_check.tick().await; // skip immediate tick
+                                 // #410: GT's breach check is a MOVING AVERAGE over the last N
+                                 // one-second samples (iperf_check_total_rate's ring), N from the
+                                 // `rate/N` interval (default 5) — never a whole-test average, and
+                                 // silent until the ring fills (GT breach at ~5 s, live-probed).
+        let mut rate_window =
+            RateLimitWindow::from_interval_secs(self.server_bitrate_limit_interval.unwrap_or(5.0));
+        let mut rate_prev_total: u64 = 0;
 
         // #237: ONE absolute deadline, pinned before the loop. A sleep()
         // recreated inside select! restarts from zero every time another arm
@@ -2343,14 +2416,19 @@ impl Server {
                     break;
                 }
                 _ = rate_check.tick(), if bitrate_limit.is_some() => {
-                    let elapsed = test_start.elapsed().as_secs_f64();
-                    if elapsed > 0.0 {
+                    {
+                        // GT sums each interval's sent+received across
+                        // streams (iperf_stats_callback, iperf_api.c:3725);
+                        // the cumulative counters here yield the same
+                        // per-tick delta.
                         let total_bytes: u64 = ctx.streams.iter().map(|s| {
                             s.meta.counters.bytes_sent() + s.meta.counters.bytes_received()
                         }).sum();
-                        let bits_per_sec = total_bytes as f64 * 8.0 / elapsed;
-                        if let Some(limit) = bitrate_limit {
-                            if bits_per_sec > limit as f64 {
+                        let interval_bytes = total_bytes.saturating_sub(rate_prev_total);
+                        rate_prev_total = total_bytes;
+                        let verdict = rate_window.push(interval_bytes);
+                        if let (Some(limit), Some(bits_per_sec)) = (bitrate_limit, verdict) {
+                            if bits_per_sec > limit {
                                 // #350 RECORDED DEVIATION: GT relays this
                                 // frame TWICE — the explicit rate-path write
                                 // (iperf_server_api.c:626-643), then
@@ -4340,6 +4418,7 @@ pub struct ServerBuilder {
     idle_timeout: Option<u32>,
     rcv_timeout: Option<u64>,
     server_bitrate_limit: Option<u64>,
+    server_bitrate_limit_interval: Option<f64>,
     server_max_duration: Option<u32>,
     forceflush: bool,
     bind_address: Option<String>,
@@ -4368,6 +4447,7 @@ impl Default for ServerBuilder {
             idle_timeout: None,
             rcv_timeout: None,
             server_bitrate_limit: None,
+            server_bitrate_limit_interval: None,
             server_max_duration: None,
             forceflush: false,
             bind_address: None,
@@ -4476,6 +4556,18 @@ impl ServerBuilder {
     /// exceeds `rate` bits/sec (unset: no limit).
     pub fn server_bitrate_limit(mut self, rate: u64) -> Self {
         self.server_bitrate_limit = Some(rate);
+        self
+    }
+
+    /// The `--server-bitrate-limit rate/N` averaging window in seconds —
+    /// iperf3's bitrate_limit_interval (default 5): the breach check is a
+    /// moving average over the last `round(N)` one-second samples and
+    /// evaluates only once that many have accumulated (#410). Hardened
+    /// input contract: a non-finite or non-positive value falls back to
+    /// the default 5 s window, and the sample count is capped at 86 400
+    /// (a day at 1 Hz). iperf3's own CLI bounds the value to 0.1..=60.
+    pub fn server_bitrate_limit_interval(mut self, secs: f64) -> Self {
+        self.server_bitrate_limit_interval = Some(secs);
         self
     }
 
@@ -4622,6 +4714,7 @@ impl ServerBuilder {
             idle_timeout: self.idle_timeout,
             rcv_timeout: self.rcv_timeout,
             server_bitrate_limit: self.server_bitrate_limit,
+            server_bitrate_limit_interval: self.server_bitrate_limit_interval,
             server_max_duration: self.server_max_duration,
             forceflush: self.forceflush,
             bind_address: self.bind_address,
@@ -4658,9 +4751,82 @@ mod tests {
         assert_eq!(super::DEFAULT_RCV_TIMEOUT_MS, 120_000);
     }
 
-    /// #316: the server adopts the client's exchanged GSO/GRO request
-    /// (GT iperf_api.c:2599-2619), including the zero-dg_size recompute
-    /// from the negotiated blksize (:2607-2613).
+    // #316 (the from_params cluster below, generally): the server adopts
+    // the client's exchanged GSO/GRO request (GT iperf_api.c:2599-2619),
+    // including the zero-dg_size recompute from the negotiated blksize
+    // (:2607-2613). A plain comment on purpose — as a doc comment it kept
+    // re-attaching to whichever test was inserted first (#443 r1 F3).
+
+    /// #410: GT's iperf_check_total_rate window semantics in isolation —
+    /// the fill gate, the ring aging, the average math, and the sample
+    /// derivation formula (iperf_api.c:2142-2179 + :2008-2012).
+    #[test]
+    fn rate_limit_window_matches_gt_semantics() {
+        // Gate: silent until the ring fills (GT :2158-2161).
+        let mut w = RateLimitWindow::from_interval_secs(5.0);
+        for _ in 0..4 {
+            assert_eq!(w.push(1_000_000), None, "no verdict before 5 samples");
+        }
+        // 5th sample: 5 x 1 MB over 5 s = 8 Mbit/s. INTEGER bits/s —
+        // GT's uint64_t assignment truncates (r1 F4).
+        assert_eq!(w.push(1_000_000), Some(8_000_000));
+
+        // Aging: a burst leaves the window once the ring wraps over it —
+        // the pre-#410 whole-test average never forgot.
+        let mut w = RateLimitWindow::from_interval_secs(5.0);
+        w.push(u64::from(u32::MAX)); // the burst
+        for _ in 0..3 {
+            w.push(0);
+        }
+        let with_burst = w.push(0).expect("ring full");
+        assert!(with_burst > 0, "burst still inside the window");
+        assert_eq!(
+            w.push(0),
+            Some(0),
+            "the next push overwrites the burst slot — aged out"
+        );
+
+        // Derivation (GT :2008-2012, stats_interval pinned 1.0): <= 1 s
+        // collapses to ONE sample (verdicts on the first push); fractions
+        // round like C round().
+        let mut w1 = RateLimitWindow::from_interval_secs(1.0);
+        assert_eq!(
+            w1.push(125_000),
+            Some(1_000_000),
+            "1-sample window verdicts immediately"
+        );
+        let mut w06 = RateLimitWindow::from_interval_secs(0.6);
+        assert!(w06.push(1).is_some(), "sub-second interval = 1 sample");
+        let mut w24 = RateLimitWindow::from_interval_secs(2.4);
+        assert!(w24.push(1).is_none());
+        assert!(w24.push(1).is_some(), "2.4 rounds to 2 samples");
+        let mut w25 = RateLimitWindow::from_interval_secs(2.5);
+        assert!(w25.push(1).is_none());
+        assert!(w25.push(1).is_none());
+        assert!(w25.push(1).is_some(), "2.5 rounds half-away to 3 samples");
+
+        // Truncation (r1 F4): GT's uint64_t drops the fraction — a window
+        // averaging 1001.6 bits/s reads 1001 and does NOT breach a 1001
+        // limit. 626 bytes over 5 s = 1001.6.
+        let mut wt = RateLimitWindow::from_interval_secs(5.0);
+        for _ in 0..4 {
+            wt.push(0);
+        }
+        assert_eq!(wt.push(626), Some(1001), "integer bits/s like GT");
+
+        // Hardening (r1 F1, lib surface beyond GT's CLI bounds): NaN,
+        // negatives, and zero fall back to the default window; huge
+        // intervals cap the ring instead of aborting on allocation.
+        let mut wn = RateLimitWindow::from_interval_secs(f64::NAN);
+        assert!(wn.push(1).is_none(), "NaN → default 5-sample window");
+        let mut wz = RateLimitWindow::from_interval_secs(0.0);
+        assert!(wz.push(1).is_none(), "0 → default window, not 1-sample");
+        let mut wneg = RateLimitWindow::from_interval_secs(-3.0);
+        assert!(wneg.push(1).is_none(), "negative → default window");
+        let wh = RateLimitWindow::from_interval_secs(1e30);
+        assert_eq!(wh.ring.len(), 86_400, "huge interval caps the ring");
+    }
+
     /// #414: the wire trio's ingest semantics, per GT's get_parameters.
     #[test]
     fn from_params_ingests_the_414_trio_like_gt() {

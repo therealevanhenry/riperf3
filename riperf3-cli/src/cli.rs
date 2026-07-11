@@ -890,11 +890,8 @@ impl Cli {
             // #328: GT's `bitrate_limit = unit_atof_rate(rate_part)` — an
             // iperf_size_t (uint64), so a negative rate wraps huge and GT
             // proceeds (iperf_api.c:1379-1383). The IETOTALINTERVAL check
-            // on the interval part runs pre-sink in main.rs. RECORDED
-            // DEVIATION: the interval VALUE is validated like GT but not
-            // wired — riperf3's limit enforcement keeps its own averaging
-            // window (the lib has no interval knob).
-            let (rate, _interval) = split_rate_interval(s);
+            // on the interval part runs pre-sink in main.rs.
+            let (rate, interval) = split_rate_interval(s);
             let n = unit_atof_rate_like_bytes(rate).map_err(|()| {
                 format!(
                     "invalid unit value or suffix: '{}'",
@@ -902,6 +899,20 @@ impl Cli {
                 )
             })?;
             builder = builder.server_bitrate_limit(c_double_to_u64(n));
+            // #410: the `/N` averaging window rides into the lib (GT's
+            // bitrate_limit_interval, iperf_api.c:1371 — un-recording the
+            // old "validated but not wired" deviation). RECORDED DEVIATION
+            // (`/0` only, r1 F5 live probe): GT's interval=0 leaves
+            // per_interval at 0 → 0.0/0.0 = NaN → uint64 conversion UB —
+            // on x86-64 that reads 2^63 bps and GT SELF-TERMINATES every
+            // test at the FIRST tick (aarch64's NaN→0 would never breach).
+            // Platform-divergent UB is not mirrorable; riperf3 reads 0 as
+            // the default 5 s window.
+            if let Some(iv) = interval.map(atof_like_bytes) {
+                if iv != 0.0 {
+                    builder = builder.server_bitrate_limit_interval(iv);
+                }
+            }
         }
         if let Some(secs) = self.server_max_duration {
             builder = builder.server_max_duration(u32::try_from(secs).unwrap_or(u32::MAX));
@@ -2888,9 +2899,10 @@ mod cli_tests {
         // #328: the rate part is GT's unit_atof_rate (1000-based) with the
         // /interval piece split off first (iperf_api.c:1366-1385) — junk
         // after the suffix is ignored, and a negative rate (uint64)-wraps
-        // huge like GT's iperf_size_t assignment. RECORDED DEVIATION: the
-        // interval VALUE is range-checked like GT (IETOTALINTERVAL, in
-        // main.rs) but not wired — the lib keeps its own averaging window.
+        // huge like GT's iperf_size_t assignment. #410: the `/N` interval
+        // half wires into the lib's averaging window (GT's
+        // bitrate_limit_interval); `/0` stays unwired — GT's 0 leaves its
+        // derivation degenerate (recorded at the build_server site).
         #[test]
         fn server_bitrate_limit_rate_parses_like_gt() {
             let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "10M/2"]);
@@ -2899,8 +2911,19 @@ mod cli_tests {
                 riperf3::ServerBuilder::new()
                     .emit_output(true)
                     .server_bitrate_limit(10_000_000)
+                    .server_bitrate_limit_interval(2.0)
                     .build()
                     .unwrap()
+            );
+            let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "10M/0"]);
+            assert_eq!(
+                build_server_from_cli(&cli),
+                riperf3::ServerBuilder::new()
+                    .emit_output(true)
+                    .server_bitrate_limit(10_000_000)
+                    .build()
+                    .unwrap(),
+                "the /0 edge keeps the default window (recorded deviation)"
             );
             let cli = Cli::parse_from(["riperf3", "-s", "--server-bitrate-limit", "10Kx"]);
             assert_eq!(

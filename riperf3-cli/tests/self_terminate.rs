@@ -1,3 +1,6 @@
+//! #410: the bitrate-breach cells run `-t 9` — GT's 5-sample moving-average
+//! gate fires at ~5 s, and a `-t 5` client races the breach at exactly the
+//! window boundary (the pre-#410 whole-test check fired at ~1 s).
 //! #224 — server self-terminate parity (--server-bitrate-limit /
 //! --server-max-duration). Ground truth (iperf 3.21, live-captured 2026-06-11
 //! on the pinned interop build): both paths use the **SERVER_ERROR (-2)**
@@ -66,7 +69,7 @@ fn bitrate_limit_text_relays_server_error_no_summaries() {
     std::thread::sleep(Duration::from_millis(300));
 
     let client = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "5"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "9"],
         Duration::from_secs(40),
         "client",
     );
@@ -120,7 +123,7 @@ fn bitrate_limit_json_client_single_doc_with_relayed_error() {
     std::thread::sleep(Duration::from_millis(300));
 
     let client = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "5", "-J"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "9", "-J"],
         Duration::from_secs(40),
         "client -J",
     );
@@ -172,7 +175,7 @@ fn bitrate_limit_json_server_doc_bare_end_and_prefixed_error() {
     std::thread::sleep(Duration::from_millis(300));
 
     let _client = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "5"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "9"],
         Duration::from_secs(40),
         "client",
     );
@@ -769,7 +772,7 @@ fn bitrate_limit_line_carries_the_timestamps_prefix() {
     let server = spawn_server(&["--server-bitrate-limit", "1K", "--timestamps=XTSX "], &ps);
     std::thread::sleep(Duration::from_millis(300));
     let _ = common::run_client(
-        &["-c", "127.0.0.1", "-p", &ps, "-t", "5"],
+        &["-c", "127.0.0.1", "-p", &ps, "-t", "9"],
         Duration::from_secs(40),
         "client",
     );
