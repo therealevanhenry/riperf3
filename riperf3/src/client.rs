@@ -157,7 +157,6 @@ fn peer_half_summary(
     }
 }
 
-/// Bytes transferred so far against an `-n`/`-k` limit. Faithful to iperf3's
 /// #428: fold a DATA-stream dial failure into GT's `IESTREAMCONNECT`
 /// class — GT stamps it for the whole netdial (bind + connect alike,
 /// iperf_tcp.c:404 / iperf_udp.c:670-672), the same class the server side
@@ -181,9 +180,10 @@ fn stream_dial_error(e: RiperfError) -> RiperfError {
 /// #428: GT's per-stream source port — `bind_port + i` over creation order
 /// behind the `if (orig_bind_port)` ZERO-GATE (iperf_client_api.c:117): a
 /// cport of 0 NEVER increments (every stream ephemeral, GT's no-bind path
-/// → None here). A nonzero cport wraps like GT's htons truncation
-/// (65535 + 1 → int 65536, still truthy → explicit bind of port 0 =
-/// ephemeral), so the wrap result stays Some.
+/// → None here). A nonzero cport wraps like GT's htons truncation at the
+/// 16-bit boundary (65535 + 1 → int 65536, still truthy → explicit bind of
+/// port 0 = ephemeral; deeper wraps land on low explicit ports, both
+/// tools), so the wrap result stays Some.
 fn stream_cport(cport: Option<u16>, i: u32) -> Option<u16> {
     match cport {
         Some(0) => None,
@@ -192,6 +192,7 @@ fn stream_cport(cport: Option<u16>, i: u32) -> Option<u16> {
     }
 }
 
+/// Bytes transferred so far against an `-n`/`-k` limit. Faithful to iperf3's
 /// `bytes_sent >= N || bytes_received >= N` end check (`iperf_client_api.c`):
 /// the client's senders accumulate in forward, its receivers in reverse, and in
 /// bidir whichever direction reaches the limit first ends the test. Counting

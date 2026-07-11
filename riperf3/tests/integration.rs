@@ -3067,7 +3067,9 @@ async fn params_blob_omits_window_zero_like_gt() {
 fn free_cport_base(span: u16) -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let window = 36000 + (std::process::id() % 450) as u16 * 64;
+    // Window stride 512 covers the full claim range (64 claims × 8) so
+    // adjacent pid windows can't overlap (r2 F2).
+    let window = 36000 + (std::process::id() % 57) as u16 * 512;
     'outer: for _ in 0..64 {
         let base = window + NEXT.fetch_add(1, Ordering::Relaxed) % 64 * 8;
         let mut holds = Vec::new();
