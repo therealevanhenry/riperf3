@@ -2798,7 +2798,7 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     const MSG: &str = "total required bandwidth is larger than server limit";
     let server = ServerBuilder::new()
         .port(Some(0))
-        .server_bitrate_limit(1_000) // 1 Kbit/s: any real transfer trips the 1 Hz check
+        .server_bitrate_limit(1_000) // 1 Kbit/s: any real transfer breaches
         .emit_output(false)
         .build()
         .unwrap();
@@ -2810,15 +2810,29 @@ async fn server_run_once_self_terminates_on_runtime_bitrate_breach() {
     // (total = 0) lets the test START, then loopback throughput blows past
     // 1 Kbit/s and the RUNTIME breach fires. An explicit `-b 2M` would instead
     // be refused UPFRONT (no server report — the other tests' path).
+    // #410: the duration must OUTLIVE GT's 5-sample moving-average gate
+    // (iperf_check_total_rate needs bitrate_limit_stats_per_interval = 5
+    // interval samples before it evaluates; live-probed GT breach = 5.0 s).
+    let t0 = std::time::Instant::now();
     let client = ClientBuilder::new("127.0.0.1")
         .port(Some(port))
-        .duration(2)
+        .duration(10)
         .emit_output(false)
         .build()
         .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(15), client.run())
+    let result = tokio::time::timeout(Duration::from_secs(20), client.run())
         .await
         .expect("client hung");
+    let breach_at = t0.elapsed();
+    assert!(
+        breach_at >= Duration::from_millis(4500),
+        "the breach must wait for GT's 5-sample window, not fire on a \
+         whole-test average at the first tick (#410): fired at {breach_at:?}"
+    );
+    assert!(
+        breach_at <= Duration::from_millis(8000),
+        "the breach fires at the window boundary, ~5 s (#410): {breach_at:?}"
+    );
     let server_result = server_task.await.expect("server task");
 
     // Server: the runtime breach produced a report → Ok (an Err here is exactly
