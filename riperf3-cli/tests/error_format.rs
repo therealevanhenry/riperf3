@@ -1406,3 +1406,254 @@ fn post_loop_parameter_errors_are_stamped() {
         "mid-loop-equivalent range errors stay bare: {stderr}"
     );
 }
+
+/// Throwaway 2048-bit RSA test pair for the #395 parse-time cells (PKCS#8 /
+/// SPKI, the formats riperf3 parses). Test-only material, not a secret.
+const TEST_RSA_PRIV: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7IhH8pfjg1P/o
+mz/9oiFCOqDTDb+2W0vr2k5MFxRmNaeNAmYv7otXAC14WBAmHsKdXZ13VJhv9zYR
+jyBn+vJYIlT5M3WyAqP5Sn8ejQ9kIYs+CDQl5QlBFaeg6xaJtY6PwBW4q8jJIXtM
+QiHN0sE9bClILMyujm8dbnhqwo8VDlIBixfvAeDDfGXETPJf0prO+64roLn44Lmc
+uoXiWPtz4cP9OnvExsQ09F2jvY4I0fu0S/EE/rUvt3HYR3dlwfIUEwrkUVLHAXVN
+pC8d1oK0b1USQndcDxNLrFsKJrgGMW1QqBg8WhsMRb9T2hkSlejProRPQ8zXx9QU
+ZHYNXGHRAgMBAAECggEAHXG3wnjmUeYMhW/WypSLRs2icXhCgocXSTsrwlrdTv8W
+knWJWPW1P1FcAN6xB8vOPmQ0+x+N7rbHRKMFwSah9s52xVEyAyTZjRzffJH1v9Zr
+/4Iwm7J6hB72pbdnxUTnyLmQvA0XhizPpt4++GY2w/CJXFMO5PusrcUB4HZ60fU4
+cSweQ9gS8AcJWSw53oUobUd3P4cs8GppIV9Y7lSf7bVXHW4COi6m1H7wP88EXLdF
+bO3TJGoCjCVuc39J7aaddEFnOC1a5pMeDFfRyWI9GddDTbGaO/DMpegBOm1H3PuN
+9JRoe0GYDovO0kRedXG0GeSYtWwUhC3TW+9FpoTYQwKBgQD85l7xC152ikbm472N
+V1RLdmz7IGj2h1CvAKr9zSHrDHshGH7qu9scsMQJhiaftO4K+j9K/yrLZ6Z0MyZm
+qjUhWG5Ko1HNE15Vn/TzJnrbK34AjRgA+WSYu2G1aYonDXFfCqVQTQblBD1JdLFl
+yJ2crxGlRLDW6k6zo94vRA3jewKBgQC9bVDItHxS44gOmvm/X1mfb4hCsuB/TXtl
+ybUqjitcS+l7LpYlXVK5AsLGOLFalVLpmdTnil+Te6UIfuZRHJbOHwdzbrV9WouJ
+QFizVha0hWEiSDIn9rBwW/eiYHx3sUMYrSL9sw3l1hY4rJRye0hNOtDRGvKkGF87
+f1WCFoxYIwKBgGHVmPr04/lFqwIdLjIki4aZ7LUFp7VfSZY50uxWU/3DGUsHV+nk
+/HHP7DanAAAelUwH3T5dEigYE+u18fAbfmxE8n3LSpTkHkVPmQoLY9GvtJHwA041
+LHZtXvI4Puq2p5oV2zgCZF1qU288RnhSsK5xh4kA1sx9Xi7egNCWKi1LAoGAEmri
+g+EohVaiD+l5huXabOoHMZT6xuXdrZPjDXQtOxgWZ2esKY3dUSe3kFZKyCfkm9nd
+HXYSvOA0t5K/CfvhncDelJabBska8AlVlno0UvD09MRYPBJ8LTCD70G6WFjf0TJk
+SI50N3iNSI1fEZJzAS9Kxkn8dX/5ImvLAI74rkkCgYEAsXzOnFN2OIBwKG1gENdT
+R7pPrq6q3IrWlWNz9k8ubrLeTeDb1LMsfWfbin4lACLlvUbwU6MYWiahK5fSmf6T
+OhSrJ/eZSXSIwnVIKSEMQwy6+D+E6BWF8FtBhL38h8tiZXqpl2pz1G6vfMfIWf3J
+saCwXnAhJ1c65yxGrEErPro=
+-----END PRIVATE KEY-----"#;
+const TEST_RSA_PUB: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuyIR/KX44NT/6Js//aIh
+Qjqg0w2/tltL69pOTBcUZjWnjQJmL+6LVwAteFgQJh7CnV2dd1SYb/c2EY8gZ/ry
+WCJU+TN1sgKj+Up/Ho0PZCGLPgg0JeUJQRWnoOsWibWOj8AVuKvIySF7TEIhzdLB
+PWwpSCzMro5vHW54asKPFQ5SAYsX7wHgw3xlxEzyX9KazvuuK6C5+OC5nLqF4lj7
+c+HD/Tp7xMbENPRdo72OCNH7tEvxBP61L7dx2Ed3ZcHyFBMK5FFSxwF1TaQvHdaC
+tG9VEkJ3XA8TS6xbCia4BjFtUKgYPFobDEW/U9oZEpXoz66ET0PM18fUFGR2DVxh
+0QIDAQAB
+-----END PUBLIC KEY-----"#;
+
+/// #395: GT's post-loop auth parameter checks (iperf_api.c:1843-1913) — a
+/// half-configured auth flag set is a STAMPED parameter error at parse time,
+/// never a silent unauthenticated run. All cells live-probed on 3.21 (banked
+/// on the issue): the two IESETCLIENTAUTH/IESETSERVERAUTH combination checks,
+/// the users-file access probe (IESERVERAUTHUSERS — checked BEFORE the
+/// privkey load), the key-load failure arms (an error line precedes the
+/// parameter error), and the headless-password cell (no IPERF3_PASSWORD, EOF
+/// stdin → getpass fails → IESETCLIENTAUTH before any connect attempt).
+/// Pre-fix riperf3 raised NONE of these: the client connected and a
+/// half-auth server LISTENED and served unauthenticated (the security shape).
+#[test]
+fn auth_param_validations_match_gt() {
+    const CLIENT_MSG: &str = "parameter error - you must specify a username, \
+                              password, and path to a valid RSA public key";
+    const SERVER_MSG: &str = "parameter error - you must specify a path to a \
+                              valid RSA private key and a user credential file";
+    const USERS_MSG: &str = "parameter error - cannot access authorized users file";
+
+    let dir = std::env::temp_dir().join(format!("riperf3-auth-395-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pub_pem = dir.join("pub.pem");
+    let priv_pem = dir.join("priv.pem");
+    let users = dir.join("users.csv");
+    let bogus = dir.join("bogus.pem");
+    let missing = dir.join("nosuch.csv");
+    std::fs::write(&pub_pem, TEST_RSA_PUB).unwrap();
+    std::fs::write(&priv_pem, TEST_RSA_PRIV).unwrap();
+    std::fs::write(&users, "user1,0123456789abcdef\n").unwrap();
+    std::fs::write(&bogus, "not a key\n").unwrap();
+    let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
+
+    // (args, IPERF3_PASSWORD value, wanted parameter-error sentence)
+    let cases: Vec<(Vec<String>, Option<&str>, &str)> = vec![
+        // The two halves of the client pair, each alone.
+        (
+            vec!["-c".into(), "127.0.0.1".into(), "--username".into(), "u".into()],
+            None,
+            CLIENT_MSG,
+        ),
+        (
+            vec!["-c".into(), "127.0.0.1".into(), "--rsa-public-key-path".into(), p(&pub_pem)],
+            None,
+            CLIENT_MSG,
+        ),
+        // The two halves of the server pair, each alone.
+        (
+            vec!["-s".into(), "--rsa-private-key-path".into(), p(&priv_pem)],
+            None,
+            SERVER_MSG,
+        ),
+        (
+            vec!["-s".into(), "--authorized-users-path".into(), p(&users)],
+            None,
+            SERVER_MSG,
+        ),
+        // Users-file access probe fires BEFORE the privkey load (GT order:
+        // fopen at :1890, load_privkey at :1899) — the bogus key must not win.
+        (
+            vec![
+                "-s".into(),
+                "--rsa-private-key-path".into(),
+                p(&bogus),
+                "--authorized-users-path".into(),
+                p(&missing),
+            ],
+            None,
+            USERS_MSG,
+        ),
+        // Key-load failure arms (both halves present, file unparseable).
+        (
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--username".into(),
+                "u".into(),
+                "--rsa-public-key-path".into(),
+                p(&bogus),
+            ],
+            Some("pw"),
+            CLIENT_MSG,
+        ),
+        (
+            vec![
+                "-s".into(),
+                "--rsa-private-key-path".into(),
+                p(&bogus),
+                "--authorized-users-path".into(),
+                p(&users),
+            ],
+            None,
+            SERVER_MSG,
+        ),
+        // Headless password cell: both halves valid, no env, stdin EOF —
+        // GT's getpass fails and the PARSE errors; no connect is attempted.
+        (
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--username".into(),
+                "u".into(),
+                "--rsa-public-key-path".into(),
+                p(&pub_pem),
+            ],
+            None,
+            CLIENT_MSG,
+        ),
+    ];
+    for (args, pw_env, want) in &cases {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"));
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .env_remove("IPERF3_PASSWORD")
+            .env_remove("RIPERF3_PASSWORD");
+        if let Some(pw) = pw_env {
+            cmd.env("IPERF3_PASSWORD", pw);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: exit 1: {stderr:?}");
+        assert!(stderr.contains(want), "{args:?}: wanted {want:?}: {stderr:?}");
+        assert!(
+            stderr.contains("Usage: riperf3 [-s|-c host] [options]"),
+            "{args:?}: the usage trailer rides the parameter error: {stderr:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?}: no banner, no doc — the check fires before any run \
+             (the security half: a half-auth server must never listen): {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            !stderr.contains("unable to connect"),
+            "{args:?}: parse-time, before any connect attempt: {stderr:?}"
+        );
+    }
+}
+
+/// #395 control: VALID auth combinations still pass the parse — the client
+/// proceeds to its (dead-port) connect error, the server reaches its
+/// listening banner. Guards the checks against over-firing.
+#[test]
+fn auth_param_valid_combos_pass_parse() {
+    let dir = std::env::temp_dir().join(format!("riperf3-auth-395-ok-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pub_pem = dir.join("pub.pem");
+    let priv_pem = dir.join("priv.pem");
+    let users = dir.join("users.csv");
+    std::fs::write(&pub_pem, TEST_RSA_PUB).unwrap();
+    std::fs::write(&priv_pem, TEST_RSA_PRIV).unwrap();
+    std::fs::write(&users, "user1,0123456789abcdef\n").unwrap();
+
+    // Client: parse passes, the run fails LATER at connect (dead port 1).
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args([
+            "-c",
+            "127.0.0.1",
+            "-p",
+            "1",
+            "--username",
+            "u",
+            "--rsa-public-key-path",
+            pub_pem.to_str().unwrap(),
+        ])
+        .env("IPERF3_PASSWORD", "pw")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("parameter error"),
+        "valid client auth trio passes the parse: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("unable to connect"),
+        "the run proceeded to the connect attempt: {stderr:?}"
+    );
+
+    // Server: parse passes, the banner prints. Bounded spawn + kill; the
+    // banner is well under FreeBSD's 8KiB single-write pipe bound, so
+    // wait-then-read is safe here (#305 rule).
+    let port = common::free_port().to_string();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+        .args([
+            "-s",
+            "-p",
+            &port,
+            "--rsa-private-key-path",
+            priv_pem.to_str().unwrap(),
+            "--authorized-users-path",
+            users.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("parameter error"),
+        "valid server auth pair passes the parse: {stderr:?}"
+    );
+    assert!(
+        stdout.contains("Server listening"),
+        "the fully-configured auth server reaches its banner: {stdout:?}"
+    );
+}

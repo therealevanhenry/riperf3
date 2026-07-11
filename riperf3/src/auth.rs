@@ -9,6 +9,54 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Result, RiperfError};
 
+/// Parse an RSA public key PEM the way OpenSSL's `PEM_read_PUBKEY` family
+/// does: SPKI (`BEGIN PUBLIC KEY`) first, PKCS#1 (`BEGIN RSA PUBLIC KEY`) as
+/// the fallback. GT accepts both via OpenSSL; parsing only SPKI silently
+/// rejected PKCS#1 keys that work on iperf3 (#395).
+pub(crate) fn parse_public_key_pem(pem: &[u8]) -> Result<RsaPublicKey> {
+    let text = std::str::from_utf8(pem)
+        .map_err(|e| RiperfError::Protocol(format!("invalid PEM encoding: {e}")))?;
+    RsaPublicKey::from_public_key_pem(text)
+        .or_else(|_| {
+            use rsa::pkcs1::DecodeRsaPublicKey;
+            RsaPublicKey::from_pkcs1_pem(text)
+        })
+        .map_err(|e| RiperfError::Protocol(format!("invalid RSA public key: {e}")))
+}
+
+/// Parse an RSA private key PEM like OpenSSL's `PEM_read_PrivateKey`:
+/// PKCS#8 (`BEGIN PRIVATE KEY`) first, PKCS#1 (`BEGIN RSA PRIVATE KEY`) as
+/// the fallback (#395, same tolerance rationale as [`parse_public_key_pem`]).
+pub(crate) fn parse_private_key_pem(pem: &[u8]) -> Result<RsaPrivateKey> {
+    let text = std::str::from_utf8(pem)
+        .map_err(|e| RiperfError::Protocol(format!("invalid PEM encoding: {e}")))?;
+    RsaPrivateKey::from_pkcs8_pem(text)
+        .or_else(|_| {
+            use rsa::pkcs1::DecodeRsaPrivateKey;
+            RsaPrivateKey::from_pkcs1_pem(text)
+        })
+        .map_err(|e| RiperfError::Protocol(format!("invalid RSA private key: {e}")))
+}
+
+/// Validate that `path` reads and parses as an RSA PUBLIC key (`--username`
+/// auth, client side). iperf3 loads the key at PARSE time and stamps
+/// IESETCLIENTAUTH when it doesn't load (iperf_api.c:1854); the returned
+/// error's text supplies the pre-error line's payload (#395).
+pub fn validate_public_key_file(path: &std::path::Path) -> Result<()> {
+    let pem = std::fs::read(path)
+        .map_err(|e| RiperfError::Protocol(format!("cannot read RSA public key file: {e}")))?;
+    parse_public_key_pem(&pem).map(|_| ())
+}
+
+/// Validate that `path` reads and parses as an RSA PRIVATE key (server-side
+/// auth). iperf3 loads it at PARSE time and stamps IESETSERVERAUTH on
+/// failure (iperf_api.c:1899) (#395).
+pub fn validate_private_key_file(path: &std::path::Path) -> Result<()> {
+    let pem = std::fs::read(path)
+        .map_err(|e| RiperfError::Protocol(format!("cannot read RSA private key file: {e}")))?;
+    parse_private_key_pem(&pem).map(|_| ())
+}
+
 /// Encode an auth token: encrypt `user: {u}\npwd:  {p}\nts:   {ts}` with the
 /// server's RSA public key, then base64-encode the ciphertext.
 pub fn encode_auth_token(
@@ -17,11 +65,7 @@ pub fn encode_auth_token(
     pubkey_pem: &[u8],
     use_pkcs1: bool,
 ) -> Result<String> {
-    let pubkey = RsaPublicKey::from_public_key_pem(
-        std::str::from_utf8(pubkey_pem)
-            .map_err(|e| RiperfError::Protocol(format!("invalid PEM encoding: {e}")))?,
-    )
-    .map_err(|e| RiperfError::Protocol(format!("invalid RSA public key: {e}")))?;
+    let pubkey = parse_public_key_pem(pubkey_pem)?;
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -54,11 +98,7 @@ pub fn decode_auth_token(
     privkey_pem: &[u8],
     use_pkcs1: bool,
 ) -> Result<(String, String, i64)> {
-    let privkey = RsaPrivateKey::from_pkcs8_pem(
-        std::str::from_utf8(privkey_pem)
-            .map_err(|e| RiperfError::Protocol(format!("invalid PEM encoding: {e}")))?,
-    )
-    .map_err(|e| RiperfError::Protocol(format!("invalid RSA private key: {e}")))?;
+    let privkey = parse_private_key_pem(privkey_pem)?;
 
     let ciphertext = base64::engine::general_purpose::STANDARD
         .decode(token)
@@ -169,11 +209,25 @@ pub fn read_password() -> Result<String> {
         return Ok(pw);
     }
 
-    // Interactive prompt with echo disabled — safe, cross-platform.
-    // #290 (r1 finding 2): a quiet run suppresses the PROMPT (the stderr
-    // write); the stdin read itself is the pre-existing interactive wart.
+    // GT's iperf_getpass (iperf_auth.c:442) runs tcgetattr BEFORE anything
+    // else, so a NON-TTY stdin fails the whole read — no prompt, no line
+    // consumed, even a piped password is refused (#395; live-probed: GT
+    // headless with no env is IESETCLIENTAUTH, silently). Mirror that gate.
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return Err(RiperfError::Protocol(
+            "password read failed: stdin is not a terminal".to_string(),
+        ));
+    }
+
+    // Interactive prompt with echo disabled — safe, cross-platform. GT's
+    // prompt goes to STDOUT (iperf_auth.c:455 printf) (#395).
+    // #290 (r1 finding 2): a quiet run suppresses the PROMPT; the stdin
+    // read itself is the pre-existing interactive wart.
     if !crate::macros::output_quiet() {
-        eprint!("Password: ");
+        use std::io::Write as _;
+        print!("Password: ");
+        let _ = std::io::stdout().flush();
     }
     rpassword::read_password()
         .map_err(|e| RiperfError::Protocol(format!("password read failed: {e}")))

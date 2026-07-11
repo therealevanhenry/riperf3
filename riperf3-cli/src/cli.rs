@@ -563,7 +563,10 @@ impl Cli {
     /// mapping rather than a hand-maintained copy. Process-level concerns
     /// (daemonize, pidfile, logfile, CPU affinity) stay in `main`; this is pure
     /// arg → builder → `build()`.
-    pub fn build_client(&self) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
+    pub fn build_client(
+        &self,
+        auth_password: Option<&str>,
+    ) -> std::result::Result<riperf3::Client, Box<dyn std::error::Error>> {
         let host = self
             .client
             .as_deref()
@@ -824,6 +827,12 @@ impl Cli {
         }
         if let Some(ref name) = self.username {
             builder = builder.username(name);
+        }
+        // #395: the password is resolved at PARSE time (GT's getpass slot in
+        // the argument post-loop) and handed in here, so the lib's own
+        // runtime prompt fallback never fires from the CLI path.
+        if let Some(pw) = auth_password {
+            builder = builder.password(pw);
         }
         if let Some(ref path) = self.rsa_public_key_path {
             builder = builder.rsa_public_key_path(path);
@@ -1716,7 +1725,7 @@ mod cli_tests {
         /// path as `main`, instead of a hand-maintained copy that can drift (the
         /// blind spot the `-J` bug exploited). See #124.
         fn build_client_from_cli(cli: &Cli) -> riperf3::Client {
-            cli.build_client().unwrap()
+            cli.build_client(None).unwrap()
         }
 
         /// Server counterpart of [`build_client_from_cli`] — exercises the real
@@ -1958,7 +1967,7 @@ mod cli_tests {
         #[test]
         fn tos_flag_rejects_out_of_range() {
             let cli = Cli::parse_from(["riperf3", "-c", "host", "-S", "256"]);
-            let err = cli.build_client().unwrap_err().to_string();
+            let err = cli.build_client(None).unwrap_err().to_string();
             assert!(err.contains("bad TOS value"), "got: {err}");
         }
 
@@ -2259,7 +2268,7 @@ mod cli_tests {
         #[test]
         fn bind_dev_rejected_on_unsupported_platforms() {
             let cli = Cli::parse_from(["riperf3", "-c", "h", "--bind-dev", "eth0"]);
-            let err = cli.build_client().unwrap_err().to_string();
+            let err = cli.build_client(None).unwrap_err().to_string();
             assert!(err.contains("--bind-dev"), "got: {err}");
         }
 
@@ -2565,7 +2574,7 @@ mod cli_tests {
             ] {
                 let cli = Cli::parse_from(args);
                 let err = cli
-                    .build_client()
+                    .build_client(None)
                     .expect_err("conflicting end conditions must be rejected")
                     .to_string();
                 assert!(
@@ -2592,7 +2601,7 @@ mod cli_tests {
             ] {
                 let cli = Cli::parse_from(args);
                 assert!(
-                    cli.build_client().is_ok(),
+                    cli.build_client(None).is_ok(),
                     "iperf3 accepts {args:?}; riperf3 must not reject it"
                 );
             }
