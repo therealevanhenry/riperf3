@@ -56,6 +56,10 @@ release tags.
 - `--cport` binds `port + i` per stream like iperf3 (`-P 2` no longer dies on a source-port
   collision; 65536 wraps to ephemeral), UDP honors `--cport` at all (was silently ephemeral),
   and a failed data-stream dial reports iperf3's `unable to connect stream: …` class (#428).
+- A setup-phase kill (failed data accept, idle timeout, …) now parks the round in iperf3's
+  sync-close drain until the peer consumes the error relay — a one-off server no longer
+  closes its listener at the kill instant, which RST'd a real iperf3 client's queued data
+  socket before it could read the SERVER ERROR frame (#390).
 - `--server-bitrate-limit` breaches on iperf3's moving average — the last `rate/N` seconds
   (default 5) of one-second samples, evaluated only once the window fills — instead of a
   whole-test average at 1 Hz (breach at ~5 s like iperf3, not ~1 s; bursts age out; a quiet
