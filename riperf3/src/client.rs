@@ -3315,10 +3315,12 @@ impl ClientBuilder {
     /// `--cport`: the local source port for the DATA streams — stream `i`
     /// binds `port + i` over creation order like iperf3
     /// (iperf_client_api.c:113-124; bidir's receive half follows the send
-    /// half, so a `-P n --bidir` run spans `port..port+2n`). Wraps at
-    /// 65536 to an ephemeral port (iperf3's htons truncation), and 0 is
-    /// iperf3's unset sentinel: no stream binds a fixed port (#428). The
-    /// CONTROL connection is always ephemeral, both tools.
+    /// half, so a `-P n --bidir` run spans `port..port+2n`). Wraps at the
+    /// 16-bit boundary like iperf3's htons truncation — exactly 65536
+    /// lands ephemeral, deeper wraps bind explicit low (typically
+    /// privileged) ports — and 0 is iperf3's unset sentinel: no stream
+    /// binds a fixed port (#428). The CONTROL connection is always
+    /// ephemeral, both tools.
     pub fn cport(mut self, port: u16) -> Self {
         self.cport = Some(port);
         self
