@@ -5679,6 +5679,56 @@ fn setup_data_accept_emfile_wires_iestreamconnect_with_live_errno() {
     );
 }
 
+/// #390: after a setup-kill wire-back, the round parks in GT's sync-close
+/// drain until the peer consumes/EOFs the ctrl — cleanup_server runs
+/// iperf_sync_close_socket on EVERY round exit (iperf_server_api.c:519;
+/// net.c:877-887), which is what holds a GT one-off's LISTENER open long
+/// enough for a real client's queued data socket to survive
+/// iperf_init_stream and read the fe relay (live-proven 4/4 on #387 r2).
+/// Pre-fix the one-off exit dropped ctrl+listener at the kill instant.
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_kill_one_off_parks_until_peer_eof() {
+    let _serial = EMFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let ps = port.to_string();
+    let mut server = common::ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &ps])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn server"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = server.0.id();
+
+    let mut ctrl = std::net::TcpStream::connect(("127.0.0.1", port)).expect("ctrl");
+    ctrl.write_all(&[b'x'; 37]).unwrap();
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 9, "ParamExchange");
+    write_json_blob(&mut ctrl, INCOMPLETE_PARAMS);
+    assert_eq!(read_exact(&mut ctrl, 1)[0], 10, "CreateStreams");
+    clamp_fd_table(pid);
+    let _data = std::net::TcpStream::connect(("127.0.0.1", port)).expect("data connect");
+    let frame = read_wireback(&mut ctrl);
+    assert_eq!(frame[0], 0xfe, "the setup-kill wire-back arrived");
+
+    // HOLD the ctrl open: the server must PARK (GT's drain), not exit.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        server.0.try_wait().expect("try_wait").is_none(),
+        "the one-off parks in the sync-close drain while the peer holds ctrl (#390)"
+    );
+
+    drop(ctrl); // peer EOF → the drain ends and the one-off exits
+    let status =
+        riperf3_test_support::wait_bounded(&mut server.0, std::time::Duration::from_secs(5))
+            .expect("one-off exits after the peer EOF");
+    assert!(status.success(), "exit 0, the keep-serving class");
+}
+
 /// #383 r2 F1: the demux design's idle exemption — the both-designs
 /// convention every other #358 cell follows.
 #[test]
