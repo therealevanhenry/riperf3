@@ -1830,3 +1830,76 @@ fn auth_param_valid_combos_pass_parse() {
         "the fully-configured auth server reaches its banner: {stdout:?}"
     );
 }
+
+/// #428: a data-stream dial failure is GT's IESTREAMCONNECT — "unable to
+/// connect stream: " + the errno text (stamped at both netdial sites,
+/// iperf_tcp.c:404 / iperf_udp.c:670-672), exit 1, same string in the -J
+/// error key (live-probed: a held port inside the `--cport + i` range →
+/// "unable to connect stream: Address already in use"). Pre-fix riperf3
+/// leaked the raw bind wrapper ("protocol violation: failed to bind local
+/// address …"). Prefix-only asserts: the errno rendering is
+/// platform-varied and the `(os error N)` suffix is the recorded
+/// deviation.
+#[test]
+fn stream_connect_failure_renders_gt_class() {
+    for json in [false, true] {
+        let sport = common::free_port().to_string();
+        let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
+            .args(["-s", "-1", "-p", &sport])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Hold cport+1 so stream 2's bind collides deterministically.
+        let base = common::free_port();
+        let _holder = loop {
+            match std::net::TcpListener::bind(("0.0.0.0", base + 1)) {
+                Ok(l) => break l,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        };
+        let cport = base.to_string();
+        let mut args = vec![
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &sport,
+            "--cport",
+            &cport,
+            "-P",
+            "2",
+            "-t",
+            "1",
+        ];
+        if json {
+            args.push("-J");
+        }
+        let run = common::run_client(&args, std::time::Duration::from_secs(15), "collide client");
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "IESTREAMCONNECT exits 1 like GT (json={json}): {err}",
+            err = run.stderr
+        );
+        if json {
+            let doc: serde_json::Value = serde_json::from_str(run.stdout.trim())
+                .unwrap_or_else(|e| panic!("one -J doc ({e}): {out}", out = run.stdout));
+            let msg = doc["error"].as_str().expect("error key");
+            assert!(
+                msg.starts_with("unable to connect stream: "),
+                "GT's IESTREAMCONNECT prefix in -J (#428): {doc}"
+            );
+        } else {
+            assert!(
+                run.stderr
+                    .contains("riperf3: error - unable to connect stream: "),
+                "GT's IESTREAMCONNECT text line (#428): {err}",
+                err = run.stderr
+            );
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+}

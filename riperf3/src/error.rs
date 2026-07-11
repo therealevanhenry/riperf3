@@ -165,12 +165,17 @@ pub enum RiperfError {
     #[error("unable to accept connection from client: {0}")]
     AcceptFailed(std::io::Error),
 
-    /// iperf3's IESTREAMCONNECT(203): the SETUP data-stream accept()
-    /// failed (iperf_tcp.c:134-135) — GT's cleanup_server round-kill with
-    /// the fe+203+LIVE-errno wire-back and the populated setup doc (#362,
-    /// the PR #384 r2 F4 cell). The site-captured errno rides text and
-    /// wire (GT's TEXT surface prints the clobbered post-cleanup errno
-    /// but WIRES the live one — #387 r1 F2/F6).
+    /// iperf3's IESTREAMCONNECT(203), BOTH sides of the data plane. Server:
+    /// the SETUP data-stream accept() failed (iperf_tcp.c:134-135) — GT's
+    /// cleanup_server round-kill with the fe+203+LIVE-errno wire-back and
+    /// the populated setup doc (#362, the PR #384 r2 F4 cell). The
+    /// site-captured errno rides text and wire (GT's TEXT surface prints
+    /// the clobbered post-cleanup errno but WIRES the live one — #387 r1
+    /// F2/F6). Client (#428): a data-stream DIAL failed — GT stamps the
+    /// same class for the whole netdial (bind + connect alike,
+    /// iperf_tcp.c:404 / iperf_udp.c:670-672); a local-bind failure carries
+    /// riperf3's bind-context message (recorded extra context vs GT's bare
+    /// strerror). The CONTROL connect is the separate IECONNECT class.
     #[error("unable to connect stream: {0}")]
     StreamConnectFailed(std::io::Error),
 

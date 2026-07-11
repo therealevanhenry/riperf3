@@ -95,6 +95,26 @@ pub struct Client {
 /// subtract for the post-omit summary (#31) — this also reads a real iperf3
 /// server's omit results correctly. `is_udp` gates the datagram columns so a
 /// TCP pair line stays a plain byte line.
+/// #428: fold a DATA-stream dial failure into GT's `IESTREAMCONNECT`
+/// class — GT stamps it for the whole netdial (bind + connect alike,
+/// iperf_tcp.c:404 / iperf_udp.c:670-672), the same class the server side
+/// stamps on a setup accept() failure (the shared variant). The io
+/// rendering keeps the recorded `(os error N)` suffix; a local-bind
+/// failure keeps riperf3's bind-context message (recorded extra context vs
+/// GT's bare strerror); the timeout rendering matches the control-connect
+/// fold's recorded text.
+fn stream_dial_error(e: RiperfError) -> RiperfError {
+    let io = match e {
+        RiperfError::Io(io) => io,
+        RiperfError::ConnectionTimeout => {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out")
+        }
+        RiperfError::Protocol(msg) => std::io::Error::other(msg),
+        other => std::io::Error::other(other.to_string()),
+    };
+    RiperfError::StreamConnectFailed(io)
+}
+
 /// This host's own omitted count for a stream (#271): omitted SENT
 /// datagrams on sending streams, omitted RECEIVED datagrams on receiving
 /// ones — the local estimate the old-peer resolution nets with. 0 without
@@ -1367,17 +1387,24 @@ impl Client {
         match self.protocol {
             TransportProtocol::Tcp => {
                 for i in 0..total {
+                    // #428: GT binds `cport + i` per stream over creation
+                    // order (iperf_create_streams, iperf_client_api.c:113-124
+                    // — the bidir receive half's `+ num_streams` collapses
+                    // into the flat index because senders are created first,
+                    // both tools). wrapping_add mirrors GT's htons truncation
+                    // at 65536 → 0 = ephemeral (live-probed).
                     let mut data_stream = net::tcp_connect(
                         &self.host,
                         self.port,
                         self.connect_timeout,
-                        self.cport,
+                        self.cport.map(|p| p.wrapping_add(i as u16)),
                         self.bind_address.as_deref(),
                         self.bind_dev.as_deref(),
                         self.mptcp,
                         self.ip_version,
                     )
-                    .await?;
+                    .await
+                    .map_err(stream_dial_error)?;
                     protocol::send_cookie(&mut data_stream, cookie).await?;
                     net::configure_tcp_stream_full(
                         &data_stream,
@@ -1538,11 +1565,23 @@ impl Client {
                 // (iperf_udp.c:459-515), and the report echoes POST-probe.
                 let (mut gso_on, mut gro_on) = (self.gsro, self.gsro);
                 for i in 0..total {
-                    let udp_sock = net::udp_bind(bind_ip.as_deref(), 0, remote.is_ipv6()).await?;
+                    // #428: GT binds `cport + i` here too (netdial gets
+                    // test->bind_port, iperf_udp.c:670) — pre-fix riperf3
+                    // passed a literal 0 and --cport was a UDP no-op. The
+                    // whole dial (bind/dev/connect) folds into GT's
+                    // IESTREAMCONNECT like netdial's.
+                    let cport = self.cport.map_or(0, |p| p.wrapping_add(i as u16));
+                    let udp_sock = net::udp_bind(bind_ip.as_deref(), cport, remote.is_ipv6())
+                        .await
+                        .map_err(stream_dial_error)?;
                     if let Some(ref dev) = self.bind_dev {
-                        net::set_bind_dev(&udp_sock, dev, remote.is_ipv6())?;
+                        net::set_bind_dev(&udp_sock, dev, remote.is_ipv6())
+                            .map_err(stream_dial_error)?;
                     }
-                    udp_sock.connect(remote).await?;
+                    udp_sock
+                        .connect(remote)
+                        .await
+                        .map_err(|e| stream_dial_error(RiperfError::Io(e)))?;
                     protocol::udp_connect_client(&udp_sock).await?;
                     // #302: GT paces its UDP connect path too
                     // (iperf_udp.c:704-718); fq-qdisc dependent, warn-only.
