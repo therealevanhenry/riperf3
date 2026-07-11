@@ -1464,6 +1464,8 @@ fn auth_param_validations_match_gt() {
     const SERVER_MSG: &str = "parameter error - you must specify a path to a \
                               valid RSA private key and a user credential file";
     const USERS_MSG: &str = "parameter error - cannot access authorized users file";
+    const SERVER_ONLY_MSG: &str =
+        "parameter error - some option you are trying to set is server only";
 
     let dir = std::env::temp_dir().join(format!("riperf3-auth-395-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1500,6 +1502,40 @@ fn auth_param_validations_match_gt() {
             ],
             None,
             CLIENT_MSG,
+        ),
+        // #395 r1 F2: `--authorized-users-path` never sets GT's server_flag
+        // (iperf_api.c:1757-1759), so on a client it survives the in-loop
+        // role check and is caught only at the POST-LOOP :1874 leg — AFTER
+        // the client-auth checks. Live-probed: this combined cell is
+        // IESETCLIENTAUTH on GT, not "server only".
+        (
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--username".into(),
+                "u".into(),
+                "--authorized-users-path".into(),
+                p(&users),
+            ],
+            None,
+            CLIENT_MSG,
+        ),
+        // ...and the full client trio + users-path resolves the password
+        // FIRST (env consumed), THEN GT's :1874 leg rejects — the late leg
+        // survives a fully valid client-auth config. Live-probed.
+        (
+            vec![
+                "-c".into(),
+                "127.0.0.1".into(),
+                "--username".into(),
+                "u".into(),
+                "--rsa-public-key-path".into(),
+                p(&pub_pem),
+                "--authorized-users-path".into(),
+                p(&users),
+            ],
+            Some("pw"),
+            SERVER_ONLY_MSG,
         ),
         // The two halves of the server pair, each alone.
         (
@@ -1620,6 +1656,79 @@ fn auth_param_validations_match_gt() {
     }
 }
 
+/// #395 r1 F6: the key-load failure shape — GT prints the loader's error
+/// line via iperf_err, then a BLANK line, then the parameter error (GT's
+/// line is raw OpenSSL internals; the CONTENT here is riperf3's own, a
+/// recorded deviation — but the three-part shape and the plain-diagnostic
+/// prefix are pinned). r1 F7: the pre-line must NOT carry the lib's
+/// "protocol violation:" Display wrapper — it is a file diagnostic, not a
+/// wire-protocol event.
+#[test]
+fn auth_key_load_failure_prints_pre_line_shape() {
+    let dir = std::env::temp_dir().join(format!("riperf3-auth-395-pre-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let users = dir.join("users.csv");
+    let bogus = dir.join("bogus.pem");
+    std::fs::write(&users, "user1,0123456789abcdef\n").unwrap();
+    std::fs::write(&bogus, "not a key\n").unwrap();
+
+    // (args, env password, expected pre-line prefix, expected param sentence)
+    let cells: [(&[&str], Option<&str>, &str, &str); 2] = [
+        (
+            &[
+                "-c",
+                "127.0.0.1",
+                "--username",
+                "u",
+                "--rsa-public-key-path",
+                bogus.to_str().unwrap(),
+            ],
+            Some("pw"),
+            "riperf3: invalid RSA public key: ",
+            "you must specify a username, password, and path to a valid RSA public key",
+        ),
+        (
+            &[
+                "-s",
+                "--rsa-private-key-path",
+                bogus.to_str().unwrap(),
+                "--authorized-users-path",
+                users.to_str().unwrap(),
+            ],
+            None,
+            "riperf3: invalid RSA private key: ",
+            "you must specify a path to a valid RSA private key and a user credential file",
+        ),
+    ];
+    for (args, pw_env, pre_prefix, sentence) in cells {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"));
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .env_remove("IPERF3_PASSWORD")
+            .env_remove("RIPERF3_PASSWORD");
+        if let Some(pw) = pw_env {
+            cmd.env("IPERF3_PASSWORD", pw);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with(pre_prefix),
+            "{args:?}: pre-line leads with the plain diagnostic (no lib \
+             Display wrapper): {stderr:?}"
+        );
+        let (pre_line, rest) = stderr.split_once('\n').expect("pre-line ends");
+        assert!(
+            !pre_line.contains("protocol violation"),
+            "{args:?}: no 'protocol violation:' wrapper on a file diagnostic: {pre_line:?}"
+        );
+        assert!(
+            rest.starts_with(&format!("\nriperf3: parameter error - {sentence}")),
+            "{args:?}: a BLANK line separates the pre-line from the parameter \
+             error, GT's iperf_err shape: {stderr:?}"
+        );
+    }
+}
+
 /// #395 control: VALID auth combinations still pass the parse — the client
 /// proceeds to its (dead-port) connect error, the server reaches its
 /// listening banner. Guards the checks against over-firing.
@@ -1662,13 +1771,16 @@ fn auth_param_valid_combos_pass_parse() {
 
     // Server: parse passes, the banner prints. Bounded spawn + kill; the
     // banner is well under FreeBSD's 8KiB single-write pipe bound, so
-    // wait-then-read is safe here (#305 rule).
-    let port = common::free_port().to_string();
+    // wait-then-read is safe here (#305 rule). r1 F4: poll the LISTEN
+    // instead of a fixed sleep — a loaded 2-core runner can outlast any
+    // constant.
+    let port = common::free_port();
+    let port_s = port.to_string();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"))
         .args([
             "-s",
             "-p",
-            &port,
+            &port_s,
             "--rsa-private-key-path",
             priv_pem.to_str().unwrap(),
             "--authorized-users-path",
@@ -1679,7 +1791,13 @@ fn auth_param_valid_combos_pass_parse() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+        && std::time::Instant::now() < deadline
+        && child.try_wait().unwrap().is_none()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let _ = child.kill();
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);

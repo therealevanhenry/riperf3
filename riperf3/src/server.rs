@@ -781,8 +781,9 @@ impl Server {
                     // emitted at the auth site, where params is in scope;
                     // only the text line prints here. #395: GT's runtime
                     // auth deny never stamps i_errno, so the line renders
-                    // iperf_strerror(0) — verbatim "no error" — not the
-                    // lib error's Display.
+                    // iperf_strerror(0) — "no error" — not the lib error's
+                    // Display. (Fresh-process string; the stale-i_errno
+                    // multi-round wrinkle is recorded at the auth gate.)
                     if !json && !crate::macros::output_quiet() {
                         eprintln!(
                             "{}riperf3: error - no error",
@@ -1034,9 +1035,15 @@ impl Server {
             // #395: EVERY runtime auth failure (tokenless, undecodable
             // token, failed credential check) shares GT's deny surface —
             // test_is_authorized returns -1 WITHOUT stamping i_errno
-            // (iperf_api.c:2313-2343), so the rendered string is verbatim
-            // iperf_strerror(0), "no error". The underlying error never
-            // reaches a surface; the lib normalizes to `AccessDenied`.
+            // (iperf_api.c:2313-2343), so a fresh GT process renders
+            // iperf_strerror(0), "no error". RECORDED DEVIATION (r1 F1):
+            // GT never RESETS the global i_errno between rounds, so a
+            // multi-round GT server whose EARLIER round stamped an errno
+            // renders that stale string on a later deny (live-probed:
+            // cookie-EOF round, then deny → "unable to receive cookie"
+            // twice); riperf3 always prints the fixed fresh-process
+            // string. The underlying error never reaches a surface; the
+            // lib normalizes to `AccessDenied`.
             self.emit_pretest_error_doc("error - no error", params.bandwidth.filter(|&b| b > 0));
             return Err(RiperfError::AccessDenied);
         }

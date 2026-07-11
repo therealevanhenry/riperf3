@@ -250,6 +250,37 @@ mod tests {
 
     const TEST_PUBKEY: &[u8] = include_bytes!("../tests/fixtures/test_public.pem");
     const TEST_PRIVKEY: &[u8] = include_bytes!("../tests/fixtures/test_private.pem");
+    // #395 r1 F3: PKCS#1-FORMAT PEMs ("BEGIN RSA PRIVATE/PUBLIC KEY") — the
+    // OpenSSL-tolerance fallback in the parse helpers. Distinct from the
+    // PKCS#1-PADDING tests below (OAEP vs v1.5 on the same PKCS#8 keys).
+    const TEST_PUBKEY_PKCS1: &[u8] = include_bytes!("../tests/fixtures/test_public_pkcs1.pem");
+    const TEST_PRIVKEY_PKCS1: &[u8] = include_bytes!("../tests/fixtures/test_private_pkcs1.pem");
+
+    #[test]
+    fn pkcs1_format_pems_parse_via_the_fallback() {
+        parse_public_key_pem(TEST_PUBKEY_PKCS1).expect("PKCS#1 public PEM parses");
+        parse_private_key_pem(TEST_PRIVKEY_PKCS1).expect("PKCS#1 private PEM parses");
+    }
+
+    #[test]
+    fn pkcs1_format_pems_round_trip_a_token() {
+        let token = encode_auth_token("mario", "rossi", TEST_PUBKEY_PKCS1, false).unwrap();
+        let (user, pass, _ts) = decode_auth_token(&token, TEST_PRIVKEY_PKCS1, false).unwrap();
+        assert_eq!(user, "mario");
+        assert_eq!(pass, "rossi");
+    }
+
+    #[test]
+    fn pkcs1_format_pems_pass_file_validation() {
+        let dir = std::env::temp_dir().join(format!("riperf3-auth-pkcs1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pub_p = dir.join("pub1.pem");
+        let priv_p = dir.join("priv1.pem");
+        std::fs::write(&pub_p, TEST_PUBKEY_PKCS1).unwrap();
+        std::fs::write(&priv_p, TEST_PRIVKEY_PKCS1).unwrap();
+        validate_public_key_file(&pub_p).expect("PKCS#1 public key file validates");
+        validate_private_key_file(&priv_p).expect("PKCS#1 private key file validates");
+    }
 
     #[test]
     fn encode_decode_round_trip_oaep() {

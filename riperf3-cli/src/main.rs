@@ -522,6 +522,18 @@ impl ParseRejection {
     }
 }
 
+/// #395 r1 F7: the pre-line is a parse-time FILE diagnostic — strip the
+/// lib's `protocol violation: ` Display wrapper so it reads
+/// `riperf3: invalid RSA private key: …`, not a wire-protocol event. (GT
+/// prints raw OpenSSL internals here; the content is riperf3's own, a
+/// recorded deviation.)
+fn plain_diagnostic(e: riperf3::RiperfError) -> String {
+    match e {
+        riperf3::RiperfError::Protocol(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
 /// GT's IESETCLIENTAUTH sentence (iperf_error.c:214) — the string names the
 /// password even though the flag check is only username⊕pubkey; the password
 /// is resolved separately (env else prompt) in the same slot (#395).
@@ -567,7 +579,7 @@ fn parse_class_rejection(cli: &Cli) -> Result<Option<String>, ParseRejection> {
                 }
                 if let Err(e) = riperf3::validate_private_key_file(std::path::Path::new(key)) {
                     return Err(ParseRejection {
-                        pre_line: Some(e.to_string()),
+                        pre_line: Some(plain_diagnostic(e)),
                         msg: SERVER_AUTH_MSG.into(),
                     });
                 }
@@ -587,16 +599,17 @@ fn parse_class_rejection(cli: &Cli) -> Result<Option<String>, ParseRejection> {
         // #395: GT's client auth-pair check, parse-time public-key load, and
         // password resolution (env else interactive getpass) — all in the
         // post-loop (iperf_api.c:1846-1872), AFTER the generic role checks
-        // (`--rsa-private-key-path` on a client is IESERVERONLY, not
-        // IESETCLIENTAUTH — live-probed) and BEFORE the rcv-timeout leg
-        // (:1880; live-probed: `--username`-only + `--rcv-timeout` reports
-        // the auth sentence). A headless run with no `IPERF3_PASSWORD` fails
-        // HERE, before any connect attempt.
+        // for the `server_flag` set (`--rsa-private-key-path` on a client is
+        // IESERVERONLY via the in-loop flag, not IESETCLIENTAUTH —
+        // live-probed) and BEFORE the rcv-timeout leg (:1880; live-probed:
+        // `--username`-only + `--rcv-timeout` reports the auth sentence). A
+        // headless run with no `IPERF3_PASSWORD` fails HERE, before any
+        // connect attempt.
         match (cli.username.as_deref(), cli.rsa_public_key_path.as_deref()) {
             (Some(_), Some(path)) => {
                 if let Err(e) = riperf3::validate_public_key_file(std::path::Path::new(path)) {
                     return Err(ParseRejection {
-                        pre_line: Some(e.to_string()),
+                        pre_line: Some(plain_diagnostic(e)),
                         msg: CLIENT_AUTH_MSG.into(),
                     });
                 }
@@ -608,6 +621,19 @@ fn parse_class_rejection(cli: &Cli) -> Result<Option<String>, ParseRejection> {
             (None, None) => {}
             // Exactly one half of the pair — GT's IESETCLIENTAUTH (#395).
             _ => return Err(ParseRejection::new(CLIENT_AUTH_MSG)),
+        }
+        // #395 r1 F2: `--authorized-users-path` never sets GT's server_flag
+        // (iperf_api.c:1757-1759), so on a client it survives the generic
+        // in-loop role check and is caught only at the post-loop :1874 leg —
+        // AFTER the client-auth legs above (live-probed: `-c --username u
+        // --authorized-users-path f` is IESETCLIENTAUTH, and the full client
+        // trio resolves the password before this rejects) and BEFORE the
+        // rcv-timeout leg (:1879).
+        if cli.authorized_users_path.is_some() {
+            return Err(ParseRejection::new(
+                "some option you are trying to set is server only: \
+                 --authorized-users-path cannot be used with -c/--client",
+            ));
         }
         // #328: GT's IERVRSONLYRCVTIMEOUT (iperf_api.c:1880-1882) — a
         // sending-mode client (neither -R nor --bidir) rejects
