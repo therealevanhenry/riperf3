@@ -2004,9 +2004,11 @@ mod unimplemented_flags {
         let start = std::time::Instant::now();
         let result = client.run().await;
         let elapsed = start.elapsed();
-        // Should terminate well before 10 seconds
+        // Terminates before the 10 s duration — at ~5 s, GT's 5-sample
+        // moving-average gate (#410; the precise timing window is pinned in
+        // server_run_once_self_terminates_on_runtime_bitrate_breach).
         assert!(
-            elapsed.as_secs() < 5,
+            elapsed.as_secs() < 8,
             "bitrate limit didn't cut test: {elapsed:?}"
         );
         // #224 ground truth (iperf 3.21): SERVER_ERROR + IETOTALRATE, the
