@@ -2935,10 +2935,14 @@ async fn run_round_actuals(
 /// clamp floor", asserted directly. Cross-run EQUALITY with an unset cell
 /// (the #391 pattern, as first merged) proved flaky on macOS, whose TCP
 /// receive-buffer autosizing lands run-dependently (observed rcvbuf_actual
-/// 881928 vs 1045248 for identical settings, CI run 29135962755).
-/// `sock_bufsize` is riperf3's own rendering, not a kernel readback, so it
-/// stays an exact equality; the unset cell remains as the control that the
-/// floor fits the environment.
+/// 881928 vs 1045248 for identical settings, CI run 29135962755); FreeBSD's
+/// TCP rcvbuf autotuning made it latent-flaky there too. `sock_bufsize` is
+/// riperf3's own rendering, not a kernel readback, so it stays an exact
+/// equality; the unset cell remains as the control that the floor fits the
+/// environment. On the BSD kernels (macOS/FreeBSD, sbreserve hiwat=0) a real
+/// regression may instead wedge the round and surface as the harness's 15s
+/// "client hung" panic rather than the floor message — still red, just
+/// hang-shaped.
 #[tokio::test]
 async fn tcp_window_zero_leaves_buffers_untouched_both_roles() {
     // Above the kernel clamp minimums (Linux SOCK_MIN_SNDBUF 4608 /
@@ -2955,7 +2959,8 @@ async fn tcp_window_zero_leaves_buffers_untouched_both_roles() {
         );
         assert_eq!(
             zero[i].0, unset[i].0,
-            "the {role}'s -w 0 sock_bufsize must equal the unset cell (#415)"
+            "the {role}'s UNSET-cell sock_bufsize must also render GT's verbatim 0 \
+             (this arm pins the unset render; the w=0 render is pinned above)"
         );
         for (name, z, u) in [
             ("sndbuf_actual", zero[i].1, unset[i].1),
@@ -2981,7 +2986,10 @@ async fn tcp_window_zero_leaves_buffers_untouched_both_roles() {
 /// (apply_window=true, the #59 path), distinct from TCP's
 /// `configure_tcp_stream_full` — GT's guard is the same truthiness in
 /// `iperf_udp_buffercheck` (iperf_udp.c:384). Client doc only: the server's
-/// UDP start block carries no actuals (#383).
+/// UDP start block carries no actuals (#383). Cross-run equality stays safe
+/// here where the TCP sibling had to drop it: UDP buffers are not autotuned
+/// on any CI platform (static defaults), and the #163 sndbuf bump is
+/// deterministic across both cells.
 #[tokio::test]
 async fn udp_window_zero_equals_unset_cell() {
     let unset = run_round_actuals(None, true).await;
