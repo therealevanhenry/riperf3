@@ -38,12 +38,13 @@ pub(crate) struct TestConfig {
     pub tos: i32,
     pub congestion: Option<String>,
     pub udp_counters_64bit: bool,
-    /// #414: the client asked for the repeating 0x00..0xFF payload — GT
-    /// fills it in iperf_new_stream on BOTH roles (iperf_api.c:4891), so
-    /// the server's reverse/bidir senders honor it too. PRESENCE-triggered
-    /// on the wire (GT sets 1 whatever the value, iperf_api.c:2645-2646).
+    /// #414: the client asked for the repeating payload (GT's ASCII
+    /// '0'..'9' pattern, iperf_util.c:85-99) — GT fills it in
+    /// iperf_new_stream on BOTH roles (iperf_api.c:4891), so the server's
+    /// reverse/bidir senders honor it too. PRESENCE-triggered on the wire
+    /// (GT sets 1 whatever the value, iperf_api.c:2645-2646).
     pub repeating_payload: bool,
-    /// #414: the client's --dont-fragment — GT sets DF in iperf_new_stream
+    /// #414: the client's --dont-fragment — GT sets DF in iperf_init_stream
     /// on BOTH roles, gated UDP && AF_INET (iperf_api.c:4964-4975), so the
     /// server's UDP v4 data sockets carry it on server-sent datagrams.
     /// (The wire `flowlabel` key is deliberately NOT plumbed here: GT's

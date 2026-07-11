@@ -3214,13 +3214,15 @@ async fn cport_65535_wraps_to_ephemeral_like_gt() {
     );
 }
 
-/// #414 (server half): GT fills the repeating 0x00..0xFF pattern in
+/// #414 (server half): GT fills the repeating pattern — ASCII '0'..'9',
+/// period 10 (fill_with_repeating_pattern, iperf_util.c:85-99) — in
 /// iperf_new_stream on BOTH roles (iperf_api.c:4891), so a server whose
-/// client sent `"repeating_payload"` sends the pattern in reverse. The
-/// riperf3 server hardcoded `make_send_buffer(blksize, false)` (zeros),
-/// ignoring the wire key entirely. A raw mock client drives a reverse
-/// round and reads the server's first block off the data socket: it must
-/// be the repeating pattern, byte-for-byte.
+/// client sent `"repeating_payload"` sends the pattern in reverse
+/// (live-probed against GT 3.21, #441 r1). The riperf3 server hardcoded
+/// `make_send_buffer(blksize, false)` (zeros), ignoring the wire key
+/// entirely. A raw mock client drives a reverse round and reads the
+/// server's first block off the data socket: it must be GT's pattern,
+/// byte-for-byte.
 #[tokio::test]
 async fn reverse_server_honors_repeating_payload_key() {
     let server = ServerBuilder::new()
@@ -3262,7 +3264,7 @@ async fn reverse_server_honors_repeating_payload_key() {
     .expect("mock");
     let _ = tokio::time::timeout(Duration::from_secs(15), server_task).await;
 
-    let want: Vec<u8> = (0..4096usize).map(|i| (i % 256) as u8).collect();
+    let want: Vec<u8> = (0..4096usize).map(|i| b'0' + (i % 10) as u8).collect();
     assert_eq!(
         first_block, want,
         "the server's reverse payload is the repeating pattern when the wire key rode (#414)"

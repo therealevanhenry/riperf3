@@ -1306,8 +1306,9 @@ impl Client {
             p.tos = Some(self.tos);
         }
         // #414: GT sends all three when set (truthy gates,
-        // iperf_api.c:2475 flowlabel / :2489 repeating_payload, literal 1 /
-        // :2494 dont_fragment) — without them the peer server can't fill
+        // iperf_api.c:2475 flowlabel / :2489 repeating_payload — the
+        // field's value, 1 for every CLI-reachable state / :2494
+        // dont_fragment) — without them the peer server can't fill
         // the repeating pattern or set DF on ITS send paths. flowlabel
         // rides for wire parity although GT's SERVER never applies it
         // (client-connect-only, iperf_tcp.c:521 in iperf_tcp_connect;
@@ -1443,7 +1444,7 @@ impl Client {
                     )?;
                     // Apply socket options (no-ops on non-Linux).
                     // #414: NO DF here — GT's gate is UDP && AF_INET only
-                    // (iperf_new_stream, iperf_api.c:4964-4975); a TCP
+                    // (iperf_init_stream, iperf_api.c:4964-4975); a TCP
                     // --dont-fragment run leaves the socket untouched.
                     // #302: GT warns and continues on a pacing failure.
                     net::apply_fq_rate(&data_stream, self.fq_rate.unwrap_or(0));
@@ -4681,7 +4682,11 @@ mod tests {
                 .build()
                 .unwrap();
             let p = c.build_params(1460);
-            assert_eq!(p.repeating_payload, Some(1), "GT sends literal 1");
+            assert_eq!(
+                p.repeating_payload,
+                Some(1),
+                "GT sends the field's value, 1 from the CLI"
+            );
             assert_eq!(p.dont_fragment, Some(1));
             assert_eq!(p.flowlabel, Some(3));
 

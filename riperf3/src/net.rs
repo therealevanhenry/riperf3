@@ -610,7 +610,7 @@ pub fn configure_udp_sender(
     use nix::sys::socket::{self, sockopt};
     use nix::sys::time::TimeVal;
     socket.set_nonblocking(false)?;
-    // #414: GT's DF gate — iperf_new_stream sets IP-level DF only for
+    // #414: GT's DF gate — iperf_init_stream sets IP-level DF only for
     // UDP && AF_INET (iperf_api.c:4964-4975), both roles; v6 and TCP never.
     // Applied at this egress choke point so every UDP sender (client,
     // server recycling, server demux) carries it. (GT also stamps its
@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     /// #414: the DF gate at the UDP egress choke point — GT's
-    /// iperf_new_stream sets IP-level DF only for UDP && AF_INET
+    /// iperf_init_stream sets IP-level DF only for UDP && AF_INET
     /// (iperf_api.c:4964-4975). Real-socket readback: IP_MTU_DISCOVER
     /// lands PMTUDISC_DO on a v4 socket with the flag, stays default
     /// without it, and a v6 socket passes through untouched (no error).

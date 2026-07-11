@@ -114,11 +114,15 @@ pub fn parse_keepalive(s: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
 }
 
 /// Create a send buffer of `size` bytes.
-/// If `repeating_payload` is true, fills with a repeating 0x00..0xFF pattern (like iperf2).
-/// Otherwise returns a zero-filled buffer.
+/// If `repeating_payload` is true, fills with GT's repeating pattern —
+/// ASCII digits `'0'..'9'`, period 10 (`fill_with_repeating_pattern`,
+/// iperf_util.c:85-99; #441 r1 fixed the old 0x00..0xFF ramp, which was a
+/// wire-payload divergence live-probed against a real GT reverse round).
+/// Otherwise returns a zero-filled buffer (the zeros-vs-GT-entropy
+/// deviation is tracked in #440).
 pub fn make_send_buffer(size: usize, repeating_payload: bool) -> Vec<u8> {
     if repeating_payload {
-        (0..size).map(|i| (i % 256) as u8).collect()
+        (0..size).map(|i| b'0' + (i % 10) as u8).collect()
     } else {
         vec![0u8; size]
     }
@@ -490,13 +494,14 @@ mod tests {
 
     // -- make_send_buffer edge cases --
 
+    /// GT's pattern: ASCII '0'..'9' with period 10 from offset 0
+    /// (fill_with_repeating_pattern, iperf_util.c:85-99) — live-probed
+    /// byte-for-byte against a GT 3.21 reverse round (#441 r1).
     #[test]
-    fn make_send_buffer_wraps_at_256() {
-        let buf = make_send_buffer(512, true);
-        assert_eq!(buf[0], 0);
-        assert_eq!(buf[255], 255);
-        assert_eq!(buf[256], 0); // wraps
-        assert_eq!(buf[511], 255);
+    fn make_send_buffer_matches_gt_digit_pattern() {
+        let buf = make_send_buffer(25, true);
+        assert_eq!(&buf[..12], b"012345678901");
+        assert_eq!(buf[24], b'4');
     }
 }
 
@@ -654,9 +659,9 @@ mod implemented_flag_unit_tests {
     fn repeating_payload_buffer() {
         let buf = crate::utils::make_send_buffer(256, true);
         assert_eq!(buf.len(), 256);
-        assert_eq!(buf[0], 0);
-        assert_eq!(buf[1], 1);
-        assert_eq!(buf[255], 255);
+        assert_eq!(buf[0], b'0');
+        assert_eq!(buf[1], b'1');
+        assert_eq!(buf[255], b'5'); // 255 % 10
 
         let zeros = crate::utils::make_send_buffer(256, false);
         assert!(zeros.iter().all(|&b| b == 0));
