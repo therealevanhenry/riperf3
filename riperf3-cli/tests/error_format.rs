@@ -1554,6 +1554,29 @@ fn auth_param_validations_match_gt() {
             CLIENT_MSG,
         ),
     ];
+    // Bounded runner: a REGRESSED check lets the `-s` cells pass the parse
+    // and listen forever — `output()` would hang the suite (and eat a CI
+    // wedge-guard timeout) instead of going red. Poll-wait 10 s, then kill.
+    fn run_bounded(cmd: &mut std::process::Command) -> std::process::Output {
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let mut out = child.wait_with_output().unwrap();
+        out.stderr
+            .extend_from_slice(b"[test] KILLED: still running at the 10s bound");
+        out
+    }
+
     for (args, pw_env, want) in &cases {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_riperf3"));
         cmd.args(args)
@@ -1563,7 +1586,7 @@ fn auth_param_validations_match_gt() {
         if let Some(pw) = pw_env {
             cmd.env("IPERF3_PASSWORD", pw);
         }
-        let out = cmd.output().unwrap();
+        let out = run_bounded(&mut cmd);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: exit 1: {stderr:?}");
         assert!(stderr.contains(want), "{args:?}: wanted {want:?}: {stderr:?}");
