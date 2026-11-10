@@ -635,6 +635,9 @@ pub async fn run_tcp_sender(
         // don't pin the 1-block figure in tests (review r4).
         if let Some(b) = &byte_budget {
             let len = buf.len() as i64;
+            // `fetch_update` is deprecated for `try_update` on current
+            // stable, which the 1.85 MSRV does not have yet.
+            #[allow(deprecated)]
             if b.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 (v > 0).then_some(v - len)
             })
