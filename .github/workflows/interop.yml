@@ -62,7 +62,7 @@ jobs:
         run: cargo build --release --bin riperf3
 
       # No XFAILs: #48 (UDP rev/bidir teardown reset vs iperf3 <=3.12) is fixed, so
-      # every cell is required on both versions. The harness still supports XFAIL
+      # every cell is required on every version. The harness still supports XFAIL
       # (interop.sh) for any future tracked known-issue.
       - name: Run interop matrix
         env:

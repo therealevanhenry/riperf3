@@ -23,26 +23,38 @@ pub const UDP_CONNECT_MSG: u32 = 0x3637_3839; // "6789" in ASCII
 pub const UDP_CONNECT_REPLY: u32 = 0x3938_3736; // "9876" in ASCII
 /// The values iperf3 used before 3.12 (iperf.h: "legacy value was
 /// 123456789" / "987654321"). Peers that old are still widely deployed and
-/// still send them (#448), so both generations are accepted on receipt;
-/// riperf3 itself always sends the current values, which every iperf3
-/// accepts (pre-3.12 peers do not inspect the value at all).
+/// still send them (#448). riperf3 itself always sends the current values,
+/// which every iperf3 accepts (pre-3.12 peers do not inspect the value).
 pub const LEGACY_UDP_CONNECT_MSG: u32 = 123_456_789;
 pub const LEGACY_UDP_CONNECT_REPLY: u32 = 987_654_321;
 
-/// Is this the client's UDP connect value (current or pre-3.12)?
-///
-/// RECORDED DEVIATION: iperf3's server does not look at the value — any
-/// datagram opens the stream (iperf_udp.c:543). riperf3 takes only the two
-/// values an iperf3 client has ever sent, so a stray datagram on the port
-/// cannot open a stream.
-pub fn is_udp_connect_msg(msg: u32) -> bool {
-    msg == UDP_CONNECT_MSG || msg == LEGACY_UDP_CONNECT_MSG
+/// Either generation of `current`/`legacy`, in either byte order: iperf3
+/// wrote these values in host order until 3.17, so an opposite-endian
+/// older peer's value arrives byte-swapped.
+fn is_connect_value(v: u32, current: u32, legacy: u32) -> bool {
+    [current, legacy]
+        .into_iter()
+        .any(|k| v == k || v == k.swap_bytes())
 }
 
-/// Is this the server's UDP connect reply (current or pre-3.12)? Matches
-/// iperf3 >= 3.12's client check (iperf_udp.c:768).
+/// Is this a client's UDP connect value, as read with `from_ne_bytes`?
+///
+/// RECORDED DEVIATION: iperf3's server does not look at the value — any
+/// datagram opens the stream (iperf_udp.c:543 @3.21). riperf3 takes only
+/// the byte patterns an iperf3 client has sent (both generations, both
+/// byte orders); anything else is dropped on the shared-socket setup path
+/// and fails the round on the per-stream path.
+pub fn is_udp_connect_msg(msg: u32) -> bool {
+    is_connect_value(msg, UDP_CONNECT_MSG, LEGACY_UDP_CONNECT_MSG)
+}
+
+/// Is this a server's UDP connect reply, as read with `from_ne_bytes`?
+///
+/// iperf3 >= 3.12's client takes the current and legacy values in its own
+/// byte order only (iperf_udp.c:768 @3.21); riperf3 also takes them
+/// byte-swapped, so an opposite-endian pre-3.17 server interoperates.
 pub fn is_udp_connect_reply(reply: u32) -> bool {
-    reply == UDP_CONNECT_REPLY || reply == LEGACY_UDP_CONNECT_REPLY
+    is_connect_value(reply, UDP_CONNECT_REPLY, LEGACY_UDP_CONNECT_REPLY)
 }
 
 // ---------------------------------------------------------------------------
