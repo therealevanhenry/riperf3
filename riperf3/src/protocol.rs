@@ -1746,20 +1746,56 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(reply), UDP_CONNECT_REPLY);
     }
 
+    /// #448: an opposite-endian pre-3.17 iperf3 server's reply arrives
+    /// byte-swapped (iperf3 wrote it in host order until 3.17) — both the
+    /// current value and the legacy one end the handshake.
+    #[tokio::test]
+    async fn udp_connect_client_accepts_byte_swapped_replies() {
+        for v in [UDP_CONNECT_REPLY, LEGACY_UDP_CONNECT_REPLY] {
+            let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server_sock.local_addr().unwrap();
+            let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client_sock.connect(server_addr).await.unwrap();
+
+            let server_task = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                let (_, caddr) = server_sock.recv_from(&mut buf).await.unwrap();
+                server_sock
+                    .send_to(&v.swap_bytes().to_ne_bytes(), caddr)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                udp_connect_client(&client_sock),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("byte-swapped reply {v:#x} must end the handshake"))
+            .unwrap();
+            server_task.await.unwrap();
+        }
+    }
+
     /// #448: the connect/reply predicates take both generations of each
-    /// value and nothing else — in particular not the byte-swapped legacy
-    /// reply the client used to compare against.
+    /// value in either byte order, and nothing else.
     #[test]
     fn udp_connect_predicates_cover_both_generations() {
-        assert!(is_udp_connect_msg(UDP_CONNECT_MSG));
-        assert!(is_udp_connect_msg(LEGACY_UDP_CONNECT_MSG));
-        assert!(!is_udp_connect_msg(UDP_CONNECT_REPLY));
+        for v in [UDP_CONNECT_MSG, LEGACY_UDP_CONNECT_MSG] {
+            assert!(is_udp_connect_msg(v));
+            assert!(is_udp_connect_msg(v.swap_bytes()));
+        }
+        assert!(!is_udp_connect_msg(LEGACY_UDP_CONNECT_REPLY));
         assert!(!is_udp_connect_msg(0xdead_beef));
+        assert!(!is_udp_connect_msg(0));
 
-        assert!(is_udp_connect_reply(UDP_CONNECT_REPLY));
-        assert!(is_udp_connect_reply(LEGACY_UDP_CONNECT_REPLY));
-        assert!(!is_udp_connect_reply(UDP_CONNECT_MSG));
-        assert!(!is_udp_connect_reply(LEGACY_UDP_CONNECT_REPLY.swap_bytes()));
+        for v in [UDP_CONNECT_REPLY, LEGACY_UDP_CONNECT_REPLY] {
+            assert!(is_udp_connect_reply(v));
+            assert!(is_udp_connect_reply(v.swap_bytes()));
+        }
+        assert!(!is_udp_connect_reply(LEGACY_UDP_CONNECT_MSG));
+        assert!(!is_udp_connect_reply(0xdead_beef));
+        assert!(!is_udp_connect_reply(0));
     }
 
     /// Issue #11 round-3: a flood of stray datagrams must NOT be amplified into
