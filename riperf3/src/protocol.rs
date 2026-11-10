@@ -30,7 +30,10 @@ pub const LEGACY_UDP_CONNECT_REPLY: u32 = 987_654_321;
 
 /// Either generation of `current`/`legacy`, in either byte order: iperf3
 /// wrote these values in host order until 3.17, so an opposite-endian
-/// older peer's value arrives byte-swapped.
+/// older peer's value arrives byte-swapped. The current connect and reply
+/// values are byte swaps of each other, so for that generation the two
+/// predicates below accept the same pair; each role only ever receives the
+/// other role's value, so the overlap is not reachable in a real exchange.
 fn is_connect_value(v: u32, current: u32, legacy: u32) -> bool {
     [current, legacy]
         .into_iter()
@@ -50,8 +53,8 @@ pub fn is_udp_connect_msg(msg: u32) -> bool {
 
 /// Is this a server's UDP connect reply, as read with `from_ne_bytes`?
 ///
-/// iperf3 >= 3.12's client takes the current and legacy values in its own
-/// byte order only (iperf_udp.c:768 @3.21); riperf3 also takes them
+/// iperf3 >= 3.12's client takes the current and legacy values in one byte
+/// layout only (iperf_udp.c:768 @3.21); riperf3 also takes them
 /// byte-swapped, so an opposite-endian pre-3.17 server interoperates.
 pub fn is_udp_connect_reply(reply: u32) -> bool {
     is_connect_value(reply, UDP_CONNECT_REPLY, LEGACY_UDP_CONNECT_REPLY)
@@ -1790,7 +1793,8 @@ mod tests {
     }
 
     /// #448: the connect/reply predicates take both generations of each
-    /// value in either byte order, and nothing else.
+    /// value in either byte order, and nothing else. The current connect
+    /// and reply values are byte swaps of each other — a known overlap.
     #[test]
     fn udp_connect_predicates_cover_both_generations() {
         for v in [UDP_CONNECT_MSG, LEGACY_UDP_CONNECT_MSG] {
@@ -1808,6 +1812,8 @@ mod tests {
         assert!(!is_udp_connect_reply(LEGACY_UDP_CONNECT_MSG));
         assert!(!is_udp_connect_reply(0xdead_beef));
         assert!(!is_udp_connect_reply(0));
+
+        assert_eq!(UDP_CONNECT_MSG.swap_bytes(), UDP_CONNECT_REPLY);
     }
 
     /// Issue #11 round-3: a flood of stray datagrams must NOT be amplified into
