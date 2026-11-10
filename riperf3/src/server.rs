@@ -3177,7 +3177,7 @@ impl Server {
                             ));
                         }
                         let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
-                        if msg != protocol::UDP_CONNECT_MSG {
+                        if !protocol::is_udp_connect_msg(msg) {
                             return Err(RiperfError::Protocol(format!(
                                 "unexpected UDP connect message: {msg:#x}"
                             )));
@@ -3460,7 +3460,7 @@ impl Server {
                         continue;
                     }
                     let msg = u32::from_ne_bytes(magic_buf[..4].try_into().unwrap());
-                    if msg != protocol::UDP_CONNECT_MSG {
+                    if !protocol::is_udp_connect_msg(msg) {
                         continue;
                     }
                     udp_sock

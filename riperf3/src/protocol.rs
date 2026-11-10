@@ -21,18 +21,28 @@ pub const MAX_PARAMS_JSON_LEN: usize = 8 * 1024;
 /// UDP "connect" handshake magic values.
 pub const UDP_CONNECT_MSG: u32 = 0x3637_3839; // "6789" in ASCII
 pub const UDP_CONNECT_REPLY: u32 = 0x3938_3736; // "9876" in ASCII
-/// Values iperf3 used before 3.12; peers that old still send them.
+/// The values iperf3 used before 3.12 (iperf.h: "legacy value was
+/// 123456789" / "987654321"). Peers that old are still widely deployed and
+/// still send them (#448), so both generations are accepted on receipt;
+/// riperf3 itself always sends the current values, which every iperf3
+/// accepts (pre-3.12 peers do not inspect the value at all).
 pub const LEGACY_UDP_CONNECT_MSG: u32 = 123_456_789;
 pub const LEGACY_UDP_CONNECT_REPLY: u32 = 987_654_321;
 
 /// Is this the client's UDP connect value (current or pre-3.12)?
+///
+/// RECORDED DEVIATION: iperf3's server does not look at the value — any
+/// datagram opens the stream (iperf_udp.c:543). riperf3 takes only the two
+/// values an iperf3 client has ever sent, so a stray datagram on the port
+/// cannot open a stream.
 pub fn is_udp_connect_msg(msg: u32) -> bool {
-    msg == UDP_CONNECT_MSG
+    msg == UDP_CONNECT_MSG || msg == LEGACY_UDP_CONNECT_MSG
 }
 
-/// Is this the server's UDP connect reply (current or pre-3.12)?
+/// Is this the server's UDP connect reply (current or pre-3.12)? Matches
+/// iperf3 >= 3.12's client check (iperf_udp.c:768).
 pub fn is_udp_connect_reply(reply: u32) -> bool {
-    reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a
+    reply == UDP_CONNECT_REPLY || reply == LEGACY_UDP_CONNECT_REPLY
 }
 
 // ---------------------------------------------------------------------------
@@ -978,14 +988,7 @@ pub async fn udp_connect_client(socket: &UdpSocket) -> Result<()> {
             .min(deadline)
             .saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(wait, socket.recv(&mut buf)).await {
-            Ok(Ok(n))
-                if n >= 4 && {
-                    let reply = u32::from_ne_bytes(buf);
-                    reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a
-                } =>
-            {
-                return Ok(())
-            }
+            Ok(Ok(n)) if n >= 4 && is_udp_connect_reply(u32::from_ne_bytes(buf)) => return Ok(()),
             // A stray/short datagram that isn't the reply: drain and ignore
             // (the real reply may be behind it). Don't resend here — the
             // interval floor gates the next send.
@@ -1071,7 +1074,7 @@ pub async fn udp_connect_server(
         ));
     }
     let msg = u32::from_ne_bytes(buf[..4].try_into().unwrap());
-    if msg != UDP_CONNECT_MSG {
+    if !is_udp_connect_msg(msg) {
         return Err(RiperfError::Protocol(format!(
             "unexpected UDP connect message: {msg:#x}"
         )));
