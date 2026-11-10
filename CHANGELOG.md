@@ -42,6 +42,9 @@ release tags.
 
 ### Fixed
 
+- UDP against iperf3 ≤ 3.11 works in both roles: the pre-3.12 UDP connect/reply values are
+  accepted (#448). Previously the client failed after 30 s with "UDP connect handshake
+  failed" and the server rejected the connect.
 - Auth flag combinations are validated at parse time like iperf3 (IESETCLIENTAUTH /
   IESETSERVERAUTH / IESERVERAUTHUSERS sentences, key files loaded up front, client
   password resolved at the getpass slot — env else TTY-only prompt): a half-configured

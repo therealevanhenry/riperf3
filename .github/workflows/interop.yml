@@ -29,9 +29,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Last release with the pre-3.12 UDP connect/reply values (#448) —
+          # the only target that exercises them. SHA-pinned like the others.
+          - iperf3: "3.11"
+            sha: 76bd67f6e90e239a7686202d2b1b595159826d24
           # Legacy target — exercises riperf3's iperf3<=3.12 compat shims (#23,
-          # #24, the legacy UDP connect reply). SHA-pinned (the tag is mutable)
-          # so the "known iperf3" can't silently change under the gate.
+          # #24). SHA-pinned (the tag is mutable) so the "known iperf3" can't
+          # silently change under the gate.
           - iperf3: "3.12"
             sha: e61aaf8c95df956cefbc54fab7b3d78914664180
           # Latest release.
@@ -58,7 +62,7 @@ jobs:
         run: cargo build --release --bin riperf3
 
       # No XFAILs: #48 (UDP rev/bidir teardown reset vs iperf3 <=3.12) is fixed, so
-      # every cell is required on both versions. The harness still supports XFAIL
+      # every cell is required on every version. The harness still supports XFAIL
       # (interop.sh) for any future tracked known-issue.
       - name: Run interop matrix
         env:
