@@ -21,6 +21,19 @@ pub const MAX_PARAMS_JSON_LEN: usize = 8 * 1024;
 /// UDP "connect" handshake magic values.
 pub const UDP_CONNECT_MSG: u32 = 0x3637_3839; // "6789" in ASCII
 pub const UDP_CONNECT_REPLY: u32 = 0x3938_3736; // "9876" in ASCII
+/// Values iperf3 used before 3.12; peers that old still send them.
+pub const LEGACY_UDP_CONNECT_MSG: u32 = 123_456_789;
+pub const LEGACY_UDP_CONNECT_REPLY: u32 = 987_654_321;
+
+/// Is this the client's UDP connect value (current or pre-3.12)?
+pub fn is_udp_connect_msg(msg: u32) -> bool {
+    msg == UDP_CONNECT_MSG
+}
+
+/// Is this the server's UDP connect reply (current or pre-3.12)?
+pub fn is_udp_connect_reply(reply: u32) -> bool {
+    reply == UDP_CONNECT_REPLY || reply == 0xb168_de3a
+}
 
 // ---------------------------------------------------------------------------
 // Test state — the single-byte state machine on the control connection
@@ -1665,6 +1678,85 @@ mod tests {
 
         udp_connect_client(&client_sock).await.unwrap();
         server_task.await.unwrap();
+    }
+
+    /// #448: a pre-3.12 iperf3 server answers the connect with the legacy
+    /// reply value (987654321, native order). The client must take it as the
+    /// reply — iperf3 >= 3.12 clients do (LEGACY_UDP_CONNECT_REPLY) — and
+    /// not drain it as a stray until the handshake budget expires.
+    #[tokio::test]
+    async fn udp_connect_client_accepts_legacy_reply() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (_, caddr) = server_sock.recv_from(&mut buf).await.unwrap();
+            // What iperf3 <= 3.11 puts on the wire from a little-endian host.
+            server_sock
+                .send_to(&987_654_321_u32.to_le_bytes(), caddr)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            udp_connect_client(&client_sock),
+        )
+        .await
+        .expect("the legacy reply must end the handshake, not be drained as a stray")
+        .unwrap();
+        server_task.await.unwrap();
+    }
+
+    /// #448 (server side): a pre-3.12 iperf3 client opens each UDP stream
+    /// with the legacy connect value (123456789, native order). The server
+    /// must take it as the connect and answer.
+    #[tokio::test]
+    async fn udp_connect_server_accepts_legacy_connect() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        // What iperf3 <= 3.11 puts on the wire from a little-endian host.
+        client_sock
+            .send(&123_456_789_u32.to_le_bytes())
+            .await
+            .unwrap();
+        let client_addr = udp_connect_server(&server_sock, std::time::Duration::from_secs(5))
+            .await
+            .expect("the legacy connect value must be accepted");
+        assert_eq!(client_addr, client_sock.local_addr().unwrap());
+
+        let mut reply = [0u8; 4];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_sock.recv(&mut reply),
+        )
+        .await
+        .expect("server must reply")
+        .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(u32::from_ne_bytes(reply), UDP_CONNECT_REPLY);
+    }
+
+    /// #448: the connect/reply predicates take both generations of each
+    /// value and nothing else — in particular not the byte-swapped legacy
+    /// reply the client used to compare against.
+    #[test]
+    fn udp_connect_predicates_cover_both_generations() {
+        assert!(is_udp_connect_msg(UDP_CONNECT_MSG));
+        assert!(is_udp_connect_msg(LEGACY_UDP_CONNECT_MSG));
+        assert!(!is_udp_connect_msg(UDP_CONNECT_REPLY));
+        assert!(!is_udp_connect_msg(0xdead_beef));
+
+        assert!(is_udp_connect_reply(UDP_CONNECT_REPLY));
+        assert!(is_udp_connect_reply(LEGACY_UDP_CONNECT_REPLY));
+        assert!(!is_udp_connect_reply(UDP_CONNECT_MSG));
+        assert!(!is_udp_connect_reply(LEGACY_UDP_CONNECT_REPLY.swap_bytes()));
     }
 
     /// Issue #11 round-3: a flood of stray datagrams must NOT be amplified into
