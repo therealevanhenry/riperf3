@@ -5200,6 +5200,123 @@ mod tests {
         assert_eq!(tos, Some(0x48), "demux UDP egress must carry cfg.tos");
     }
 
+    /// Test client half of the UDP connect handshake with a caller-chosen
+    /// connect datagram: retries it until a 4-byte reply lands and returns
+    /// the reply bytes (None if the server never answers).
+    #[cfg(target_os = "linux")]
+    fn udp_connect_probe_client(
+        server: std::net::SocketAddr,
+        connect: [u8; 4],
+    ) -> std::thread::JoinHandle<Option<[u8; 4]>> {
+        std::thread::spawn(move || {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(250)))
+                .unwrap();
+            let mut reply = [0u8; 4];
+            // The server task may bind after our first send.
+            for _ in 0..20 {
+                let _ = sock.send_to(&connect, server);
+                if let Ok((4, _)) = sock.recv_from(&mut reply) {
+                    return Some(reply);
+                }
+            }
+            None
+        })
+    }
+
+    /// Drive one UDP setup path (server receives, one stream) against a
+    /// client that opens the stream with `connect`, and assert the setup
+    /// completes and answers with the current reply value.
+    #[cfg(target_os = "linux")]
+    async fn assert_udp_setup_accepts_connect(demux: bool, connect: [u8; 4]) {
+        let port = free_udp_port();
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _ctrl_client = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (ctrl_srv, _) = l.accept().await.unwrap();
+
+        let srv = ServerBuilder::new()
+            .port(Some(port))
+            .bind_address("127.0.0.1")
+            .build()
+            .unwrap();
+        let params = TestParams {
+            udp: Some(true),
+            parallel: Some(1),
+            ..Default::default()
+        };
+        let cfg = TestConfig::from_params(&params).unwrap();
+        let mut ctx = test_run_ctx(ctrl_srv, params, cfg);
+
+        let client =
+            udp_connect_probe_client(format!("127.0.0.1:{port}").parse().unwrap(), connect);
+
+        let mut abort_guard = stream::AbortStreamsOnDrop::new();
+        // Bounded: a rejected connect is a hard error on the recycling path
+        // but a silent drop (so an endless wait) on the demux path.
+        let setup = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            if demux {
+                srv.setup_udp_demux_streams(&mut ctx, 1, 1, None, &mut abort_guard)
+                    .await
+            } else {
+                srv.setup_udp_recycling_streams(&mut ctx, 1, 1, None, &mut abort_guard)
+                    .await
+            }
+        })
+        .await;
+        let reply = client.join().unwrap();
+        drop(abort_guard);
+        ctx.done.store(true, Ordering::Relaxed);
+        if let Some(h) = ctx.udp_demux_handle.take() {
+            h.abort();
+        }
+
+        setup
+            .expect("setup must not wait forever on this connect value")
+            .expect("setup must accept this connect value");
+        assert_eq!(
+            reply,
+            Some(protocol::UDP_CONNECT_REPLY.to_ne_bytes()),
+            "server must answer the connect with the current reply value"
+        );
+    }
+
+    /// #448: a pre-3.12 iperf3 client opens each UDP stream with the legacy
+    /// connect value. Recycling path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_recycling_setup_accepts_legacy_connect() {
+        assert_udp_setup_accepts_connect(false, 123_456_789_u32.to_ne_bytes()).await;
+    }
+
+    /// #448, demux flavor (the default path on Windows).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_demux_setup_accepts_legacy_connect() {
+        assert_udp_setup_accepts_connect(true, 123_456_789_u32.to_ne_bytes()).await;
+    }
+
+    /// #448: iperf3 wrote the connect in host order until 3.17, so an
+    /// opposite-endian client's value arrives byte-swapped — both the
+    /// current value (3.12–3.16) and the legacy one (<= 3.11).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_recycling_setup_accepts_byte_swapped_connects() {
+        for v in [protocol::UDP_CONNECT_MSG, protocol::LEGACY_UDP_CONNECT_MSG] {
+            assert_udp_setup_accepts_connect(false, v.swap_bytes().to_ne_bytes()).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_demux_setup_accepts_byte_swapped_connects() {
+        for v in [protocol::UDP_CONNECT_MSG, protocol::LEGACY_UDP_CONNECT_MSG] {
+            assert_udp_setup_accepts_connect(true, v.swap_bytes().to_ne_bytes()).await;
+        }
+    }
+
     // Per-setter builder tests migrated in-crate from `tests/integration.rs`
     // when `Server`'s fields became `pub(crate)` (#43): an external test crate
     // can no longer read `s.one_off`, `s.verbose`, etc.
